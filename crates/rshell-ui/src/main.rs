@@ -29,6 +29,9 @@ fn main() {
     app.run(|cx: &mut App| {
         tracing::info!("GPUI application initialized");
 
+        // 初始化 gpui-component（注册全局样式 / Theme）
+        gpui_component::init(cx);
+
         // 设置应用标题和窗口大小
         let options = gpui::WindowOptions {
             window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {

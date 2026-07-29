@@ -1,35 +1,40 @@
 //! 撰写窗格视图
 //!
 //! 多行文本编辑器，支持将文本批量发送到目标会话。
+//! 使用 gpui_component::input 提供真实的多行编辑能力。
 //! 可选择发送到当前会话、所有会话或选中会话。
 
 use gpui::*;
+use gpui_component::input::{Input, InputState};
 use rshell_api::types::ComposeTarget;
 use uuid::Uuid;
 
 /// 撰写窗格视图
 pub struct ComposePaneView {
-    /// 编辑内容
-    content: String,
+    /// 编辑内容状态（gpui_component）
+    input_state: Entity<InputState>,
     /// 发送目标
     target: ComposeTarget,
     /// 发送历史
     history: Vec<String>,
     /// 当前活动会话 ID
     active_session: Option<Uuid>,
-    /// 光标位置（行，列）
-    cursor_pos: (usize, usize),
 }
 
 impl ComposePaneView {
     /// 创建新的撰写窗格
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let input_state = cx.new(|cx: &mut Context<InputState>| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .placeholder("在此输入要发送的文本...")
+        });
+
         Self {
-            content: String::new(),
+            input_state,
             target: ComposeTarget::CurrentSession,
             history: Vec::new(),
             active_session: None,
-            cursor_pos: (0, 0),
         }
     }
 
@@ -38,14 +43,9 @@ impl ComposePaneView {
         self.active_session = session_id;
     }
 
-    /// 设置内容
-    pub fn set_content(&mut self, content: String) {
-        self.content = content;
-    }
-
     /// 获取内容
-    pub fn content(&self) -> &str {
-        &self.content
+    pub fn content(&self, cx: &App) -> String {
+        self.input_state.read(cx).value().clone()
     }
 
     /// 获取发送目标
@@ -70,21 +70,12 @@ impl ComposePaneView {
             ComposeTarget::SelectedSessions(_) => "选中会话",
         }
     }
-
-    /// 获取内容行数
-    fn line_count(&self) -> usize {
-        if self.content.is_empty() {
-            1
-        } else {
-            self.content.lines().count().max(1)
-        }
-    }
 }
 
 impl Render for ComposePaneView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let target_desc = self.target_description();
-        let line_count = self.line_count();
+        let char_count = self.input_state.read(cx).value().len();
 
         div()
             .size_full()
@@ -106,10 +97,7 @@ impl Render for ComposePaneView {
                             .text_sm()
                             .child("撰写窗格"),
                     )
-                    .child(
-                        div()
-                            .flex_1(),
-                    )
+                    .child(div().flex_1())
                     // 目标选择
                     .child(
                         div()
@@ -139,58 +127,13 @@ impl Render for ComposePaneView {
                             ),
                     ),
             )
-            // 编辑区域
+            // 编辑区域（gpui_component Input）
             .child(
                 div()
                     .flex_1()
                     .bg(rgb(0x1e1e2e))
-                    .flex()
-                    .flex_row()
-                    // 行号栏
-                    .child(
-                        div()
-                            .w(px(40.0))
-                            .bg(rgb(0x181825))
-                            .flex()
-                            .flex_col()
-                            .children((1..=line_count).map(|i| {
-                                div()
-                                    .h(px(20.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_end()
-                                    .pr(px(8.0))
-                                    .child(
-                                        div()
-                                            .text_color(rgb(0x6c7086))
-                                            .text_xs()
-                                            .child(i.to_string()),
-                                    )
-                            })),
-                    )
-                    // 文本编辑区
-                    .child(
-                        div()
-                            .flex_1()
-                            .bg(rgb(0x1e1e2e))
-                            .p(px(4.0))
-                            .child(
-                                if self.content.is_empty() {
-                                    div()
-                                        .text_color(rgb(0x6c7086))
-                                        .text_sm()
-                                        .child("在此输入要发送的文本...")
-                                        .into_any()
-                                } else {
-                                    div()
-                                        .text_color(rgb(0xcdd6f4))
-                                        .font_family("Consolas")
-                                        .text_sm()
-                                        .child(self.content.clone())
-                                        .into_any()
-                                },
-                            ),
-                    ),
+                    .p(px(4.0))
+                    .child(Input::new(&self.input_state)),
             )
             // 状态栏
             .child(
@@ -205,18 +148,9 @@ impl Render for ComposePaneView {
                         div()
                             .text_color(rgb(0x6c7086))
                             .text_xs()
-                            .child(format!("行数: {}", line_count)),
+                            .child(format!("字符: {}", char_count)),
                     )
-                    .child(
-                        div()
-                            .text_color(rgb(0x6c7086))
-                            .text_xs()
-                            .child(format!("字符: {}", self.content.len())),
-                    )
-                    .child(
-                        div()
-                            .flex_1(),
-                    )
+                    .child(div().flex_1())
                     .child(
                         div()
                             .text_color(rgb(0x6c7086))
