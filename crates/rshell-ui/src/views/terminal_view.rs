@@ -1,9 +1,20 @@
 //! 终端视图
 //!
-//! 渲染终端单元格，支持字符显示、颜色、样式、光标、选区。
+//! 渲染终端单元格，支持字符显示、颜色、样式、光标、选区、键盘输入。
 
-use gpui::{div, prelude::*, rgb, Rgba, Window};
+use gpui::{div, prelude::*, rgb, App, FocusHandle, KeyDownEvent, Rgba, Window};
 use rshell_api::types::{CellFlags, TerminalBufferSnapshot};
+use rshell_api::AppCommand;
+use uuid::Uuid;
+
+use crate::bridge::AppBridge;
+
+/// 全局终端输入状态（由 RshellApp 在 tab 切换时更新；
+/// TerminalView 的 key listener 读取这里拿到当前 session_id）
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalInputState {
+    pub session_id: Uuid,
+}
 
 /// 选区（行/列坐标）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,16 +35,22 @@ pub struct TerminalView {
     cell_height: f32,
     /// 当前选区（None 表示无选区）
     selection: Option<Selection>,
+    /// 焦点句柄（用于接收键盘事件）
+    focus_handle: FocusHandle,
+    /// 当前激活 session id（用于构造 SendInput 命令）
+    session_id: uuid::Uuid,
 }
 
 impl TerminalView {
     /// 创建新的视图
-    pub fn new() -> Self {
+    pub fn new(cx: &mut gpui::Context<Self>) -> Self {
         Self {
             buffer: None,
             cell_width: 8.0,
             cell_height: 16.0,
             selection: None,
+            focus_handle: cx.focus_handle(),
+            session_id: uuid::Uuid::nil(),
         }
     }
 
@@ -53,6 +70,11 @@ impl TerminalView {
         self.selection = sel;
     }
 
+    /// 设置当前会话 id（用于 SendInput）
+    pub fn set_session_id(&mut self, id: uuid::Uuid) {
+        self.session_id = id;
+    }
+
     /// 检查某 cell 是否在选区内
     fn is_in_selection(&self, row: usize, col: usize, sel: Selection) -> bool {
         let pos = (row, col);
@@ -60,6 +82,60 @@ impl TerminalView {
         let head = (sel.head_row, sel.head_col);
         let (top, bottom) = if anchor <= head { (anchor, head) } else { (head, anchor) };
         pos >= top && pos <= bottom
+    }
+
+    /// 把 keystroke 转为发往后端的字节序列
+    fn keystroke_to_bytes(key: &str, key_char: Option<&str>, has_control: bool, has_alt: bool) -> Vec<u8> {
+        // 控制字符（C0）：Enter -> CR, Tab, Backspace, Escape
+        match key {
+            "enter" | "return" => return vec![b'\r'],
+            "tab" => return vec![b'\t'],
+            "backspace" => return vec![0x7f],
+            "escape" | "esc" => return vec![0x1b],
+            "up" => return b"\x1b[A".to_vec(),
+            "down" => return b"\x1b[B".to_vec(),
+            "right" => return b"\x1b[C".to_vec(),
+            "left" => return b"\x1b[D".to_vec(),
+            "home" => return b"\x1b[H".to_vec(),
+            "end" => return b"\x1b[F".to_vec(),
+            "delete" | "del" => return b"\x1b[3~".to_vec(),
+            "pageup" => return b"\x1b[5~".to_vec(),
+            "pagedown" => return b"\x1b[6~".to_vec(),
+            _ => {}
+        }
+
+        // Ctrl+字母 → 控制字符（0x01-0x1a）
+        if has_control {
+            if let Some(c) = key_char.and_then(|s| s.chars().next()) {
+                if c.is_ascii_alphabetic() {
+                    let upper = c.to_ascii_uppercase() as u8;
+                    if upper >= b'A' && upper <= b'Z' {
+                        return vec![upper - b'A' + 1];
+                    }
+                }
+            }
+        }
+
+        // Alt+键 → ESC 前缀
+        if has_alt {
+            if let Some(s) = key_char {
+                let mut bytes = vec![0x1b];
+                bytes.extend_from_slice(s.as_bytes());
+                return bytes;
+            }
+        }
+
+        // 普通可打印字符
+        if let Some(s) = key_char {
+            return s.as_bytes().to_vec();
+        }
+
+        // 回退到 key 字符串（多数情况下 key == key_char）
+        if !key.is_empty() && key.chars().all(|c| !c.is_control()) {
+            key.as_bytes().to_vec()
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -72,6 +148,34 @@ impl Render for TerminalView {
             .bg(rgb(0x000000))
             .font_family("Consolas")
             .text_size(gpui::px(self.cell_height))
+            .track_focus(&self.focus_handle)
+            .on_key_down(|event, _window, app: &mut App| {
+                // 转换 keystroke → 字节序列
+                let key = event.keystroke.key.as_str();
+                let key_char = event.keystroke.key_char.as_deref();
+                let has_control = event.keystroke.modifiers.control;
+                let has_alt = event.keystroke.modifiers.alt;
+
+                let bytes = TerminalView::keystroke_to_bytes(key, key_char, has_control, has_alt);
+                if bytes.is_empty() {
+                    return;
+                }
+
+                // 通过 global 拿到 AppBridge + 当前 session_id
+                // (session_id 由 RshellApp 在 tab 切换时更新到 global)
+                let bridge = app.global::<AppBridge>().clone();
+                let session_id = app
+                    .try_global::<TerminalInputState>()
+                    .map(|s| s.session_id)
+                    .unwrap_or_else(uuid::Uuid::nil);
+
+                if session_id.is_nil() {
+                    // 尚未选择激活的 tab，丢弃输入
+                    return;
+                }
+
+                bridge.send_command(AppCommand::SendInput { session_id, data: bytes });
+            })
             .map(|_this| {
                 if let Some(buffer) = buffer {
                     // 渲染终端内容

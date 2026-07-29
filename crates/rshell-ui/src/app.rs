@@ -10,6 +10,9 @@ use rshell_api::types::{ConnectionState, SessionConfig};
 use uuid::Uuid;
 
 use crate::bridge::AppBridge;
+use crate::view_models::session_vm::SessionViewModel;
+use crate::view_models::terminal_vm::TerminalViewModel;
+use crate::view_models::transfer_vm::TransferViewModel;
 use crate::views::file_manager_view::FileManagerView;
 use crate::views::key_management_view::KeyManagementView;
 use crate::views::plugin_manager_view::PluginManagerView;
@@ -33,6 +36,11 @@ pub struct RshellApp {
     show_file_manager: bool,
     /// 当前激活的 Dock 面板
     active_panel: PanelKind,
+
+    /// 已挂载的 ViewModel（3 个核心）
+    session_vm: gpui::Entity<SessionViewModel>,
+    terminal_vm: gpui::Entity<TerminalViewModel>,
+    transfer_vm: gpui::Entity<TransferViewModel>,
 
     /// 已挂载的视图（10 个）
     file_manager: gpui::Entity<FileManagerView>,
@@ -80,9 +88,13 @@ struct SessionInfo {
 impl RshellApp {
     /// 创建新的应用实例
     pub fn new(bridge: AppBridge, cx: &mut gpui::Context<Self>) -> Self {
+        let session_vm = cx.new(|_cx| SessionViewModel::new());
+        let terminal_vm = cx.new(|_cx| TerminalViewModel::new(Uuid::new_v4()));
+        let transfer_vm = cx.new(|_cx| TransferViewModel::new());
+
         let file_manager = cx.new(|cx| FileManagerView::new(cx));
         let session_view = cx.new(|cx| SessionView::new(cx));
-        let terminal_view = cx.new(|_cx| TerminalView::new());
+        let terminal_view = cx.new(|cx| TerminalView::new(cx));
         let transfer_view = cx.new(|cx| TransferView::new(cx));
         let key_mgmt_view = cx.new(|cx| KeyManagementView::new(cx));
         let theme_view = cx.new(|cx| ThemeSettingsView::new(cx));
@@ -97,6 +109,9 @@ impl RshellApp {
             tabs: Vec::new(),
             show_file_manager: false,
             active_panel: PanelKind::Terminal,
+            session_vm,
+            terminal_vm,
+            transfer_vm,
             file_manager,
             session_view,
             terminal_view,
@@ -117,31 +132,42 @@ impl RshellApp {
     }
 
     /// 处理后端事件（在 render 前调用）
-    fn process_events(&mut self) {
+    fn process_events(&mut self, cx: &mut gpui::Context<Self>) {
         let events = self.bridge.drain_events();
         for event in events {
-            match event {
-                AppEvent::SessionListChanged => {
-                    // 会话列表变化，可以触发重新加载
-                    tracing::debug!("Session list changed");
-                }
+            // 1) 路由到各 ViewModel（让 VM 拥有完整状态）
+            self.session_vm.update(cx, |vm, _| vm.handle_event(&event));
+            self.terminal_vm.update(cx, |vm, _| vm.handle_event(&event));
+            self.transfer_vm.update(cx, |vm, _| vm.handle_event(&event));
+
+            // 2) 路由到 TransferView（它有内部 vm handle_event）
+            // 注意：TransferView 自己持有 vm，所以这里直接 forward 即可
+            // TransferView::handle_event 会调它自己的 vm.handle_event
+            // 但当前 TransferView 是 gpui::Entity，需要 cx.update；这里省略避免双重处理
+
+            // 3) 本地状态同步（tabs/sessions UI 状态）
+            match &event {
                 AppEvent::ConnectionStateChanged { session_id, state, .. } => {
-                    // 更新会话状态
+                    // 更新本地会话状态
                     for session in &mut self.sessions {
-                        if session.id == session_id {
-                            session.state = state;
+                        if session.id == *session_id {
+                            session.state = *state;
                         }
                     }
                     // 更新标签页连接状态
                     for tab in &mut self.tabs {
-                        if tab.session_id == session_id {
-                            tab.connected = state == ConnectionState::Connected;
+                        if tab.session_id == *session_id {
+                            tab.connected = *state == ConnectionState::Connected;
                         }
+                    }
+                    // 自动打开 tab（如果连接成功且未在列表中）
+                    if *state == ConnectionState::Connected {
+                        self.open_tab_for_session(cx, *session_id);
                     }
                 }
                 AppEvent::TerminalTitleChanged { session_id, title } => {
                     for tab in &mut self.tabs {
-                        if tab.session_id == session_id {
+                        if tab.session_id == *session_id {
                             tab.title = title.clone();
                         }
                     }
@@ -158,6 +184,38 @@ impl RshellApp {
                 _ => {}
             }
         }
+    }
+
+    /// 连接成功时自动打开对应 session 的 tab
+    fn open_tab_for_session(&mut self, cx: &mut gpui::Context<Self>, session_id: Uuid) {
+        if self.tabs.iter().any(|t| t.session_id == session_id) {
+            // 已存在则切换到该 tab
+            if let Some(idx) = self.tabs.iter().position(|t| t.session_id == session_id) {
+                self.active_tab = Some(idx);
+                self.update_active_session(cx, session_id);
+            }
+            return;
+        }
+        // 新建 tab
+        let title = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| format!("Session {}", &session_id.to_string()[..8]));
+        self.tabs.push(TabInfo {
+            title,
+            connected: true,
+            session_id,
+        });
+        self.active_tab = Some(self.tabs.len() - 1);
+    }
+
+    /// 切换激活 tab 时同步更新 TerminalInputState global（用于 key listener）
+    fn update_active_session(&self, cx: &mut gpui::Context<Self>, session_id: Uuid) {
+        cx.set_global(crate::views::terminal_view::TerminalInputState { session_id });
+        // 同时设置 TerminalView 的 session_id 字段（即使 listener 不用，也可用于 future 内部逻辑）
+        let _ = self.terminal_view.update(cx, |v, _| v.set_session_id(session_id));
     }
 
     /// 发送命令到后端
@@ -201,9 +259,9 @@ impl RshellApp {
 }
 
 impl Render for RshellApp {
-    fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        // 处理后端事件
-        self.process_events();
+    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        // 处理后端事件（路由到 ViewModel）
+        self.process_events(cx);
 
         div()
             .size_full()

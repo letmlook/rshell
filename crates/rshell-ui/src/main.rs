@@ -46,6 +46,10 @@ fn main() {
             ..Default::default()
         };
 
+        // 将 bridge 设为全局（供子 View 如 TerminalView 通过 cx.global::<AppBridge>() 访问，
+        // 用于把键盘事件转为 AppCommand 投递到后端）。
+        cx.set_global(bridge.clone());
+
         // 打开主窗口，将 bridge 传递给 RshellApp
         let _window = cx.open_window(options, |_window, cx| {
             cx.new(|cx| app::RshellApp::new(bridge, cx))
