@@ -17,6 +17,7 @@ tracing = { workspace = true }
 russh = "0.48"
 russh-keys = "0.48"
 russh-sftp = "2.3"
+serialport = "4.9"
 async-trait = "0.1"
 anyhow = "1"
 ssh-key = { version = "0.6", features = ["ed25519"] }
