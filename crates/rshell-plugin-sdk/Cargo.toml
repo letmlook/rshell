@@ -15,6 +15,8 @@ serde_json = "1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = "0.10"
+wasmtime = { version = "27", features = ["cranelift"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+wat = "1"
