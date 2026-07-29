@@ -24,7 +24,7 @@ pub struct ThemeSettingsView {
 
 impl ThemeSettingsView {
     /// 创建新的主题设置视图
-    pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
             current_theme: None,
             available_themes: vec!["Dark".to_string(), "Light".to_string()],

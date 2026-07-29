@@ -16,7 +16,7 @@ pub struct PluginManagerView {
 
 impl PluginManagerView {
     /// 创建新的插件管理视图
-    pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
             plugins: Vec::new(),
             selected_plugin: None,

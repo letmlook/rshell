@@ -14,7 +14,7 @@ pub struct TunnelPanelView {
 
 impl TunnelPanelView {
     /// 创建新的隧道面板视图
-    pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
             tunnels: Vec::new(),
             selected_tunnel: None,

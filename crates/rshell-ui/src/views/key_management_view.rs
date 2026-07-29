@@ -15,7 +15,7 @@ pub struct KeyManagementView {
 
 impl KeyManagementView {
     /// 创建新的密钥管理视图
-    pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
             keys: Vec::new(),
             selected_key: None,

@@ -11,6 +11,15 @@ use uuid::Uuid;
 
 use crate::bridge::AppBridge;
 use crate::views::file_manager_view::FileManagerView;
+use crate::views::key_management_view::KeyManagementView;
+use crate::views::plugin_manager_view::PluginManagerView;
+use crate::views::quick_commands_view::QuickCommandsView;
+use crate::views::session_view::SessionView;
+use crate::views::terminal_view::TerminalView;
+use crate::views::theme_settings_view::ThemeSettingsView;
+use crate::views::transfer_view::TransferView;
+use crate::views::tunnel_panel_view::TunnelPanelView;
+use crate::views::compose_pane_view::ComposePaneView;
 
 /// 应用根组件
 pub struct RshellApp {
@@ -22,10 +31,36 @@ pub struct RshellApp {
     tabs: Vec<TabInfo>,
     /// 是否显示文件管理器
     show_file_manager: bool,
-    /// 文件管理器视图
+    /// 当前激活的 Dock 面板
+    active_panel: PanelKind,
+
+    /// 已挂载的视图（10 个）
     file_manager: gpui::Entity<FileManagerView>,
+    session_view: gpui::Entity<SessionView>,
+    terminal_view: gpui::Entity<TerminalView>,
+    transfer_view: gpui::Entity<TransferView>,
+    key_mgmt_view: gpui::Entity<KeyManagementView>,
+    theme_view: gpui::Entity<ThemeSettingsView>,
+    quick_cmds_view: gpui::Entity<QuickCommandsView>,
+    compose_view: gpui::Entity<ComposePaneView>,
+    tunnel_view: gpui::Entity<TunnelPanelView>,
+    plugin_view: gpui::Entity<PluginManagerView>,
+
     /// 会话列表（从后端同步）
     sessions: Vec<SessionInfo>,
+}
+
+/// 当前激活的中央面板
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelKind {
+    Terminal,
+    FileManager,
+    Keys,
+    Theme,
+    QuickCommands,
+    Compose,
+    Tunnels,
+    Plugins,
 }
 
 /// 标签信息
@@ -46,13 +81,32 @@ impl RshellApp {
     /// 创建新的应用实例
     pub fn new(bridge: AppBridge, cx: &mut gpui::Context<Self>) -> Self {
         let file_manager = cx.new(|cx| FileManagerView::new(cx));
+        let session_view = cx.new(|cx| SessionView::new(cx));
+        let terminal_view = cx.new(|_cx| TerminalView::new());
+        let transfer_view = cx.new(|cx| TransferView::new(cx));
+        let key_mgmt_view = cx.new(|cx| KeyManagementView::new(cx));
+        let theme_view = cx.new(|cx| ThemeSettingsView::new(cx));
+        let quick_cmds_view = cx.new(|cx| QuickCommandsView::new(cx));
+        let compose_view = cx.new(|cx| ComposePaneView::new(cx));
+        let tunnel_view = cx.new(|cx| TunnelPanelView::new(cx));
+        let plugin_view = cx.new(|cx| PluginManagerView::new(cx));
 
         Self {
             bridge,
             active_tab: None,
             tabs: Vec::new(),
             show_file_manager: false,
+            active_panel: PanelKind::Terminal,
             file_manager,
+            session_view,
+            terminal_view,
+            transfer_view,
+            key_mgmt_view,
+            theme_view,
+            quick_cmds_view,
+            compose_view,
+            tunnel_view,
+            plugin_view,
             sessions: Vec::new(),
         }
     }
@@ -157,31 +211,14 @@ impl Render for RshellApp {
             .flex()
             .flex_row()
             .child(
-                // 左侧：会话树
+                // 左侧：会话树（使用真实 SessionView 组件）
                 div()
                     .w(px(250.0))
                     .bg(rgb(0x252535))
                     .flex_shrink_0()
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .p_2()
-                            .text_color(rgb(0xffffff))
-                            .child("会话树"),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .px_2()
-                            .text_color(rgb(0x888888))
-                            .text_sm()
-                            .child("双击会话以连接"),
-                    )
-                    .child(
-                        // 会话列表
-                        self.render_session_list(),
-                    )
+                    .child(self.session_view.clone())
                     .child(
                         // 新建会话按钮
                         div()
@@ -216,13 +253,13 @@ impl Render for RshellApp {
                     ),
             )
             .child(
-                // 中心：终端区域
+                // 中心：当前激活面板
                 div()
                     .flex_1()
                     .flex()
                     .flex_col()
                     .child(
-                        // 标签栏
+                        // 标签栏（保留 — 多会话标签是核心 UX）
                         div()
                             .h(px(32.0))
                             .bg(rgb(0x2d2d3d))
@@ -270,70 +307,20 @@ impl Render for RshellApp {
                             ),
                     )
                     .child(
-                        // 终端/文件管理器内容
+                        // 当前面板内容（按 PanelKind 路由）
                         div()
                             .flex_1()
-                            .child(
-                                if self.show_file_manager {
-                                    // 文件管理器视图
-                                    div()
-                                        .size_full()
-                                        .child(self.file_manager.clone())
-                                        .into_any()
-                                } else if self.tabs.is_empty() {
-                                    // 欢迎界面
-                                    div()
-                                        .size_full()
-                                        .bg(rgb(0x000000))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            div()
-                                                .text_color(rgb(0x888888))
-                                                .child("从左侧选择会话并连接以开始"),
-                                        )
-                                        .into_any()
-                                } else {
-                                    // 终端视图
-                                    div()
-                                        .size_full()
-                                        .bg(rgb(0x000000))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            div()
-                                                .text_color(rgb(0x00ff00))
-                                                .font_family("Consolas")
-                                                .text_size(px(14.0))
-                                                .child("终端输出区域"),
-                                        )
-                                        .into_any()
-                                },
-                            ),
+                            .child(self.render_active_panel()),
                     ),
             )
             .child(
-                // 底部：传输队列
+                // 底部：传输队列（使用真实 TransferView 组件）
                 div()
                     .h(px(150.0))
                     .bg(rgb(0x252535))
                     .border_t_1()
                     .border_color(rgb(0x3d3d4d))
-                    .child(
-                        div()
-                            .p_2()
-                            .text_color(rgb(0xffffff))
-                            .child("传输队列")
-                            .child(
-                                div()
-                                    .mt_2()
-                                    .text_color(rgb(0x888888))
-                                    .text_sm()
-                                    .child("无活动的传输任务"),
-                            ),
-                    ),
+                    .child(self.transfer_view.clone()),
             )
     }
 }
@@ -387,5 +374,45 @@ impl RshellApp {
         }
 
         list
+    }
+
+    /// 按当前 PanelKind 路由渲染中央面板
+    fn render_active_panel(&self) -> gpui::AnyElement {
+        match self.active_panel {
+            PanelKind::Terminal => {
+                if self.show_file_manager {
+                    // 兼容旧逻辑：show_file_manager 覆盖 PanelKind::FileManager
+                    div()
+                        .size_full()
+                        .child(self.file_manager.clone())
+                        .into_any()
+                } else if self.tabs.is_empty() {
+                    div()
+                        .size_full()
+                        .bg(rgb(0x000000))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_color(rgb(0x888888))
+                                .child("从左侧选择会话并连接以开始"),
+                        )
+                        .into_any()
+                } else {
+                    div()
+                        .size_full()
+                        .child(self.terminal_view.clone())
+                        .into_any()
+                }
+            }
+            PanelKind::FileManager => div().size_full().child(self.file_manager.clone()).into_any(),
+            PanelKind::Keys => div().size_full().child(self.key_mgmt_view.clone()).into_any(),
+            PanelKind::Theme => div().size_full().child(self.theme_view.clone()).into_any(),
+            PanelKind::QuickCommands => div().size_full().child(self.quick_cmds_view.clone()).into_any(),
+            PanelKind::Compose => div().size_full().child(self.compose_view.clone()).into_any(),
+            PanelKind::Tunnels => div().size_full().child(self.tunnel_view.clone()).into_any(),
+            PanelKind::Plugins => div().size_full().child(self.plugin_view.clone()).into_any(),
+        }
     }
 }
