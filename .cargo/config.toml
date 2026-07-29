@@ -1,0 +1,11 @@
+[build]
+# 并行编译
+jobs = 8
+
+[target.x86_64-pc-windows-msvc]
+# Windows 链接器优化
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[alias]
+# 常用命令别名
+xtask = "run --package xtask --"

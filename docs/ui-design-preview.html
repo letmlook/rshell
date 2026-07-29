@@ -1,0 +1,1454 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RShell UI 设计预览</title>
+    <!-- 
+    ====================================================================
+    RShell UI 视觉设计预览稿
+    版本: v1.0
+    日期: 2026-07-29
+    关联文档: docs/03-detailed-design.md 第8章 UI 视觉与交互设计规范
+    ====================================================================
+    
+    本文件为 RShell 应用的 UI 高保真可视化预览，包含：
+    - 主应用界面（菜单栏 + 工具栏 + 会话管理器 + 终端工作区 + 状态栏）
+    - 终端视图（多标签切换、终端内容、搜索栏）
+    - 文件管理器（双窗格布局 + 传输队列）
+    - 设置对话框（多页签设置）
+    - Dark/Light 主题切换
+    
+    设计规范参考：
+    - 8.1 设计语言与视觉基础（色彩、字体、间距、图标）
+    - 8.2 核心界面详细设计（布局、组件、交互）
+    - 8.3 交互状态与动效规范（状态、动画、快捷键）
+    - 8.4 可复用 UI 组件库（按钮、输入框、表格等）
+    -->
+    <style>
+        /* ====================================================================
+           CSS 变量系统 - 设计规范 8.1.2 色彩系统
+           ==================================================================== */
+        :root {
+            /* 品牌色 - 8.1.2.1 */
+            --brand-primary: #2563EB;
+            --brand-secondary: #7C3AED;
+            --brand-accent: #06B6D4;
+            
+            /* 语义色 - 8.1.2.1 */
+            --success: #10B981;
+            --warning: #F59E0B;
+            --error: #EF4444;
+            --info: #3B82F6;
+            
+            /* 间距系统 - 8.1.4.1 */
+            --spacing-xs: 4px;
+            --spacing-sm: 8px;
+            --spacing-md: 12px;
+            --spacing-lg: 16px;
+            --spacing-xl: 24px;
+            --spacing-2xl: 32px;
+            
+            /* 圆角规范 - 8.1.6.2 */
+            --radius-sm: 4px;
+            --radius-md: 6px;
+            --radius-lg: 8px;
+            
+            /* 布局尺寸 - 8.1.4.2 */
+            --menu-height: 32px;
+            --toolbar-height: 40px;
+            --sidebar-width: 240px;
+            --tab-height: 36px;
+            --statusbar-height: 28px;
+            
+            /* 动画时长 - 8.3.2.1 */
+            --animation-fast: 150ms;
+            --animation-normal: 250ms;
+        }
+        
+        /* Dark 主题 - 8.1.2.1 */
+        [data-theme="dark"] {
+            --bg-base: #1E1E1E;
+            --bg-elevated: #252525;
+            --bg-surface: #2D2D2D;
+            --bg-hover: #3A3A3A;
+            --bg-active: #4A4A4A;
+            --border: #404040;
+            --text-primary: #E5E5E5;
+            --text-secondary: #A3A3A3;
+            --text-disabled: #737373;
+            --selection-bg: rgba(37, 99, 235, 0.3);
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
+            --shadow-md: 0 2px 8px rgba(0,0,0,0.4);
+            --shadow-lg: 0 4px 16px rgba(0,0,0,0.5);
+        }
+        
+        /* Light 主题 - 8.1.2.1 */
+        [data-theme="light"] {
+            --bg-base: #FFFFFF;
+            --bg-elevated: #F9FAFB;
+            --bg-surface: #F3F4F6;
+            --bg-hover: #E5E7EB;
+            --bg-active: #D1D5DB;
+            --border: #E5E7EB;
+            --text-primary: #111827;
+            --text-secondary: #6B7280;
+            --text-disabled: #9CA3AF;
+            --selection-bg: rgba(37, 99, 235, 0.2);
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+            --shadow-md: 0 2px 8px rgba(0,0,0,0.1);
+            --shadow-lg: 0 4px 16px rgba(0,0,0,0.15);
+        }
+        
+        /* ====================================================================
+           全局样式 - 设计规范 8.1.3 字体排版系统
+           ==================================================================== */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            font-size: 13px;
+            line-height: 18px;
+            color: var(--text-primary);
+            background: var(--bg-base);
+            overflow: hidden;
+            height: 100vh;
+        }
+        
+        /* 等宽字体 - 8.1.3.1 */
+        .mono {
+            font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, 'Courier New', monospace;
+        }
+        
+        /* ====================================================================
+           主应用布局 - 设计规范 8.2.1 主应用布局
+           ==================================================================== */
+        .app-container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            background: var(--bg-base);
+        }
+        
+        /* ====================================================================
+           菜单栏 - 设计规范 8.2.1.1 (32px 高度)
+           ==================================================================== */
+        .menu-bar {
+            height: var(--menu-height);
+            background: var(--bg-surface);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 var(--spacing-md);
+            font-size: 12px;
+            user-select: none;
+        }
+        
+        .menu-item {
+            padding: 4px 12px;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            transition: background var(--animation-fast);
+        }
+        
+        .menu-item:hover {
+            background: var(--bg-hover);
+        }
+        
+        /* ====================================================================
+           工具栏 - 设计规范 8.2.1.1 (40px 高度)
+           ==================================================================== */
+        .toolbar {
+            height: var(--toolbar-height);
+            background: var(--bg-surface);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 var(--spacing-md);
+            gap: var(--spacing-sm);
+        }
+        
+        .toolbar-btn {
+            height: 28px;
+            padding: 0 var(--spacing-md);
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            color: var(--text-primary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-sm);
+            font-size: 12px;
+            transition: all var(--animation-fast);
+        }
+        
+        .toolbar-btn:hover {
+            background: var(--bg-hover);
+            border-color: var(--brand-primary);
+        }
+        
+        .toolbar-btn.primary {
+            background: var(--brand-primary);
+            border-color: var(--brand-primary);
+            color: white;
+        }
+        
+        .toolbar-btn.primary:hover {
+            background: #1d4ed8;
+        }
+        
+        .toolbar-spacer {
+            flex: 1;
+        }
+        
+        /* ====================================================================
+           主内容区 - 设计规范 8.2.1.1
+           ==================================================================== */
+        .main-content {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+        
+        /* ====================================================================
+           会话管理器侧边栏 - 设计规范 8.2.2 (240px 宽度)
+           ==================================================================== */
+        .sidebar {
+            width: var(--sidebar-width);
+            background: var(--bg-elevated);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            transition: width var(--animation-normal);
+        }
+        
+        .sidebar.collapsed {
+            width: 0;
+            overflow: hidden;
+        }
+        
+        .sidebar-header {
+            height: 32px;
+            padding: 0 var(--spacing-md);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+            font-weight: 500;
+            font-size: 12px;
+        }
+        
+        .sidebar-search {
+            padding: var(--spacing-sm);
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .sidebar-search input {
+            width: 100%;
+            height: 28px;
+            padding: 0 var(--spacing-md);
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            color: var(--text-primary);
+            font-size: 12px;
+            outline: none;
+            transition: border-color var(--animation-fast);
+        }
+        
+        .sidebar-search input:focus {
+            border-color: var(--brand-primary);
+            box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.2);
+        }
+        
+        .session-tree {
+            flex: 1;
+            overflow-y: auto;
+            padding: var(--spacing-sm);
+        }
+        
+        .session-item {
+            height: 28px;
+            padding: 0 var(--spacing-sm);
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-sm);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-size: 12px;
+            transition: background var(--animation-fast);
+            user-select: none;
+        }
+        
+        .session-item:hover {
+            background: var(--bg-hover);
+        }
+        
+        .session-item.selected {
+            background: rgba(37, 99, 235, 0.2);
+        }
+        
+        .session-folder {
+            font-weight: 500;
+        }
+        
+        .session-icon {
+            width: 16px;
+            height: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+        }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-left: auto;
+        }
+        
+        .status-dot.connected {
+            background: var(--success);
+        }
+        
+        .status-dot.disconnected {
+            background: var(--text-disabled);
+        }
+        
+        .sidebar-footer {
+            padding: var(--spacing-sm);
+            border-top: 1px solid var(--border);
+            display: flex;
+            gap: var(--spacing-sm);
+        }
+        
+        .sidebar-footer button {
+            flex: 1;
+            height: 28px;
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 11px;
+            transition: all var(--animation-fast);
+        }
+        
+        .sidebar-footer button:hover {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+        
+        /* ====================================================================
+           工作区 - 设计规范 8.2.3 终端工作区
+           ==================================================================== */
+        .workspace {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        /* 标签栏 - 8.2.3.1 */
+        .tab-bar {
+            height: var(--tab-height);
+            background: var(--bg-surface);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: flex-end;
+            padding: 0 var(--spacing-sm);
+            gap: 2px;
+        }
+        
+        .tab {
+            height: 34px;
+            padding: 0 var(--spacing-md);
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-bottom: none;
+            border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-sm);
+            cursor: pointer;
+            font-size: 12px;
+            transition: all var(--animation-fast);
+            min-width: 120px;
+            max-width: 200px;
+        }
+        
+        .tab:hover {
+            background: var(--bg-hover);
+        }
+        
+        .tab.active {
+            background: var(--bg-base);
+            border-bottom: 2px solid var(--brand-primary);
+            margin-bottom: -1px;
+        }
+        
+        .tab-close {
+            width: 16px;
+            height: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            margin-left: auto;
+            font-size: 14px;
+            opacity: 0.5;
+            transition: all var(--animation-fast);
+        }
+        
+        .tab-close:hover {
+            background: var(--error);
+            color: white;
+            opacity: 1;
+        }
+        
+        .tab-add {
+            width: 28px;
+            height: 28px;
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            margin-left: var(--spacing-sm);
+            transition: all var(--animation-fast);
+        }
+        
+        .tab-add:hover {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+        
+        /* 标签内容区 */
+        .tab-content {
+            flex: 1;
+            overflow: hidden;
+            position: relative;
+        }
+        
+        .tab-panel {
+            position: absolute;
+            inset: 0;
+            display: none;
+            flex-direction: column;
+        }
+        
+        .tab-panel.active {
+            display: flex;
+        }
+        
+        /* ====================================================================
+           终端视图 - 设计规范 8.2.3.2
+           ==================================================================== */
+        .terminal {
+            flex: 1;
+            background: #000000;
+            padding: var(--spacing-md);
+            font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+            font-size: 13px;
+            line-height: 1.3;
+            color: #E5E5E5;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        
+        .terminal-line {
+            margin-bottom: 2px;
+        }
+        
+        .terminal-prompt {
+            color: #10B981;
+        }
+        
+        .terminal-path {
+            color: #3B82F6;
+        }
+        
+        .terminal-cursor {
+            display: inline-block;
+            width: 8px;
+            height: 16px;
+            background: #E5E5E5;
+            animation: blink 1s step-end infinite;
+        }
+        
+        @keyframes blink {
+            50% { opacity: 0; }
+        }
+        
+        /* 终端搜索栏 - 8.2.3.3 */
+        .terminal-search {
+            height: 32px;
+            background: var(--bg-surface);
+            border-top: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 var(--spacing-md);
+            gap: var(--spacing-sm);
+        }
+        
+        .terminal-search input {
+            flex: 1;
+            max-width: 300px;
+            height: 24px;
+            padding: 0 var(--spacing-sm);
+            background: var(--bg-base);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-size: 12px;
+            outline: none;
+        }
+        
+        .terminal-search input:focus {
+            border-color: var(--brand-primary);
+        }
+        
+        .search-btn {
+            width: 24px;
+            height: 24px;
+            background: transparent;
+            border: none;
+            border-radius: var(--radius-sm);
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all var(--animation-fast);
+        }
+        
+        .search-btn:hover {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+        
+        /* ====================================================================
+           文件管理器 - 设计规范 8.2.4 双窗格布局
+           ==================================================================== */
+        .file-manager {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .file-panes {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+        
+        .file-pane {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid var(--border);
+        }
+        
+        .file-pane:last-child {
+            border-right: none;
+        }
+        
+        .file-pane-header {
+            height: 32px;
+            padding: 0 var(--spacing-md);
+            background: var(--bg-surface);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-sm);
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .file-path {
+            flex: 1;
+            padding: 4px 8px;
+            background: var(--bg-base);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            font-size: 11px;
+            font-family: monospace;
+        }
+        
+        .file-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: var(--spacing-sm);
+        }
+        
+        .file-item {
+            height: 24px;
+            padding: 0 var(--spacing-sm);
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-sm);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-size: 12px;
+            transition: background var(--animation-fast);
+        }
+        
+        .file-item:hover {
+            background: var(--bg-hover);
+        }
+        
+        .file-item.selected {
+            background: rgba(37, 99, 235, 0.2);
+        }
+        
+        .file-icon {
+            width: 16px;
+            height: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+        }
+        
+        .file-name {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        
+        .file-size {
+            width: 60px;
+            text-align: right;
+            color: var(--text-secondary);
+            font-size: 11px;
+        }
+        
+        .file-date {
+            width: 80px;
+            text-align: right;
+            color: var(--text-secondary);
+            font-size: 11px;
+        }
+        
+        /* 传输队列 - 8.2.4.4 */
+        .transfer-queue {
+            height: 120px;
+            background: var(--bg-elevated);
+            border-top: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .transfer-header {
+            height: 28px;
+            padding: 0 var(--spacing-md);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .transfer-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: var(--spacing-sm);
+        }
+        
+        .transfer-item {
+            height: 28px;
+            padding: 0 var(--spacing-sm);
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-sm);
+            font-size: 12px;
+        }
+        
+        .transfer-progress {
+            flex: 1;
+            height: 8px;
+            background: var(--bg-surface);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        
+        .transfer-progress-bar {
+            height: 100%;
+            background: var(--brand-primary);
+            border-radius: 4px;
+            transition: width var(--animation-normal);
+        }
+        
+        .transfer-progress-bar.complete {
+            background: var(--success);
+        }
+        
+        .transfer-speed {
+            width: 80px;
+            text-align: right;
+            color: var(--text-secondary);
+            font-size: 11px;
+        }
+        
+        .transfer-actions {
+            display: flex;
+            gap: 4px;
+        }
+        
+        .transfer-btn {
+            width: 20px;
+            height: 20px;
+            background: transparent;
+            border: none;
+            border-radius: var(--radius-sm);
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            transition: all var(--animation-fast);
+        }
+        
+        .transfer-btn:hover {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+        
+        /* ====================================================================
+           状态栏 - 设计规范 8.2.1.1 (28px 高度)
+           ==================================================================== */
+        .status-bar {
+            height: var(--statusbar-height);
+            background: var(--bg-surface);
+            border-top: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 var(--spacing-md);
+            gap: var(--spacing-lg);
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+        
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-xs);
+        }
+        
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        
+        .status-indicator.connected {
+            background: var(--success);
+        }
+        
+        /* ====================================================================
+           设置对话框 - 设计规范 8.2.5.1
+           ==================================================================== */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            animation: fadeIn var(--animation-normal);
+        }
+        
+        .modal-overlay.active {
+            display: flex;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        
+        .modal {
+            width: 700px;
+            max-height: 80vh;
+            background: var(--bg-base);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-lg);
+            display: flex;
+            flex-direction: column;
+            animation: slideUp var(--animation-normal);
+        }
+        
+        @keyframes slideUp {
+            from {
+                transform: translateY(20px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+        
+        .modal-header {
+            height: 48px;
+            padding: 0 var(--spacing-xl);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+            font-size: 16px;
+            font-weight: 600;
+        }
+        
+        .modal-close {
+            width: 28px;
+            height: 28px;
+            background: transparent;
+            border: none;
+            border-radius: var(--radius-sm);
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            transition: all var(--animation-fast);
+        }
+        
+        .modal-close:hover {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+        
+        .modal-tabs {
+            height: 40px;
+            padding: 0 var(--spacing-xl);
+            display: flex;
+            gap: var(--spacing-sm);
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .modal-tab {
+            padding: 0 var(--spacing-md);
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 13px;
+            transition: all var(--animation-fast);
+        }
+        
+        .modal-tab:hover {
+            color: var(--text-primary);
+        }
+        
+        .modal-tab.active {
+            color: var(--brand-primary);
+            border-bottom-color: var(--brand-primary);
+        }
+        
+        .modal-body {
+            flex: 1;
+            padding: var(--spacing-xl);
+            overflow-y: auto;
+        }
+        
+        .form-group {
+            margin-bottom: var(--spacing-lg);
+        }
+        
+        .form-label {
+            display: block;
+            margin-bottom: var(--spacing-xs);
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+        
+        .form-input {
+            width: 100%;
+            height: 32px;
+            padding: 0 var(--spacing-md);
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            color: var(--text-primary);
+            font-size: 13px;
+            outline: none;
+            transition: border-color var(--animation-fast);
+        }
+        
+        .form-input:focus {
+            border-color: var(--brand-primary);
+            box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.2);
+        }
+        
+        .modal-footer {
+            padding: var(--spacing-lg) var(--spacing-xl);
+            border-top: 1px solid var(--border);
+            display: flex;
+            justify-content: flex-end;
+            gap: var(--spacing-sm);
+        }
+        
+        .btn {
+            height: 32px;
+            padding: 0 var(--spacing-lg);
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            color: var(--text-primary);
+            cursor: pointer;
+            font-size: 13px;
+            transition: all var(--animation-fast);
+        }
+        
+        .btn:hover {
+            background: var(--bg-hover);
+        }
+        
+        .btn.primary {
+            background: var(--brand-primary);
+            border-color: var(--brand-primary);
+            color: white;
+        }
+        
+        .btn.primary:hover {
+            background: #1d4ed8;
+        }
+        
+        /* ====================================================================
+           主题切换按钮
+           ==================================================================== */
+        .theme-toggle {
+            position: fixed;
+            top: 50px;
+            right: 20px;
+            width: 40px;
+            height: 40px;
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            box-shadow: var(--shadow-md);
+            z-index: 100;
+            transition: all var(--animation-fast);
+        }
+        
+        .theme-toggle:hover {
+            background: var(--bg-hover);
+            transform: scale(1.1);
+        }
+        
+        /* 滚动条样式 */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: var(--bg-active);
+            border-radius: 4px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--text-disabled);
+        }
+    </style>
+</head>
+<body>
+    <!-- ====================================================================
+         主应用容器 - 设计规范 8.2.1 主应用布局
+         ==================================================================== -->
+    <div class="app-container">
+        <!-- 菜单栏 - 设计规范 8.2.1.1 (32px) -->
+        <div class="menu-bar">
+            <div class="menu-item">文件</div>
+            <div class="menu-item">编辑</div>
+            <div class="menu-item">查看</div>
+            <div class="menu-item">会话</div>
+            <div class="menu-item">工具</div>
+            <div class="menu-item">帮助</div>
+        </div>
+        
+        <!-- 工具栏 - 设计规范 8.2.1.1 (40px) -->
+        <div class="toolbar">
+            <button class="toolbar-btn primary">
+                <span>🔗</span>
+                <span>连接</span>
+            </button>
+            <button class="toolbar-btn">
+                <span>📁</span>
+                <span>文件</span>
+            </button>
+            <button class="toolbar-btn">
+                <span>⚡</span>
+                <span>快速命令</span>
+            </button>
+            <button class="toolbar-btn">
+                <span>🔧</span>
+                <span>隧道</span>
+            </button>
+            <div class="toolbar-spacer"></div>
+            <button class="toolbar-btn" onclick="toggleSidebar()">
+                <span>☰</span>
+            </button>
+            <button class="toolbar-btn" onclick="openSettings()">
+                <span>⚙</span>
+                <span>设置</span>
+            </button>
+        </div>
+        
+        <!-- 主内容区 -->
+        <div class="main-content">
+            <!-- 会话管理器侧边栏 - 设计规范 8.2.2 (240px) -->
+            <div class="sidebar" id="sidebar">
+                <div class="sidebar-header">
+                    <span>会话管理器</span>
+                    <span style="cursor: pointer;">⚙</span>
+                </div>
+                <div class="sidebar-search">
+                    <input type="text" placeholder="🔍 搜索会话...">
+                </div>
+                <div class="session-tree">
+                    <!-- 生产环境文件夹 -->
+                    <div class="session-item session-folder">
+                        <span class="session-icon">📁</span>
+                        <span>生产环境</span>
+                    </div>
+                    <div class="session-item" style="padding-left: 24px;">
+                        <span class="session-icon">🔗</span>
+                        <span>web-prod-01</span>
+                        <span class="status-dot connected"></span>
+                    </div>
+                    <div class="session-item selected" style="padding-left: 24px;">
+                        <span class="session-icon">🔗</span>
+                        <span>web-prod-02</span>
+                        <span class="status-dot connected"></span>
+                    </div>
+                    <div class="session-item" style="padding-left: 24px;">
+                        <span class="session-icon">🔗</span>
+                        <span>db-master</span>
+                        <span class="status-dot connected"></span>
+                    </div>
+                    
+                    <!-- 测试环境文件夹 -->
+                    <div class="session-item session-folder" style="margin-top: 8px;">
+                        <span class="session-icon">📁</span>
+                        <span>测试环境</span>
+                    </div>
+                    <div class="session-item" style="padding-left: 24px;">
+                        <span class="session-icon">🔗</span>
+                        <span>test-server-01</span>
+                        <span class="status-dot disconnected"></span>
+                    </div>
+                    
+                    <!-- IoT 设备文件夹 -->
+                    <div class="session-item session-folder" style="margin-top: 8px;">
+                        <span class="session-icon">📁</span>
+                        <span>IoT 设备</span>
+                    </div>
+                    <div class="session-item" style="padding-left: 24px;">
+                        <span class="session-icon">🔗</span>
+                        <span>sensor-gateway</span>
+                        <span class="status-dot disconnected"></span>
+                    </div>
+                </div>
+                <div class="sidebar-footer">
+                    <button>＋ 新建会话</button>
+                    <button>＋ 新建文件夹</button>
+                </div>
+            </div>
+            
+            <!-- 工作区 - 设计规范 8.2.3 -->
+            <div class="workspace">
+                <!-- 标签栏 - 8.2.3.1 -->
+                <div class="tab-bar">
+                    <div class="tab active" onclick="switchTab(0)">
+                        <span>🔗</span>
+                        <span>web-prod-02</span>
+                        <span class="tab-close">×</span>
+                    </div>
+                    <div class="tab" onclick="switchTab(1)">
+                        <span>🔗</span>
+                        <span>db-master</span>
+                        <span class="tab-close">×</span>
+                    </div>
+                    <div class="tab" onclick="switchTab(2)">
+                        <span>📁</span>
+                        <span>SFTP - web-prod-02</span>
+                        <span class="tab-close">×</span>
+                    </div>
+                    <button class="tab-add">+</button>
+                </div>
+                
+                <!-- 标签内容区 -->
+                <div class="tab-content">
+                    <!-- 终端标签 1 - 设计规范 8.2.3.2 -->
+                    <div class="tab-panel active" id="tab-0">
+                        <div class="terminal">
+                            <div class="terminal-line"><span class="terminal-prompt">user@web-prod-02</span>:<span class="terminal-path">~</span>$ ls -la</div>
+                            <div class="terminal-line">total 32</div>
+                            <div class="terminal-line">drwxr-xr-x  5 user user 4096 Jul 29 10:20 .</div>
+                            <div class="terminal-line">drwxr-xr-x  3 root root 4096 Jul 28 14:30 ..</div>
+                            <div class="terminal-line">-rw-r--r--  1 user user  220 Jul 28 14:30 .bash_logout</div>
+                            <div class="terminal-line">-rw-r--r--  1 user user 3771 Jul 28 14:30 .bashrc</div>
+                            <div class="terminal-line">drwxr-xr-x  2 user user 4096 Jul 29 10:20 logs</div>
+                            <div class="terminal-line">drwxr-xr-x  4 user user 4096 Jul 27 16:45 projects</div>
+                            <div class="terminal-line"></div>
+                            <div class="terminal-line"><span class="terminal-prompt">user@web-prod-02</span>:<span class="terminal-path">~</span>$ <span class="terminal-cursor"></span></div>
+                        </div>
+                        <div class="terminal-search">
+                            <input type="text" placeholder="搜索...">
+                            <button class="search-btn">▲</button>
+                            <button class="search-btn">▼</button>
+                            <span style="font-size: 11px; color: var(--text-secondary);">0/0</span>
+                            <button class="search-btn">.*</button>
+                            <button class="search-btn">Aa</button>
+                            <button class="search-btn">×</button>
+                        </div>
+                    </div>
+                    
+                    <!-- 终端标签 2 -->
+                    <div class="tab-panel" id="tab-1">
+                        <div class="terminal">
+                            <div class="terminal-line"><span class="terminal-prompt">root@db-master</span>:<span class="terminal-path">~</span>$ systemctl status mysql</div>
+                            <div class="terminal-line">● mysql.service - MySQL Community Server</div>
+                            <div class="terminal-line">   Loaded: loaded (/lib/systemd/system/mysql.service; enabled)</div>
+                            <div class="terminal-line">   Active: <span style="color: #10B981;">active (running)</span> since Mon 2026-07-28 14:30:00 UTC</div>
+                            <div class="terminal-line">   Main PID: 1234 (mysqld)</div>
+                            <div class="terminal-line">   Memory: 512.0M</div>
+                            <div class="terminal-line"></div>
+                            <div class="terminal-line"><span class="terminal-prompt">root@db-master</span>:<span class="terminal-path">~</span>$ <span class="terminal-cursor"></span></div>
+                        </div>
+                    </div>
+                    
+                    <!-- 文件管理器标签 - 设计规范 8.2.4 -->
+                    <div class="tab-panel" id="tab-2">
+                        <div class="file-manager">
+                            <div class="file-panes">
+                                <!-- 本地文件窗格 -->
+                                <div class="file-pane">
+                                    <div class="file-pane-header">
+                                        <span>本地文件</span>
+                                        <div class="file-path">/home/user/projects</div>
+                                        <button class="search-btn">🔖</button>
+                                    </div>
+                                    <div class="file-list">
+                                        <div class="file-item">
+                                            <span class="file-icon">📁</span>
+                                            <span class="file-name">src</span>
+                                            <span class="file-size">-</span>
+                                            <span class="file-date">Jul 28</span>
+                                        </div>
+                                        <div class="file-item">
+                                            <span class="file-icon">📁</span>
+                                            <span class="file-name">tests</span>
+                                            <span class="file-size">-</span>
+                                            <span class="file-date">Jul 27</span>
+                                        </div>
+                                        <div class="file-item selected">
+                                            <span class="file-icon">📄</span>
+                                            <span class="file-name">.env</span>
+                                            <span class="file-size">1.2KB</span>
+                                            <span class="file-date">Jul 29</span>
+                                        </div>
+                                        <div class="file-item">
+                                            <span class="file-icon">📄</span>
+                                            <span class="file-name">README.md</span>
+                                            <span class="file-size">2.3KB</span>
+                                            <span class="file-date">Jul 25</span>
+                                        </div>
+                                        <div class="file-item">
+                                            <span class="file-icon">📄</span>
+                                            <span class="file-name">package.json</span>
+                                            <span class="file-size">800B</span>
+                                            <span class="file-date">Jul 20</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <!-- 远程文件窗格 -->
+                                <div class="file-pane">
+                                    <div class="file-pane-header">
+                                        <span>远程文件</span>
+                                        <div class="file-path">/var/www/html</div>
+                                        <button class="search-btn">🔖</button>
+                                    </div>
+                                    <div class="file-list">
+                                        <div class="file-item">
+                                            <span class="file-icon">📁</span>
+                                            <span class="file-name">css</span>
+                                            <span class="file-size">-</span>
+                                            <span class="file-date">Jul 28</span>
+                                        </div>
+                                        <div class="file-item">
+                                            <span class="file-icon">📁</span>
+                                            <span class="file-name">js</span>
+                                            <span class="file-size">-</span>
+                                            <span class="file-date">Jul 28</span>
+                                        </div>
+                                        <div class="file-item">
+                                            <span class="file-icon">📄</span>
+                                            <span class="file-name">index.html</span>
+                                            <span class="file-size">4.5KB</span>
+                                            <span class="file-date">Jul 29</span>
+                                        </div>
+                                        <div class="file-item">
+                                            <span class="file-icon">📄</span>
+                                            <span class="file-name">style.css</span>
+                                            <span class="file-size">12KB</span>
+                                            <span class="file-date">Jul 28</span>
+                                        </div>
+                                        <div class="file-item">
+                                            <span class="file-icon">📄</span>
+                                            <span class="file-name">app.js</span>
+                                            <span class="file-size">28KB</span>
+                                            <span class="file-date">Jul 29</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- 传输队列 - 8.2.4.4 -->
+                            <div class="transfer-queue">
+                                <div class="transfer-header">
+                                    <span>传输队列 (2/5)</span>
+                                    <span style="color: var(--text-secondary); font-weight: normal;">↑ 1.2MB/s  ↓ 3.4MB/s</span>
+                                </div>
+                                <div class="transfer-list">
+                                    <div class="transfer-item">
+                                        <span>📄</span>
+                                        <span style="width: 150px;">backup.tar.gz</span>
+                                        <div class="transfer-progress">
+                                            <div class="transfer-progress-bar" style="width: 45%;"></div>
+                                        </div>
+                                        <span class="transfer-speed">1.2MB/s</span>
+                                        <div class="transfer-actions">
+                                            <button class="transfer-btn">⏸</button>
+                                            <button class="transfer-btn">×</button>
+                                        </div>
+                                    </div>
+                                    <div class="transfer-item">
+                                        <span>📄</span>
+                                        <span style="width: 150px;">config.json</span>
+                                        <div class="transfer-progress">
+                                            <div class="transfer-progress-bar complete" style="width: 100%;"></div>
+                                        </div>
+                                        <span class="transfer-speed">完成</span>
+                                        <div class="transfer-actions">
+                                            <button class="transfer-btn">×</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 状态栏 - 设计规范 8.2.1.1 (28px) -->
+        <div class="status-bar">
+            <div class="status-item">
+                <span class="status-indicator connected"></span>
+                <span>已连接</span>
+            </div>
+            <div class="status-item">
+                <span>🔒</span>
+                <span>web-prod-02:22</span>
+            </div>
+            <div class="status-item">
+                <span>SSH2</span>
+            </div>
+            <div class="status-item">
+                <span>↑ 1.2KB/s</span>
+            </div>
+            <div class="status-item">
+                <span>↓ 3.4KB/s</span>
+            </div>
+            <div style="flex: 1;"></div>
+            <div class="status-item">
+                <span>UTF-8</span>
+            </div>
+            <div class="status-item">
+                <span>xterm-256color</span>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 主题切换按钮 -->
+    <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">
+        <span id="theme-icon">☀</span>
+    </button>
+    
+    <!-- 设置对话框 - 设计规范 8.2.5.1 -->
+    <div class="modal-overlay" id="settings-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <span>设置</span>
+                <button class="modal-close" onclick="closeSettings()">×</button>
+            </div>
+            <div class="modal-tabs">
+                <button class="modal-tab active">基本信息</button>
+                <button class="modal-tab">连接</button>
+                <button class="modal-tab">终端</button>
+                <button class="modal-tab">外观</button>
+                <button class="modal-tab">安全</button>
+                <button class="modal-tab">高级</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">会话名称</label>
+                    <input type="text" class="form-input" value="web-prod-02">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">主机地址</label>
+                    <input type="text" class="form-input" value="192.168.1.101">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">端口</label>
+                    <input type="text" class="form-input" value="22">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">协议</label>
+                    <input type="text" class="form-input" value="SSH" readonly>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">用户名</label>
+                    <input type="text" class="form-input" value="user">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeSettings()">取消</button>
+                <button class="btn primary">保存</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // ====================================================================
+        // 交互逻辑 - 设计规范 8.3 交互状态与动效规范
+        // ====================================================================
+        
+        // 主题切换 - 8.3.2.3
+        function toggleTheme() {
+            const html = document.documentElement;
+            const currentTheme = html.getAttribute('data-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            html.setAttribute('data-theme', newTheme);
+            
+            const icon = document.getElementById('theme-icon');
+            icon.textContent = newTheme === 'dark' ? '☀' : '🌙';
+        }
+        
+        // 侧边栏切换 - 8.2.1.3
+        function toggleSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            sidebar.classList.toggle('collapsed');
+        }
+        
+        // 标签切换 - 8.2.3.1
+        function switchTab(index) {
+            // 更新标签栏状态
+            const tabs = document.querySelectorAll('.tab');
+            tabs.forEach((tab, i) => {
+                if (i === index) {
+                    tab.classList.add('active');
+                } else {
+                    tab.classList.remove('active');
+                }
+            });
+            
+            // 更新标签内容
+            const panels = document.querySelectorAll('.tab-panel');
+            panels.forEach((panel, i) => {
+                if (i === index) {
+                    panel.classList.add('active');
+                } else {
+                    panel.classList.remove('active');
+                }
+            });
+        }
+        
+        // 设置对话框 - 8.2.5.1
+        function openSettings() {
+            document.getElementById('settings-modal').classList.add('active');
+        }
+        
+        function closeSettings() {
+            document.getElementById('settings-modal').classList.remove('active');
+        }
+        
+        // 会话项点击 - 8.2.2.3
+        document.querySelectorAll('.session-item:not(.session-folder)').forEach(item => {
+            item.addEventListener('click', function() {
+                document.querySelectorAll('.session-item').forEach(i => i.classList.remove('selected'));
+                this.classList.add('selected');
+            });
+        });
+        
+        // 文件项点击 - 8.2.4.3
+        document.querySelectorAll('.file-item').forEach(item => {
+            item.addEventListener('click', function() {
+                const pane = this.closest('.file-pane');
+                pane.querySelectorAll('.file-item').forEach(i => i.classList.remove('selected'));
+                this.classList.add('selected');
+            });
+        });
+        
+        // 设置对话框标签切换
+        document.querySelectorAll('.modal-tab').forEach(tab => {
+            tab.addEventListener('click', function() {
+                document.querySelectorAll('.modal-tab').forEach(t => t.classList.remove('active'));
+                this.classList.add('active');
+            });
+        });
+        
+        // 点击遮罩层关闭对话框
+        document.getElementById('settings-modal').addEventListener('click', function(e) {
+            if (e.target === this) {
+                closeSettings();
+            }
+        });
+        
+        // 键盘快捷键 - 8.3.5
+        document.addEventListener('keydown', function(e) {
+            // Esc 关闭对话框
+            if (e.key === 'Escape') {
+                closeSettings();
+            }
+            // Ctrl+Shift+S 切换侧边栏
+            if (e.ctrlKey && e.shiftKey && e.key === 'S') {
+                e.preventDefault();
+                toggleSidebar();
+            }
+        });
+    </script>
+</body>
+</html>

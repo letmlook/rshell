@@ -1,0 +1,27 @@
+# crates/rshell-protocol/Cargo.toml
+[package]
+name = "rshell-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RShell 协议层 - SSH/Telnet/Serial/RDP 协议实现"
+
+[dependencies]
+rshell-api = { workspace = true }
+rshell-infra = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+russh = "0.48"
+russh-keys = "0.48"
+russh-sftp = "2.3"
+async-trait = "0.1"
+anyhow = "1"
+ssh-key = { version = "0.6", features = ["ed25519"] }
+dirs = "5"
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }

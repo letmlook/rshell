@@ -1,0 +1,13 @@
+# crates/rshell-api/Cargo.toml
+[package]
+name = "rshell-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RShell API 边界层 - Command/Event 定义（零运行时依赖）"
+
+[dependencies]
+serde = { workspace = true }
+uuid = { workspace = true }
+# 注意：不依赖 GPUI、tokio 或其他运行时

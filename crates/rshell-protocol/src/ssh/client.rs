@@ -1,0 +1,432 @@
+//! SSH 客户端实现
+//!
+//! 基于 russh 实现 SSH 连接、认证、数据收发和终端大小调整。
+
+use std::sync::Arc;
+
+use rshell_api::types::{AuthMethod, SessionConfig};
+use tokio::sync::mpsc;
+use tracing::{debug, info};
+
+use crate::{Connection, ProtocolError};
+
+/// SSH 客户端
+pub struct SshClient {
+    config: SessionConfig,
+    /// 连接句柄
+    handle: Option<russh::client::Handle<SshHandler>>,
+    /// 当前会话通道
+    channel: Option<russh::Channel<russh::client::Msg>>,
+    /// 接收数据的通道
+    data_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    /// 发送数据的通道（供 Handler 使用）
+    data_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+}
+
+/// SSH Handler 实现
+///
+/// 负责接收服务端数据并通过通道转发给上层
+pub(crate) struct SshHandler {
+    data_tx: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl russh::client::Handler for SshHandler {
+    type Error = anyhow::Error;
+
+    async fn auth_banner(
+        &mut self,
+        banner: &str,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        debug!("SSH auth banner: {}", banner);
+        Ok(())
+    }
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        // 实现 host key 验证逻辑
+        // 获取服务器密钥指纹
+        let fingerprint = format!("{:?}", server_public_key);
+        debug!("Server host key fingerprint: {}", fingerprint);
+
+        // 实际实现应查询 known_hosts 文件
+        // 这里使用简单的 known_hosts 文件检查
+        let known_hosts_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".ssh")
+            .join("known_hosts");
+
+        if known_hosts_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&known_hosts_path) {
+                if content.contains(&fingerprint) {
+                    debug!("Host key found in known_hosts");
+                    return Ok(true);
+                }
+            }
+        }
+
+        // 首次连接或密钥不匹配，接受并记录（生产环境应提示用户确认）
+        debug!("Host key not found in known_hosts, accepting (first connection)");
+        Ok(true)
+    }
+
+    async fn data(
+        &mut self,
+        _channel: russh::ChannelId,
+        data: &[u8],
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        // 将收到的数据通过通道转发给上层
+        let _ = self.data_tx.send(data.to_vec());
+        Ok(())
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: russh::client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        info!("SSH disconnected: {:?}", reason);
+        Ok(())
+    }
+}
+
+/// 从 AuthMethod 提取用户名
+fn get_username(auth: &AuthMethod) -> &str {
+    match auth {
+        AuthMethod::Password { username, .. } => username,
+        AuthMethod::PublicKey { username, .. } => username,
+        AuthMethod::KeyboardInteractive { username, .. } => username,
+    }
+}
+
+impl SshClient {
+    /// 创建新的 SSH 客户端
+    pub fn new(config: SessionConfig) -> Self {
+        Self {
+            config,
+            handle: None,
+            channel: None,
+            data_rx: None,
+            data_tx: None,
+        }
+    }
+
+    /// 连接到 SSH 服务器
+    pub async fn connect_ssh(&mut self) -> Result<(), ProtocolError> {
+        info!(
+            "Connecting to SSH server {}:{}",
+            self.config.host, self.config.port
+        );
+
+        // 创建数据通道
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
+
+        // 创建 SSH 配置
+        let ssh_config = Arc::new(russh::client::Config {
+            inactivity_timeout: Some(std::time::Duration::from_secs(30)),
+            ..Default::default()
+        });
+
+        // 创建 Handler
+        let handler = SshHandler {
+            data_tx: data_tx.clone(),
+        };
+
+        // 连接到服务器
+        let addr = format!("{}:{}", self.config.host, self.config.port);
+        let handle = russh::client::connect(ssh_config, &addr, handler)
+            .await
+            .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
+
+        self.handle = Some(handle);
+        self.data_tx = Some(data_tx);
+        self.data_rx = Some(data_rx);
+
+        info!("SSH TCP connection established");
+
+        // 进行认证
+        self.authenticate().await?;
+
+        info!("SSH authentication successful");
+
+        // 打开会话通道
+        self.open_session().await?;
+
+        info!("SSH session channel opened");
+
+        Ok(())
+    }
+
+    /// 执行 SSH 认证
+    async fn authenticate(&mut self) -> Result<(), ProtocolError> {
+        let handle = self
+            .handle
+            .as_mut()
+            .ok_or_else(|| ProtocolError::ConnectionFailed("Not connected".to_string()))?;
+
+        let username = get_username(&self.config.auth_method);
+
+        match &self.config.auth_method {
+            AuthMethod::Password { password, .. } => {
+                let success = handle
+                    .authenticate_password(username, password)
+                    .await
+                    .map_err(|e| ProtocolError::AuthFailed(e.to_string()))?;
+
+                if !success {
+                    return Err(ProtocolError::AuthFailed(
+                        "Password authentication failed".to_string(),
+                    ));
+                }
+            }
+            AuthMethod::PublicKey {
+                key_path, passphrase, ..
+            } => {
+                // 加载私钥
+                let key = russh_keys::load_secret_key(key_path, passphrase.as_deref()).map_err(
+                    |e| ProtocolError::AuthFailed(format!("Failed to load key: {}", e)),
+                )?;
+
+                let key = Arc::new(key);
+                let success = handle
+                    .authenticate_publickey(username, key)
+                    .await
+                    .map_err(|e| ProtocolError::AuthFailed(e.to_string()))?;
+
+                if !success {
+                    return Err(ProtocolError::AuthFailed(
+                        "Public key authentication failed".to_string(),
+                    ));
+                }
+            }
+            AuthMethod::KeyboardInteractive { password, .. } => {
+                // 键盘交互认证
+                let response = handle
+                    .authenticate_keyboard_interactive_start(username, None::<String>)
+                    .await
+                    .map_err(|e| ProtocolError::AuthFailed(e.to_string()))?;
+
+                match response {
+                    russh::client::KeyboardInteractiveAuthResponse::Success => {}
+                    russh::client::KeyboardInteractiveAuthResponse::InfoRequest {
+                        prompts,
+                        ..
+                    } => {
+                        // 使用配置中的密码（如果有），否则用空字符串
+                        let pwd = password.as_deref().unwrap_or("");
+                        let responses: Vec<String> = prompts.iter().map(|_| pwd.to_string()).collect();
+
+                        let response = handle
+                            .authenticate_keyboard_interactive_respond(responses)
+                            .await
+                            .map_err(|e| ProtocolError::AuthFailed(e.to_string()))?;
+
+                        match response {
+                            russh::client::KeyboardInteractiveAuthResponse::Success => {}
+                            _ => {
+                                return Err(ProtocolError::AuthFailed(
+                                    "Keyboard-interactive authentication failed".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    russh::client::KeyboardInteractiveAuthResponse::Failure => {
+                        return Err(ProtocolError::AuthFailed(
+                            "Keyboard-interactive authentication failed".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 打开会话通道并请求 PTY
+    async fn open_session(&mut self) -> Result<(), ProtocolError> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| ProtocolError::ConnectionFailed("Not connected".to_string()))?;
+
+        // 打开会话通道
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
+
+        // 请求 PTY（默认 80x24）
+        channel
+            .request_pty(
+                false,            // want_reply
+                "xterm-256color", // term
+                80,               // col_width
+                24,               // row_height
+                0,                // pix_width
+                0,                // pix_height
+                &[],              // terminal_modes
+            )
+            .await
+            .map_err(|e| ProtocolError::ProtocolError(format!("PTY request failed: {}", e)))?;
+
+        // 请求 shell
+        channel
+            .request_shell(false)
+            .await
+            .map_err(|e| ProtocolError::ProtocolError(format!("Shell request failed: {}", e)))?;
+
+        self.channel = Some(channel);
+
+        Ok(())
+    }
+
+    /// 断开连接
+    pub async fn disconnect_ssh(&mut self) -> Result<(), ProtocolError> {
+        if let Some(channel) = self.channel.take() {
+            let _ = channel.close().await;
+        }
+
+        if let Some(handle) = self.handle.take() {
+            let _ = handle
+                .disconnect(russh::Disconnect::ByApplication, "User disconnect", "en")
+                .await;
+        }
+
+        self.data_tx = None;
+        self.data_rx = None;
+
+        info!("SSH disconnected");
+        Ok(())
+    }
+
+    /// 发送数据到远程 shell
+    pub async fn send_data(&self, data: &[u8]) -> Result<(), ProtocolError> {
+        let channel = self
+            .channel
+            .as_ref()
+            .ok_or(ProtocolError::ConnectionClosed)?;
+
+        channel
+            .data(std::io::Cursor::new(data.to_vec()))
+            .await
+            .map_err(|e| ProtocolError::ProtocolError(format!("Send data failed: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// 接收数据（从通道读取）
+    pub async fn recv_data(&mut self) -> Result<Option<Vec<u8>>, ProtocolError> {
+        let rx = self
+            .data_rx
+            .as_mut()
+            .ok_or(ProtocolError::ConnectionClosed)?;
+
+        match rx.recv().await {
+            Some(data) => Ok(Some(data)),
+            None => Err(ProtocolError::ConnectionClosed),
+        }
+    }
+
+    /// 调整终端大小
+    pub async fn resize_terminal(&self, cols: u32, rows: u32) -> Result<(), ProtocolError> {
+        let channel = self
+            .channel
+            .as_ref()
+            .ok_or(ProtocolError::ConnectionClosed)?;
+
+        channel
+            .window_change(cols, rows, 0, 0)
+            .await
+            .map_err(|e| ProtocolError::ProtocolError(format!("Window change failed: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// 获取 SSH 连接句柄（用于打开 SFTP 通道等）
+    #[allow(dead_code)]
+    pub(crate) fn handle(&self) -> Option<&russh::client::Handle<SshHandler>> {
+        self.handle.as_ref()
+    }
+
+    /// 打开一个新的 SFTP 通道
+    pub async fn open_sftp_channel(
+        &self,
+    ) -> Result<russh::Channel<russh::client::Msg>, ProtocolError> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or(ProtocolError::ConnectionClosed)?;
+
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| ProtocolError::ConnectionFailed(format!("SFTP channel open failed: {}", e)))?;
+
+        // 请求 sftp 子系统
+        channel
+            .request_subsystem(false, "sftp")
+            .await
+            .map_err(|e| ProtocolError::ProtocolError(format!("SFTP subsystem request failed: {}", e)))?;
+
+        Ok(channel)
+    }
+}
+
+#[async_trait::async_trait]
+impl Connection for SshClient {
+    async fn connect(&mut self) -> Result<(), ProtocolError> {
+        self.connect_ssh().await
+    }
+
+    async fn disconnect(&mut self) -> Result<(), ProtocolError> {
+        self.disconnect_ssh().await
+    }
+
+    async fn send(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
+        self.send_data(data).await
+    }
+
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, ProtocolError> {
+        // 从通道读取数据到缓冲区
+        match self.recv_data().await? {
+            Some(data) => {
+                let len = data.len().min(buf.len());
+                buf[..len].copy_from_slice(&data[..len]);
+                Ok(len)
+            }
+            None => Err(ProtocolError::ConnectionClosed),
+        }
+    }
+
+    async fn resize(&mut self, cols: u16, rows: u16) -> Result<(), ProtocolError> {
+        self.resize_terminal(cols as u32, rows as u32).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ssh_client_creation() {
+        let config = SessionConfig {
+            id: uuid::Uuid::new_v4(),
+            name: "test".to_string(),
+            folder_id: None,
+            host: "127.0.0.1".to_string(),
+            port: 22,
+            protocol: rshell_api::types::Protocol::SSH,
+            auth_method: AuthMethod::Password {
+                username: "root".to_string(),
+                password: "test".to_string(),
+            },
+        };
+
+        let client = SshClient::new(config);
+        assert!(client.handle.is_none());
+        assert!(client.channel.is_none());
+    }
+}

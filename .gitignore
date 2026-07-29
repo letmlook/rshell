@@ -1,0 +1,35 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 构建产物
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# 日志和数据
+*.log
+*.tmp
+*.bak
+
+# Rust 工具链相关
+rust-toolchain.toml.bak
+
+# 本地配置
+.env
+.env.local

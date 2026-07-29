@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rshell-api",
+    "crates/rshell-ui",
+    "crates/rshell-core",
+    "crates/rshell-protocol",
+    "crates/rshell-infra",
+    "crates/rshell-plugin-sdk",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://github.com/your-org/rshell"
+
+[workspace.dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# 错误处理
+thiserror = "2"
+anyhow = "1"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 工具
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+
+# 测试
+mockall = "0.13"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+tokio-test = "0.4"
+
+# 内部 crate 依赖（路径引用）
+rshell-api = { path = "crates/rshell-api" }
+rshell-core = { path = "crates/rshell-core" }
+rshell-protocol = { path = "crates/rshell-protocol" }
+rshell-infra = { path = "crates/rshell-infra" }
+rshell-plugin-sdk = { path = "crates/rshell-plugin-sdk" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
