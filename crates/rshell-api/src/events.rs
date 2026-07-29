@@ -117,6 +117,10 @@ pub enum AppEvent {
     /// 配色方案列表更新
     ColorSchemeListChanged,
 
+    // ===== 剪贴板事件 =====
+    /// 用户请求拷贝文本到系统剪贴板（前端应调 arboard / nopclipboard 写入）
+    ClipboardCopy { text: String },
+
     // ===== 插件事件 =====
     /// 插件列表已更新
     PluginListUpdated,

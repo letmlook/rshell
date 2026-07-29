@@ -18,8 +18,8 @@ use crate::session::service::SessionService;
 use crate::terminal::service::TerminalService;
 use crate::theme::ThemeManager;
 use crate::transfer::service::TransferService;
+use rshell_api::types::{TerminalBufferSnapshot, TerminalConfig};
 use rshell_api::AppCommand;
-use rshell_api::types::TerminalConfig;
 use rshell_protocol::Connection;
 use rshell_protocol::telnet::TelnetConnection;
 use rshell_protocol::serial::{SerialConnection, SerialConfig as ProtocolSerialConfig};
@@ -138,8 +138,28 @@ impl CommandDispatcher {
             AppCommand::ResizeTerminal { session_id, cols, rows } => {
                 self.terminal_service.resize(session_id, cols, rows)?;
             }
-            AppCommand::CopySelection { session_id: _ } => {
-                debug!("CopySelection not yet implemented");
+            AppCommand::CopySelection { session_id } => {
+                // 从 TerminalService 拿当前 buffer，序列化为文本并发布 ClipboardCopy
+                // 事件。MVP 实现：拷贝整个可见屏幕（Xshell 中对应 "Copy All"）。
+                // 真实选择区跟踪留作后续（需在 TerminalService 中加 Selection 状态）。
+                match self.terminal_service.get_buffer_snapshot(session_id) {
+                    Ok(snapshot) => {
+                        let text = buffer_snapshot_to_text(&snapshot);
+                        info!(
+                            session_id = %session_id,
+                            bytes = text.len(),
+                            "CopySelection → ClipboardCopy"
+                        );
+                        self.event_bus.publish(rshell_api::AppEvent::ClipboardCopy { text });
+                    }
+                    Err(e) => {
+                        warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "CopySelection failed: terminal snapshot unavailable"
+                        );
+                    }
+                }
             }
 
             // ===== 文件传输命令 =====
@@ -572,4 +592,32 @@ impl CommandDispatcher {
     pub fn theme_manager(&self) -> &Arc<ThemeManager> {
         &self.theme_manager
     }
+}
+
+/// 将终端 buffer snapshot 序列化为可拷贝的纯文本
+///
+/// 每行末尾去除尾随空格；空行用单个 `\n` 表示；行间用 `\n` 分隔；
+/// 末尾追加 `\n`。宽字符（>1 cell）当前按单字符处理 — 后续若有 width>1 cell
+/// 的 cell 标志可在此扩展。
+fn buffer_snapshot_to_text(snapshot: &TerminalBufferSnapshot) -> String {
+    let mut out = String::with_capacity(snapshot.cells.len());
+    for row in 0..snapshot.rows {
+        let mut line = String::with_capacity(snapshot.cols);
+        for col in 0..snapshot.cols {
+            let idx = row * snapshot.cols + col;
+            if idx < snapshot.cells.len() {
+                let c = snapshot.cells[idx].character;
+                if c == '\0' {
+                    line.push(' ');
+                } else {
+                    line.push(c);
+                }
+            }
+        }
+        // 去掉行尾空格
+        let trimmed = line.trim_end_matches(' ');
+        out.push_str(trimmed);
+        out.push('\n');
+    }
+    out
 }

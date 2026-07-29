@@ -181,6 +181,12 @@ impl RshellApp {
                 AppEvent::TransferFailed { task_id, error } => {
                     tracing::error!("Transfer failed: {} - {}", task_id, error);
                 }
+                AppEvent::ClipboardCopy { text } => {
+                    // 后端请求拷贝文本到系统剪贴板。当前实现仅记录长度。
+                    // 完整实现在于把 text 写入 OS 剪贴板（arboard crate / macOS NSPasteboard），
+                    // 需要时可在 bridge.rs 中调用 arboard::Clipboard::set_text(text)。
+                    tracing::info!(bytes = text.len(), "ClipboardCopy requested");
+                }
                 _ => {}
             }
         }
