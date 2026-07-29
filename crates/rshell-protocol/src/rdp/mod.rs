@@ -8,9 +8,27 @@
 //! - `send(data)`：将字节序列排队为键盘事件。
 //! - 桌面帧通过独立的 `frame_rx: mpsc::UnboundedReceiver<RdpFrame>` 通道向外发布。
 //!
-//! ⚠️ **MVP 范围限制**：本实现仅完成 TCP 连接 + `connect_begin` 的早期阶段。
-//! 完整的 TLS 升级 + NLA 认证 + ActiveStage 帧渲染需要服务端配合与 ironrdp-graphics
-//! 集成，留作后续工作。客户端握手失败时会返回明确错误。
+//! ## 实现状态
+//!
+//! | 阶段 | 状态 |
+//! |------|------|
+//! | TCP connect | ✅ |
+//! | X.224 协商（`connect_begin`） | ✅ |
+//! | TLS 升级（tokio-rustls） | ❌ 留作后续 — 需要把 framed 内部的 TcpStream 拆出来做 TLS 握手，再包装为新的 TokioFramed |
+//! | CredSSP / NLA | ❌ 留作后续（依赖 sspi + reqwest） |
+//! | `connect_finalize`（能力交换 + 通道连接） | ❌ 需要 TLS 成功后才能跑 |
+//! | ActiveStage 帧渲染（ironrdp-graphics + SoftDisplay） | ❌ 需要 connect_finalize 成功后驱动 |
+//!
+//! 当前实现成功完成 X.224 后将状态标记为 `X224Only`，GUI 可收到连接成功信号但
+//! 桌面帧通道仅发出占位帧。完整 RDP 端到端验证需要一个真实的 RDP 服务器
+//! （Windows / xrdp / FreeRDP）；本环境无 RDP 服务端，最终阶段未跑通。
+//!
+//! 后续接入的入口：
+//! 1. 实现 `upgrade_to_tls`（拆 framed 内部 TcpStream → rustls client.connect →
+//!    重新包装为 TokioFramed<TlsStream>）
+//! 2. 实现 `NoopNetworkClient`/`ReqwestNetworkClient` + `connect_finalize`
+//! 3. 把 `ActiveStage::process()` 放进后台任务，用 `ironrdp-graphics`
+//!    `Software` 渲染器把 GraphicsUpdate 转为 RGBA 帧并通过 frame_tx 发出
 
 use async_trait::async_trait;
 use ironrdp_connector::{ClientConnector, Config as ConnectorConfig, Credentials, DesktopSize};
@@ -31,6 +49,9 @@ pub struct RdpConfig {
     pub domain: Option<String>,
     pub width: u32,
     pub height: u32,
+    /// 是否启用 NLA（CredSSP）。生产环境建议 true；当前 MVP 留 false 以避免
+    /// 引入 sspi / reqwest / hickory-resolver 等重依赖。
+    pub enable_nla: bool,
 }
 
 impl Default for RdpConfig {
@@ -43,6 +64,7 @@ impl Default for RdpConfig {
             domain: None,
             width: 1920,
             height: 1080,
+            enable_nla: false,
         }
     }
 }
@@ -52,7 +74,10 @@ impl Default for RdpConfig {
 pub enum RdpState {
     Disconnected,
     Connecting,
-    Connected,
+    /// X.224 已完成；TLS 升级未完成 / 已失败
+    X224Only,
+    /// TLS + 能力交换完成（ActiveStage 可用）
+    Active,
 }
 
 /// 桌面帧通道项（调用方拿走 `frame_receiver` 后消费）
@@ -69,9 +94,7 @@ pub struct RdpConnection {
     config: RdpConfig,
     state: RdpState,
     frame_rx: Option<mpsc::UnboundedReceiver<RdpFrame>>,
-    /// 后台驱动任务是否存活
     driver_handle: Option<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// 键盘事件发送端
     key_tx: Option<mpsc::UnboundedSender<u8>>,
 }
 
@@ -115,16 +138,17 @@ impl RdpConnection {
 impl Connection for RdpConnection {
     async fn connect(&mut self) -> Result<(), ProtocolError> {
         info!(
-            "Connecting to RDP server {}:{} as {} ({}x{})",
+            "Connecting to RDP server {}:{} as {} ({}x{}, nla={})",
             self.config.host,
             self.config.port,
             self.config.username,
             self.config.width,
-            self.config.height
+            self.config.height,
+            self.config.enable_nla
         );
         self.state = RdpState::Connecting;
 
-        // 1. 打开 TCP
+        // ====== 第 1 步：TCP 连接 ======
         let tcp = tokio::net::TcpStream::connect((self.config.host.as_str(), self.config.port))
             .await
             .map_err(|e| {
@@ -138,7 +162,7 @@ impl Connection for RdpConnection {
             .local_addr()
             .map_err(|e| ProtocolError::ConnectionFailed(format!("local_addr: {}", e)))?;
 
-        // 2. 构造 Connector
+        // ====== 第 2 步：构造 Connector（标准 RDP 配置） ======
         let credentials = Credentials::UsernamePassword {
             username: self.config.username.clone(),
             password: self.config.password.clone().unwrap_or_default(),
@@ -146,8 +170,8 @@ impl Connection for RdpConnection {
         let connector_config = ConnectorConfig {
             credentials,
             domain: self.config.domain.clone(),
-            enable_tls: false,
-            enable_credssp: false,
+            enable_tls: true,
+            enable_credssp: self.config.enable_nla,
             keyboard_type: KeyboardType::IbmEnhanced,
             keyboard_subtype: 0,
             keyboard_layout: 0,
@@ -177,11 +201,9 @@ impl Connection for RdpConnection {
 
         let mut connector = ClientConnector::new(connector_config, client_addr);
 
-        // 3. 构造 TokioFramed 包装流
+        // ====== 第 3 步：X.224 协商 ======
         let mut framed = ironrdp_tokio::TokioFramed::new(tcp);
 
-        // 4. 启动 connect_begin（仅完成 X.224 协商；后续 TLS/NLA 升级留给后续工作）
-        // ironrdp_async 重导出 ironrdp-connector 的 connect_begin，签名与 Framed 一致。
         if let Err(e) = ironrdp_async::connect_begin(&mut framed, &mut connector).await {
             self.state = RdpState::Disconnected;
             return Err(ProtocolError::ConnectionFailed(format!(
@@ -190,32 +212,36 @@ impl Connection for RdpConnection {
             )));
         }
 
-        info!("RDP X.224 negotiation completed; full TLS+NLA handshake pending implementation");
+        info!("RDP X.224 negotiation completed");
 
-        // 5. 创建桌面帧 channel + 键盘事件 channel
+        // ====== 第 4 步：TLS 升级（未实现） ======
+        // 当前直接标记为 X224Only。完整 TLS 升级需要：
+        //   a) 从 connector 拿 server_public_key 与 server_name
+        //   b) 拆 framed 内部的 TcpStream → tokio_rustls::TlsConnector::connect
+        //   c) 把 TlsStream 包回 TokioFramed 并继续 connect_finalize
+        //   d) 调用 mark_as_upgraded(should_upgrade, &mut connector)
+        // 后续 PR 在 `upgrade_to_tls()` 函数中实现。
+        self.state = RdpState::X224Only;
+
+        // ====== 第 5 步：建立 frame 通道 + 后台驱动 ======
         let (frame_tx, frame_rx) = mpsc::unbounded_channel::<RdpFrame>();
         let (key_tx, _key_rx) = mpsc::unbounded_channel::<u8>();
 
-        // 6. 后台驱动任务：当前为占位实现，发送连接已建立信号帧。
-        // 完整实现需要：
-        //   - 升级到 TLS（tokio-rustls）
-        //   - 跑 NLA / CredSSP
-        //   - ActiveStage pump
-        //   - 用 ironrdp-graphics SoftDisplay 渲染桌面为 RGBA bytes
         let handle = tokio::spawn(async move {
+            // 真实实现：循环 pump ActiveStage → GraphicsUpdate → SoftDisplay → RGBA
+            // 当前为占位：发送一帧连接已建立信号帧。
             let _ = frame_tx.send(RdpFrame {
                 width: 0,
                 height: 0,
                 pixels: vec![0, 0, 0, 0],
             });
-            debug!("RDP driver placeholder task started; awaiting full handshake implementation");
+            debug!("RDP driver placeholder started (state: X224Only)");
         });
 
         self.driver_handle = Some(TokioMutex::new(Some(handle)));
         self.frame_rx = Some(frame_rx);
         self.key_tx = Some(key_tx);
-        self.state = RdpState::Connected;
-        info!("RDP connection marked Connected (partial handshake)");
+        info!("RDP connection marked X224Only (TLS upgrade + ActiveStage pending)");
         Ok(())
     }
 
@@ -233,7 +259,7 @@ impl Connection for RdpConnection {
     }
 
     async fn send(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
-        if self.state != RdpState::Connected {
+        if self.state == RdpState::Disconnected {
             return Err(ProtocolError::ConnectionFailed("RDP not connected".to_string()));
         }
         if let Some(tx) = &self.key_tx {
@@ -246,7 +272,7 @@ impl Connection for RdpConnection {
     }
 
     async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, ProtocolError> {
-        if self.state != RdpState::Connected {
+        if self.state == RdpState::Disconnected {
             return Err(ProtocolError::ConnectionFailed("RDP not connected".to_string()));
         }
         debug!("RDP recv (no byte-stream data; use take_frame_receiver)");
@@ -256,7 +282,10 @@ impl Connection for RdpConnection {
     async fn resize(&mut self, cols: u16, rows: u16) -> Result<(), ProtocolError> {
         self.config.width = cols as u32;
         self.config.height = rows as u32;
-        info!("RDP resize requested to {}x{} (no-op until ActiveStage hooked up)", cols, rows);
+        info!(
+            "RDP resize requested to {}x{} (no-op until ActiveStage hooked up)",
+            cols, rows
+        );
         Ok(())
     }
 }
@@ -271,6 +300,7 @@ mod tests {
         assert_eq!(cfg.port, 3389);
         assert_eq!(cfg.width, 1920);
         assert_eq!(cfg.height, 1080);
+        assert!(!cfg.enable_nla);
     }
 
     #[tokio::test]

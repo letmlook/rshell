@@ -23,6 +23,8 @@ ironrdp-tokio = "=0.8.0"
 ironrdp-connector = "=0.8.0"
 ironrdp-async = "=0.8.0"
 ironrdp-pdu = "=0.7.0"
+ironrdp-graphics = "=0.5.0"
+tokio-rustls = "0.26"
 async-trait = "0.1"
 anyhow = "1"
 ssh-key = { version = "0.6", features = ["ed25519"] }
