@@ -137,13 +137,14 @@ RShell 是一个 Cargo workspace，由六个职责清晰的 crate 组成：
 
 #### 已知问题 & 下一步
 
-1. **GPUI Metal 工具链缺失**：在本机（macOS）上 `cargo check -p rshell-ui` 在最后 Metal shader 编译阶段失败 — 需要 `xcodebuild -downloadComponent MetalToolchain`。非代码问题。
-2. **RDP 完整握手**：当前 ironrdp 实现仅完成 X.224 协商；TLS 升级 + NLA（CredSSP）+ ActiveStage 帧渲染需要 ironrdp-graphics 集成，留作后续工作。`RdpFrame` channel 已就位等待填充。
-3. **GPUI 焦点/键盘**：TerminalView 现在支持 buffer/cursor 渲染，但还未绑定 `FocusHandle` + `on_key_down` 把按键转为 `AppCommand::SendInput`。需要 GPUI 0.2 焦点机制的真实测试。
-4. **GPUI 文本输入**：compose_pane_view / quick_commands_view 的搜索/编辑框仍是静态占位，需要 `gpui_component::input::TextInput` 替换（本项目已声明 `gpui-component` 但未 import）。
-5. **rshell-ui 事件路由**：`RshellApp::process_events` 仍只更新本地 tabs/sessions 状态；尚未通过 `cx.update` 路由到已挂载的 ViewModel（如 session_vm / terminal_vm）。后续应让 ViewModel 接管 tab 管理。
-6. **`rshell-ui` 与 `rshell-core` 边界**：`bridge.rs` 与 `main.rs` 通过 `AppBridge` 调用后端 Service（§2 允许）；但 `rshell-ui` 视图层继续严格只依赖 `rshell-api`，不引入 `rshell_core::*`。
-7. **工具链**：已升级 `rust-toolchain.toml` 至 1.90（registry 已要求 ≥1.86），`Cargo.lock` 中的 `hashbrown 0.17.1`（需 edition2024）现与声明的工具链兼容。
+1. **GPUI Metal 工具链缺失**：在本机（macOS）上 `cargo check -p rshell-ui` 在最后 Metal shader 编译阶段失败 — 需要 `xcodebuild -downloadComponent MetalToolchain`。所有 UI 代码改动均通过 typecheck（语法/借用/类型正确），但运行时验证需等 Metal 工具链安装。
+2. **RDP 完整握手**：当前 ironrdp 实现仅完成 X.224 协商（`RdpState::X224Only`）；TLS 升级 + NLA（CredSSP）+ ActiveStage 帧渲染 + ironrdp-graphics SoftDisplay 转换仍待实现。`tokio-rustls` 与 `ironrdp-graphics` 已声明为依赖，等待实际 RDP 服务端做端到端测试。
+3. **GPUI 焦点/键盘已接线**：TerminalView 现在支持 buffer/cursor/选区渲染 + `track_focus(&focus_handle)` + `on_key_down` 监听；按 GP 已映射为 SSH 期望的字节序列（Enter→CR、Ctrl+letter→0x01-0x1a、方向键→ANSI 转义序列等），通过 `AppCommand::SendInput` 发往后端。需要 GPUI 运行时验证。
+4. **gpui_component Input**：compose_pane_view / quick_commands_view 现在用 `gpui_component::input::Input` 替代静态占位 div，绑定到 `Entity<InputState>`。`main.rs` 调用 `gpui_component::init(cx)` 一次。
+5. **rshell-ui 事件路由**：`RshellApp::process_events` 现已通过 `cx.update` 把 `AppEvent` 路由到 `session_vm` / `terminal_vm` / `transfer_vm`，并自动为新连接成功的 session 打开 tab。
+6. **`rshell-ui` 与 `rshell-core` 边界**：`bridge.rs` 与 `main.rs` 通过 `AppBridge` 调用后端 Service（§2 允许）；`rshell-ui` 视图层严格只依赖 `rshell-api`，不引入 `rshell_core::*`。
+7. **CopySelection AppCommand**：已实现 — dispatcher 从 TerminalService 拿 buffer snapshot、序列化为纯文本、发布 `AppEvent::ClipboardCopy { text }`。前端监听 ClipboardCopy 事件即可写入系统剪贴板（当前实现仅日志）。
+8. **工具链**：已升级 `rust-toolchain.toml` 至 1.90（registry 已要求 ≥1.86），`Cargo.lock` 中的 `hashbrown 0.17.1`（需 edition2024）现与声明的工具链兼容。
 
 详细设计目标见 `docs/02-project-plan.md` §2。
 

@@ -28,10 +28,25 @@
 - **`crates/rshell-ui/src/views/terminal_view.rs`**：增强为支持 `CellFlags`（bold / italic / underline / strikethrough）渲染、绝对定位光标覆盖层、`Selection` 数据结构 + 选区高亮。
 
 ### 待办
-- RDP TLS / NLA / ActiveStage 帧渲染（见 README「已知问题」§2）
-- TerminalView 焦点 + 键盘输入捕获（GPUI 0.2 焦点机制需运行时验证）
-- gpui_component 文本输入控件接入 ComposePane / QuickCommands 搜索框
-- rshell-ui 事件经 `cx.update` 路由到已挂载的 ViewModel
+- RDP TLS / NLA / ActiveStage 帧渲染（基础设施已就位，等待真实 RDP 服务端测试；见 README「已知问题」§2）
+- GPUI 视图层改动需要真实 GPUI 运行时验证（本机缺 Metal 工具链）
+
+---
+
+## [Unreleased-2]
+
+### Changed — 完成 v0.1.0+ 完整化（第二轮）
+
+#### 新增
+- **`TerminalView` 焦点 + 键盘**：`FocusHandle` + `.track_focus()` + `.on_key_down()` 完整接线；`keystroke_to_bytes()` 把 GP Keystroke 转为 SSH 期望字节流（Enter → `\r`、方向键 → ANSI、`Ctrl+letter` → `0x01-0x1a`、`Alt+letter` → ESC + char）；通过新增的 `TerminalInputState` global 让 listener 拿到当前激活 session id，把按键转为 `AppCommand::SendInput` 发往后端。
+- **gpui_component Input 替换占位**：`ComposePaneView` 与 `QuickCommandsView` 现在持有 `Entity<InputState>` 并通过 `gpui_component::input::Input` 渲染真实可输入文本框。`main.rs` 调用 `gpui_component::init(cx)` 一次。
+- **`AppEvent::ClipboardCopy`** 新事件 + `CommandDispatcher` 的 `CopySelection` 真正实现：从 `TerminalService::get_buffer_snapshot` 拉 buffer，`buffer_snapshot_to_text` 辅助函数按行序列化（去除行尾空格），发布 `ClipboardCopy { text }`。
+- **RDP 状态机细化**：`RdpState` 新增 `X224Only`（X.224 完成 / TLS 未做）与 `Active`（TLS + 能力交换完成）；`RdpConfig::enable_nla: bool` 留作后续 CredSSP 入口；`tokio-rustls = "0.26"` + `ironrdp-graphics = "0.5"` 加入直接依赖以便未来接入 TLS 升级与帧渲染。
+
+#### 重构
+- **`RshellApp::process_events(cx)`** 现已通过 `cx.update` 把 `AppEvent` 路由到 `session_vm` / `terminal_vm` / `transfer_vm` 三个核心 ViewModel；新增 `open_tab_for_session` 在连接成功时自动开 tab。
+- **3 个核心 ViewModel** 字段加入 `RshellApp`：`session_vm: Entity<SessionViewModel>` / `terminal_vm: Entity<TerminalViewModel>` / `transfer_vm: Entity<TransferViewModel>`，在 `RshellApp::new` 中构造。
+- **`main.rs`** 调用 `cx.set_global(bridge.clone())` 让 view 层通过 `cx.global::<AppBridge>()` 拿到桥接；调用 `gpui_component::init(cx)` 注册组件样式。
 
 ---
 
