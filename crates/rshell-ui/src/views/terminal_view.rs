@@ -2,7 +2,7 @@
 //!
 //! 渲染终端单元格，支持字符显示、颜色、样式、光标、选区、键盘输入。
 
-use gpui::{div, prelude::*, rgb, App, FocusHandle, KeyDownEvent, Rgba, Window};
+use gpui::{div, prelude::*, rgb, App, FocusHandle, Rgba, Window};
 use rshell_api::types::{CellFlags, TerminalBufferSnapshot};
 use rshell_api::AppCommand;
 use uuid::Uuid;
@@ -15,6 +15,9 @@ use crate::bridge::AppBridge;
 pub struct TerminalInputState {
     pub session_id: Uuid,
 }
+
+// gpui::Global 实现 — 让 listener 通过 cx.global::<TerminalInputState>() 读取
+impl gpui::Global for TerminalInputState {}
 
 /// 选区（行/列坐标）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

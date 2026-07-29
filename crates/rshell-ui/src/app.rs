@@ -98,8 +98,8 @@ impl RshellApp {
         let transfer_view = cx.new(|cx| TransferView::new(cx));
         let key_mgmt_view = cx.new(|cx| KeyManagementView::new(cx));
         let theme_view = cx.new(|cx| ThemeSettingsView::new(cx));
-        let quick_cmds_view = cx.new(|window, cx| QuickCommandsView::new(window, cx));
-        let compose_view = cx.new(|window, cx| ComposePaneView::new(window, cx));
+        let quick_cmds_view = cx.new(|cx| QuickCommandsView::new(cx));
+        let compose_view = cx.new(|cx| ComposePaneView::new(cx));
         let tunnel_view = cx.new(|cx| TunnelPanelView::new(cx));
         let plugin_view = cx.new(|cx| PluginManagerView::new(cx));
 

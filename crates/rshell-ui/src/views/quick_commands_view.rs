@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 /// 快速命令面板视图
 pub struct QuickCommandsView {
-    /// 搜索框状态（gpui_component）
-    search_state: Entity<InputState>,
+    /// 搜索框状态（gpui_component，懒创建 — 在首次 render() 时构造）
+    search_state: Option<Entity<InputState>>,
     /// 快速命令列表
     commands: Vec<QuickCommand>,
     /// 当前活动会话 ID
@@ -22,18 +22,25 @@ pub struct QuickCommandsView {
 }
 
 impl QuickCommandsView {
-    /// 创建新的快速命令面板
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search_state = cx.new(|cx: &mut Context<InputState>| {
-            InputState::new(window, cx)
-                .placeholder("搜索命令...")
-        });
-
+    /// 创建新的快速命令面板（InputState 在首次 render 时懒构造）
+    pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
-            search_state,
+            search_state: None,
             commands: Vec::new(),
             active_session: None,
         }
+    }
+
+    /// 获取搜索 InputState（懒构造）
+    fn ensure_search_state(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if self.search_state.is_none() {
+            let state = cx.new(|cx: &mut Context<InputState>| {
+                InputState::new(window, cx)
+                    .placeholder("搜索命令...")
+            });
+            self.search_state = Some(state);
+        }
+        self.search_state.clone().unwrap()
     }
 
     /// 更新快速命令列表
@@ -48,7 +55,10 @@ impl QuickCommandsView {
 
     /// 当前过滤关键字（从 search_state 派生）
     fn current_filter(&self, cx: &App) -> String {
-        self.search_state.read(cx).value().to_string()
+        match &self.search_state {
+            Some(s) => s.read(cx).value().to_string(),
+            None => String::new(),
+        }
     }
 
     /// 获取过滤后的命令列表
@@ -92,7 +102,8 @@ impl QuickCommandsView {
 }
 
 impl Render for QuickCommandsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let search_state = self.ensure_search_state(window, cx);
         let filter = self.current_filter(cx);
         let groups = self.grouped_commands(&filter);
 
@@ -123,7 +134,7 @@ impl Render for QuickCommandsView {
                     .bg(rgb(0x1e1e2e))
                     .px(px(8.0))
                     .py(px(4.0))
-                    .child(Input::new(&self.search_state).w_full()),
+                    .child(Input::new(&search_state).w_full()),
             )
             // 命令列表
             .child(div().flex_1().children(groups.into_iter().flat_map(

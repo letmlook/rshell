@@ -28,6 +28,7 @@ use tracing::{info, error};
 pub type SharedEventQueue = Arc<Mutex<Vec<AppEvent>>>;
 
 /// UI ↔ Backend 桥接
+#[derive(Clone)]
 pub struct AppBridge {
     /// 命令发送端（UI 持有）
     command_tx: mpsc::UnboundedSender<AppCommand>,
@@ -37,6 +38,9 @@ pub struct AppBridge {
     #[allow(dead_code)]
     event_bus: Arc<EventBusImpl>,
 }
+
+// gpui::Global 实现 — 让 view 层通过 cx.global::<AppBridge>() 拿到桥接
+impl gpui::Global for AppBridge {}
 
 impl AppBridge {
     /// 发送命令到后端

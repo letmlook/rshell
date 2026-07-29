@@ -11,8 +11,9 @@ use uuid::Uuid;
 
 /// 撰写窗格视图
 pub struct ComposePaneView {
-    /// 编辑内容状态（gpui_component）
-    input_state: Entity<InputState>,
+    /// 编辑内容状态（gpui_component，懒创建 — 在首次 render() 时构造，
+    /// 因为 InputState::new 需要 `&mut Window`，而 cx.new 闭包拿不到）
+    input_state: Option<Entity<InputState>>,
     /// 发送目标
     target: ComposeTarget,
     /// 发送历史
@@ -22,16 +23,10 @@ pub struct ComposePaneView {
 }
 
 impl ComposePaneView {
-    /// 创建新的撰写窗格
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input_state = cx.new(|cx: &mut Context<InputState>| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .placeholder("在此输入要发送的文本...")
-        });
-
+    /// 创建新的撰写窗格（InputState 在首次 render 时懒构造）
+    pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
-            input_state,
+            input_state: None,
             target: ComposeTarget::CurrentSession,
             history: Vec::new(),
             active_session: None,
@@ -43,9 +38,25 @@ impl ComposePaneView {
         self.active_session = session_id;
     }
 
+    /// 获取 InputState（懒构造）
+    fn ensure_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if self.input_state.is_none() {
+            let state = cx.new(|cx: &mut Context<InputState>| {
+                InputState::new(window, cx)
+                    .multi_line(true)
+                    .placeholder("在此输入要发送的文本...")
+            });
+            self.input_state = Some(state);
+        }
+        self.input_state.clone().unwrap()
+    }
+
     /// 获取内容
     pub fn content(&self, cx: &App) -> String {
-        self.input_state.read(cx).value().clone()
+        match &self.input_state {
+            Some(s) => s.read(cx).value().to_string(),
+            None => String::new(),
+        }
     }
 
     /// 获取发送目标
@@ -73,9 +84,10 @@ impl ComposePaneView {
 }
 
 impl Render for ComposePaneView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let input_state = self.ensure_input_state(window, cx);
         let target_desc = self.target_description();
-        let char_count = self.input_state.read(cx).value().len();
+        let char_count = input_state.read(cx).value().len();
 
         div()
             .size_full()
@@ -133,7 +145,7 @@ impl Render for ComposePaneView {
                     .flex_1()
                     .bg(rgb(0x1e1e2e))
                     .p(px(4.0))
-                    .child(Input::new(&self.input_state)),
+                    .child(Input::new(&input_state)),
             )
             // 状态栏
             .child(
