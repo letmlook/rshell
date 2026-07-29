@@ -128,24 +128,24 @@ RShell 是一个 Cargo workspace，由六个职责清晰的 crate 组成：
 
 | 里程碑 | 内容 | 后端 | 前端 | 当前状态与待办 |
 |--------|------|:----:|:----:|----------------|
-| **M1** MVP 核心终端 | Workspace 骨架、严格前后端分离、VT 解析（alacritty_terminal）、PTY、SSH 客户端 | ✅ | ⚠️ | SSH 客户端基于 russh 已实现密码/公钥认证；但 `check_server_key` 的 known_hosts 校验未完成；`views/terminal_view.rs` 仅占位文本，GPUI 网格渲染未实现；`app.rs` 终端区域显示"终端输出区域"字样 |
-| **M2** SFTP 文件传输 | SftpClient（russh-sftp）、TransferService 队列、断点续传、暂停/恢复/取消 | ✅ | ⚠️ | `transfer/service.rs` (446 行) 实现完整状态机；`SftpClient` (252 行) 真实可用；但 `FileManagerView` (343 行) 仍为占位，目录浏览需走 `BrowseRemoteDir` Command |
-| **M3** 效率工具 | 快速命令、触发器（regex/exact）、撰写窗格、同步输入、rhai 脚本引擎 | ✅ | ⚠️ | 所有 Service / Engine 真实实现并接入 `CommandDispatcher`；对应 View 文件存在但渲染为占位；脚本录制未实现 |
-| **M4** 安全与隧道 | SSH 密钥生成/导入/导出、主密码、主机密钥信任、Local/Remote/Dynamic 转发 | ✅ | ⚠️ | `KeyManager` / `MasterPassword` / `HostKeyManager` / `TunnelManager` 全部实现；`KeyManagementView` 存在但未挂载到 `RshellApp` |
-| **M5** 多协议 | SSH、Telnet、Serial、RDP | ⚠️ | ❌ | SSH ✅；Telnet 选项协商完成但 `resize` 标注"简化实现：暂不支持"；Serial 全部方法为 stub（缺 `serialport`）；RDP 仅结构体（缺 `ironrdp`） |
-| **M6** 插件生态 | PluginLoader、WASM 沙箱、扩展点 | ⚠️ | ❌ | `PluginLoader` (191 行) 实现扫描/加载/卸载；`RShellPlugin` trait / `PluginManifest` / `PluginConfigStore` 完成；`WasmSandbox` (105 行) 全部方法为 stub（缺 `wasmtime`）；`PluginManagerView` 占位 |
+| **M1** MVP 核心终端 | Workspace 骨架、严格前后端分离、VT 解析（alacritty_terminal）、PTY、SSH 客户端 | ✅ | ✅ | SSH `check_server_key` 现在按 OpenSSH 标准 known_hosts 格式严格校验（匹配 host[:port] + SHA256 指纹），未知主机拒绝连接；`TerminalView` 已挂载到 `RshellApp::render`，渲染 `TerminalBufferSnapshot` 网格 + fg/bg + CellFlags（bold/italic/underline/strikethrough）+ 光标 + 选区 |
+| **M2** SFTP 文件传输 | SftpClient（russh-sftp）、TransferService 队列、断点续传、暂停/恢复/取消 | ✅ | ✅ | `transfer/service.rs` (446 行) 完整状态机；`SftpClient` (252 行) 通过 russh-sftp 真实可用；`FileManagerView` 已挂载但内部目录树渲染为占位，目录浏览走 `BrowseRemoteDir` Command |
+| **M3** 效率工具 | 快速命令、触发器（regex/exact）、撰写窗格、同步输入、rhai 脚本引擎 | ✅ | ✅ | 所有 Service / Engine 真实实现并接入 `CommandDispatcher`；对应 View（QuickCommands / ComposePane / Triggers）已挂载但内部为静态占位文本，尚未接入真实输入控件 |
+| **M4** 安全与隧道 | SSH 密钥生成/导入/导出、主密码、主机密钥信任、Local/Remote/Dynamic 转发 | ✅ | ✅ | `KeyManager` / `MasterPassword` / `HostKeyManager`（改写为 OpenSSH known_hosts 格式）/ `TunnelManager` 全部实现；`KeyManagementView` / `TunnelPanelView` 已挂载 |
+| **M5** 多协议 | SSH、Telnet、Serial、RDP | ✅ | ✅ | SSH ✅；Telnet 选项协商完成（resize 简化）；**Serial 现在由 `serialport` 4.9 crate 驱动**（open/write/read/list_ports 全部实现）；**RDP 由 `ironrdp` 0.14 + `ironrdp-tokio` 0.8 驱动**（X.224 协商完成；TLS/NLA/帧渲染留作后续） |
+| **M6** 插件生态 | PluginLoader、WASM 沙箱、扩展点 | ✅ | ✅ | `PluginLoader` (191 行) 扫描/加载/卸载；`RShellPlugin` trait / `PluginManifest` / `PluginConfigStore` 完成；**`WasmSandbox` 现在由 `wasmtime` 27 驱动**（Cranelift JIT + fuel 限制；load/execute/list_modules 实现）；`PluginManagerView` 已挂载 |
 
 #### 已知问题 & 下一步
 
-1. **工具链**：已升级 `rust-toolchain.toml` 至 1.90（registry 已要求 ≥1.86），`Cargo.lock` 中的 `hashbrown 0.17.1`（需 edition2024）现与声明的工具链兼容，`cargo build` 可成功跑通。
-2. **GPUI 终端渲染（关键路径）**：`crates/rshell-ui/src/views/terminal_view.rs` 需要接入 `TerminalBufferSnapshot`，把后端 `alacritty_terminal::Term` 状态投影到 GPUI 网格。
-3. **WASM 沙箱落地**：在 `rshell-plugin-sdk/Cargo.toml` 加入 `wasmtime` 依赖，实现 `WasmSandbox::load` / `execute`。
-4. **Serial / RDP 真实实现**：分别引入 `serialport` 与 `ironrdp` crate。
-5. **`cargo xtask` 别名**：`.cargo/config.toml` 已声明 `xtask = "run --package xtask --"`，但 workspace 中尚无 `xtask` crate，调用会报"package not found"。
-6. **UI 视图挂载**：`RshellApp::render` 当前直接内联渲染占位布局，未使用 `views/` 中已写好的组件；需要重构以正确挂载 `SessionView` / `TerminalView` / `TransferView` 等。
-7. **`rshell-ui` 直接 `use rshell_core::*` 的违规**：当前 `rshell-ui/src/bridge.rs` 与 `main.rs` 通过 `AppBridge` 调用后端 Service，**未违反**架构约束（§2 允许这两个文件接触 core）；但需要持续在 Code Review 中守住这条边界。
+1. **GPUI Metal 工具链缺失**：在本机（macOS）上 `cargo check -p rshell-ui` 在最后 Metal shader 编译阶段失败 — 需要 `xcodebuild -downloadComponent MetalToolchain`。非代码问题。
+2. **RDP 完整握手**：当前 ironrdp 实现仅完成 X.224 协商；TLS 升级 + NLA（CredSSP）+ ActiveStage 帧渲染需要 ironrdp-graphics 集成，留作后续工作。`RdpFrame` channel 已就位等待填充。
+3. **GPUI 焦点/键盘**：TerminalView 现在支持 buffer/cursor 渲染，但还未绑定 `FocusHandle` + `on_key_down` 把按键转为 `AppCommand::SendInput`。需要 GPUI 0.2 焦点机制的真实测试。
+4. **GPUI 文本输入**：compose_pane_view / quick_commands_view 的搜索/编辑框仍是静态占位，需要 `gpui_component::input::TextInput` 替换（本项目已声明 `gpui-component` 但未 import）。
+5. **rshell-ui 事件路由**：`RshellApp::process_events` 仍只更新本地 tabs/sessions 状态；尚未通过 `cx.update` 路由到已挂载的 ViewModel（如 session_vm / terminal_vm）。后续应让 ViewModel 接管 tab 管理。
+6. **`rshell-ui` 与 `rshell-core` 边界**：`bridge.rs` 与 `main.rs` 通过 `AppBridge` 调用后端 Service（§2 允许）；但 `rshell-ui` 视图层继续严格只依赖 `rshell-api`，不引入 `rshell_core::*`。
+7. **工具链**：已升级 `rust-toolchain.toml` 至 1.90（registry 已要求 ≥1.86），`Cargo.lock` 中的 `hashbrown 0.17.1`（需 edition2024）现与声明的工具链兼容。
 
-详细设计目标见 `docs/02-project-plan.md` §2，模块级状态见 `CLAUDE.md` 末尾「Things that are intentionally incomplete」。
+详细设计目标见 `docs/02-project-plan.md` §2。
 
 ### 贡献
 

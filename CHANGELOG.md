@@ -9,12 +9,29 @@
 
 ## [Unreleased]
 
-### 计划中
-- Phase 2（M2）SFTP 双窗格文件管理器
-- Phase 3（M3）快速命令、触发器、脚本引擎完善
-- Phase 4（M4）密钥管理与端口转发隧道
-- Phase 5（M5）Telnet / Serial / RDP 协议完善
-- Phase 6（M6）WASM 插件系统落地
+### Changed — 完成 v0.1.0 完整化
+
+#### 工具链
+- 升级 `rust-toolchain.toml` 至 Rust 1.90（registry 已要求 ≥1.86）；同步更新 `Cargo.toml` workspace `rust-version`、`CLAUDE.md`、`README.md`、`docs/07-project-setup-guide.md`。
+- 升级 `alacritty_terminal` 0.24 → 0.25 以匹配新版 rustix API；修复 `rshell-infra` PTY Unix 实现缺失的 `std::io::{Read, Write}` 导入。
+
+#### 新增
+- **`crates/xtask/`**：clap 驱动的任务运行器，子命令 `fmt` / `lint` / `test` / `dev` / `build` / `xtask-help`。`.cargo/config.toml` 中已存在的 `cargo xtask` 别名现在真正可用。
+- **SSH 主机密钥校验**：`SshHandler::check_server_key` 现在按 OpenSSH 标准 `known_hosts` 格式（`<host_pattern> <keytype> <base64-key>`）严格匹配 host[:port] + SHA256 指纹，未知主机**拒绝连接**（之前是静默接受）。`HostKeyManager` 重写为 OpenSSH 文件格式，与 `ssh-keygen` 等工具互操作。
+- **Serial（`crates/rshell-protocol/src/serial/mod.rs`）**：基于 `serialport` 4.9 实现真实串口通信。`open` / `write` / `read` / `list_ports` 全部就绪；阻塞 I/O 通过 `tokio::task::spawn_blocking` 包装；`SerialPort`（非 `Sync`）由 `Arc<Mutex<Box<dyn SerialPort>>>` 持有。
+- **RDP（`crates/rshell-protocol/src/rdp/mod.rs`）**：基于 `ironrdp` 0.14 + `ironrdp-tokio` 0.8 + `ironrdp-connector` 0.8 + `ironrdp-async` 0.8 + `ironrdp-pdu` 0.7。TCP + `TokioFramed` + `connect_begin` 完成 X.224 协商。`RdpFrame` 通过独立 mpsc 通道对外提供。⚠️ TLS 升级 + NLA 认证 + ActiveStage 帧渲染留作后续工作（标记在 README「已知问题」中）。
+- **WASM 沙箱（`crates/rshell-plugin-sdk/src/sandbox.rs`）**：基于 `wasmtime` 27（Cranelift JIT）。Engine 启动 `consume_fuel`；`Store::set_fuel` 近似 `max_execution_time_ms` 限制执行时间；`Module::new` / `Instance::new` / `Func::call` 全部走通；测试通过 `(2, 3) == 5` 的 WAT `add` 函数验证。
+
+#### 重构
+- **`crates/rshell-ui/src/views/*`**：6 个 View 的构造器从 `new(_window, _cx)` 统一为 `new(cx)` 以适配 `cx.new(|cx| ...)` 挂载闭包。
+- **`crates/rshell-ui/src/app.rs`**：`RshellApp` 现在持有 10 个 `gpui::Entity<View>` 字段（FileManager / Session / Terminal / Transfer / Key / Theme / QuickCommands / Compose / Tunnel / Plugin），新增 `PanelKind` 枚举 + `render_active_panel()` 路由方法。侧边栏"会话树"占位 → 真实 `SessionView`；底部"传输队列"占位 → 真实 `TransferView`；中央"终端输出区域"占位 → 真实 `TerminalView`。
+- **`crates/rshell-ui/src/views/terminal_view.rs`**：增强为支持 `CellFlags`（bold / italic / underline / strikethrough）渲染、绝对定位光标覆盖层、`Selection` 数据结构 + 选区高亮。
+
+### 待办
+- RDP TLS / NLA / ActiveStage 帧渲染（见 README「已知问题」§2）
+- TerminalView 焦点 + 键盘输入捕获（GPUI 0.2 焦点机制需运行时验证）
+- gpui_component 文本输入控件接入 ComposePane / QuickCommands 搜索框
+- rshell-ui 事件经 `cx.update` 路由到已挂载的 ViewModel
 
 ---
 

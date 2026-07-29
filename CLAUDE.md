@@ -119,8 +119,8 @@ So even though the backend lives on another thread, GPUI only ever touches a `Mu
 
 These exist as scaffolding and may be referenced but are not yet wired up — be careful when adding tests or docs that assume they work:
 
-- `WasmSandbox` (`rshell-plugin-sdk/src/sandbox.rs`) — no wasmtime dep yet.
-- `RDP` protocol (`rshell-protocol/src/rdp/`) — module only.
-- `AppCommand::CopySelection` — dispatcher explicitly logs "not yet implemented".
-- The `cargo xtask` alias — no `xtask` crate in `Cargo.toml` workspace members.
-- `rshell-ui` `view_models/*.rs` files exist alongside views but most rendering still happens inline in `RshellApp::render` — see the TODO in the file's comment.
+- **RDP full handshake**: `crates/rshell-protocol/src/rdp/mod.rs` completes X.224 negotiation via `ironrdp-async::connect_begin`, but the TLS upgrade + NLA (CredSSP) + ActiveStage frame pump are not yet implemented. `RdpConnection::recv` always returns 0; frame data flows through `take_frame_receiver()` once the pump lands.
+- **GPUI focus & keyboard input**: `TerminalView` renders `TerminalBufferSnapshot` but does not yet capture keystrokes and convert them to `AppCommand::SendInput`. Adding `.track_focus(&focus_handle).on_key_down(cx.listener(...))` requires real GPUI 0.2 runtime testing that this environment cannot run (Metal toolchain missing).
+- **GPUI text inputs**: `compose_pane_view.rs` and `quick_commands_view.rs` still render static `div()` placeholders for text input rather than `gpui_component::input::TextInput` (declared in `Cargo.toml` but not imported anywhere).
+- **rshell-ui event routing**: `RshellApp::process_events` only mutates local `tabs`/`sessions` state; it does not yet forward events to mounted ViewModels via `cx.update`. A future rev should route `AppEvent` into `SessionViewModel::handle_event` etc.
+- **AppCommand::CopySelection**: dispatcher still logs "not yet implemented" — pending TerminalView selection-copy wiring.
