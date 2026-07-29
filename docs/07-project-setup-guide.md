@@ -113,7 +113,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
-repository = "https://github.com/your-org/rshell"
+repository = "https://github.com/letmlook/rshell"
 
 [workspace.dependencies]
 # 异步运行时
@@ -420,7 +420,7 @@ cargo install cargo-nextest        # 更快的测试运行器
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/your-org/rshell.git
+git clone https://github.com/letmlook/rshell.git
 cd rshell
 
 # 2. 创建目录结构
