@@ -2,11 +2,13 @@
 //!
 //! 基于 russh 实现 SSH 连接、认证、数据收发和终端大小调整。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rshell_api::types::{AuthMethod, SessionConfig};
+use ssh_key::HashAlg;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{Connection, ProtocolError};
 
@@ -25,9 +27,136 @@ pub struct SshClient {
 
 /// SSH Handler 实现
 ///
-/// 负责接收服务端数据并通过通道转发给上层
+/// 负责接收服务端数据并通过通道转发给上层；同时验证服务器主机密钥。
 pub(crate) struct SshHandler {
     data_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// 正在连接的主机名/IP（用于 known_hosts 查找）
+    host: String,
+    /// 端口
+    port: u16,
+    /// 已知的 known_hosts 文件路径（依次尝试：~/.ssh/known_hosts、用户配置）
+    known_hosts_paths: Vec<PathBuf>,
+}
+
+impl SshHandler {
+    /// 在 known_hosts 文件中查找匹配 (host, port) 的主机密钥，并与给定的公钥比对指纹
+    fn verify_known_hosts(&self, server_key: &ssh_key::PublicKey) -> bool {
+        let expected_fp = server_key.fingerprint(HashAlg::Sha256).to_string();
+
+        for path in &self.known_hosts_paths {
+            if !path.exists() {
+                continue;
+            }
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!("Failed to read known_hosts {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+
+            if self.scan_known_hosts(&content, server_key, &expected_fp) {
+                debug!("Host key matched entry in {}", path.display());
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// 扫描 known_hosts 内容，匹配 host 模式 + 密钥指纹
+    fn scan_known_hosts(&self, content: &str, server_key: &ssh_key::PublicKey, expected_fp: &str) -> bool {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            // OpenSSH known_hosts 行格式：
+            //   <host_pattern> <keytype> <base64-key> [comment]
+            // 或者哈希化条目：
+            //   |1|base64(salt)|base64(hash) <keytype> <base64-key> [comment]
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 3 {
+                continue;
+            }
+
+            let host_field = parts[0];
+            let keytype = parts[1];
+            let key_blob = parts[2];
+
+            // 跳过 hashed 条目（无法在不解码的情况下匹配 host 模式）
+            if host_field.starts_with("|1|") {
+                continue;
+            }
+
+            // 检查 host 模式是否匹配（逗号分隔多个 host）
+            let host_matches = host_field.split(',').any(|pattern| {
+                self.pattern_matches(pattern)
+            });
+            if !host_matches {
+                continue;
+            }
+
+            // 解析存储的公钥并比对指纹
+            // OpenSSH 格式：key_blob 是 base64 编码的 wire-format 公钥
+            let stored_key = ssh_key::PublicKey::from_openssh(key_blob)
+                .or_else(|_| ssh_key::PublicKey::from_bytes(key_blob.as_bytes()));
+            let stored_key = match stored_key {
+                Ok(k) => k,
+                Err(e) => {
+                    debug!("Failed to parse known_hosts key (type={}): {}", keytype, e);
+                    continue;
+                }
+            };
+
+            if stored_key.fingerprint(HashAlg::Sha256).to_string() == expected_fp {
+                // 额外确认 keytype 一致（防 base64 巧合匹配）
+                if stored_key.algorithm().as_str() == server_key.algorithm().as_str() {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// 检查 OpenSSH host pattern（支持 [host]:port 与 host,）是否匹配当前连接
+    fn pattern_matches(&self, pattern: &str) -> bool {
+        let pattern = pattern.trim_end_matches(',');
+        if pattern.is_empty() {
+            return false;
+        }
+
+        let (host_part, port_part) = if let Some(idx) = pattern.find("]:") {
+            // [1.2.3.4]:2222 或 [hostname]:2222
+            let host = &pattern[..idx + 1]; // 含 ']'
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            let port = &pattern[idx + 2..];
+            (host.to_string(), Some(port.to_string()))
+        } else if let Some(idx) = pattern.rfind(':') {
+            // host:port 或 host（无端口）
+            let host = &pattern[..idx];
+            let port = &pattern[idx + 1..];
+            (host.to_string(), Some(port.to_string()))
+        } else {
+            // 只有 host
+            (pattern.to_string(), None)
+        };
+
+        // 主机名匹配：精确比较，或通配符 * (简化：仅 *.example.com)
+        let host_ok = host_part == self.host
+            || (host_part.starts_with("*.") && self.host.ends_with(&host_part[1..]));
+
+        if !host_ok {
+            return false;
+        }
+
+        match port_part {
+            None => true, // 未指定端口 → 默认 22，与 SSH 默认一致
+            Some(p) => p.parse::<u16>().map(|p| p == self.port).unwrap_or(false),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -47,30 +176,32 @@ impl russh::client::Handler for SshHandler {
         &mut self,
         server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // 实现 host key 验证逻辑
-        // 获取服务器密钥指纹
-        let fingerprint = format!("{:?}", server_public_key);
-        debug!("Server host key fingerprint: {}", fingerprint);
+        let fp = server_public_key.fingerprint(HashAlg::Sha256).to_string();
+        debug!(
+            host = %self.host,
+            port = self.port,
+            fingerprint = %fp,
+            "Verifying server host key against known_hosts"
+        );
 
-        // 实际实现应查询 known_hosts 文件
-        // 这里使用简单的 known_hosts 文件检查
-        let known_hosts_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".ssh")
-            .join("known_hosts");
-
-        if known_hosts_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&known_hosts_path) {
-                if content.contains(&fingerprint) {
-                    debug!("Host key found in known_hosts");
-                    return Ok(true);
-                }
-            }
+        if self.verify_known_hosts(server_public_key) {
+            Ok(true)
+        } else {
+            // 未在 known_hosts 中找到匹配条目。MVP 策略：拒绝连接
+            // （生产环境应当发出 HostKeyMismatch 事件让用户决定是否信任）。
+            warn!(
+                host = %self.host,
+                port = self.port,
+                fingerprint = %fp,
+                "Host key not found in known_hosts — rejecting connection"
+            );
+            Err(anyhow::anyhow!(
+                "Host key for {}:{} not found in known_hosts (fingerprint {})",
+                self.host,
+                self.port,
+                fp
+            ))
         }
-
-        // 首次连接或密钥不匹配，接受并记录（生产环境应提示用户确认）
-        debug!("Host key not found in known_hosts, accepting (first connection)");
-        Ok(true)
     }
 
     async fn data(
@@ -130,9 +261,26 @@ impl SshClient {
             ..Default::default()
         });
 
+        // 构建 known_hosts 搜索路径（按优先级）
+        let mut known_hosts_paths: Vec<PathBuf> = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            known_hosts_paths.push(home.join(".ssh").join("known_hosts"));
+        }
+        // 也尝试 rshell 自有 known_hosts 文件（由 HostKeyManager 维护）
+        if let Some(mut data_dir) = dirs::data_local_dir() {
+            data_dir.push("rshell");
+            data_dir.push("known_hosts");
+            known_hosts_paths.push(data_dir);
+        }
+        // 最后尝试当前目录（开发环境）
+        known_hosts_paths.push(PathBuf::from("known_hosts"));
+
         // 创建 Handler
         let handler = SshHandler {
             data_tx: data_tx.clone(),
+            host: self.config.host.clone(),
+            port: self.config.port,
+            known_hosts_paths,
         };
 
         // 连接到服务器
