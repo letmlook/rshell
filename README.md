@@ -5,7 +5,7 @@
 > Built with Rust + GPUI. Apache-2.0 licensed.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange.svg)](rust-toolchain.toml)
 [![Version](https://img.shields.io/badge/version-0.1.0-green.svg)](Cargo.toml)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](#%E6%94%AF%E6%8C%81%E5%B9%B3%E5%8F%B0)
 
@@ -76,7 +76,7 @@ UI design preview: see [`docs/ui-design-preview.html`](docs/ui-design-preview.ht
 
 ### 快速开始
 
-需要 **Rust 1.80 或更高**（版本在 `rust-toolchain.toml` 中锁定）。
+需要 **Rust 1.90 或更高**（版本在 `rust-toolchain.toml` 中锁定）。
 
 ```bash
 # 克隆仓库
@@ -120,18 +120,32 @@ RShell 是一个 Cargo workspace，由六个职责清晰的 crate 组成：
 | [`docs/07-project-setup-guide.md`](docs/07-project-setup-guide.md) | 项目初始化指南 |
 | [`docs/ui-design-preview.html`](docs/ui-design-preview.html) | UI 设计预览 |
 
-### 路线图
+### 开发进度
 
-| 里程碑 | 阶段 | 状态 |
-|--------|------|------|
-| M1 | MVP 核心终端（SSH + VT 解析） | 进行中 |
-| M2 | 文件传输（SFTP 双窗格） | 计划中 |
-| M3 | 效率工具（快速命令 / 触发器 / 脚本） | 计划中 |
-| M4 | 安全与隧道 | 计划中 |
-| M5 | 多协议完善（Telnet / Serial / RDP） | 计划中 |
-| M6 | 插件生态（WASM 沙箱） | 计划中 |
+> **v0.1.0 快照（2026-07-29）**：六个 crate 已就位，源码约 13 000 行 Rust。后端框架基本成型，但**多个里程碑的协议/子系统仍为脚手架**，且前端的 GPUI 视图多为占位实现。下表反映当前真实完成度（基于源码 `grep` 结果 + 代码审查）。
 
-详细交付计划见 `docs/02-project-plan.md` §2。
+**图例**：✅ 主要完成 &nbsp;·&nbsp; ⚠️ 部分实现 / 脚手架 &nbsp;·&nbsp; ❌ 未实现或仅类型定义
+
+| 里程碑 | 内容 | 后端 | 前端 | 当前状态与待办 |
+|--------|------|:----:|:----:|----------------|
+| **M1** MVP 核心终端 | Workspace 骨架、严格前后端分离、VT 解析（alacritty_terminal）、PTY、SSH 客户端 | ✅ | ⚠️ | SSH 客户端基于 russh 已实现密码/公钥认证；但 `check_server_key` 的 known_hosts 校验未完成；`views/terminal_view.rs` 仅占位文本，GPUI 网格渲染未实现；`app.rs` 终端区域显示"终端输出区域"字样 |
+| **M2** SFTP 文件传输 | SftpClient（russh-sftp）、TransferService 队列、断点续传、暂停/恢复/取消 | ✅ | ⚠️ | `transfer/service.rs` (446 行) 实现完整状态机；`SftpClient` (252 行) 真实可用；但 `FileManagerView` (343 行) 仍为占位，目录浏览需走 `BrowseRemoteDir` Command |
+| **M3** 效率工具 | 快速命令、触发器（regex/exact）、撰写窗格、同步输入、rhai 脚本引擎 | ✅ | ⚠️ | 所有 Service / Engine 真实实现并接入 `CommandDispatcher`；对应 View 文件存在但渲染为占位；脚本录制未实现 |
+| **M4** 安全与隧道 | SSH 密钥生成/导入/导出、主密码、主机密钥信任、Local/Remote/Dynamic 转发 | ✅ | ⚠️ | `KeyManager` / `MasterPassword` / `HostKeyManager` / `TunnelManager` 全部实现；`KeyManagementView` 存在但未挂载到 `RshellApp` |
+| **M5** 多协议 | SSH、Telnet、Serial、RDP | ⚠️ | ❌ | SSH ✅；Telnet 选项协商完成但 `resize` 标注"简化实现：暂不支持"；Serial 全部方法为 stub（缺 `serialport`）；RDP 仅结构体（缺 `ironrdp`） |
+| **M6** 插件生态 | PluginLoader、WASM 沙箱、扩展点 | ⚠️ | ❌ | `PluginLoader` (191 行) 实现扫描/加载/卸载；`RShellPlugin` trait / `PluginManifest` / `PluginConfigStore` 完成；`WasmSandbox` (105 行) 全部方法为 stub（缺 `wasmtime`）；`PluginManagerView` 占位 |
+
+#### 已知问题 & 下一步
+
+1. **工具链**：已升级 `rust-toolchain.toml` 至 1.90（registry 已要求 ≥1.86），`Cargo.lock` 中的 `hashbrown 0.17.1`（需 edition2024）现与声明的工具链兼容，`cargo build` 可成功跑通。
+2. **GPUI 终端渲染（关键路径）**：`crates/rshell-ui/src/views/terminal_view.rs` 需要接入 `TerminalBufferSnapshot`，把后端 `alacritty_terminal::Term` 状态投影到 GPUI 网格。
+3. **WASM 沙箱落地**：在 `rshell-plugin-sdk/Cargo.toml` 加入 `wasmtime` 依赖，实现 `WasmSandbox::load` / `execute`。
+4. **Serial / RDP 真实实现**：分别引入 `serialport` 与 `ironrdp` crate。
+5. **`cargo xtask` 别名**：`.cargo/config.toml` 已声明 `xtask = "run --package xtask --"`，但 workspace 中尚无 `xtask` crate，调用会报"package not found"。
+6. **UI 视图挂载**：`RshellApp::render` 当前直接内联渲染占位布局，未使用 `views/` 中已写好的组件；需要重构以正确挂载 `SessionView` / `TerminalView` / `TransferView` 等。
+7. **`rshell-ui` 直接 `use rshell_core::*` 的违规**：当前 `rshell-ui/src/bridge.rs` 与 `main.rs` 通过 `AppBridge` 调用后端 Service，**未违反**架构约束（§2 允许这两个文件接触 core）；但需要持续在 Code Review 中守住这条边界。
+
+详细设计目标见 `docs/02-project-plan.md` §2，模块级状态见 `CLAUDE.md` 末尾「Things that are intentionally incomplete」。
 
 ### 贡献
 

@@ -5,6 +5,8 @@
 
 use super::{Pty, PtyError};
 use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
 
 #[cfg(unix)]
 use std::fs::{File, OpenOptions};

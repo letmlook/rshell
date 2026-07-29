@@ -111,7 +111,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.90"
 license = "Apache-2.0"
 repository = "https://github.com/letmlook/rshell"
 
@@ -330,7 +330,7 @@ mockall = { workspace = true }
 
 | 项目 | 最低要求 | 推荐 |
 |------|----------|------|
-| Rust | 1.80+ (stable) | 最新 stable |
+| Rust | 1.90+ (stable) | 最新 stable |
 | OS | Windows 10 / macOS 12 / Ubuntu 22.04 | Windows 11 / macOS 14 |
 | 内存 | 8GB | 16GB+ |
 | 磁盘 | 10GB 可用空间 | 20GB+ SSD |
@@ -347,15 +347,15 @@ Invoke-WebRequest -Uri https://static.rust-lang.org/rustup/dist/x86_64-pc-window
 .\rustup-init.exe
 
 # 2. 设置工具链版本
-rustup toolchain install 1.80
+rustup toolchain install 1.90
 rustup default stable
 
 # 3. 安装必要组件
 rustup component add rustfmt clippy
 
 # 4. 验证安装
-rustc --version     # rustc 1.80.0+
-cargo --version     # cargo 1.80.0+
+rustc --version     # rustc 1.90.0+
+cargo --version     # cargo 1.90.0+
 ```
 
 ### 3.3 系统依赖
@@ -562,7 +562,7 @@ jobs:
 ```toml
 # rust-toolchain.toml
 [toolchain]
-channel = "1.80"
+channel = "1.90"
 components = ["rustfmt", "clippy"]
 ```
 

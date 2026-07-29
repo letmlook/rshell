@@ -76,9 +76,7 @@ impl TerminalInstance {
 
     /// 处理输入数据（VT 序列解析）
     fn process_bytes(&mut self, data: &[u8]) {
-        for byte in data {
-            self.parser.advance(&mut self.term, *byte);
-        }
+        self.parser.advance(&mut self.term, data);
     }
 
     /// 调整终端大小

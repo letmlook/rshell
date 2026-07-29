@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-RShell — a cross-platform (Windows / macOS / Linux) Xshell-like remote terminal & SFTP client, written in Rust with a GPUI frontend. Workspace version `0.1.0`, Rust `1.80` (see `rust-toolchain.toml`). All Chinese-language design docs live under `docs/` (read `docs/02-project-plan.md`, `docs/03-detailed-design.md`, and `docs/05-development-standards.md` before making non-trivial changes — they encode the architecture and conventions).
+RShell — a cross-platform (Windows / macOS / Linux) Xshell-like remote terminal & SFTP client, written in Rust with a GPUI frontend. Workspace version `0.1.0`, Rust `1.90` (see `rust-toolchain.toml`). All Chinese-language design docs live under `docs/` (read `docs/02-project-plan.md`, `docs/03-detailed-design.md`, and `docs/05-development-standards.md` before making non-trivial changes — they encode the architecture and conventions).
 
 ## Common commands
 
