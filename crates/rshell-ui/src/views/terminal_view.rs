@@ -112,7 +112,7 @@ impl TerminalView {
             if let Some(c) = key_char.and_then(|s| s.chars().next()) {
                 if c.is_ascii_alphabetic() {
                     let upper = c.to_ascii_uppercase() as u8;
-                    if upper >= b'A' && upper <= b'Z' {
+                    if upper.is_ascii_uppercase() {
                         return vec![upper - b'A' + 1];
                     }
                 }

@@ -58,7 +58,7 @@ impl Pty for WindowsPty {
 
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if let Some(ref mut writer) = self.writer {
-            writer.write(buf)?;
+            writer.write_all(buf)?;
             writer.flush()?;
             Ok(buf.len())
         } else {

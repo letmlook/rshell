@@ -41,6 +41,8 @@ pub struct RshellApp {
     session_vm: gpui::Entity<SessionViewModel>,
     terminal_vm: gpui::Entity<TerminalViewModel>,
     transfer_vm: gpui::Entity<TransferViewModel>,
+    /// 当前激活 tab 的 session id（用于 TerminalBufferUpdated 路由）
+    active_session_id: Uuid,
 
     /// 已挂载的视图（10 个）
     file_manager: gpui::Entity<FileManagerView>,
@@ -92,16 +94,16 @@ impl RshellApp {
         let terminal_vm = cx.new(|_cx| TerminalViewModel::new(Uuid::new_v4()));
         let transfer_vm = cx.new(|_cx| TransferViewModel::new());
 
-        let file_manager = cx.new(|cx| FileManagerView::new(cx));
-        let session_view = cx.new(|cx| SessionView::new(cx));
-        let terminal_view = cx.new(|cx| TerminalView::new(cx));
-        let transfer_view = cx.new(|cx| TransferView::new(cx));
-        let key_mgmt_view = cx.new(|cx| KeyManagementView::new(cx));
-        let theme_view = cx.new(|cx| ThemeSettingsView::new(cx));
-        let quick_cmds_view = cx.new(|cx| QuickCommandsView::new(cx));
-        let compose_view = cx.new(|cx| ComposePaneView::new(cx));
-        let tunnel_view = cx.new(|cx| TunnelPanelView::new(cx));
-        let plugin_view = cx.new(|cx| PluginManagerView::new(cx));
+        let file_manager = cx.new(FileManagerView::new);
+        let session_view = cx.new(SessionView::new);
+        let terminal_view = cx.new(TerminalView::new);
+        let transfer_view = cx.new(TransferView::new);
+        let key_mgmt_view = cx.new(KeyManagementView::new);
+        let theme_view = cx.new(ThemeSettingsView::new);
+        let quick_cmds_view = cx.new(QuickCommandsView::new);
+        let compose_view = cx.new(ComposePaneView::new);
+        let tunnel_view = cx.new(TunnelPanelView::new);
+        let plugin_view = cx.new(PluginManagerView::new);
 
         Self {
             bridge,
@@ -112,6 +114,7 @@ impl RshellApp {
             session_vm,
             terminal_vm,
             transfer_vm,
+            active_session_id: Uuid::nil(),
             file_manager,
             session_view,
             terminal_view,
@@ -140,10 +143,12 @@ impl RshellApp {
             self.terminal_vm.update(cx, |vm, _| vm.handle_event(&event));
             self.transfer_vm.update(cx, |vm, _| vm.handle_event(&event));
 
-            // 2) 路由到 TransferView（它有内部 vm handle_event）
-            // 注意：TransferView 自己持有 vm，所以这里直接 forward 即可
-            // TransferView::handle_event 会调它自己的 vm.handle_event
-            // 但当前 TransferView 是 gpui::Entity，需要 cx.update；这里省略避免双重处理
+            // 2) TerminalBufferUpdated → 转给 TerminalView 让它渲染实际 buffer
+            if let rshell_api::AppEvent::TerminalBufferUpdated { session_id, snapshot } = &event {
+                if *session_id == self.active_session_id {
+                    self.terminal_view.update(cx, |v, _| v.update_buffer(snapshot.clone()));
+                }
+            }
 
             // 3) 本地状态同步（tabs/sessions UI 状态）
             match &event {
@@ -165,6 +170,10 @@ impl RshellApp {
                         self.open_tab_for_session(cx, *session_id);
                     }
                 }
+                AppEvent::TerminalBufferUpdated { session_id, .. } => {
+                    // 确保 TerminalInputState global 指向正确的 session
+                    self.update_active_session(cx, *session_id);
+                }
                 AppEvent::TerminalTitleChanged { session_id, title } => {
                     for tab in &mut self.tabs {
                         if tab.session_id == *session_id {
@@ -182,10 +191,27 @@ impl RshellApp {
                     tracing::error!("Transfer failed: {} - {}", task_id, error);
                 }
                 AppEvent::ClipboardCopy { text } => {
-                    // 后端请求拷贝文本到系统剪贴板。当前实现仅记录长度。
-                    // 完整实现在于把 text 写入 OS 剪贴板（arboard crate / macOS NSPasteboard），
-                    // 需要时可在 bridge.rs 中调用 arboard::Clipboard::set_text(text)。
-                    tracing::info!(bytes = text.len(), "ClipboardCopy requested");
+                    // 后端请求拷贝文本到系统剪贴板。
+                    // arboard 在 Windows 上走 Ole32 / OLE 自动化的 Clipboard API,
+                    // 在 macOS 上走 NSPasteboard, Linux 上走 X11 / wayland-clipboard。
+                    match arboard::Clipboard::new() {
+                        Ok(mut cb) => match cb.set_text(text.clone()) {
+                            Ok(()) => tracing::info!(
+                                bytes = text.len(),
+                                "ClipboardCopy → 系统剪贴板写入成功"
+                            ),
+                            Err(e) => tracing::error!(
+                                bytes = text.len(),
+                                error = %e,
+                                "ClipboardCopy: arboard.set_text 失败"
+                            ),
+                        },
+                        Err(e) => tracing::error!(
+                            bytes = text.len(),
+                            error = %e,
+                            "ClipboardCopy: 无法获取 arboard::Clipboard 句柄"
+                        ),
+                    }
                 }
                 _ => {}
             }
@@ -215,13 +241,15 @@ impl RshellApp {
             session_id,
         });
         self.active_tab = Some(self.tabs.len() - 1);
+        self.update_active_session(cx, session_id);
     }
 
     /// 切换激活 tab 时同步更新 TerminalInputState global（用于 key listener）
-    fn update_active_session(&self, cx: &mut gpui::Context<Self>, session_id: Uuid) {
+    fn update_active_session(&mut self, cx: &mut gpui::Context<Self>, session_id: Uuid) {
+        self.active_session_id = session_id;
         cx.set_global(crate::views::terminal_view::TerminalInputState { session_id });
         // 同时设置 TerminalView 的 session_id 字段（即使 listener 不用，也可用于 future 内部逻辑）
-        let _ = self.terminal_view.update(cx, |v, _| v.set_session_id(session_id));
+        self.terminal_view.update(cx, |v, _| v.set_session_id(session_id));
     }
 
     /// 发送命令到后端

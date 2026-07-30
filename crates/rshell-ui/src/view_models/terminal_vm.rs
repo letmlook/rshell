@@ -47,15 +47,20 @@ impl TerminalViewModel {
             }
             rshell_api::AppEvent::TerminalOutput { session_id, data } => {
                 if *session_id == self.session_id {
-                    tracing::debug!(
+                    // raw 字节流只用于日志/触发器匹配，不再驱动渲染。
+                    // 真正的渲染由 TerminalBufferUpdated 驱动（见下）。
+                    tracing::trace!(
                         session_id = %session_id,
                         bytes = data.len(),
-                        "Received terminal output"
+                        "Received terminal output (raw bytes)"
                     );
-                    // 实际场景：前端收到后端发布的 TerminalOutput 事件后，
-                    // 应通过 CommandDispatcher 请求后端 TerminalService 进行 VT 解析，
-                    // 然后获取最新的 buffer snapshot 更新本地渲染。
-                    // 这里通过 on_terminal_output 回调通知视图层。
+                }
+            }
+            rshell_api::AppEvent::TerminalBufferUpdated { session_id, snapshot } => {
+                if *session_id == self.session_id {
+                    // 后端已解析 VT 序列并生成完整 snapshot，
+                    // 直接喂给本地 buffer，触发 Render 重绘。
+                    self.update_buffer(snapshot.clone());
                 }
             }
             rshell_api::AppEvent::TerminalTitleChanged { session_id, title } => {
@@ -63,12 +68,11 @@ impl TerminalViewModel {
                     self.title = title.clone();
                 }
             }
-            rshell_api::AppEvent::SessionUpdated { session_id } => {
-                if *session_id == self.session_id {
+            rshell_api::AppEvent::SessionUpdated { session_id }
+                if *session_id == self.session_id => {
                     // 会话配置更新，可触发视图刷新
                     tracing::debug!(session_id = %session_id, "Session updated");
                 }
-            }
             _ => {}
         }
     }

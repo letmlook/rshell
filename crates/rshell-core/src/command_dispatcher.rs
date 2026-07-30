@@ -50,6 +50,7 @@ pub struct CommandDispatcher {
 
 impl CommandDispatcher {
     /// 创建新的命令分发器
+    #[allow(clippy::too_many_arguments)] // 9 个服务注入是显式契约,bundle 不拆分更清晰
     pub fn new(
         session_service: Arc<SessionService>,
         terminal_service: Arc<TerminalService>,
@@ -64,6 +65,9 @@ impl CommandDispatcher {
         let quick_command_service = Arc::new(QuickCommandService::new(event_bus.clone()));
         let trigger_engine = Arc::new(TriggerEngine::new(event_bus.clone()));
         let compose_service = Arc::new(ComposeService::new(event_bus.clone()));
+        // rhai::Engine is !Send+!Sync by design; ScriptEngine is only ever touched
+        // from the dedicated backend thread that owns this Arc (see bridge.rs).
+        #[allow(clippy::arc_with_non_send_sync)]
         let script_engine = Arc::new(ScriptEngine::new(event_bus.clone()));
         let sync_input_service = Arc::new(SyncInputService::new(event_bus.clone()));
 
@@ -96,9 +100,15 @@ impl CommandDispatcher {
     /// 初始化传输服务的 SSH 客户端提供函数
     pub async fn initialize(&self) {
         let session_service = self.session_service.clone();
-        let provider = Arc::new(move |session_id: Uuid| {
-            session_service.get_ssh_client(session_id)
-        });
+        let provider = Arc::new(
+            move |session_id: Uuid| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<crate::session::service::SshClientHandle, CoreError>>
+                    + Send>,
+            > {
+                let svc = session_service.clone();
+                Box::pin(async move { svc.get_ssh_client(session_id).await })
+            },
+        );
         self.transfer_service.set_ssh_client_provider(provider).await;
     }
 
@@ -127,7 +137,11 @@ impl CommandDispatcher {
 
             // ===== 终端命令 =====
             AppCommand::SendInput { session_id, data } => {
-                self.terminal_service.send_input(session_id, &data)?;
+                // 用户输入直接发到 SessionService（→ 远端 SSH shell），
+                // 不再走 TerminalService::send_input —— 那个方法会
+                // 把 data 重新当 TerminalOutput 发布，构成回路，
+                // 真实场景下用户输入不会在本地终端回显（前端 View 已渲染）。
+                self.session_service.send_data(session_id, &data).await?;
                 // 同步输入：同时发送到其他同步会话
                 if self.sync_input_service.is_sync_active()? {
                     self.sync_input_service
@@ -184,7 +198,9 @@ impl CommandDispatcher {
 
             // ===== 隧道命令 =====
             AppCommand::CreateTunnel { session_id, rule } => {
-                self.tunnel_manager.create_tunnel(session_id, rule, None).await?;
+                // 尝试获取关联会话的 SSH client 引用，供隧道做 direct-tcpip 转发
+                let ssh_client = self.session_service.get_ssh_client(session_id).await.ok();
+                self.tunnel_manager.create_tunnel(session_id, rule, ssh_client).await?;
             }
             AppCommand::CloseTunnel { tunnel_id } => {
                 self.tunnel_manager.close_tunnel(tunnel_id).await?;
@@ -262,9 +278,8 @@ impl CommandDispatcher {
             }
 
             // ===== 安全：主机密钥 =====
-            AppCommand::TrustHostKey { host, port } => {
-                // 需要 key_type 和 fingerprint，这里简化处理
-                self.host_key_manager.trust_host_key(&host, port, "unknown", "unknown").await?;
+            AppCommand::TrustHostKey { host, port, key_type, public_key_blob, .. } => {
+                self.host_key_manager.trust_host_key(&host, port, &key_type, &public_key_blob).await?;
             }
             AppCommand::DeleteHostKey { host, port } => {
                 self.host_key_manager.delete_host_key(&host, port).await?;

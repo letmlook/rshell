@@ -2,14 +2,18 @@
 
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
+use crate::terminal::service::TerminalService;
 use rshell_api::types::{ConnectionInfo, ConnectionState, RemoteFileEntry, SessionConfig};
 use rshell_protocol::ssh::SshClient;
 use rshell_protocol::ssh::sftp::SftpClient;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+
+/// 活动连接的 SSH 客户端句柄别名（与 SshClient 内部使用了同样的 tokio RwLock）
+pub type SshClientHandle = Arc<tokio::sync::RwLock<SshClient>>;
 
 /// 会话运行时状态
 struct SessionState {
@@ -22,7 +26,7 @@ struct SessionState {
 /// 活动连接（使用 channel 来接收数据）
 struct ActiveConnection {
     /// 用于发送数据到远程 shell
-    client: Arc<tokio::sync::RwLock<SshClient>>,
+    client: SshClientHandle,
     /// 用于取消后台读取任务的通道
     _cancel_tx: mpsc::Sender<()>,
 }
@@ -31,19 +35,22 @@ struct ActiveConnection {
 pub struct SessionService {
     /// 会话状态映射
     sessions: Arc<RwLock<HashMap<Uuid, SessionState>>>,
-    /// 活动连接映射
+    /// 活动连接映射（tokio RwLock，因为持锁等待期需要跨 await）
     connections: Arc<RwLock<HashMap<Uuid, ActiveConnection>>>,
     /// 事件总线
     event_bus: Arc<EventBus>,
+    /// 终端服务（用于在收到远端输出时解析 VT 并推回 snapshot）
+    terminal_service: Arc<TerminalService>,
 }
 
 impl SessionService {
     /// 创建新的会话服务
-    pub fn new(event_bus: Arc<EventBus>) -> Self {
+    pub fn new(event_bus: Arc<EventBus>, terminal_service: Arc<TerminalService>) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             connections: Arc::new(RwLock::new(HashMap::new())),
             event_bus,
+            terminal_service,
         }
     }
 
@@ -54,7 +61,7 @@ impl SessionService {
 
         // 获取会话配置
         let config = {
-            let sessions = self.sessions.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+            let sessions = self.sessions.read().await;
             sessions
                 .get(&session_id)
                 .ok_or_else(|| CoreError::NotFound(format!("Session {} not found", session_id)))?
@@ -64,7 +71,7 @@ impl SessionService {
 
         // 更新状态为 Connecting
         {
-            let mut sessions = self.sessions.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+            let mut sessions = self.sessions.write().await;
             if let Some(state) = sessions.get_mut(&session_id) {
                 state.connection_state = ConnectionState::Connecting;
             }
@@ -78,14 +85,16 @@ impl SessionService {
         });
 
         // 创建 SSH 客户端并连接
+        //
+        // 后续工作(TODO 下一轮):把 `_decision_tx` 留作 `SessionService::connect` 返回
+        // 类型的一部分(连同会话 ID),让 `CommandDispatcher::Connect` 分支能 await 用户
+        // 在 UI 上的"信任/拒绝"决定后 send。当下用户若触发未知 host key,SshHandler
+        // 的 oneshot rx 接收方将收到 `Err` (channel close),连接被保守拒绝。
         let mut client = SshClient::new(config.clone());
 
         match client.connect_ssh().await {
-            Ok(()) => {
+            Ok(_decision_tx) => {
                 info!(session_id = %session_id, "SSH connection established");
-
-                // 创建数据通道（用于从 SSH 客户端接收数据）
-                let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
                 // 创建取消通道
                 let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
@@ -95,7 +104,7 @@ impl SessionService {
 
                 // 保存活动连接
                 {
-                    let mut connections = self.connections.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+                    let mut connections = self.connections.write().await;
                     connections.insert(session_id, ActiveConnection {
                         client: client.clone(),
                         _cancel_tx: cancel_tx,
@@ -104,7 +113,7 @@ impl SessionService {
 
                 // 更新状态为 Connected
                 {
-                    let mut sessions = self.sessions.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+                    let mut sessions = self.sessions.write().await;
                     if let Some(state) = sessions.get_mut(&session_id) {
                         state.connection_state = ConnectionState::Connected;
                         state.connection_info = Some(ConnectionInfo {
@@ -136,6 +145,7 @@ impl SessionService {
 
                 // 启动后台数据读取任务
                 let event_bus = self.event_bus.clone();
+                let terminal_service = self.terminal_service.clone();
                 let client_clone = client.clone();
                 tokio::spawn(async move {
                     loop {
@@ -144,27 +154,36 @@ impl SessionService {
                                 debug!(session_id = %session_id, "Data reader cancelled");
                                 break;
                             }
-                            _ = async {
-                                // 从 SSH 客户端读取数据
+                            result = async {
                                 let mut client = client_clone.write().await;
-                                match client.recv_data().await {
+                                client.recv_data().await
+                            } => {
+                                match result {
                                     Ok(Some(data)) => {
-                                        let _ = data_tx.send(data);
+                                        event_bus.publish(rshell_api::AppEvent::TerminalOutput {
+                                            session_id,
+                                            data: data.clone(),
+                                        });
+                                        if let Err(e) = terminal_service.process_output(session_id, &data) {
+                                            warn!(session_id = %session_id, error = %e, "process_output failed");
+                                        }
+                                        if let Ok(snapshot) = terminal_service.get_buffer_snapshot(session_id) {
+                                            event_bus.publish(rshell_api::AppEvent::TerminalBufferUpdated {
+                                                session_id,
+                                                snapshot,
+                                            });
+                                        }
                                     }
-                                    Ok(None) => {}
+                                    Ok(None) => {
+                                        debug!(session_id = %session_id, "recv_data stream ended");
+                                        break;
+                                    }
                                     Err(e) => {
-                                        warn!(session_id = %session_id, error = %e, "Data reader error");
+                                        warn!(session_id = %session_id, error = %e, "recv_data error");
+                                        break;
                                     }
                                 }
-                            } => {}
-                        }
-
-                        // 检查是否有数据可发送
-                        while let Ok(data) = data_rx.try_recv() {
-                            event_bus.publish(rshell_api::AppEvent::TerminalOutput {
-                                session_id,
-                                data,
-                            });
+                            }
                         }
                     }
                 });
@@ -177,7 +196,7 @@ impl SessionService {
 
                 // 更新状态为 Disconnected
                 {
-                    let mut sessions = self.sessions.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+                    let mut sessions = self.sessions.write().await;
                     if let Some(state) = sessions.get_mut(&session_id) {
                         state.connection_state = ConnectionState::Disconnected;
                     }
@@ -200,23 +219,24 @@ impl SessionService {
     pub async fn disconnect(&self, session_id: Uuid) -> Result<(), CoreError> {
         info!(session_id = %session_id, "Disconnecting session");
 
-        // 关闭活动连接
-        {
-            let mut connections = self.connections.write().map_err(|e| CoreError::Internal(e.to_string()))?;
-            if let Some(conn) = connections.remove(&session_id) {
-                // 发送取消信号
-                let _ = conn._cancel_tx.send(()).await;
-                // 断开 SSH 连接
-                let mut client = conn.client.write().await;
-                if let Err(e) = client.disconnect_ssh().await {
-                    warn!(session_id = %session_id, error = %e, "Error disconnecting SSH");
-                }
+        // 关闭活动连接:从 connections 中取出,然后在 guard 释放后再做 await
+        let active = {
+            let mut connections = self.connections.write().await;
+            connections.remove(&session_id)
+        };
+        if let Some(conn) = active {
+            // 发送取消信号
+            let _ = conn._cancel_tx.send(()).await;
+            // 断开 SSH 连接
+            let mut client = conn.client.write().await;
+            if let Err(e) = client.disconnect_ssh().await {
+                warn!(session_id = %session_id, error = %e, "Error disconnecting SSH");
             }
         }
 
         // 更新状态为 Disconnected
         {
-            let mut sessions = self.sessions.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+            let mut sessions = self.sessions.write().await;
             if let Some(state) = sessions.get_mut(&session_id) {
                 state.connection_state = ConnectionState::Disconnected;
                 state.connection_info = None;
@@ -237,32 +257,37 @@ impl SessionService {
 
     /// 发送数据到会话
     pub async fn send_data(&self, session_id: Uuid, data: &[u8]) -> Result<(), CoreError> {
-        let connections = self.connections.read().map_err(|e| CoreError::Internal(e.to_string()))?;
-        if let Some(conn) = connections.get(&session_id) {
-            let client = conn.client.read().await;
-            client
-                .send_data(data)
-                .await
-                .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-            Ok(())
-        } else {
-            Err(CoreError::NotFound(format!("Connection {} not found", session_id)))
-        }
+        // 先在锁内克隆出 client 句柄，立刻释放 connections guard，避免跨 await 持锁
+        let client = {
+            let connections = self.connections.read().await;
+            connections
+                .get(&session_id)
+                .map(|c| c.client.clone())
+                .ok_or_else(|| CoreError::NotFound(format!("Connection {} not found", session_id)))?
+        };
+        let client = client.read().await;
+        client
+            .send_data(data)
+            .await
+            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+        Ok(())
     }
 
     /// 调整终端大小
     pub async fn resize_terminal(&self, session_id: Uuid, cols: u32, rows: u32) -> Result<(), CoreError> {
-        let connections = self.connections.read().map_err(|e| CoreError::Internal(e.to_string()))?;
-        if let Some(conn) = connections.get(&session_id) {
-            let client = conn.client.read().await;
-            client
-                .resize_terminal(cols, rows)
-                .await
-                .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-            Ok(())
-        } else {
-            Err(CoreError::NotFound(format!("Connection {} not found", session_id)))
-        }
+        let client = {
+            let connections = self.connections.read().await;
+            connections
+                .get(&session_id)
+                .map(|c| c.client.clone())
+                .ok_or_else(|| CoreError::NotFound(format!("Connection {} not found", session_id)))?
+        };
+        let client = client.read().await;
+        client
+            .resize_terminal(cols, rows)
+            .await
+            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+        Ok(())
     }
 
     /// 创建会话
@@ -277,7 +302,7 @@ impl SessionService {
             connection_info: None,
         };
 
-        let mut sessions = self.sessions.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut sessions = self.sessions.write().await;
         sessions.insert(id, state);
 
         self.event_bus.publish(rshell_api::AppEvent::SessionListChanged);
@@ -291,7 +316,7 @@ impl SessionService {
     pub async fn update_session(&self, id: Uuid, config: SessionConfig) -> Result<(), CoreError> {
         info!(session_id = %id, "Updating session");
 
-        let mut sessions = self.sessions.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut sessions = self.sessions.write().await;
         if let Some(state) = sessions.get_mut(&id) {
             state.config = config;
         } else {
@@ -312,7 +337,7 @@ impl SessionService {
         // 先断开连接（如果已连接）
         let _ = self.disconnect(id).await;
 
-        let mut sessions = self.sessions.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut sessions = self.sessions.write().await;
         sessions.remove(&id);
 
         self.event_bus.publish(rshell_api::AppEvent::SessionListChanged);
@@ -322,8 +347,8 @@ impl SessionService {
     }
 
     /// 获取会话状态
-    pub fn get_state(&self, session_id: Uuid) -> Result<ConnectionState, CoreError> {
-        let sessions = self.sessions.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+    pub async fn get_state(&self, session_id: Uuid) -> Result<ConnectionState, CoreError> {
+        let sessions = self.sessions.read().await;
         sessions
             .get(&session_id)
             .map(|s| s.connection_state)
@@ -331,14 +356,14 @@ impl SessionService {
     }
 
     /// 获取连接信息
-    pub fn get_connection_info(&self, session_id: Uuid) -> Result<Option<ConnectionInfo>, CoreError> {
-        let sessions = self.sessions.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+    pub async fn get_connection_info(&self, session_id: Uuid) -> Result<Option<ConnectionInfo>, CoreError> {
+        let sessions = self.sessions.read().await;
         Ok(sessions.get(&session_id).and_then(|s| s.connection_info.clone()))
     }
 
     /// 获取活动连接的 SSH 客户端引用（用于 SFTP 操作等）
-    pub fn get_ssh_client(&self, session_id: Uuid) -> Result<Arc<tokio::sync::RwLock<SshClient>>, CoreError> {
-        let connections = self.connections.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+    pub async fn get_ssh_client(&self, session_id: Uuid) -> Result<SshClientHandle, CoreError> {
+        let connections = self.connections.read().await;
         connections
             .get(&session_id)
             .map(|c| c.client.clone())
@@ -351,7 +376,7 @@ impl SessionService {
         session_id: Uuid,
         path: &str,
     ) -> Result<Vec<RemoteFileEntry>, CoreError> {
-        let client = self.get_ssh_client(session_id)?;
+        let client = self.get_ssh_client(session_id).await?;
         let ssh = client.read().await;
 
         let channel = ssh
@@ -379,8 +404,8 @@ impl SessionService {
     }
 
     /// 列出所有会话
-    pub fn list_sessions(&self) -> Result<Vec<SessionConfig>, CoreError> {
-        let sessions = self.sessions.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+    pub async fn list_sessions(&self) -> Result<Vec<SessionConfig>, CoreError> {
+        let sessions = self.sessions.read().await;
         Ok(sessions.values().map(|s| s.config.clone()).collect())
     }
 }

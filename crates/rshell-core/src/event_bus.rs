@@ -10,10 +10,13 @@ use tracing::{debug, instrument};
 /// 事件订阅句柄（用于取消订阅）
 pub type SubscriptionId = u64;
 
+/// 事件订阅回调
+type Subscriber = Box<dyn Fn(&AppEvent) + Send + Sync>;
+
 /// 事件总线
 pub struct EventBus {
     /// 订阅者列表
-    subscribers: Arc<RwLock<Vec<(SubscriptionId, Box<dyn Fn(&AppEvent) + Send + Sync>)>>>,
+    subscribers: Arc<RwLock<Vec<(SubscriptionId, Subscriber)>>>,
     /// 下一个订阅 ID
     next_id: Arc<std::sync::atomic::AtomicU64>,
 }

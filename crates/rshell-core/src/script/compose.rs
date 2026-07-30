@@ -39,7 +39,7 @@ impl ComposeService {
                 }
             }
             ComposeTarget::AllSessions => {
-                let sessions = session_service.list_sessions()?;
+                let sessions = session_service.list_sessions().await?;
                 sessions.iter().map(|s| s.id).collect()
             }
             ComposeTarget::SelectedSessions(ids) => ids.clone(),

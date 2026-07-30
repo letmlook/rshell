@@ -109,8 +109,8 @@ pub fn init_backend() -> (AppBridge, ()) {
                 let known_hosts_path = data_dir.join("known_hosts");
                 let _ = std::fs::create_dir_all(&keys_dir);
 
-                let session_service = Arc::new(SessionService::new(event_bus_for_thread.clone()));
                 let terminal_service = Arc::new(TerminalService::new(event_bus_for_thread.clone()));
+                let session_service = Arc::new(SessionService::new(event_bus_for_thread.clone(), terminal_service.clone()));
                 let transfer_service = Arc::new(TransferService::new(event_bus_for_thread.clone()));
                 let key_manager = Arc::new(KeyManager::new(keys_dir, event_bus_for_thread.clone()));
                 let master_password = Arc::new(MasterPassword::new(event_bus_for_thread.clone()));

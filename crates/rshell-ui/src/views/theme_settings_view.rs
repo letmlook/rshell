@@ -145,7 +145,7 @@ impl ThemeSettingsView {
                     .text_size(px(10.0))
                     .mb(px(4.0)),
             )
-            .children(self.available_themes.iter().enumerate().map(|(_idx, name)| {
+            .children(self.available_themes.iter().map(|name| {
                 let is_current = self.current_theme.as_ref().map(|t| &t.name) == Some(name);
                 let bg = if is_current { rgb(0x094771) } else { rgb(0x2d2d2d) };
                 div()
@@ -197,7 +197,7 @@ impl ThemeSettingsView {
                     .text_size(px(10.0))
                     .mb(px(4.0)),
             )
-            .children(self.available_schemes.iter().enumerate().map(|(_idx, name)| {
+            .children(self.available_schemes.iter().map(|name| {
                 let is_current = self.current_scheme.as_ref().map(|s| &s.name) == Some(name);
                 let bg = if is_current { rgb(0x094771) } else { rgb(0x2d2d2d) };
                 div()

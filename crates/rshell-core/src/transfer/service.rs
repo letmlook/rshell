@@ -5,14 +5,26 @@
 
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
+use crate::session::service::SshClientHandle;
 use rshell_api::AppEvent;
 use rshell_protocol::ssh::sftp::SftpClient;
-use rshell_protocol::ssh::SshClient;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+
+/// SSH 客户端解析回调（外部注入，避免 TransferService 反向依赖 SessionService）
+///
+/// 返回 future 是必要的：`SessionService::get_ssh_client` 本身是 async，而
+/// `SshClientProvider` 会在多处同步调用，所以必须用 boxed-future 形式。
+pub type SshClientProvider = Arc<
+    dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = Result<SshClientHandle, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
 use uuid::Uuid;
 
 /// 传输任务状态
@@ -77,7 +89,7 @@ pub struct TransferService {
     /// 事件总线
     event_bus: Arc<EventBus>,
     /// 获取 SSH 客户端的函数（由外部注入）
-    ssh_client_provider: Arc<RwLock<Option<Arc<dyn Fn(Uuid) -> Result<Arc<tokio::sync::RwLock<SshClient>>, CoreError> + Send + Sync>>>>,
+    ssh_client_provider: Arc<RwLock<Option<SshClientProvider>>>,
 }
 
 impl TransferService {
@@ -91,10 +103,7 @@ impl TransferService {
     }
 
     /// 设置 SSH 客户端提供函数
-    pub async fn set_ssh_client_provider(
-        &self,
-        provider: Arc<dyn Fn(Uuid) -> Result<Arc<tokio::sync::RwLock<SshClient>>, CoreError> + Send + Sync>,
-    ) {
+    pub async fn set_ssh_client_provider(&self, provider: SshClientProvider) {
         let mut p = self.ssh_client_provider.write().await;
         *p = Some(provider);
     }
@@ -209,7 +218,7 @@ impl TransferService {
             }
         };
 
-        let ssh_client = match ssh_client_provider(task.session_id) {
+        let ssh_client = match ssh_client_provider(task.session_id).await {
             Ok(c) => c,
             Err(e) => {
                 let err = format!("Failed to get SSH client: {}", e);
@@ -442,5 +451,213 @@ impl TransferService {
     pub async fn get_task(&self, task_id: Uuid) -> Option<TransferTask> {
         let tasks = self.tasks.read().await;
         tasks.get(&task_id).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_service() -> TransferService {
+        TransferService::new(Arc::new(crate::event_bus::EventBus::new()))
+    }
+
+    fn make_task(id: Uuid, state: TransferTaskState) -> TransferTask {
+        TransferTask {
+            id,
+            session_id: Uuid::new_v4(),
+            direction: TransferDirection::Upload,
+            local_path: PathBuf::from("/tmp/test"),
+            remote_path: "/remote/test".to_string(),
+            state,
+            bytes_transferred: 0,
+            total_bytes: 100,
+            error_message: None,
+            started_at: None,
+            last_update: None,
+            last_bytes: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pause_only_affects_transferring_task() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+
+        // 直接塞一个 Transferring 任务
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Transferring));
+        }
+
+        svc.pause_transfer(id).await.unwrap();
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Paused);
+    }
+
+    #[tokio::test]
+    async fn test_pause_pending_task_is_noop() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Pending));
+        }
+
+        svc.pause_transfer(id).await.unwrap();
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Pending); // 未变化
+    }
+
+    #[tokio::test]
+    async fn test_resume_only_affects_paused_task() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Paused));
+        }
+
+        svc.resume_transfer(id).await.unwrap();
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Transferring);
+    }
+
+    #[tokio::test]
+    async fn test_resume_completed_is_noop() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Completed));
+        }
+
+        svc.resume_transfer(id).await.unwrap();
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Completed); // 未变化
+    }
+
+    #[tokio::test]
+    async fn test_cancel_not_completed_task() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Transferring));
+        }
+
+        svc.cancel_transfer(id).await.unwrap();
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_completed_is_noop() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Completed));
+        }
+
+        svc.cancel_transfer(id).await.unwrap();
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Completed); // 未变化
+    }
+
+    #[tokio::test]
+    async fn test_mark_completed() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Transferring));
+        }
+
+        svc.mark_completed(id).await.unwrap();
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_mark_failed() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Transferring));
+        }
+
+        svc.mark_failed(id, "connection reset".to_string()).await.unwrap();
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Failed);
+        assert_eq!(t.error_message.as_deref(), Some("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks() {
+        let svc = make_service();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id1, make_task(id1, TransferTaskState::Transferring));
+            tasks.insert(id2, make_task(id2, TransferTaskState::Paused));
+        }
+
+        let all = svc.list_tasks().await;
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|t| t.state == TransferTaskState::Transferring));
+        assert!(all.iter().any(|t| t.state == TransferTaskState::Paused));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_not_found() {
+        let svc = make_service();
+        assert!(svc.get_task(Uuid::new_v4()).await.is_none());
+    }
+
+    #[test]
+    fn test_transfer_task_progress() {
+        let task = TransferTask {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            direction: TransferDirection::Upload,
+            local_path: PathBuf::from("/tmp/test"),
+            remote_path: "/remote/test".to_string(),
+            state: TransferTaskState::Transferring,
+            bytes_transferred: 50,
+            total_bytes: 100,
+            error_message: None,
+            started_at: None,
+            last_update: None,
+            last_bytes: 0,
+        };
+        assert!((task.progress() - 0.5).abs() < f64::EPSILON);
+
+        // total_bytes == 0 不会 panic
+        let zero = TransferTask {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            direction: TransferDirection::Download,
+            local_path: PathBuf::from("/tmp/test2"),
+            remote_path: "/remote/test2".to_string(),
+            state: TransferTaskState::Transferring,
+            bytes_transferred: 0,
+            total_bytes: 0,
+            error_message: None,
+            started_at: None,
+            last_update: None,
+            last_bytes: 0,
+        };
+        assert_eq!(zero.progress(), 0.0);
     }
 }
