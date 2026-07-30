@@ -121,7 +121,10 @@ pub fn init_backend() -> (AppBridge, ()) {
                 let transfer_service = Arc::new(TransferService::new(event_bus_for_thread.clone()));
                 let key_manager = Arc::new(KeyManager::new(keys_dir, event_bus_for_thread.clone()));
                 let master_password = Arc::new(MasterPassword::new(event_bus_for_thread.clone()));
-                let tunnel_manager = Arc::new(TunnelManager::new(event_bus_for_thread.clone()));
+                let tunnel_manager = Arc::new(
+                    TunnelManager::new(event_bus_for_thread.clone())
+                        .with_persistence(data_dir.join("tunnels.toml")),
+                );
                 let host_key_manager = Arc::new(HostKeyManager::new(known_hosts_path, event_bus_for_thread.clone()));
                 let theme_manager = Arc::new(ThemeManager::new(event_bus_for_thread.clone()));
 
