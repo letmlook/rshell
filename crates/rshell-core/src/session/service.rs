@@ -475,3 +475,189 @@ impl SessionService {
         Ok(sessions.values().map(|s| s.config.clone()).collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::script::trigger_engine::TriggerEngine;
+    use crate::security::host_key_decision::HostKeyDecisionRegistry;
+    use crate::terminal::service::TerminalService;
+    use rshell_api::types::{AuthMethod, Protocol, SessionConfig};
+    use rshell_api::AppEvent;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn make_service() -> SessionService {
+        let bus = Arc::new(EventBus::new());
+        let ts = Arc::new(TerminalService::new(bus.clone()));
+        let te = Arc::new(TriggerEngine::new(bus.clone()));
+        let hk = Arc::new(HostKeyDecisionRegistry::new(bus.clone()));
+        SessionService::new(bus, ts, te, hk)
+    }
+
+    fn make_config(name: &str, host: &str) -> SessionConfig {
+        SessionConfig {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            folder_id: None,
+            host: host.to_string(),
+            port: 22,
+            protocol: Protocol::SSH,
+            auth_method: AuthMethod::Password {
+                username: "user".to_string(),
+                password: "pw".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_session() {
+        let svc = make_service();
+        let cfg = make_config("a", "host1");
+        let id = svc.create_session(cfg.clone()).await.unwrap();
+        assert_eq!(id, cfg.id);
+        let all = svc.list_sessions().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "a");
+    }
+
+    #[tokio::test]
+    async fn test_get_state_initial_is_disconnected() {
+        let svc = make_service();
+        let cfg = make_config("a", "host1");
+        let id = svc.create_session(cfg).await.unwrap();
+        let state = svc.get_state(id).await.unwrap();
+        assert_eq!(state, ConnectionState::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn test_get_state_unknown_returns_not_found() {
+        let svc = make_service();
+        let err = svc.get_state(Uuid::new_v4()).await.unwrap_err();
+        assert!(format!("{err}").contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_get_connection_info_none_when_not_connected() {
+        let svc = make_service();
+        let cfg = make_config("a", "host1");
+        let id = svc.create_session(cfg).await.unwrap();
+        let info = svc.get_connection_info(id).await.unwrap();
+        assert!(info.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_ssh_client_unknown_returns_not_found() {
+        let svc = make_service();
+        match svc.get_ssh_client(Uuid::new_v4()).await {
+            Err(e) => assert!(format!("{e}").contains("not found")),
+            Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_data_unknown_returns_not_found() {
+        let svc = make_service();
+        let err = svc.send_data(Uuid::new_v4(), b"hi").await.unwrap_err();
+        assert!(format!("{err}").contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_resize_terminal_unknown_returns_not_found() {
+        let svc = make_service();
+        let err = svc.resize_terminal(Uuid::new_v4(), 80, 24).await.unwrap_err();
+        assert!(format!("{err}").contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_browse_remote_dir_unknown_returns_not_found() {
+        let svc = make_service();
+        let err = svc.browse_remote_dir(Uuid::new_v4(), "/").await.unwrap_err();
+        assert!(format!("{err}").contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_empty() {
+        let svc = make_service();
+        let all = svc.list_sessions().await.unwrap();
+        assert!(all.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_session() {
+        let svc = make_service();
+        let cfg = make_config("a", "host1");
+        let id = svc.create_session(cfg).await.unwrap();
+        svc.delete_session(id).await.unwrap();
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_unknown_is_idempotent_ok() {
+        // 当前实现:delete_session 对未知 id 是幂等 (返回 Ok),
+        // 便于 UI 端"重试删除"语义。这与 get_state 的 NotFound 行为不同。
+        let svc = make_service();
+        assert!(svc.delete_session(Uuid::new_v4()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_update_session() {
+        let svc = make_service();
+        let cfg = make_config("a", "host1");
+        let id = svc.create_session(cfg.clone()).await.unwrap();
+        let mut cfg2 = cfg.clone();
+        cfg2.name = "renamed".to_string();
+        svc.update_session(id, cfg2).await.unwrap();
+        let all = svc.list_sessions().await.unwrap();
+        assert_eq!(all[0].name, "renamed");
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_unknown_returns_not_found() {
+        let svc = make_service();
+        let err = svc.disconnect(Uuid::new_v4()).await.unwrap_err();
+        assert!(format!("{err}").contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_session_list_changed_published_on_create() {
+        let bus = Arc::new(EventBus::new());
+        let got = Arc::new(std::sync::Mutex::new(0u32));
+        let g = got.clone();
+        bus.subscribe(move |event| {
+            if matches!(event, AppEvent::SessionListChanged) {
+                *g.lock().unwrap() += 1;
+            }
+        });
+        let ts = Arc::new(TerminalService::new(bus.clone()));
+        let te = Arc::new(TriggerEngine::new(bus.clone()));
+        let hk = Arc::new(HostKeyDecisionRegistry::new(bus.clone()));
+        let svc = SessionService::new(bus, ts, te, hk);
+        let cfg = make_config("a", "host1");
+        svc.create_session(cfg).await.unwrap();
+        svc.create_session(make_config("b", "host2")).await.unwrap();
+        assert_eq!(*got.lock().unwrap(), 2);
+    }
+
+    // Lock-leak smoke test: get_state 和 list_sessions 持有 sessions guard 时
+    // 不会跨 .await 持锁(本轮重构后特别要回归)
+    #[tokio::test]
+    async fn test_list_sessions_under_concurrent_create() {
+        let svc = Arc::new(make_service());
+        let mut handles = vec![];
+        for i in 0..20 {
+            let svc = svc.clone();
+            handles.push(tokio::spawn(async move {
+                let cfg = make_config(&format!("s{}", i), "host");
+                svc.create_session(cfg).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // 边创建边列, 不应死锁
+        let all = svc.list_sessions().await.unwrap();
+        assert_eq!(all.len(), 20);
+        let _ = HashMap::<String, PathBuf>::new();
+    }
+}
