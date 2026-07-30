@@ -107,6 +107,30 @@ impl Render for QuickCommandsView {
         let filter = self.current_filter(cx);
         let groups = self.grouped_commands(&filter);
 
+        // clone commands 出来, render 期间需要 &mut self 调用 on_click listener
+        let mut items: Vec<AnyElement> = Vec::new();
+        for (group_name, cmds) in groups.into_iter() {
+            if let Some(name) = group_name {
+                items.push(IntoElement::into_any_element(
+                    div()
+                        .h(px(24.0))
+                        .bg(rgb(0x181825))
+                        .px(px(12.0))
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_color(rgb(0x6c7086))
+                                .text_xs()
+                                .child(name),
+                        ),
+                ));
+            }
+            for cmd in cmds {
+                items.push(self.render_command_item(cmd, cx));
+            }
+        }
+
         div()
             .size_full()
             .bg(rgb(0x1e1e2e))
@@ -137,76 +161,74 @@ impl Render for QuickCommandsView {
                     .child(Input::new(&search_state).w_full()),
             )
             // 命令列表
-            .child(div().flex_1().children(groups.into_iter().flat_map(
-                |(group_name, cmds)| {
-                    let mut elements = Vec::new();
+            .child(div().flex_1().children(items))
+    }
+}
 
-                    if let Some(name) = group_name {
-                        elements.push(
-                            div()
-                                .h(px(24.0))
-                                .bg(rgb(0x181825))
-                                .px(px(12.0))
-                                .flex()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .text_color(rgb(0x6c7086))
-                                        .text_xs()
-                                        .child(name),
-                                )
-                                .into_any(),
-                        );
+impl QuickCommandsView {
+    /// 渲染单个快速命令 row — on_click 触发 ExecuteQuickCommand
+    fn render_command_item(&self, cmd: &QuickCommand, cx: &mut Context<Self>) -> AnyElement {
+        let scope_icon = match cmd.scope {
+            rshell_api::types::QuickCommandScope::CurrentSession => "▶",
+            rshell_api::types::QuickCommandScope::AllSessions => "▶▶",
+            rshell_api::types::QuickCommandScope::SelectedSessions(_) => "▶#",
+        };
+
+        let cmd_id = cmd.id;
+        let name = cmd.name.clone();
+        let command_text: String = cmd.command.chars().take(40).collect();
+        let target_sessions = match &cmd.scope {
+            rshell_api::types::QuickCommandScope::CurrentSession => {
+                vec![self.active_session.unwrap_or(uuid::Uuid::nil())]
+            }
+            rshell_api::types::QuickCommandScope::AllSessions => vec![],
+            rshell_api::types::QuickCommandScope::SelectedSessions(ids) => ids.clone(),
+        };
+        let targets = target_sessions.clone();
+
+        let cmd_id_owned = cmd.id;
+        // ElementId 接 (&'static str, T) — leak 一个 'static str 拿 id
+        let id_static: &'static str = Box::leak(format!("qc-{}", cmd.id).into_boxed_str());
+        IntoElement::into_any_element(
+            div()
+                .id((id_static, 0usize))
+                .h(px(32.0))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .cursor_pointer()
+                .hover(|this| this.bg(rgb(0x313244)))
+                .on_click(cx.listener(move |_, _, _window, cx| {
+                    if let Some(bridge) = cx.try_global::<crate::bridge::AppBridge>() {
+                        bridge.send_command(rshell_api::AppCommand::ExecuteQuickCommand {
+                            command_id: cmd_id_owned,
+                            target_sessions: targets.clone(),
+                        });
                     }
-
-                    for cmd in cmds {
-                        let scope_icon = match cmd.scope {
-                            rshell_api::types::QuickCommandScope::CurrentSession => "▶",
-                            rshell_api::types::QuickCommandScope::AllSessions => "▶▶",
-                            rshell_api::types::QuickCommandScope::SelectedSessions(_) => "▶#",
-                        };
-
-                        elements.push(
+                }))
+                .child(
+                    div()
+                        .text_color(rgb(0x89b4fa))
+                        .text_xs()
+                        .child(scope_icon),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .child(
                             div()
-                                .h(px(32.0))
-                                .px(px(12.0))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .hover(|this| this.bg(rgb(0x313244)))
-                                .child(
-                                    div()
-                                        .text_color(rgb(0x89b4fa))
-                                        .text_xs()
-                                        .child(scope_icon),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .child(
-                                            div()
-                                                .text_color(rgb(0xcdd6f4))
-                                                .text_sm()
-                                                .child(cmd.name.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_color(rgb(0x6c7086))
-                                                .text_xs()
-                                                .child(
-                                                    cmd.command
-                                                        .chars()
-                                                        .take(40)
-                                                        .collect::<String>(),
-                                                ),
-                                        ),
-                                )
-                                .into_any(),
-                        );
-                    }
-
-                    elements
-                },
-            )))
+                                .text_color(rgb(0xcdd6f4))
+                                .text_sm()
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .text_color(rgb(0x6c7086))
+                                .text_xs()
+                                .child(command_text),
+                        ),
+                ),
+        )
     }
 }

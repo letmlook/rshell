@@ -82,7 +82,7 @@ impl ThemeSettingsView {
 }
 
 impl Render for ThemeSettingsView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .bg(rgb(0x1e1e1e))
@@ -105,15 +105,15 @@ impl Render for ThemeSettingsView {
                 div()
                     .flex_1()
                     .p(px(16.0))
-                    .child(self.render_theme_section())
+                    .child(self.render_theme_section(cx))
                     .child(div().h(px(16.0)))
-                    .child(self.render_scheme_section()),
+                    .child(self.render_scheme_section(cx)),
             )
     }
 }
 
 impl ThemeSettingsView {
-    fn render_theme_section(&self) -> impl IntoElement {
+    fn render_theme_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current_name = self.current_theme.as_ref()
             .map(|t| t.name.clone())
             .unwrap_or_else(|| "Dark".to_string());
@@ -124,6 +124,38 @@ impl ThemeSettingsView {
             Some(ThemeMode::System) => "跟随系统",
             None => "未知",
         };
+
+        // 收集 themes + on_click closures (需要 &mut self 不能直接 in .map)
+        let mut items: Vec<AnyElement> = Vec::new();
+        for name in &self.available_themes {
+            let is_current = self.current_theme.as_ref().map(|t| &t.name) == Some(name);
+            let bg = if is_current { rgb(0x094771) } else { rgb(0x2d2d2d) };
+            let name_owned = name.clone();
+            let name_id: &'static str = Box::leak(format!("theme-{}", name).into_boxed_str());
+            items.push(IntoElement::into_any_element(
+                div()
+                    .id((name_id, 0usize))
+                    .bg(bg)
+                    .rounded(px(4.0))
+                    .mb(px(2.0))
+                    .p(px(6.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x094771)))
+                    .on_click(cx.listener(move |_, _, _window, cx| {
+                        if let Some(bridge) = cx.try_global::<crate::bridge::AppBridge>() {
+                            bridge.send_command(rshell_api::AppCommand::SetAppTheme {
+                                theme_name: name_owned.clone(),
+                            });
+                        }
+                    }))
+                    .child(
+                        div()
+                            .child(name.clone())
+                            .text_color(rgb(0xcccccc))
+                            .text_size(px(11.0)),
+                    ),
+            ));
+        }
 
         div()
             .child(
@@ -160,28 +192,50 @@ impl ThemeSettingsView {
                     .text_size(px(10.0))
                     .mb(px(4.0)),
             )
-            .children(self.available_themes.iter().map(|name| {
-                let is_current = self.current_theme.as_ref().map(|t| &t.name) == Some(name);
-                let bg = if is_current { rgb(0x094771) } else { rgb(0x2d2d2d) };
+            .children(items)
+    }
+
+    fn render_scheme_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current_name = self.current_scheme.as_ref()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "Default Dark".to_string());
+
+        let mut items: Vec<AnyElement> = Vec::new();
+        for name in &self.available_schemes {
+            let is_current = self.current_scheme.as_ref().map(|s| &s.name) == Some(name);
+            let bg = if is_current { rgb(0x094771) } else { rgb(0x2d2d2d) };
+            let name_owned = name.clone();
+            let name_id: &'static str = Box::leak(format!("scheme-{}", name).into_boxed_str());
+            items.push(IntoElement::into_any_element(
                 div()
+                    .id((name_id, 0usize))
                     .bg(bg)
                     .rounded(px(4.0))
                     .mb(px(2.0))
                     .p(px(6.0))
                     .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x094771)))
+                    .on_click(cx.listener(move |_, _, _window, cx| {
+                        if let Some(bridge) = cx.try_global::<crate::bridge::AppBridge>() {
+                            bridge.send_command(rshell_api::AppCommand::SetTerminalColorScheme {
+                                scheme_name: name_owned.clone(),
+                            });
+                        }
+                    }))
                     .child(
                         div()
-                            .child(name.clone())
-                            .text_color(rgb(0xcccccc))
-                            .text_size(px(11.0)),
-                    )
-            }))
-    }
-
-    fn render_scheme_section(&self) -> impl IntoElement {
-        let current_name = self.current_scheme.as_ref()
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "Default Dark".to_string());
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .child(name.clone())
+                                    .text_color(rgb(0xcccccc))
+                                    .text_size(px(11.0)),
+                            ),
+                    ),
+            ));
+        }
 
         div()
             .child(
@@ -212,27 +266,6 @@ impl ThemeSettingsView {
                     .text_size(px(10.0))
                     .mb(px(4.0)),
             )
-            .children(self.available_schemes.iter().map(|name| {
-                let is_current = self.current_scheme.as_ref().map(|s| &s.name) == Some(name);
-                let bg = if is_current { rgb(0x094771) } else { rgb(0x2d2d2d) };
-                div()
-                    .bg(bg)
-                    .rounded(px(4.0))
-                    .mb(px(2.0))
-                    .p(px(6.0))
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .child(name.clone())
-                                    .text_color(rgb(0xcccccc))
-                                    .text_size(px(11.0)),
-                            ),
-                    )
-            }))
+            .children(items)
     }
 }
