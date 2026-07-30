@@ -61,6 +61,23 @@ pub struct RshellApp {
 
     /// 待显示的主机密钥信任对话框 (None = 不显示)
     pending_host_key_prompt: Option<HostKeyPromptData>,
+
+    /// 新建会话表单 (None = 不显示)
+    new_session_form: Option<NewSessionFormData>,
+
+    /// 临时存储: 新建会话表单字段 (用 RefCell 让 on_click 闭包可写)
+    /// 实际更优: view 自身维护 form state; 这里简化版
+    new_session_form_state: std::rc::Rc<std::cell::Cell<Option<NewSessionFormData>>>,
+}
+
+/// 新建会话表单字段
+#[derive(Clone, Default)]
+struct NewSessionFormData {
+    name: String,
+    host: String,
+    port: String,
+    username: String,
+    password: String,
 }
 
 /// 待显示的主机密钥信任对话框数据
@@ -134,6 +151,8 @@ impl RshellApp {
             plugin_view,
             sessions: Vec::new(),
             pending_host_key_prompt: None,
+            new_session_form: None,
+            new_session_form_state: std::rc::Rc::new(std::cell::Cell::new(None)),
         };
         // 启动时拉所有列表 (后端立即 publish XSnapshot 事件)
         app.refresh_all_lists();
@@ -439,8 +458,15 @@ impl Render for RshellApp {
                                     .hover(|s| s.bg(rgb(0x2563eb)))
                                     .child("+ 新建会话")
                                     .on_click(cx.listener(|this, _, _window, _cx| {
-                                        // 无 dialog 阶段: 直接创建 localhost 占位 session
-                                        this.create_demo_session();
+                                        // 弹"新建会话" form (本地 modal overlay)
+                                        let next_idx = this.sessions.len() + 1;
+                                        this.new_session_form = Some(NewSessionFormData {
+                                            name: format!("Session {}", next_idx),
+                                            host: "localhost".to_string(),
+                                            port: "22".to_string(),
+                                            username: "user".to_string(),
+                                            password: String::new(),
+                                        });
                                     })),
                             ),
                     )
@@ -572,6 +598,7 @@ impl Render for RshellApp {
                     .child(self.transfer_view.clone()),
             )
             .children(self.render_host_key_dialog_overlay(cx))
+            .children(self.render_new_session_form_overlay(cx))
     }
 }
 
@@ -814,6 +841,166 @@ impl RshellApp {
                     this.pending_host_key_prompt = None;
                 }))
                 .child(label),
+        )
+    }
+
+    /// 渲染"新建会话" form modal overlay
+    fn render_new_session_form_overlay(
+        &mut self,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let Some(f) = self.new_session_form.clone() else {
+            return vec![];
+        };
+        let overlay = div()
+            .absolute()
+            .inset_0()
+            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.7))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .id(("new-session-modal", 0usize))
+                    .w(px(420.0))
+                    .bg(rgb(0x1e1e2e))
+                    .border_1()
+                    .border_color(rgb(0x45475a))
+                    .rounded(px(8.0))
+                    .p(px(20.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .text_color(rgb(0xcdd6f4))
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("新建会话"),
+                    )
+                    .child(Self::form_field("名称", f.name.clone(), "session-name"))
+                    .child(Self::form_field("主机", f.host.clone(), "session-host"))
+                    .child(Self::form_field("端口", f.port.clone(), "session-port"))
+                    .child(Self::form_field("用户名", f.username.clone(), "session-user"))
+                    .child(Self::form_field("密码", f.password.clone(), "session-pass"))
+                    .child(
+                        div()
+                            .text_color(rgb(0x6c7086))
+                            .text_xs()
+                            .child("注: 字段为占位 default, 完整可编辑 input 留 follow-up"),
+                    )
+                    .child(
+                        div()
+                            .mt(px(8.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(self.form_btn_cancel(cx))
+                            .child(self.form_btn_create(cx, &f)),
+                    ),
+            );
+        vec![gpui::IntoElement::into_any_element(overlay)]
+    }
+
+    fn form_field(label: &'static str, value: String, id: &'static str) -> gpui::AnyElement {
+        gpui::IntoElement::into_any_element(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_color(rgb(0xbac2de))
+                        .text_xs()
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .id((id, 0usize))
+                        .h(px(28.0))
+                        .bg(rgb(0x313244))
+                        .rounded(px(3.0))
+                        .px(px(8.0))
+                        .text_color(rgb(0xcdd6f4))
+                        .text_sm()
+                        .flex()
+                        .items_center()
+                        .child(value),
+                ),
+        )
+    }
+
+    fn form_btn_cancel(&self, cx: &mut gpui::Context<Self>) -> gpui::AnyElement {
+        gpui::IntoElement::into_any_element(
+            div()
+                .id(("new-session-cancel", 0usize))
+                .flex_1()
+                .h(px(32.0))
+                .bg(rgb(0x45475a))
+                .rounded(px(4.0))
+                .text_color(rgb(0xffffff))
+                .text_sm()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x585b70)))
+                .on_click(cx.listener(|this, _, _window, _cx| {
+                    this.new_session_form = None;
+                }))
+                .child("取消"),
+        )
+    }
+
+    fn form_btn_create(
+        &self,
+        cx: &mut gpui::Context<Self>,
+        f: &NewSessionFormData,
+    ) -> gpui::AnyElement {
+        let name = f.name.clone();
+        let host = f.host.clone();
+        let port = f.port.clone();
+        let username = f.username.clone();
+        let password = f.password.clone();
+        gpui::IntoElement::into_any_element(
+            div()
+                .id(("new-session-create", 0usize))
+                .flex_1()
+                .h(px(32.0))
+                .bg(rgb(0x10b981))
+                .rounded(px(4.0))
+                .text_color(rgb(0xffffff))
+                .text_sm()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x059669)))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    let port_num = port.parse::<u16>().unwrap_or(22);
+                    let config = rshell_api::types::SessionConfig {
+                        id: uuid::Uuid::new_v4(),
+                        name: name.clone(),
+                        folder_id: None,
+                        host: host.clone(),
+                        port: port_num,
+                        protocol: rshell_api::types::Protocol::SSH,
+                        auth_method: rshell_api::types::AuthMethod::Password {
+                            username: username.clone(),
+                            password: password.clone(),
+                        },
+                    };
+                    this.sessions.push(rshell_api::types::SessionInfo {
+                        id: config.id,
+                        config: config.clone(),
+                        state: rshell_api::types::ConnectionState::Disconnected,
+                    });
+                    if let Some(bridge) = cx.try_global::<crate::bridge::AppBridge>() {
+                        bridge.send_command(rshell_api::AppCommand::CreateSession { config });
+                    }
+                    this.new_session_form = None;
+                }))
+                .child("创建"),
         )
     }
 }
