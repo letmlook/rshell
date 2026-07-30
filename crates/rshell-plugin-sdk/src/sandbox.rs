@@ -68,6 +68,14 @@ pub enum WasmValue {
     I64(i64),
     F32(f32),
     F64(f64),
+    /// 字符串的 logical 形式(尚未与 linear memory 互转)
+    ///
+    /// `From<WasmValue> for Val` 当前把 String 折叠为 `Val::I32(0)` —
+    /// 因为把字符串写入 plugin linear memory 需要 caller 持有 `Memory`,
+    /// 而 `execute` 的 `args: &[WasmValue]` 不携带 store/memory 引用。
+    ///
+    /// **生产用法**: 直接传 `I32` ptr + 字符串 bytes 通过 host function
+    /// 写入 memory 后 invoke。或者使用 `marshal_string_input` 辅助。
     String(String),
 }
 
@@ -78,9 +86,67 @@ impl From<WasmValue> for Val {
             WasmValue::I64(i) => Val::I64(i),
             WasmValue::F32(f) => Val::F32(f.to_bits()),
             WasmValue::F64(f) => Val::F64(f.to_bits()),
-            WasmValue::String(_) => Val::I32(0), // 字符串需通过 linear memory 传递，留 TODO
+            // 字符串需通过 linear memory 传递,本转换保留 0 作为 placeholder。
+            // 见 marshal_string_input 走真正路径。
+            WasmValue::String(_) => Val::I32(0),
         }
     }
+}
+
+/// 把 `s` 写到 wasm linear memory,返回 (ptr, len) 给 plugin 调用方
+///
+/// 调用方拿到 ptr/len 后:
+/// - 作为参数 (i32, i32) 传给 plugin 函数
+/// - plugin 用 `memory.load(ptr, len)` 读出 bytes
+///
+/// **约束**:
+/// - 字符串长度 <= `MAX_LEN` (默认 64 KiB, 防止 plugin 写满整个 linear memory)
+/// - 当前实现简单线性追加,不维护 free list — 多次调用会**覆盖**前次。
+///   对单次调用的 host function 足够;若需要多次 marshal, 改为 bump allocator。
+pub fn marshal_string_input(
+    memory: &wasmtime::Memory,
+    store: &mut wasmtime::Store<()>,
+    s: &str,
+) -> Result<(i32, i32), SandboxError> {
+    const MAX_LEN: usize = 64 * 1024;
+    if s.len() > MAX_LEN {
+        return Err(SandboxError::ExecutionError(format!(
+            "string too long: {} > {}",
+            s.len(),
+            MAX_LEN
+        )));
+    }
+    let bytes = s.as_bytes();
+    // 偏移 0 写入并返回 (ptr, len)。
+    let data = memory.data_mut(store);
+    if data.len() < bytes.len() {
+        return Err(SandboxError::MemoryLimitExceeded);
+    }
+    data[..bytes.len()].copy_from_slice(bytes);
+    Ok((0, bytes.len() as i32))
+}
+
+/// 从 wasm linear memory 读出 (ptr, len) 指向的字符串
+pub fn unmarshal_string_output(
+    memory: &wasmtime::Memory,
+    store: &wasmtime::Store<()>,
+    ptr: i32,
+    len: i32,
+) -> Result<String, SandboxError> {
+    if ptr < 0 || len < 0 {
+        return Err(SandboxError::ExecutionError(format!(
+            "invalid string ptr/len: ({}, {})",
+            ptr, len
+        )));
+    }
+    let start = ptr as usize;
+    let end = start.saturating_add(len as usize);
+    let data = memory.data(store);
+    if end > data.len() {
+        return Err(SandboxError::MemoryLimitExceeded);
+    }
+    String::from_utf8(data[start..end].to_vec())
+        .map_err(|e| SandboxError::ExecutionError(format!("string not utf-8: {}", e)))
 }
 
 /// WASM 模块句柄（编译后的模块）
@@ -289,5 +355,76 @@ mod tests {
             .execute("add", "add", &[WasmValue::I32(2), WasmValue::I32(3)])
             .unwrap();
         assert_eq!(result, vec![WasmValue::I32(5)]);
+    }
+
+    /// 测试 marshal / unmarshal 字符串跨 linear memory 往返:
+    /// host 写一段 UTF-8 到 memory, plugin 读出来返回长度, host 再读
+    ///
+    /// WAT:
+    ///   (module
+    ///     (memory (export "memory") 1)
+    ///     (func (export "echo_len") (param i32 i32) (result i32)
+    ///       local.get 0
+    ///       local.get 1
+    ///       i32.add))
+    const ECHO_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "echo_len") (param i32 i32) (result i32)
+            local.get 0
+            local.get 1
+            i32.add))
+    "#;
+
+    #[test]
+    fn test_string_marshal_roundtrip() {
+        use wat::parse_str;
+        use wasmtime::{Instance, Memory, Store};
+
+        let bytes = parse_str(ECHO_WAT).expect("valid wat");
+        let sandbox = WasmSandbox::default();
+        let module = WasmModule { name: "echo".to_string(), bytes };
+        sandbox.load(&module).unwrap();
+
+        // 自己 instance 一个, 拿 Memory, 调 marshal / unmarshal
+        let mut store = Store::new(&sandbox.engine, ());
+        let instance = Instance::new(&mut store, &sandbox_module(&sandbox, "echo").unwrap(), &[])
+            .expect("instantiate");
+        let memory: Memory = instance.get_memory(&mut store, "memory").expect("memory export");
+
+        let input = "hello, rshell plugin";
+        let (ptr, len) = marshal_string_input(&memory, &mut store, input).expect("marshal");
+        assert_eq!(ptr, 0);
+        assert_eq!(len as usize, input.len());
+
+        // unmarshal 读回
+        let recovered = unmarshal_string_output(&memory, &store, ptr, len).expect("unmarshal");
+        assert_eq!(recovered, input);
+    }
+
+    #[test]
+    fn test_string_marshal_rejects_oversize() {
+        use wat::parse_str;
+        use wasmtime::{Instance, Memory, Store};
+
+        let bytes = parse_str(ECHO_WAT).expect("valid wat");
+        let sandbox = WasmSandbox::default();
+        sandbox.load(&WasmModule { name: "echo_big".to_string(), bytes }).unwrap();
+
+        let mut store = Store::new(&sandbox.engine, ());
+        let instance = Instance::new(&mut store, &sandbox_module(&sandbox, "echo_big").unwrap(), &[])
+            .expect("instantiate");
+        let memory: Memory = instance.get_memory(&mut store, "memory").expect("memory export");
+
+        // 1 page = 64 KiB; 超过会被拒
+        let big = "x".repeat(64 * 1024 + 1);
+        let r = marshal_string_input(&memory, &mut store, &big);
+        assert!(r.is_err());
+    }
+
+    /// 内部 helper: 拿已加载模块的克隆 (用 load 缓存的, 走 sandbox.modules)
+    fn sandbox_module(sandbox: &WasmSandbox, name: &str) -> Option<wasmtime::Module> {
+        let modules = sandbox.modules.lock().unwrap();
+        modules.iter().find(|(n, _)| n == name).map(|(_, m)| m.clone())
     }
 }
