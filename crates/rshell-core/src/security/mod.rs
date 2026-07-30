@@ -6,3 +6,4 @@ pub mod key_manager;
 pub mod master_password;
 pub mod tunnel_manager;
 pub mod host_key_manager;
+pub mod host_key_decision;

@@ -71,11 +71,22 @@ pub enum AppEvent {
     TunnelStateChanged { tunnel_id: Uuid, state: TunnelState },
 
     // ===== 安全事件 =====
-    /// 主机密钥不匹配
+    /// 主机密钥不匹配（握手期间由 SshHandler 通过 EventBus 发出,
+    /// 等待 UI 端 AppCommand::DecideHostKey { decision_id, ... } 响应）
     HostKeyMismatch {
+        /// 决策 ID,与 AppCommand::DecideHostKey 中的 decision_id 一一对应
+        #[serde(default)]
+        decision_id: Uuid,
         host: String,
+        port: u16,
+        key_type: String,
+        /// 期望指纹（known_hosts 中能找到的）,未知主机为空
+        #[serde(default)]
         expected: String,
+        /// 实际收到的指纹
         received: String,
+        /// ssh-keygen 风格的 base64 编码公钥 blob,用于用户交叉校验
+        public_key_blob: String,
     },
     /// 需要主密码
     MasterPasswordRequired,

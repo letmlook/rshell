@@ -20,6 +20,7 @@ use crate::theme::ThemeManager;
 use crate::transfer::service::TransferService;
 use rshell_api::types::{TerminalBufferSnapshot, TerminalConfig};
 use rshell_api::AppCommand;
+use rshell_protocol::ssh::HostKeyDecision;
 use rshell_protocol::Connection;
 use rshell_protocol::telnet::TelnetConnection;
 use rshell_protocol::serial::{SerialConnection, SerialConfig as ProtocolSerialConfig};
@@ -46,24 +47,31 @@ pub struct CommandDispatcher {
     theme_manager: Arc<ThemeManager>,
     plugin_loader: Arc<PluginLoader>,
     event_bus: Arc<EventBus>,
+    /// 主机密钥决策注册表:负责把 SshHandler 同步等待转成 UI 端异步响应
+    host_key_registry: Arc<crate::security::host_key_decision::HostKeyDecisionRegistry>,
 }
 
 impl CommandDispatcher {
     /// 创建新的命令分发器
-    #[allow(clippy::too_many_arguments)] // 9 个服务注入是显式契约,bundle 不拆分更清晰
+    ///
+    /// 接受一组"已在外部创建好"的服务/注册表。trigger_engine 必须在外部创建并共享,
+    /// 因为 SessionService 后台 recv 循环也需要它做 trigger 匹配 ——
+    /// 用同一个 Arc,确保用户通过 `CreateTrigger` 加进去的项对 recv 循环立即可见。
+    #[allow(clippy::too_many_arguments)] // 显式服务 bundle,留给 #25 后续重构
     pub fn new(
         session_service: Arc<SessionService>,
         terminal_service: Arc<TerminalService>,
         transfer_service: Arc<TransferService>,
+        trigger_engine: Arc<TriggerEngine>,
         key_manager: Arc<KeyManager>,
         master_password: Arc<MasterPassword>,
         tunnel_manager: Arc<TunnelManager>,
         host_key_manager: Arc<HostKeyManager>,
         theme_manager: Arc<ThemeManager>,
         event_bus: Arc<EventBus>,
+        host_key_registry: Arc<crate::security::host_key_decision::HostKeyDecisionRegistry>,
     ) -> Self {
         let quick_command_service = Arc::new(QuickCommandService::new(event_bus.clone()));
-        let trigger_engine = Arc::new(TriggerEngine::new(event_bus.clone()));
         let compose_service = Arc::new(ComposeService::new(event_bus.clone()));
         // rhai::Engine is !Send+!Sync by design; ScriptEngine is only ever touched
         // from the dedicated backend thread that owns this Arc (see bridge.rs).
@@ -94,6 +102,7 @@ impl CommandDispatcher {
             theme_manager,
             plugin_loader,
             event_bus,
+            host_key_registry,
         }
     }
 
@@ -280,6 +289,27 @@ impl CommandDispatcher {
             // ===== 安全：主机密钥 =====
             AppCommand::TrustHostKey { host, port, key_type, public_key_blob, .. } => {
                 self.host_key_manager.trust_host_key(&host, port, &key_type, &public_key_blob).await?;
+            }
+            AppCommand::DecideHostKey { decision_id, accept, permanent } => {
+                // UI 端响应 HostKeyMismatch 事件:把决策 send 到 SshHandler 在
+                // check_server_key 中阻塞的 oneshot。
+                // 找不到 decision_id(超时/竞态/双重决策)时记录 warning 并忽略。
+                let decision = HostKeyDecision {
+                    // fingerprint/key_blob 这里没有从事件带过来;
+                    // SshHandler 在 publish_request 时已经把它们打包进了
+                    // HostKeyMismatch.public_key_blob,UI 端如果要展示校验靠该字段,
+                    // 而不是 decision 本身。
+                    fingerprint: String::new(),
+                    key_blob: String::new(),
+                    accept,
+                    permanent,
+                };
+                if !self.host_key_registry.resolve(decision_id, decision) {
+                    warn!(
+                        decision_id = %decision_id,
+                        "DecideHostKey: decision_id not found (already resolved or unknown)"
+                    );
+                }
             }
             AppCommand::DeleteHostKey { host, port } => {
                 self.host_key_manager.delete_host_key(&host, port).await?;

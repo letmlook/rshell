@@ -17,6 +17,7 @@ use rshell_api::events::AppEvent;
 use rshell_api::types::{HostKeyEntry, TrustLevel};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
@@ -188,9 +189,18 @@ impl HostKeyManager {
                     host, port, entry.fingerprint, key_blob
                 );
                 self.event_bus.publish(AppEvent::HostKeyMismatch {
+                    // 这个分支是 host_key_manager 在 verify 阶段发现已知 key 但
+                    // 实际收到的不匹配 — 它跟握手期间 SshHandler 的"未知 key"
+                    // 是两个不同的路径;这里发的事件 UI 端应作为"严重告警"展示,
+                    // 不应回 AppCommand::DecideHostKey(那会回 SshHandler 阻塞的
+                    // oneshot)。decision_id 留零,UI 端通过 host/port 区分。
+                    decision_id: Uuid::nil(),
                     host: host.to_string(),
+                    port,
+                    key_type: String::new(),
                     expected: entry.fingerprint.clone(),
                     received: key_blob.to_string(),
+                    public_key_blob: String::new(),
                 });
                 Ok(Some(false))
             } else {

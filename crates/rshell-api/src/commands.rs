@@ -115,6 +115,17 @@ pub enum AppCommand {
         decision: TrustHostKeyDecision,
     },
 
+    /// 实时决策某个 host key（握手期间通过 HostKeyMismatch 事件带过来的 decision_id）
+    ///
+    /// 这是**会话握手阶段**的决策通道；与 `TrustHostKey` 的区别:
+    /// - `DecideHostKey` 是**带 decision_id**的实时响应,会唤醒阻塞在 SshHandler 的 oneshot
+    /// - `TrustHostKey` 是已连接后对 known_hosts 的离线增删
+    DecideHostKey {
+        decision_id: Uuid,
+        accept: bool,
+        permanent: bool,
+    },
+
     /// 删除主机密钥
     DeleteHostKey { host: String, port: u16 },
 

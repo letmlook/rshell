@@ -5,4 +5,4 @@
 pub mod client;
 pub mod sftp;
 
-pub use client::SshClient;
+pub use client::{HostKeyDecision, HostKeyDecisionRequest, HostKeyDecisionSink, SshClient};

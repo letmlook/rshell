@@ -110,7 +110,14 @@ pub fn init_backend() -> (AppBridge, ()) {
                 let _ = std::fs::create_dir_all(&keys_dir);
 
                 let terminal_service = Arc::new(TerminalService::new(event_bus_for_thread.clone()));
-                let session_service = Arc::new(SessionService::new(event_bus_for_thread.clone(), terminal_service.clone()));
+                let trigger_engine = Arc::new(rshell_core::script::trigger_engine::TriggerEngine::new(event_bus_for_thread.clone()));
+                let host_key_registry = Arc::new(rshell_core::security::host_key_decision::HostKeyDecisionRegistry::new(event_bus_for_thread.clone()));
+                let session_service = Arc::new(SessionService::new(
+                    event_bus_for_thread.clone(),
+                    terminal_service.clone(),
+                    trigger_engine.clone(),
+                    host_key_registry.clone(),
+                ));
                 let transfer_service = Arc::new(TransferService::new(event_bus_for_thread.clone()));
                 let key_manager = Arc::new(KeyManager::new(keys_dir, event_bus_for_thread.clone()));
                 let master_password = Arc::new(MasterPassword::new(event_bus_for_thread.clone()));
@@ -122,12 +129,14 @@ pub fn init_backend() -> (AppBridge, ()) {
                     session_service,
                     terminal_service,
                     transfer_service,
+                    trigger_engine,
                     key_manager,
                     master_password,
                     tunnel_manager,
                     host_key_manager,
                     theme_manager,
                     event_bus_for_thread.clone(),
+                    host_key_registry,
                 );
 
                 // 初始化 dispatcher
