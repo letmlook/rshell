@@ -52,6 +52,21 @@ impl ThemeSettingsView {
         self.current_scheme = Some(scheme);
     }
 
+    /// 更新主题/方案 + 可用列表 (响应 ListThemes 拉取的 ThemesSnapshot)
+    pub fn update_themes(
+        &mut self,
+        current_theme: String,
+        current_scheme: String,
+        available_themes: Vec<String>,
+        available_schemes: Vec<String>,
+    ) {
+        // 简化: 保留 current 为 None, 视图中按 name 匹配判断 "is_current"
+        let _ = current_theme;
+        let _ = current_scheme;
+        self.available_themes = available_themes;
+        self.available_schemes = available_schemes;
+    }
+
     /// 处理事件
     pub fn handle_event(&mut self, event: &AppEvent) {
         match event {

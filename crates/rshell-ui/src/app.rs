@@ -5,8 +5,8 @@
 #![allow(dead_code)]
 
 use gpui::{div, prelude::*, px, rgb, Window};
-use rshell_api::{AppCommand, AppEvent};
 use rshell_api::types::{ConnectionState, SessionConfig};
+use rshell_api::{AppCommand, AppEvent};
 use uuid::Uuid;
 
 use crate::bridge::AppBridge;
@@ -56,8 +56,8 @@ pub struct RshellApp {
     tunnel_view: gpui::Entity<TunnelPanelView>,
     plugin_view: gpui::Entity<PluginManagerView>,
 
-    /// 会话列表（从后端同步）
-    sessions: Vec<SessionInfo>,
+    /// 会话列表（rshell_api::types::SessionInfo, 与 SessionView 共享, 状态在 handle_event 增量更新）
+    sessions: Vec<rshell_api::types::SessionInfo>,
 }
 
 /// 当前激活的中央面板
@@ -80,13 +80,6 @@ struct TabInfo {
     session_id: Uuid,
 }
 
-/// 会话信息（UI 用）
-struct SessionInfo {
-    id: Uuid,
-    name: String,
-    state: ConnectionState,
-}
-
 impl RshellApp {
     /// 创建新的应用实例
     pub fn new(bridge: AppBridge, cx: &mut gpui::Context<Self>) -> Self {
@@ -105,7 +98,7 @@ impl RshellApp {
         let tunnel_view = cx.new(TunnelPanelView::new);
         let plugin_view = cx.new(PluginManagerView::new);
 
-        Self {
+        let app = Self {
             bridge,
             active_tab: None,
             tabs: Vec::new(),
@@ -126,7 +119,19 @@ impl RshellApp {
             tunnel_view,
             plugin_view,
             sessions: Vec::new(),
-        }
+        };
+        // 启动时拉所有列表 (后端立即 publish XSnapshot 事件)
+        app.refresh_all_lists();
+        app
+    }
+
+    /// 拉所有后端列表 (XSnapshot 事件)
+    fn refresh_all_lists(&self) {
+        self.send_command(AppCommand::ListSessions);
+        self.send_command(AppCommand::ListTunnels);
+        self.send_command(AppCommand::ListKeys);
+        self.send_command(AppCommand::ListPlugins);
+        self.send_command(AppCommand::ListThemes);
     }
 
     /// 切换文件管理器显示状态
@@ -148,6 +153,57 @@ impl RshellApp {
                 if *session_id == self.active_session_id {
                     self.terminal_view.update(cx, |v, _| v.update_buffer(snapshot.clone()));
                 }
+            }
+
+            // 3) 快照事件 → 推到对应 view 的 update_*()
+            // ListTriggers / ListQuickCommands / ListTunnels 走回原 ListChanged
+            // 事件 (因为 ListTriggers/ListQuickCommands 没有自己的 snapshot event)
+            match &event {
+                AppEvent::SessionsSnapshot { sessions } => {
+                    // 把 Vec<SessionConfig> 转成 Vec<SessionInfo> 给 view
+                    // view 内部在 handle_event 增量更新 state, 初次填 Disconnected
+                    let infos: Vec<rshell_api::types::SessionInfo> = sessions
+                        .iter()
+                        .map(|cfg: &SessionConfig| rshell_api::types::SessionInfo {
+                            id: cfg.id,
+                            config: cfg.clone(),
+                            state: ConnectionState::Disconnected,
+                        })
+                        .collect();
+                    self.sessions = infos.clone();
+                    self.session_view.update(cx, |v, _| v.update_sessions(infos));
+                }
+                AppEvent::TunnelsSnapshot { tunnels } => {
+                    let t = tunnels.clone();
+                    self.tunnel_view.update(cx, |v, _| v.update_tunnels(t));
+                }
+                AppEvent::KeysSnapshot { keys } => {
+                    let k = keys.clone();
+                    self.key_mgmt_view.update(cx, |v, _| v.update_keys(k));
+                }
+                AppEvent::PluginsSnapshot { plugins } => {
+                    let p = plugins.clone();
+                    self.plugin_view.update(cx, |v, _| v.update_plugins(p));
+                }
+                AppEvent::ThemesSnapshot {
+                    current_theme,
+                    current_scheme,
+                    available_themes,
+                    available_schemes,
+                } => {
+                    let t = current_theme.clone();
+                    let s = current_scheme.clone();
+                    let at = available_themes.clone();
+                    let ac = available_schemes.clone();
+                    self.theme_view.update(cx, |v, _| v.update_themes(t, s, at, ac));
+                }
+                AppEvent::SessionListChanged => {
+                    self.send_command(AppCommand::ListSessions);
+                }
+                AppEvent::ActiveTunnelsChanged => {
+                    self.send_command(AppCommand::ListTunnels);
+                }
+                _ => {}
             }
 
             // 3) 本地状态同步（tabs/sessions UI 状态）
@@ -233,7 +289,7 @@ impl RshellApp {
             .sessions
             .iter()
             .find(|s| s.id == session_id)
-            .map(|s| s.name.clone())
+            .map(|s| s.config.name.clone())
             .unwrap_or_else(|| format!("Session {}", &session_id.to_string()[..8]));
         self.tabs.push(TabInfo {
             title,
@@ -267,7 +323,27 @@ impl RshellApp {
         self.send_command(AppCommand::DisconnectSession { session_id });
     }
 
-    /// 创建示例会话（用于测试）
+    /// 关闭 tab: 断开会话 + 从 tabs 移除
+    fn close_tab(&mut self, cx: &mut gpui::Context<Self>, session_id: Uuid) {
+        self.send_command(AppCommand::DisconnectSession { session_id });
+        self.tabs.retain(|t| t.session_id != session_id);
+        if self.tabs.is_empty() {
+            self.active_tab = None;
+            self.update_active_session(cx, Uuid::nil());
+        } else if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| t.session_id == self.active_session_id)
+        {
+            self.active_tab = Some(idx);
+        } else {
+            self.active_tab = Some(0);
+            self.update_active_session(cx, self.tabs[0].session_id);
+        }
+        cx.notify();
+    }
+
+    /// 创建示例会话（用于测试 + 不实现 dialog 前的快速创建入口）
     fn create_demo_session(&mut self) {
         let config = SessionConfig {
             id: Uuid::new_v4(),
@@ -282,9 +358,9 @@ impl RshellApp {
             },
         };
 
-        self.sessions.push(SessionInfo {
+        self.sessions.push(rshell_api::types::SessionInfo {
             id: config.id,
-            name: config.name.clone(),
+            config: config.clone(),
             state: ConnectionState::Disconnected,
         });
 
@@ -318,6 +394,7 @@ impl Render for RshellApp {
                             .p_2()
                             .child(
                                 div()
+                                    .id("new-session-btn")
                                     .bg(rgb(0x3b82f6))
                                     .px(px(12.0))
                                     .py(px(6.0))
@@ -325,7 +402,13 @@ impl Render for RshellApp {
                                     .text_color(rgb(0xffffff))
                                     .text_sm()
                                     .text_center()
-                                    .child("+ 新建会话"),
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(0x2563eb)))
+                                    .child("+ 新建会话")
+                                    .on_click(cx.listener(|this, _, _window, _cx| {
+                                        // 无 dialog 阶段: 直接创建 localhost 占位 session
+                                        this.create_demo_session();
+                                    })),
                             ),
                     )
                     .child(
@@ -333,6 +416,7 @@ impl Render for RshellApp {
                             .p_2()
                             .child(
                                 div()
+                                    .id("toggle-file-manager-btn")
                                     .bg(rgb(0x6366f1))
                                     .px(px(12.0))
                                     .py(px(6.0))
@@ -340,7 +424,16 @@ impl Render for RshellApp {
                                     .text_color(rgb(0xffffff))
                                     .text_sm()
                                     .text_center()
-                                    .child(if self.show_file_manager { "隐藏文件管理器" } else { "显示文件管理器" }),
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(0x4f46e5)))
+                                    .child(if self.show_file_manager {
+                                        "隐藏文件管理器"
+                                    } else {
+                                        "显示文件管理器"
+                                    })
+                                    .on_click(cx.listener(|this, _, _window, _cx| {
+                                        this.toggle_file_manager();
+                                    })),
                             ),
                     ),
             )
@@ -360,19 +453,26 @@ impl Render for RshellApp {
                             .px_2()
                             .child(
                                 if self.tabs.is_empty() {
-                                    div()
-                                        .text_color(rgb(0x888888))
-                                        .child("无打开的标签页")
-                                        .into_any()
+                                    gpui::IntoElement::into_any_element(
+                                        div()
+                                            .text_color(rgb(0x888888))
+                                            .child("无打开的标签页"),
+                                    )
                                 } else {
-                                    let mut tabs_div = div().flex().flex_row().gap_1();
-                                    for (idx, tab) in self.tabs.iter().enumerate() {
+                                    let mut tabs: Vec<gpui::AnyElement> = Vec::with_capacity(self.tabs.len());
+                                    // 同样的 take/replace 模式
+                                    let tabs_data = std::mem::take(&mut self.tabs);
+                                    for (idx, tab) in tabs_data.iter().enumerate() {
                                         let is_active = self.active_tab == Some(idx);
                                         let bg_color = if is_active { rgb(0x3d3d5d) } else { rgb(0x2d2d3d) };
                                         let status_color = if tab.connected { rgb(0x00ff00) } else { rgb(0x888888) };
+                                        let title = tab.title.clone();
+                                        let session_id = tab.session_id;
+                                        let close_id = tab.session_id;
 
-                                        tabs_div = tabs_div.child(
+                                        tabs.push(gpui::IntoElement::into_any_element(
                                             div()
+                                                .id(("tab", idx))
                                                 .px_2()
                                                 .py_1()
                                                 .bg(bg_color)
@@ -380,6 +480,13 @@ impl Render for RshellApp {
                                                 .flex()
                                                 .items_center()
                                                 .gap_1()
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(rgb(0x4d4d6d)))
+                                                .on_click(cx.listener(move |this, _, _window, cx| {
+                                                    this.active_tab = Some(idx);
+                                                    this.update_active_session(cx, session_id);
+                                                    cx.notify();
+                                                }))
                                                 .child(
                                                     div()
                                                         .w(px(8.0))
@@ -390,11 +497,28 @@ impl Render for RshellApp {
                                                 .child(
                                                     div()
                                                         .text_color(rgb(0xffffff))
-                                                        .child(tab.title.clone()),
+                                                        .text_sm()
+                                                        .child(title),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(("tab-close", idx))
+                                                        .ml_1()
+                                                        .text_color(rgb(0x888888))
+                                                        .text_sm()
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.text_color(rgb(0xff6666)))
+                                                        .child("×")
+                                                        .on_click(cx.listener(move |this, _, _window, cx| {
+                                                            this.close_tab(cx, close_id);
+                                                        })),
                                                 ),
-                                        );
+                                        ));
                                     }
-                                    tabs_div.into_any()
+                                    let _ = std::mem::replace(&mut self.tabs, tabs_data);
+                                    gpui::IntoElement::into_any_element(
+                                        div().flex().flex_row().gap_1().children(tabs),
+                                    )
                                 },
                             ),
                     )
@@ -459,7 +583,7 @@ impl RshellApp {
                             div()
                                 .text_color(rgb(0xffffff))
                                 .text_sm()
-                                .child(session.name.clone()),
+                                .child(session.config.name.clone()),
                         ),
                 );
             }

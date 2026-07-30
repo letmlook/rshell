@@ -9,7 +9,6 @@ use rshell_api::types::{ConnectionState, SessionInfo};
 pub struct SessionView {
     sessions: Vec<SessionInfo>,
     selected_session: Option<usize>,
-    expanded_folders: Vec<String>,
 }
 
 impl SessionView {
@@ -18,7 +17,6 @@ impl SessionView {
         Self {
             sessions: Vec::new(),
             selected_session: None,
-            expanded_folders: Vec::new(),
         }
     }
 
@@ -44,7 +42,17 @@ impl SessionView {
 }
 
 impl Render for SessionView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 在 render 内需要 &mut self 调用 render_session_item (里面有 on_click cx.listener)。
+        // 用 take + replace 避免 borrow checker 冲突。
+        let mut items: Vec<gpui::AnyElement> = Vec::with_capacity(self.sessions.len());
+        let sessions = std::mem::take(&mut self.sessions);
+        for (idx, session) in sessions.iter().enumerate() {
+            items.push(gpui::IntoElement::into_any_element(self.render_session_item(idx, session, cx)));
+        }
+        // 写回
+        let _ = std::mem::replace(&mut self.sessions, sessions);
+
         div()
             .size_full()
             .bg(rgb(0x181825))
@@ -63,21 +71,23 @@ impl Render for SessionView {
                             .font_weight(gpui::FontWeight::BOLD),
                     ),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .p(px(4.0))
-                    .children(self.sessions.iter().enumerate().map(|(idx, session)| {
-                        self.render_session_item(idx, session)
-                    })),
-            )
+            .child(div().flex_1().p(px(4.0)).children(items))
     }
 }
 
 impl SessionView {
-    fn render_session_item(&self, idx: usize, session: &SessionInfo) -> impl IntoElement {
+    fn render_session_item(
+        &mut self,
+        idx: usize,
+        session: &SessionInfo,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let is_selected = self.selected_session == Some(idx);
-        let bg = if is_selected { rgb(0x094771) } else { rgb(0x181825) };
+        let bg = if is_selected {
+            rgb(0x094771)
+        } else {
+            rgb(0x181825)
+        };
 
         let (state_color, _state_text) = match session.state {
             ConnectionState::Connected => (rgb(0x4ec9b0), "已连接"),
@@ -93,13 +103,29 @@ impl SessionView {
             rshell_api::types::Protocol::RDP => "RDP",
         };
 
+        let session_id = session.id;
+        let name = session.config.name.clone();
+        let host = session.config.host.clone();
+        let port = session.config.port;
+
         div()
+            .id(("session-row", idx))
             .bg(bg)
             .rounded(px(3.0))
             .mb(px(2.0))
             .px(px(8.0))
             .py(px(4.0))
             .cursor_pointer()
+            .hover(|s| s.bg(rgb(0x252535)))
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.selected_session = Some(idx);
+                cx.notify();
+                if let Some(bridge) = cx.try_global::<crate::bridge::AppBridge>() {
+                    bridge.send_command(rshell_api::AppCommand::ConnectSession {
+                        session_id,
+                    });
+                }
+            }))
             .child(
                 div()
                     .flex()
@@ -114,7 +140,7 @@ impl SessionView {
                     )
                     .child(
                         div()
-                            .child(session.config.name.clone())
+                            .child(name)
                             .text_color(rgb(0xcccccc))
                             .text_size(px(11.0)),
                     ),
@@ -122,7 +148,7 @@ impl SessionView {
             .child(
                 div()
                     .ml(px(12.0))
-                    .child(format!("{} {}:{}", protocol_text, session.config.host, session.config.port))
+                    .child(format!("{} {}:{}", protocol_text, host, port))
                     .text_color(rgb(0x606060))
                     .text_size(px(9.0)),
             )
