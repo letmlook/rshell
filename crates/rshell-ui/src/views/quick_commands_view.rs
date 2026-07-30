@@ -175,6 +175,7 @@ impl QuickCommandsView {
         };
 
         let cmd_id = cmd.id;
+        let _ = cmd_id; // 下面用 cmd_id_owned 捕获
         let name = cmd.name.clone();
         let command_text: String = cmd.command.chars().take(40).collect();
         let target_sessions = match &cmd.scope {
