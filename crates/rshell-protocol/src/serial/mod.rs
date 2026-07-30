@@ -263,6 +263,59 @@ mod tests {
         assert_eq!(cfg.flow_control, SerialFlowControl::None);
     }
 
+    #[test]
+    fn test_to_serialport_data_bits() {
+        assert!(matches!(to_serialport_data_bits(5), serialport::DataBits::Five));
+        assert!(matches!(to_serialport_data_bits(6), serialport::DataBits::Six));
+        assert!(matches!(to_serialport_data_bits(7), serialport::DataBits::Seven));
+        // 任何其他值 (含 0、8、9) 都 fallback 到 8
+        assert!(matches!(to_serialport_data_bits(0), serialport::DataBits::Eight));
+        assert!(matches!(to_serialport_data_bits(8), serialport::DataBits::Eight));
+        assert!(matches!(to_serialport_data_bits(99), serialport::DataBits::Eight));
+    }
+
+    #[test]
+    fn test_to_serialport_stop_bits() {
+        assert!(matches!(to_serialport_stop_bits(1), serialport::StopBits::One));
+        assert!(matches!(to_serialport_stop_bits(2), serialport::StopBits::Two));
+        // 其他值 fallback 到 1
+        assert!(matches!(to_serialport_stop_bits(0), serialport::StopBits::One));
+        assert!(matches!(to_serialport_stop_bits(3), serialport::StopBits::One));
+    }
+
+    #[test]
+    fn test_to_serialport_parity() {
+        assert!(matches!(to_serialport_parity(SerialParity::None), serialport::Parity::None));
+        assert!(matches!(to_serialport_parity(SerialParity::Even), serialport::Parity::Even));
+        assert!(matches!(to_serialport_parity(SerialParity::Odd), serialport::Parity::Odd));
+    }
+
+    #[test]
+    fn test_to_serialport_flow() {
+        assert!(matches!(to_serialport_flow(SerialFlowControl::None), serialport::FlowControl::None));
+        assert!(matches!(to_serialport_flow(SerialFlowControl::Software), serialport::FlowControl::Software));
+        assert!(matches!(to_serialport_flow(SerialFlowControl::Hardware), serialport::FlowControl::Hardware));
+    }
+
+    #[test]
+    fn test_serial_config_clone_preserves_all_fields() {
+        let cfg = SerialConfig {
+            port: "COM3".to_string(),
+            baud_rate: 9600,
+            data_bits: 7,
+            stop_bits: 2,
+            parity: SerialParity::Even,
+            flow_control: SerialFlowControl::Hardware,
+        };
+        let cfg2 = cfg.clone();
+        assert_eq!(cfg.port, cfg2.port);
+        assert_eq!(cfg.baud_rate, cfg2.baud_rate);
+        assert_eq!(cfg.data_bits, cfg2.data_bits);
+        assert_eq!(cfg.stop_bits, cfg2.stop_bits);
+        assert_eq!(cfg.parity, cfg2.parity);
+        assert_eq!(cfg.flow_control, cfg2.flow_control);
+    }
+
     #[tokio::test]
     async fn test_serial_connection_creation() {
         let conn = SerialConnection::new(SerialConfig::default());

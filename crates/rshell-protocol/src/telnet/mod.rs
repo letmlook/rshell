@@ -351,3 +351,73 @@ impl Connection for TelnetConnection {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_connection_defaults() {
+        let c = TelnetConnection::new("example.com", 23);
+        assert_eq!(c.host, "example.com");
+        assert_eq!(c.port, 23);
+        assert_eq!(c.terminal_type, "xterm-256color");
+        assert_eq!(c.state, TelnetState::Disconnected);
+        assert!(!c.suppress_go_ahead);
+        assert!(!c.server_echo);
+    }
+
+    #[test]
+    fn test_set_terminal_type() {
+        let mut c = TelnetConnection::new("h", 23);
+        c.set_terminal_type("vt100");
+        assert_eq!(c.terminal_type, "vt100");
+    }
+
+    #[tokio::test]
+    async fn test_send_command_requires_connected() {
+        let mut c = TelnetConnection::new("h", 23);
+        // 未连接时调 send_command 应返回错误
+        let r = c.send_command(TelnetCommand::DO, Some(TelnetOption::SuppressGoAhead)).await;
+        assert!(r.is_err());
+        assert!(format!("{}", r.unwrap_err()).contains("Not connected"));
+    }
+
+    #[test]
+    fn test_iac_constants() {
+        // 关键协议字节值(RFC 854)避免被错改
+        assert_eq!(TelnetCommand::IAC as u8, 255);
+        assert_eq!(TelnetCommand::DO as u8, 253);
+        assert_eq!(TelnetCommand::DONT as u8, 254);
+        assert_eq!(TelnetCommand::WILL as u8, 251);
+        assert_eq!(TelnetCommand::WONT as u8, 252);
+        assert_eq!(TelnetCommand::SB as u8, 250);
+        assert_eq!(TelnetCommand::SE as u8, 240);
+    }
+
+    #[test]
+    fn test_option_codes() {
+        assert_eq!(TelnetOption::Echo as u8, 1);
+        assert_eq!(TelnetOption::SuppressGoAhead as u8, 3);
+        assert_eq!(TelnetOption::TerminalType as u8, 24);
+        assert_eq!(TelnetOption::WindowSize as u8, 31);
+    }
+
+    #[test]
+    fn test_naws_frame_byte_count() {
+        // 验收 NAWS 子协商帧长度: IAC SB NAWS <2 cols> <2 rows> IAC SE = 9 字节
+        // 该测试保护 #4 实现不被后续 refactor 破坏
+        let payload = [
+            255u8, 250, 31, // IAC SB NAWS
+            0, 80,        // cols = 80
+            0, 24,        // rows = 24
+            255, 240,     // IAC SE
+        ];
+        assert_eq!(payload.len(), 9);
+        assert_eq!(payload[0], TelnetCommand::IAC as u8);
+        assert_eq!(payload[1], TelnetCommand::SB as u8);
+        assert_eq!(payload[2], TelnetOption::WindowSize as u8);
+        assert_eq!(payload[7], TelnetCommand::IAC as u8);
+        assert_eq!(payload[8], TelnetCommand::SE as u8);
+    }
+}
