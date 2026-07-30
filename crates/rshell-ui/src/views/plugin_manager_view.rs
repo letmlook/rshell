@@ -27,13 +27,10 @@ impl PluginManagerView {
     }
 
     pub fn handle_event(&mut self, event: &AppEvent) {
-        match event {
-            AppEvent::PluginStateChanged { plugin_id, state } => {
-                if let Some(plugin) = self.plugins.iter_mut().find(|p| p.id == *plugin_id) {
-                    plugin.state = *state;
-                }
+        if let AppEvent::PluginStateChanged { plugin_id, state } = event {
+            if let Some(plugin) = self.plugins.iter_mut().find(|p| p.id == *plugin_id) {
+                plugin.state = *state;
             }
-            _ => {}
         }
     }
 }
