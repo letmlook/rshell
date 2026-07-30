@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 use tracing::{info, warn, error};
 
-use rshell_api::types::{ActiveTunnelInfo, PortForwardRule, TunnelState};
+use rshell_api::types::{ActiveTunnelInfo, ForwardDirection, PortForwardRule, TunnelState};
 use rshell_api::events::AppEvent;
 
 use crate::error::CoreError;
@@ -168,7 +168,7 @@ impl TunnelManager {
         let handle = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((mut inbound, peer_addr)) => {
+                    Ok((inbound, peer_addr)) => {
                         info!("Tunnel {}: new connection from {}", tunnel_id_for_task, peer_addr);
 
                         // 更新连接计数
@@ -181,71 +181,32 @@ impl TunnelManager {
 
                         let remote_host = rule_for_task.remote_host.clone();
                         let remote_port = rule_for_task.remote_port;
+                        let direction = rule_for_task.direction;
                         let tunnels_clone = tunnels.clone();
                         let tid = tunnel_id_for_task;
 
                         // 为每条连接 spawn 一个转发任务
                         let ssh_client_for_task = ssh_client_ref.clone();
                         tokio::spawn(async move {
-                            let res = match ssh_client_for_task {
-                                Some(ssh) => {
-                                    // 真 SSH direct-tcpip: 拿 Channel<Msg>,跟 inbound TCP 做双向 copy
-                                    let channel = {
-                                        let client = ssh.read().await;
-                                        client
-                                            .open_direct_tcpip(&remote_host, remote_port as u32)
-                                            .await
-                                    };
-                                    match channel {
-                                        Ok(mut ch) => {
-                                            let (mut ri, mut wi) = inbound.split();
-                                            // 顺序关键: 先 make_writer(&self) 再 make_reader(&mut self),
-                                            // 避免持有 &mut self 时再借 &self 失败。
-                                            let mut wo = ch.make_writer();
-                                            let mut ro = ch.make_reader();
-                                            let c2s = tokio::io::copy(&mut ri, &mut wo);
-                                            let s2c = tokio::io::copy(&mut ro, &mut wi);
-                                            let (c2s_res, s2c_res) = tokio::join!(c2s, s2c);
-                                            // ro/wo 持 ch 的借用,显式 drop 后才能调 ch.eof()
-                                            drop(ro);
-                                            drop(wo);
-                                            let _ = ch.eof().await;
-                                            if let Err(e) = c2s_res {
-                                                warn!("Tunnel {}: client→remote (ssh) copy error: {}", tid, e);
-                                            }
-                                            if let Err(e) = s2c_res {
-                                                warn!("Tunnel {}: remote→client (ssh) copy error: {}", tid, e);
-                                            }
-                                            Ok(())
-                                        }
-                                        Err(e) => Err(format!(
-                                            "ssh direct-tcpip {}:{} failed: {}",
-                                            remote_host, remote_port, e
-                                        )),
-                                    }
+                            let res = match direction {
+                                ForwardDirection::Local => {
+                                    forward_local(ssh_client_for_task, inbound, &remote_host, remote_port, tid).await
                                 }
-                                None => {
-                                    // Plain TCP 代理(非 SSH session 的隧道)
-                                    match TcpStream::connect(format!("{}:{}", remote_host, remote_port)).await {
-                                        Ok(mut remote) => {
-                                            let (mut ri, mut wi) = inbound.split();
-                                            let (mut ro, mut wo) = remote.split();
-                                            let c2s = tokio::io::copy(&mut ri, &mut wo);
-                                            let s2c = tokio::io::copy(&mut ro, &mut wi);
-                                            let (c2s_res, s2c_res) = tokio::join!(c2s, s2c);
-                                            if let Err(e) = c2s_res {
-                                                warn!("Tunnel {}: client→remote (tcp) copy error: {}", tid, e);
-                                            }
-                                            if let Err(e) = s2c_res {
-                                                warn!("Tunnel {}: remote→client (tcp) copy error: {}", tid, e);
-                                            }
-                                            Ok(())
-                                        }
-                                        Err(e) => Err(format!(
-                                            "TCP connect to {}:{} failed: {}",
-                                            remote_host, remote_port, e
-                                        )),
-                                    }
+                                ForwardDirection::Remote => {
+                                    // RemoteForward 需要 SSH 端向 server 申请监听 + 接收 server→client 通道;
+                                    // russh 不直接暴露 server-initiated channel 接收, 留 TODO。
+                                    // 当前 LocalForward 复用同一 inbound 走 SSH direct-tcpip 作 fallback
+                                    // (如果用户误用 RemoteForward 配置, 行为退化为 LocalForward 足够明显)。
+                                    warn!(
+                                        "Tunnel {}: RemoteForward not fully implemented; falling back to LocalForward semantics",
+                                        tid
+                                    );
+                                    forward_local(ssh_client_for_task, inbound, &remote_host, remote_port, tid).await
+                                }
+                                ForwardDirection::Dynamic => {
+                                    // SOCKS5 DynamicForward: 解析客户端握手得到目标 host:port,
+                                    // 再用 SSH direct-tcpip 转发(无 SSH client 时走 plain TCP)。
+                                    forward_dynamic_socks5(ssh_client_for_task, inbound, tid).await
                                 }
                             };
                             if let Err(msg) = res {
@@ -389,6 +350,174 @@ impl TunnelManager {
     }
 }
 
+/// 内部 helper: LocalForward — inbound → remote_host:remote_port
+///
+/// 优先走 SSH direct-tcpip(有 ssh_client), 否则 plain TCP。
+async fn forward_local(
+    ssh_client: Option<SshClientHandle>,
+    mut inbound: TcpStream,
+    remote_host: &str,
+    remote_port: u16,
+    tid: Uuid,
+) -> Result<(), String> {
+    if let Some(ssh) = ssh_client {
+        let channel = {
+            let client = ssh.read().await;
+            client
+                .open_direct_tcpip(remote_host, remote_port as u32)
+                .await
+        };
+        match channel {
+            Ok(mut ch) => {
+                let (mut ri, mut wi) = inbound.split();
+                let mut wo = ch.make_writer();
+                let mut ro = ch.make_reader();
+                let c2s = tokio::io::copy(&mut ri, &mut wo);
+                let s2c = tokio::io::copy(&mut ro, &mut wi);
+                let (c2s_res, s2c_res) = tokio::join!(c2s, s2c);
+                drop(ro);
+                drop(wo);
+                let _ = ch.eof().await;
+                if let Err(e) = c2s_res {
+                    warn!("Tunnel {}: client→remote (ssh) copy error: {}", tid, e);
+                }
+                if let Err(e) = s2c_res {
+                    warn!("Tunnel {}: remote→client (ssh) copy error: {}", tid, e);
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "ssh direct-tcpip {}:{} failed: {}",
+                remote_host, remote_port, e
+            )),
+        }
+    } else {
+        match TcpStream::connect(format!("{}:{}", remote_host, remote_port)).await {
+            Ok(mut remote) => {
+                let (mut ri, mut wi) = inbound.split();
+                let (mut ro, mut wo) = remote.split();
+                let c2s = tokio::io::copy(&mut ri, &mut wo);
+                let s2c = tokio::io::copy(&mut ro, &mut wi);
+                let (c2s_res, s2c_res) = tokio::join!(c2s, s2c);
+                if let Err(e) = c2s_res {
+                    warn!("Tunnel {}: client→remote (tcp) copy error: {}", tid, e);
+                }
+                if let Err(e) = s2c_res {
+                    warn!("Tunnel {}: remote→client (tcp) copy error: {}", tid, e);
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "TCP connect to {}:{} failed: {}",
+                remote_host, remote_port, e
+            )),
+        }
+    }
+}
+
+/// 内部 helper: DynamicForward (SOCKS5) — 解析客户端握手得到目标,
+/// 然后跟 LocalForward 一样转发到 host:port (从握手解析).
+async fn forward_dynamic_socks5(
+    ssh_client: Option<SshClientHandle>,
+    mut inbound: TcpStream,
+    tid: Uuid,
+) -> Result<(), String> {
+    let (host, port) = socks5_handshake(&mut inbound).await?;
+    info!("Tunnel {}: SOCKS5 CONNECT to {}:{}", tid, host, port);
+
+    forward_local(ssh_client, inbound, &host, port, tid).await
+}
+
+/// SOCKS5 握手: 读 greeting + request, 写回 reply.
+async fn socks5_handshake(inbound: &mut TcpStream) -> Result<(String, u16), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 1. 读 greeting: VER NMETHODS METHODS, 回 VER METHOD (0x00 = no auth)
+    let mut buf = [0u8; 512];
+    let n = inbound
+        .read(&mut buf)
+        .await
+        .map_err(|e| format!("socks5 read greeting: {}", e))?;
+    if n < 2 || buf[0] != 0x05 {
+        return Err(format!("socks5 bad greeting: n={} ver={}", n, buf[0]));
+    }
+    let nmethods = buf[1] as usize;
+    if n < 2 + nmethods {
+        return Err(format!("socks5 greeting truncated: n={} nmethods={}", n, nmethods));
+    }
+    // 强制 no-auth (即便客户端没列, RFC 允许 server 选)
+    inbound
+        .write_all(&[0x05, 0x00])
+        .await
+        .map_err(|e| format!("socks5 write method: {}", e))?;
+
+    // 2. 读请求: VER CMD RSV ATYP DST.ADDR DST.PORT
+    let n = inbound
+        .read(&mut buf)
+        .await
+        .map_err(|e| format!("socks5 read request: {}", e))?;
+    if n < 7 {
+        return Err(format!("socks5 request too short: {}", n));
+    }
+    if buf[0] != 0x05 {
+        return Err(format!("socks5 request bad ver: {}", buf[0]));
+    }
+    let cmd = buf[1];
+    if cmd != 0x01 {
+        // 仅支持 CONNECT
+        let _ = inbound
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
+        return Err(format!("socks5 unsupported cmd: {}", cmd));
+    }
+    let atyp = buf[3];
+    let (host, port) = match atyp {
+        0x01 => {
+            if n < 4 + 4 + 2 {
+                return Err("socks5 ipv4 truncated".to_string());
+            }
+            let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+            let port = u16::from_be_bytes([buf[8], buf[9]]);
+            (ip.to_string(), port)
+        }
+        0x03 => {
+            let dlen = buf[4] as usize;
+            if n < 5 + dlen + 2 {
+                return Err("socks5 domain truncated".to_string());
+            }
+            let domain = std::str::from_utf8(&buf[5..5 + dlen])
+                .map_err(|e| format!("socks5 domain utf-8: {}", e))?
+                .to_string();
+            let port = u16::from_be_bytes([buf[5 + dlen], buf[6 + dlen]]);
+            (domain, port)
+        }
+        0x04 => {
+            if n < 4 + 16 + 2 {
+                return Err("socks5 ipv6 truncated".to_string());
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[4..20]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([buf[20], buf[21]]);
+            (ip.to_string(), port)
+        }
+        _ => {
+            let _ = inbound
+                .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return Err(format!("socks5 unsupported atyp: {}", atyp));
+        }
+    };
+
+    // 3. 写 REP=0x00 成功响应 (BND 用 0.0.0.0:0 占位)
+    inbound
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .map_err(|e| format!("socks5 write reply: {}", e))?;
+
+    Ok((host, port))
+}
+
 impl Drop for ActiveTunnel {
     fn drop(&mut self) {
         if let Some(handle) = self.listener_handle.take() {
@@ -454,5 +583,157 @@ mod tests {
             .with_persistence(tmp);
         let pending = mgr.restore_pending_rules().await;
         assert!(pending.is_empty());
+    }
+
+    /// SOCKS5 握手解析端到端测试: 用 socks5_handshake 直接验证 (绕开 forward 阻塞)
+    #[tokio::test]
+    async fn test_socks5_handshake_ipv4() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let socks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut inbound, _)) = socks.accept().await {
+                // handshake 后 server 调 drop(inbound) 让 client 收 EOF
+                let r = socks5_handshake(&mut inbound).await;
+                drop(inbound);
+                r
+            } else {
+                Err("accept failed".to_string())
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(socks_addr).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+
+        let mut resp = [0u8; 2];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.read_exact(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+
+        // IPv4 request
+        let req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50]; // port 80
+        client.write_all(&req).await.unwrap();
+
+        // Server handshake result
+        let r = tokio::time::timeout(std::time::Duration::from_millis(500), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let (host, port) = r.unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 80);
+    }
+
+    /// Domain ATYP=0x03 解析
+    #[tokio::test]
+    async fn test_socks5_handshake_domain() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let socks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut inbound, _)) = socks.accept().await {
+                let r = socks5_handshake(&mut inbound).await;
+                drop(inbound);
+                r
+            } else {
+                Err("accept failed".to_string())
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(socks_addr).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.read_exact(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let domain = b"example.com";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
+        req.extend_from_slice(domain);
+        req.extend_from_slice(&443u16.to_be_bytes());
+        client.write_all(&req).await.unwrap();
+
+        let r = tokio::time::timeout(std::time::Duration::from_millis(500), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let (host, port) = r.unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+    }
+
+    /// 不支持的 cmd (BIND=2) 应写 REP=0x07 拒绝
+    #[tokio::test]
+    async fn test_socks5_handshake_rejects_bind() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let socks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut inbound, _)) = socks.accept().await {
+                socks5_handshake(&mut inbound).await
+            } else {
+                Err("accept failed".to_string())
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(socks_addr).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.read_exact(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // CMD=2 (BIND), 应被拒
+        let req = vec![0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50];
+        client.write_all(&req).await.unwrap();
+
+        let r = tokio::time::timeout(std::time::Duration::from_millis(500), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r.is_err());
+    }
+
+    /// SOCKS5 bad greeting: client 发 VER=4 应被拒
+    #[tokio::test]
+    async fn test_socks5_bad_version_rejected() {
+        use tokio::io::AsyncWriteExt;
+
+        let socks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut inbound, _)) = socks.accept().await {
+                let r = socks5_handshake(&mut inbound).await;
+                drop(inbound);
+                r
+            } else {
+                Err("accept failed".to_string())
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(socks_addr).await.unwrap();
+        client.write_all(&[0x04, 0x01, 0x00]).await.unwrap(); // bad ver
+
+        let r = tokio::time::timeout(std::time::Duration::from_millis(500), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r.is_err());
     }
 }
