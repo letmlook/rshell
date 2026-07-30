@@ -230,6 +230,7 @@
 |----|------|--------|------|
 | #4 | telnet NAWS resize | `97df88f` | RFC 1073 字节级 + 测试 |
 | #5 | trigger engine 接入 recv | `97df88f` | 4 个 trigger action 派发 |
+| #7 | tunnel 持久化 + UI 入口 | `81ee342` + `5251be0` | ListPendingTunnels / RestoreTunnel API |
 | #9 | NAWS 协商 + DO 命令 | (同上) | telnet `connect` 时主动 DO |
 | #10 | trigger / quick_command / sync_input 单测 | `97df88f` | 0 → 20 测试 |
 | #11 | terminal buffer 60Hz 节流 | `97df88f` | ticker + dirty flag |
@@ -243,6 +244,7 @@
 | #23 | Telnet/Serial 测试 | `62980f8` | 11 测试覆盖配置不变性 |
 | #25 | CommandDispatcher bundle | `9abc0e4` | Services struct 替代 11 参数 |
 | #26 | toolchain 修 | `e1e673d` | channel = stable (避开 1.90 alias 404) |
+| #29 | SOCKS5 DynamicForward | `09f7b8b` | 4 测试覆盖 IPv4/Domain/BIND/bad_ver |
 | 17 | terminal_view 1 行清理 | `97df88f` | upper.is_ascii_uppercase() |
 
 ## 留作 follow-up
@@ -250,7 +252,7 @@
 | id | 原因 |
 |----|------|
 | #1 RDP TLS/NLA/frame pump | 需要真 RDP server 验证 |
-| #3 RemoteForward + DynamicForward (SOCKS) | 本轮仅做 LocalForward 基础 |
+| #3 RemoteForward + DynamicForward (SOCKS) | DynamicForward 已做 (#29); RemoteForward 缺 russh 0.48 client `tcpip-forward` 申请 API, 标 blocked |
 | #7 隧道 rules 启动时**自动**重建 | 本轮只持久化 + 暴露 restore_pending_rules, 自动重建需 UI 端 |
 | #8 RDP resize 真实现 | 依赖 #1 ActiveStage |
 | #9 Windows ConPTY | 当前 `WindowsPty` 用 cmd.exe stdin/stdout 管道, 不是真 ConPTY, 整层重写 |
