@@ -62,12 +62,13 @@ pub struct RshellApp {
     /// 待显示的主机密钥信任对话框 (None = 不显示)
     pending_host_key_prompt: Option<HostKeyPromptData>,
 
-    /// 新建会话表单 (None = 不显示)
     new_session_form: Option<NewSessionFormData>,
-
-    /// 临时存储: 新建会话表单字段 (用 RefCell 让 on_click 闭包可写)
-    /// 实际更优: view 自身维护 form state; 这里简化版
     new_session_form_state: std::rc::Rc<std::cell::Cell<Option<NewSessionFormData>>>,
+    edit_session_form: Option<EditSessionFormData>,
+    generate_key_form: Option<GenerateKeyFormData>,
+    import_key_form: Option<ImportKeyFormData>,
+    quick_command_form: Option<QuickCommandFormData>,
+    tunnel_form: Option<TunnelFormData>,
 }
 
 /// 新建会话表单字段
@@ -79,6 +80,21 @@ struct NewSessionFormData {
     username: String,
     password: String,
 }
+
+#[derive(Clone)]
+struct EditSessionFormData { session_id: uuid::Uuid, name: String, host: String, port: String, username: String }
+
+#[derive(Clone)]
+struct GenerateKeyFormData { name: String, key_type: String, has_passphrase: bool }
+
+#[derive(Clone, Default)]
+struct ImportKeyFormData { path: String, passphrase: String }
+
+#[derive(Clone)]
+struct QuickCommandFormData { name: String, command: String, scope: String }
+
+#[derive(Clone)]
+struct TunnelFormData { name: String, bind_address: String, bind_port: String, remote_host: String, remote_port: String }
 
 /// 待显示的主机密钥信任对话框数据
 #[derive(Clone)]
@@ -153,6 +169,11 @@ impl RshellApp {
             pending_host_key_prompt: None,
             new_session_form: None,
             new_session_form_state: std::rc::Rc::new(std::cell::Cell::new(None)),
+            edit_session_form: None,
+            generate_key_form: None,
+            import_key_form: None,
+            quick_command_form: None,
+            tunnel_form: None,
         };
         // 启动时拉所有列表 (后端立即 publish XSnapshot 事件)
         app.refresh_all_lists();
@@ -599,10 +620,212 @@ impl Render for RshellApp {
             )
             .children(self.render_host_key_dialog_overlay(cx))
             .children(self.render_new_session_form_overlay(cx))
+            .children(self.render_edit_session_form_overlay(cx))
+            .children(self.render_generate_key_form_overlay(cx))
+            .children(self.render_import_key_form_overlay(cx))
+            .children(self.render_quick_command_form_overlay(cx))
+            .children(self.render_tunnel_form_overlay(cx))
     }
 }
 
 impl RshellApp {
+    pub fn open_edit_session_dialog(&mut self, session_id: uuid::Uuid, config: rshell_api::types::SessionConfig) {
+        let username = match &config.auth_method {
+            rshell_api::types::AuthMethod::Password { username, .. } => username.clone(),
+            rshell_api::types::AuthMethod::PublicKey { username, .. } => username.clone(),
+            rshell_api::types::AuthMethod::KeyboardInteractive { username, .. } => username.clone(),
+        };
+        self.edit_session_form = Some(EditSessionFormData {
+            session_id, name: config.name, host: config.host, port: config.port.to_string(), username,
+        });
+    }
+    fn render_edit_session_form_overlay(&mut self, cx: &mut gpui::Context<Self>) -> Vec<gpui::AnyElement> {
+        let Some(f) = self.edit_session_form.clone() else { return vec![]; };
+        self.render_simple_modal("编辑会话",
+            vec![("名称", f.name.clone(), "es-name"), ("主机", f.host.clone(), "es-host"),
+                  ("端口", f.port.clone(), "es-port"), ("用户名", f.username.clone(), "es-user")],
+            cx, |this, cx| {
+                let f = this.edit_session_form.clone().unwrap();
+                let port = f.port.parse::<u16>().unwrap_or(22);
+                let config = rshell_api::types::SessionConfig {
+                    id: f.session_id, name: f.name, folder_id: None,
+                    host: f.host, port, protocol: rshell_api::types::Protocol::SSH,
+                    auth_method: rshell_api::types::AuthMethod::Password { username: f.username, password: String::new() },
+                };
+                if let Some(b) = cx.try_global::<crate::bridge::AppBridge>() {
+                    b.send_command(rshell_api::AppCommand::UpdateSession { id: f.session_id, config });
+                }
+                this.edit_session_form = None;
+            })
+    }
+    pub fn open_generate_key_dialog(&mut self) {
+        self.generate_key_form = Some(GenerateKeyFormData {
+            name: "default".to_string(), key_type: "ED25519".to_string(), has_passphrase: false,
+        });
+    }
+    fn render_generate_key_form_overlay(&mut self, cx: &mut gpui::Context<Self>) -> Vec<gpui::AnyElement> {
+        let Some(f) = self.generate_key_form.clone() else { return vec![]; };
+        self.render_simple_modal("生成 SSH 密钥",
+            vec![("名称", f.name.clone(), "gk-name"), ("类型", f.key_type.clone(), "gk-type"),
+                  ("密码", if f.has_passphrase { "是".to_string() } else { "否".to_string() }, "gk-pass")],
+            cx, |this, cx| {
+                let f = this.generate_key_form.clone().unwrap();
+                let key_type = match f.key_type.as_str() {
+                    "RSA2048" => rshell_api::types::SshKeyType::RSA2048,
+                    "RSA4096" => rshell_api::types::SshKeyType::RSA4096,
+                    _ => rshell_api::types::SshKeyType::ED25519,
+                };
+                if let Some(b) = cx.try_global::<crate::bridge::AppBridge>() {
+                    b.send_command(rshell_api::AppCommand::GenerateSshKey {
+                        name: f.name, key_type,
+                        passphrase: if f.has_passphrase { Some(String::new()) } else { None },
+                    });
+                }
+                this.generate_key_form = None;
+            })
+    }
+    pub fn open_import_key_dialog(&mut self) {
+        self.import_key_form = Some(ImportKeyFormData::default());
+    }
+    fn render_import_key_form_overlay(&mut self, cx: &mut gpui::Context<Self>) -> Vec<gpui::AnyElement> {
+        let Some(f) = self.import_key_form.clone() else { return vec![]; };
+        self.render_simple_modal("导入私钥",
+            vec![("路径", f.path.clone(), "ik-path"), ("密码", f.passphrase.clone(), "ik-pass")],
+            cx, |this, cx| {
+                let f = this.import_key_form.clone().unwrap();
+                if let Some(b) = cx.try_global::<crate::bridge::AppBridge>() {
+                    b.send_command(rshell_api::AppCommand::ImportPrivateKey {
+                        path: std::path::PathBuf::from(f.path),
+                        passphrase: if f.passphrase.is_empty() { None } else { Some(f.passphrase) },
+                    });
+                }
+                this.import_key_form = None;
+            })
+    }
+    pub fn open_quick_command_dialog(&mut self) {
+        self.quick_command_form = Some(QuickCommandFormData {
+            name: "新命令".to_string(), command: "ls -la".to_string(), scope: "current".to_string(),
+        });
+    }
+    fn render_quick_command_form_overlay(&mut self, cx: &mut gpui::Context<Self>) -> Vec<gpui::AnyElement> {
+        let Some(f) = self.quick_command_form.clone() else { return vec![]; };
+        self.render_simple_modal("新建快速命令",
+            vec![("名称", f.name.clone(), "qc-name"), ("命令", f.command.clone(), "qc-cmd"),
+                  ("作用范围", f.scope.clone(), "qc-scope")],
+            cx, |this, cx| {
+                let f = this.quick_command_form.clone().unwrap();
+                let scope = match f.scope.as_str() {
+                    "all" => rshell_api::types::QuickCommandScope::AllSessions,
+                    _ => rshell_api::types::QuickCommandScope::CurrentSession,
+                };
+                let cmd = rshell_api::types::QuickCommand {
+                    id: uuid::Uuid::new_v4(), name: f.name, command: f.command, scope,
+                    send_enter: true, description: String::new(), group: None, hotkey: None,
+                };
+                if let Some(b) = cx.try_global::<crate::bridge::AppBridge>() {
+                    b.send_command(rshell_api::AppCommand::CreateQuickCommand { command: cmd });
+                }
+                this.quick_command_form = None;
+            })
+    }
+    pub fn open_tunnel_dialog(&mut self, _session_id: uuid::Uuid) {
+        self.tunnel_form = Some(TunnelFormData {
+            name: "本地转发".to_string(),
+            bind_address: "127.0.0.1".to_string(), bind_port: "8080".to_string(),
+            remote_host: "localhost".to_string(), remote_port: "80".to_string(),
+        });
+    }
+    fn render_tunnel_form_overlay(&mut self, cx: &mut gpui::Context<Self>) -> Vec<gpui::AnyElement> {
+        let Some(f) = self.tunnel_form.clone() else { return vec![]; };
+        self.render_simple_modal("新建隧道 (LocalForward)",
+            vec![("名称", f.name.clone(), "tf-name"), ("绑定地址", f.bind_address.clone(), "tf-bind"),
+                  ("绑定端口", f.bind_port.clone(), "tf-bind-port"), ("远程主机", f.remote_host.clone(), "tf-remote"),
+                  ("远程端口", f.remote_port.clone(), "tf-remote-port")],
+            cx, |this, cx| {
+                let f = this.tunnel_form.clone().unwrap();
+                let session_id = this.active_session_id;
+                if session_id.is_nil() { return; }
+                let bind_port: u16 = f.bind_port.parse().unwrap_or(0);
+                let remote_port: u16 = f.remote_port.parse().unwrap_or(0);
+                let rule = rshell_api::types::PortForwardRule {
+                    bind_address: f.bind_address, bind_port, remote_host: f.remote_host,
+                    remote_port, direction: rshell_api::types::ForwardDirection::Local,
+                };
+                if let Some(b) = cx.try_global::<crate::bridge::AppBridge>() {
+                    b.send_command(rshell_api::AppCommand::CreateTunnel { session_id, rule });
+                }
+                this.tunnel_form = None;
+            })
+    }
+    /// 通用 modal overlay: title + N fields + 2 buttons (cancel/confirm)
+    fn render_simple_modal(
+        &mut self,
+        title: &'static str,
+        fields: Vec<(&'static str, String, &'static str)>,
+        cx: &mut gpui::Context<Self>,
+        on_confirm: impl Fn(&mut Self, &mut gpui::Context<Self>) + 'static,
+    ) -> Vec<gpui::AnyElement> {
+        let on_confirm_cell = std::rc::Rc::new(std::cell::RefCell::new(Some(on_confirm)));
+        let on_confirm_for_click = on_confirm_cell.clone();
+        let mut body = div()
+            .text_color(rgb(0xcdd6f4)).text_lg().font_weight(gpui::FontWeight::BOLD)
+            .child(title);
+        for (label, value, id) in &fields {
+            body = body.child(Self::form_field(label, value.clone(), id));
+        }
+        let overlay = div()
+            .absolute().inset_0()
+            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.7))
+            .flex().items_center().justify_center()
+            .child(
+                div()
+                    .id(("modal-card", 0usize))
+                    .w(px(420.0)).bg(rgb(0x1e1e2e))
+                    .border_1().border_color(rgb(0x45475a))
+                    .rounded(px(8.0)).p(px(20.0))
+                    .flex().flex_col().gap(px(10.0))
+                    .child(body)
+                    .child(
+                        div()
+                            .mt(px(8.0))
+                            .flex().items_center().gap(px(8.0))
+                            .child(
+                                div()
+                                    .id(("modal-cancel", 0usize))
+                                    .flex_1().h(px(32.0)).bg(rgb(0x45475a))
+                                    .rounded(px(4.0)).text_color(rgb(0xffffff)).text_sm()
+                                    .flex().items_center().justify_center()
+                                    .cursor_pointer().hover(|s| s.bg(rgb(0x585b70)))
+                                    .on_click(cx.listener(|this, _, _window, _cx| {
+                                        this.new_session_form = None;
+                                        this.edit_session_form = None;
+                                        this.generate_key_form = None;
+                                        this.import_key_form = None;
+                                        this.quick_command_form = None;
+                                        this.tunnel_form = None;
+                                    }))
+                                    .child("取消"),
+                            )
+                            .child(
+                                div()
+                                    .id(("modal-confirm", 0usize))
+                                    .flex_1().h(px(32.0)).bg(rgb(0x10b981))
+                                    .rounded(px(4.0)).text_color(rgb(0xffffff)).text_sm()
+                                    .flex().items_center().justify_center()
+                                    .cursor_pointer().hover(|s| s.bg(rgb(0x059669)))
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        if let Some(f) = on_confirm_for_click.borrow_mut().take() {
+                                            f(this, cx);
+                                        }
+                                    }))
+                                    .child("确认"),
+                            ),
+                    ),
+            );
+        let _ = on_confirm_cell;
+        vec![gpui::IntoElement::into_any_element(overlay)]
+    }
+}impl RshellApp {
     /// 渲染会话列表
     fn render_session_list(&self) -> impl IntoElement {
         let mut list = div().mt_2().flex().flex_col().gap_1();
