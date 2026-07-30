@@ -149,4 +149,21 @@ pub enum AppEvent {
     PluginStateChanged { plugin_id: String, state: crate::types::PluginState },
     /// 插件加载失败
     PluginLoadFailed { plugin_id: String, error: String },
+
+    // ===== 快照事件 (响应 ListX 命令) =====
+    /// 会话列表快照 — 响应 ListSessions
+    SessionsSnapshot { sessions: Vec<crate::types::SessionConfig> },
+    /// 活动隧道列表快照 — 响应 ListTunnels
+    TunnelsSnapshot { tunnels: Vec<crate::types::ActiveTunnelInfo> },
+    /// SSH 密钥列表快照 — 响应 ListKeys
+    KeysSnapshot { keys: Vec<crate::types::SshKeyInfo> },
+    /// 插件列表快照 — 响应 ListPlugins
+    PluginsSnapshot { plugins: Vec<crate::types::PluginInfo> },
+    /// 主题/配色方案列表快照 — 响应 ListThemes
+    ThemesSnapshot {
+        current_theme: String,
+        current_scheme: String,
+        available_themes: Vec<String>,
+        available_schemes: Vec<String>,
+    },
 }

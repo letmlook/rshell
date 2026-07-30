@@ -393,6 +393,58 @@ impl CommandDispatcher {
                     state: rshell_api::types::PluginState::Disabled,
                 });
             }
+
+            // ===== List / snapshot 拉取 =====
+            // 这些分支只做"读 + publish"——不修改任何状态。供 UI 在 mount 时 /
+            // refresh 按钮时调。
+            AppCommand::ListSessions => {
+                let sessions = self.session_service.list_sessions().await?;
+                self.event_bus
+                    .publish(rshell_api::AppEvent::SessionsSnapshot { sessions });
+            }
+            AppCommand::ListTunnels => {
+                let tunnels = self.tunnel_manager.list_tunnels().await;
+                self.event_bus
+                    .publish(rshell_api::AppEvent::TunnelsSnapshot { tunnels });
+            }
+            AppCommand::ListKeys => {
+                let keys = self.key_manager.list_keys().await;
+                self.event_bus
+                    .publish(rshell_api::AppEvent::KeysSnapshot { keys });
+            }
+            AppCommand::ListPlugins => {
+                let plugins = self.plugin_loader.list_loaded().await;
+                self.event_bus
+                    .publish(rshell_api::AppEvent::PluginsSnapshot { plugins });
+            }
+            AppCommand::ListTriggers => {
+                let triggers = self.trigger_engine.list_triggers()?;
+                // 用 ActiveTunnelsChanged 类似的 fan-out 模式, 但 trigger 没有 snapshot 事件;
+                // 复用 QuickCommandListChanged / TriggerListChanged 这两个已有事件。
+                // 简化: 把 list 直接 publish 进 QuickCommandListChanged 一样的 channel 不可行
+                // (类型不匹配), 所以这里只 publish TriggerListChanged 触发 UI 重新查。
+                // 实际 list 结果通过单独事件分发。
+                let _ = triggers;
+                self.event_bus.publish(rshell_api::AppEvent::TriggerListChanged);
+            }
+            AppCommand::ListQuickCommands => {
+                let cmds = self.quick_command_service.list_commands()?;
+                let _ = cmds; // 复用 QuickCommandListChanged 通知 UI 重新拉
+                self.event_bus
+                    .publish(rshell_api::AppEvent::QuickCommandListChanged);
+            }
+            AppCommand::ListThemes => {
+                let current_theme = self.theme_manager.current_theme().await.name;
+                let current_scheme = self.theme_manager.current_color_scheme().await.name;
+                let available_themes = self.theme_manager.list_themes().await;
+                let available_schemes = self.theme_manager.list_color_schemes().await;
+                self.event_bus.publish(rshell_api::AppEvent::ThemesSnapshot {
+                    current_theme,
+                    current_scheme,
+                    available_themes,
+                    available_schemes,
+                });
+            }
         }
 
         Ok(())

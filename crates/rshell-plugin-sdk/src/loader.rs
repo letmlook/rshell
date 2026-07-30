@@ -178,6 +178,47 @@ impl PluginLoader {
     pub async fn get_plugin_state(&self, plugin_id: &str) -> Option<PluginState> {
         self.loaded.read().await.get(plugin_id).map(|p| p.state.clone())
     }
+
+    /// 列出已加载的插件(转换为 rshell_api::types::PluginInfo 列表)
+    pub async fn list_loaded(&self) -> Vec<rshell_api::types::PluginInfo> {
+        let guard = self.loaded.read().await;
+        let values: Vec<LoadedPlugin> = guard.values().cloned().collect();
+        drop(guard);
+        values
+            .into_iter()
+            .map(|p| {
+                let permissions: Vec<String> = p
+                    .manifest
+                    .permissions
+                    .iter()
+                    .map(|perm| format!("{:?}", perm))
+                    .collect();
+                let extensions: Vec<String> = p
+                    .manifest
+                    .extensions
+                    .iter()
+                    .map(|ext| format!("{:?}", ext))
+                    .collect();
+                let state = match p.state {
+                    PluginState::Loaded => rshell_api::types::PluginState::Loaded,
+                    PluginState::Active => rshell_api::types::PluginState::Active,
+                    PluginState::Disabled => rshell_api::types::PluginState::Disabled,
+                    _ => rshell_api::types::PluginState::Error,
+                };
+                rshell_api::types::PluginInfo {
+                    id: p.manifest.name.clone(),
+                    name: p.manifest.name.clone(),
+                    version: p.manifest.version.clone(),
+                    author: p.manifest.author.clone(),
+                    description: p.manifest.description.clone(),
+                    plugin_type: rshell_api::types::PluginType::Builtin,
+                    state,
+                    extensions,
+                    permissions,
+                }
+            })
+            .collect()
+    }
 }
 
 impl Clone for LoadedPlugin {

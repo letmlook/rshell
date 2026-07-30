@@ -165,4 +165,22 @@ pub enum AppCommand {
     EnablePlugin { plugin_id: String },
     /// 禁用插件
     DisablePlugin { plugin_id: String },
+
+    // ===== List / snapshot 拉取 =====
+    // 这些命令让 UI 主动拉数据, 触发后端 publish 对应 XSnapshot 事件。
+    // 解决 view.update_*() 从未被调用的问题——UI 在 mount 时 + 每次 refresh button 时调用。
+    /// 拉取所有会话列表
+    ListSessions,
+    /// 拉取所有活动隧道列表
+    ListTunnels,
+    /// 拉取所有 SSH 密钥列表
+    ListKeys,
+    /// 拉取已加载插件列表
+    ListPlugins,
+    /// 拉取所有触发器
+    ListTriggers,
+    /// 拉取所有快速命令
+    ListQuickCommands,
+    /// 拉取当前主题和配色方案 (含可用列表)
+    ListThemes,
 }
