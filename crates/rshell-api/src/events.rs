@@ -24,6 +24,12 @@ pub enum AppEvent {
     TerminalOutput { session_id: Uuid, data: Vec<u8> },
     /// 终端标题改变
     TerminalTitleChanged { session_id: Uuid, title: String },
+    /// 终端缓冲区更新（解析 VT 后的完整快照，前端可直接渲染）
+    ///
+    /// 后端在收到 `TerminalOutput` 后用 `alacritty_terminal` 解析 VT 序列，
+    /// 生成 `TerminalBufferSnapshot` 通过本事件推回前端。事件频率受
+    /// `TerminalService` 节流（当前每 chunk 一次；生产环境应做 60Hz 节流）。
+    TerminalBufferUpdated { session_id: Uuid, snapshot: crate::types::TerminalBufferSnapshot },
 
     // ===== 会话数据变化 =====
     /// 会话列表改变（前端需重新拉取）

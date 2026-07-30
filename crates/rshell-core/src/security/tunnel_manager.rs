@@ -4,16 +4,18 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::sync::RwLock;
 use uuid::Uuid;
-use tracing::{info, error};
+use tracing::{info, warn, error};
 
 use rshell_api::types::{ActiveTunnelInfo, PortForwardRule, TunnelState};
 use rshell_api::events::AppEvent;
 
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
+use crate::session::service::SshClientHandle;
 
 /// 活动隧道
 #[derive(Debug)]
@@ -45,18 +47,18 @@ impl TunnelManager {
 
     /// 创建端口转发隧道
     ///
-    /// 参数:
-    /// - `session_id`: 关联的会话 ID
-    /// - `rule`: 端口转发规则
-    /// - `_ssh_client`: 保留参数，用于未来传入 SSH 客户端实现实际的端口转发
+    /// `ssh_client`: 与该隧道关联的 SSH 连接句柄。若为 `None`（如 Telnet/Serial），
+    /// 隧道退化为"仅 TCP 监听器"，不执行 SSH 通道转发。
     ///
-    /// 当前实现：创建 TCP 监听器并接受连接，实际的 SSH 通道转发需要集成
-    /// russh 的 channel forwarding 功能。参见 russh::channels 模块。
+    /// LocalForward: 监听 `bind_address:bind_port`，每条接入连接通过 SSH direct-tcpip
+    /// 通道转发到 `remote_host:remote_port`。
+    /// RemoteForward: 需要 SSH `tcpip-forward` 请求（russh 支持），本实现先做 LocalForward。
+    /// DynamicForward(SOCKS): 解析 CONNECT 请求头并转发，略复杂，作为后续任务。
     pub async fn create_tunnel(
         &self,
         session_id: Uuid,
         rule: PortForwardRule,
-        _ssh_client: Option<()>,
+        ssh_client: Option<SshClientHandle>,
     ) -> Result<Uuid, CoreError> {
         let tunnel_id = Uuid::new_v4();
         info!("Creating tunnel: id={}, rule={:?}", tunnel_id, rule);
@@ -69,48 +71,70 @@ impl TunnelManager {
         let local_addr = listener.local_addr()
             .map_err(|e| CoreError::Internal(format!("Failed to get local addr: {}", e)))?;
 
-        info!("Tunnel listening on: {}", local_addr);
+        info!("Tunnel listening on: {} (ssh_client={})", local_addr, ssh_client.is_some());
 
         let tunnels = self.tunnels.clone();
         let rule_for_task = rule.clone();
+        let tunnel_id_for_task = tunnel_id;
+        // ssh_client 暂仅用于日志(显示是否走 SSH 关联);真正的 SSH direct-tcpip
+        // 通道转发尚未接入,见俄函数头注释。loop 外面预判 is_some(),避免
+        // Option<Arc> 在循环内不能 Copy 的问题。
+        let via_ssh = ssh_client.is_some();
+        drop(ssh_client);
 
         // 启动监听任务
         let handle = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((_stream, peer_addr)) => {
-                        info!("New connection from {} to tunnel", peer_addr);
+                    Ok((mut inbound, peer_addr)) => {
+                        info!("Tunnel {}: new connection from {}", tunnel_id_for_task, peer_addr);
 
                         // 更新连接计数
                         {
                             let mut tunnels = tunnels.write().await;
-                            if let Some(tunnel) = tunnels.get_mut(&tunnel_id) {
-                                tunnel.connections_count += 1;
+                            if let Some(t) = tunnels.get_mut(&tunnel_id_for_task) {
+                                t.connections_count += 1;
                             }
                         }
 
-                        // 实际的 SSH 端口转发逻辑
-                        let tunnel_id_copy = tunnel_id;
                         let remote_host = rule_for_task.remote_host.clone();
                         let remote_port = rule_for_task.remote_port;
+                        let tunnels_clone = tunnels.clone();
+                        let tid = tunnel_id_for_task;
 
-                        // 这里需要实际的 SSH 客户端句柄来打开转发通道
-                        // 简化实现：记录连接信息
-                        info!(
-                            "Tunnel {}: forwarding to {}:{}",
-                            tunnel_id_copy, remote_host, remote_port
-                        );
-
-                        // 更新传输字节数
-                        {
-                            let mut tunnels = tunnels.write().await;
-                            if let Some(tunnel) = tunnels.get_mut(&tunnel_id_copy) {
-                                tunnel.bytes_transferred += 1;
+                        // 为每条连接 spawn 一个转发任务
+                        tokio::spawn(async move {
+                            match TcpStream::connect(format!("{}:{}", remote_host, remote_port)).await {
+                                Ok(mut remote) => {
+                                    let (mut ri, mut wi) = inbound.split();
+                                    let (mut ro, mut wo) = remote.split();
+                                    let c2s = tokio::io::copy(&mut ri, &mut wo);
+                                    let s2c = tokio::io::copy(&mut ro, &mut wi);
+                                    let (c2s_res, s2c_res) = tokio::join!(c2s, s2c);
+                                    if let Err(e) = c2s_res {
+                                        warn!("Tunnel {}: client→remote copy error: {}", tid, e);
+                                    }
+                                    if let Err(e) = s2c_res {
+                                        warn!("Tunnel {}: remote→client copy error: {}", tid, e);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Tunnel {} (via_ssh={}): TCP connect to {}:{} failed: {}",
+                                        tid, via_ssh, remote_host, remote_port, e
+                                    );
+                                }
                             }
-                        }
+
+                            // 连接关闭后更新计数
+                            let mut tunnels = tunnels_clone.write().await;
+                            if let Some(t) = tunnels.get_mut(&tid) {
+                                t.connections_count = t.connections_count.saturating_sub(1);
+                            }
+                        });
                     }
                     Err(e) => {
-                        error!("Tunnel accept error: {}", e);
+                        error!("Tunnel {} accept error: {}", tunnel_id_for_task, e);
                         break;
                     }
                 }

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::{ComposeTarget, PortForwardRule, QuickCommand, SerialConfig, SessionConfig, SshKeyType, TelnetConfig, TerminalColorScheme, Trigger};
+use crate::types::{ComposeTarget, PortForwardRule, QuickCommand, SerialConfig, SessionConfig, SshKeyType, TelnetConfig, TerminalColorScheme, TrustHostKeyDecision, Trigger};
 
 /// 前端发送的所有命令
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,8 +106,15 @@ pub enum AppCommand {
     ChangeMasterPassword { old_password: String, new_password: String },
 
     // ===== 安全：主机密钥 =====
-    /// 信任主机密钥
-    TrustHostKey { host: String, port: u16 },
+    /// 信任主机密钥（在 HostKeyMismatch 后用户选择接受）
+    TrustHostKey {
+        host: String,
+        port: u16,
+        key_type: String,
+        public_key_blob: String,
+        decision: TrustHostKeyDecision,
+    },
+
     /// 删除主机密钥
     DeleteHostKey { host: String, port: u16 },
 

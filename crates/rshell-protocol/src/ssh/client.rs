@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use rshell_api::types::{AuthMethod, SessionConfig};
 use ssh_key::HashAlg;
-use tokio::sync::mpsc;
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::{Connection, ProtocolError};
@@ -25,6 +26,15 @@ pub struct SshClient {
     data_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
+/// 主机密钥决策（从 UI 传回 SSH 层）
+#[derive(Debug, Clone)]
+pub struct HostKeyDecision {
+    pub fingerprint: String,
+    pub key_blob: String,
+    pub accept: bool,
+    pub permanent: bool, // true = 写入 known_hosts
+}
+
 /// SSH Handler 实现
 ///
 /// 负责接收服务端数据并通过通道转发给上层；同时验证服务器主机密钥。
@@ -36,6 +46,8 @@ pub(crate) struct SshHandler {
     port: u16,
     /// 已知的 known_hosts 文件路径（依次尝试：~/.ssh/known_hosts、用户配置）
     known_hosts_paths: Vec<PathBuf>,
+    /// 主机密钥决策 channel（未知 key 时发送到此，等待 UI 决策）
+    host_key_decision_rx: Option<oneshot::Receiver<HostKeyDecision>>,
 }
 
 impl SshHandler {
@@ -177,6 +189,7 @@ impl russh::client::Handler for SshHandler {
         server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
         let fp = server_public_key.fingerprint(HashAlg::Sha256).to_string();
+
         debug!(
             host = %self.host,
             port = self.port,
@@ -185,23 +198,75 @@ impl russh::client::Handler for SshHandler {
         );
 
         if self.verify_known_hosts(server_public_key) {
-            Ok(true)
-        } else {
-            // 未在 known_hosts 中找到匹配条目。MVP 策略：拒绝连接
-            // （生产环境应当发出 HostKeyMismatch 事件让用户决定是否信任）。
-            warn!(
-                host = %self.host,
-                port = self.port,
-                fingerprint = %fp,
-                "Host key not found in known_hosts — rejecting connection"
-            );
-            Err(anyhow::anyhow!(
-                "Host key for {}:{} not found in known_hosts (fingerprint {})",
-                self.host,
-                self.port,
-                fp
-            ))
+            return Ok(true);
         }
+
+        // ===== 未在 known_hosts 中找到匹配条目 → 等待 UI 决策 =====
+        // `check_server_key` 是同步 trait 方法，但 tokio runtime 已在底层线程上运行，
+        // 用 Handle::current().block_on 把 oneshot::recv 丢进 runtime。
+        if let Some(rx) = self.host_key_decision_rx.take() {
+            let host = self.host.clone();
+            let port = self.port;
+            let fp_clone = fp.clone();
+
+            // 在后台线程的 runtime 上 await。block_on 在已有多线程 runtime 时是 OK 的，
+            // 但更精确的做法是传入 Arc<RuntimeHandle>；当前 single-threaded runtime
+            // 用 Handle::current().block_on 是安全的。
+            let user_decided = Handle::current().block_on(rx);
+
+            match user_decided {
+                Ok(decision) => {
+                    if decision.accept {
+                        // TrustOnce 或 TrustPermanent 都被接受，russh 继续握手。
+                        // TrustPermanent 的写入由调用方（SessionService::connect）处理。
+                        info!(
+                            host = %host,
+                            port = port,
+                            fingerprint = %fp_clone,
+                            permanent = decision.permanent,
+                            "User accepted unknown host key"
+                        );
+                        return Ok(true);
+                    } else {
+                        warn!(
+                            host = %host,
+                            port = port,
+                            fingerprint = %fp_clone,
+                            "User rejected host key"
+                        );
+                        return Err(anyhow::anyhow!("User rejected host key for {}:{}", host, port));
+                    }
+                }
+                Err(_) => {
+                    // UI 端 channel 关闭（会话取消），拒绝连接
+                    warn!(
+                        host = %self.host,
+                        port = self.port,
+                        fingerprint = %fp,
+                        "Host key decision channel closed — rejecting"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Host key decision channel closed for {}:{}",
+                        self.host,
+                        self.port
+                    ));
+                }
+            }
+        }
+
+        // 没有 decision channel，直接拒绝（保守策略）
+        warn!(
+            host = %self.host,
+            port = self.port,
+            fingerprint = %fp,
+            "Host key not found in known_hosts — rejecting (no decision channel)"
+        );
+        Err(anyhow::anyhow!(
+            "Host key for {}:{} not found in known_hosts (fingerprint {})",
+            self.host,
+            self.port,
+            fp
+        ))
     }
 
     async fn data(
@@ -246,7 +311,14 @@ impl SshClient {
     }
 
     /// 连接到 SSH 服务器
-    pub async fn connect_ssh(&mut self) -> Result<(), ProtocolError> {
+    ///
+    /// 返回值包含:
+    /// - `decision_tx`: 发给此端以注入用户对未知 host key 的决策。
+    ///   若未发送(如用户取消),`SshHandler::check_server_key` 中的 recv 会报错,
+    ///   导致 SSH 握手失败并断开连接。
+    ///
+    /// 连接成功后,`data_rx` 由 `SshClient` 内部持有,通过 `recv_data()` 访问。
+    pub async fn connect_ssh(&mut self) -> Result<oneshot::Sender<HostKeyDecision>, ProtocolError> {
         info!(
             "Connecting to SSH server {}:{}",
             self.config.host, self.config.port
@@ -254,6 +326,9 @@ impl SshClient {
 
         // 创建数据通道
         let (data_tx, data_rx) = mpsc::unbounded_channel();
+
+        // 创建主机密钥决策 channel
+        let (decision_tx, decision_rx) = oneshot::channel();
 
         // 创建 SSH 配置
         let ssh_config = Arc::new(russh::client::Config {
@@ -275,12 +350,13 @@ impl SshClient {
         // 最后尝试当前目录（开发环境）
         known_hosts_paths.push(PathBuf::from("known_hosts"));
 
-        // 创建 Handler
+        // 创建 Handler（带 decision_rx）
         let handler = SshHandler {
             data_tx: data_tx.clone(),
             host: self.config.host.clone(),
             port: self.config.port,
             known_hosts_paths,
+            host_key_decision_rx: Some(decision_rx),
         };
 
         // 连接到服务器
@@ -305,7 +381,7 @@ impl SshClient {
 
         info!("SSH session channel opened");
 
-        Ok(())
+        Ok(decision_tx)
     }
 
     /// 执行 SSH 认证
@@ -526,7 +602,9 @@ impl SshClient {
 #[async_trait::async_trait]
 impl Connection for SshClient {
     async fn connect(&mut self) -> Result<(), ProtocolError> {
-        self.connect_ssh().await
+        // 忽略 decision_tx —— 调用方应直接用 SshClient::connect_ssh() 获取它
+        let _ = self.connect_ssh().await?;
+        Ok(())
     }
 
     async fn disconnect(&mut self) -> Result<(), ProtocolError> {

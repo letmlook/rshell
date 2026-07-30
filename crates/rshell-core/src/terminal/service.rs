@@ -277,12 +277,21 @@ impl TerminalService {
     }
 
     /// 发送输入到终端（用户输入，发送到远程主机）
+    ///
+    /// **已弃用**:用户输入应直接通过 `SessionService::send_data(session_id, data)`
+    /// 发往远端,不应再回流到 `TerminalService` 重新发布 `TerminalOutput` 事件 —
+    /// 那会构成"输入 → 假输出 → 再次解析"的回路,而且前端 View 已自行渲染按键回显。
+    ///
+    /// 保留该方法仅为 API 兼容性;调用方会收到 deprecation warning。
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use SessionService::send_data directly; this method echoes input as TerminalOutput which forms a feedback loop"
+    )]
     #[instrument(skip(self, data))]
     pub fn send_input(&self, terminal_id: Uuid, data: &[u8]) -> Result<(), CoreError> {
-        debug!(terminal_id = %terminal_id, bytes = data.len(), "Sending terminal input");
+        debug!(terminal_id = %terminal_id, bytes = data.len(), "Sending terminal input (deprecated path)");
 
-        // 用户输入通过 SessionService 发送到远程主机
-        // 这里只是发布事件通知（如果需要）
+        // 保留旧的实现以避免 hard break，但不再被 CommandDispatcher 调用
         self.event_bus.publish(rshell_api::AppEvent::TerminalOutput {
             session_id: terminal_id,
             data: data.to_vec(),

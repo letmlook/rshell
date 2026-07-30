@@ -400,6 +400,17 @@ pub enum TrustLevel {
     Mismatch,
 }
 
+/// 用户对未知主机密钥的决策
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TrustHostKeyDecision {
+    /// 信任一次（仅本次会话有效，不写入 known_hosts）
+    TrustOnce,
+    /// 永久信任（写入 known_hosts）
+    TrustPermanent,
+    /// 拒绝
+    Reject,
+}
+
 // ===== 主题/配色方案 =====
 
 /// 应用主题

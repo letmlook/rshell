@@ -271,3 +271,122 @@ impl ThemeManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rshell_api::types::ThemeMode;
+    use std::sync::Arc;
+
+    fn make_bus() -> Arc<EventBus> {
+        Arc::new(EventBus::new())
+    }
+
+    #[tokio::test]
+    async fn test_theme_switch() {
+        let bus = make_bus();
+        let mgr = ThemeManager::new(bus.clone());
+
+        // 默认是 Dark
+        assert_eq!(mgr.current_theme().await.name, "Dark");
+        assert_eq!(mgr.current_theme().await.mode, ThemeMode::Dark);
+
+        // 切换到 Light
+        mgr.set_theme("Light").await.unwrap();
+        assert_eq!(mgr.current_theme().await.name, "Light");
+        assert_eq!(mgr.current_theme().await.mode, ThemeMode::Light);
+
+        // 切回 Dark
+        mgr.set_theme("Dark").await.unwrap();
+        assert_eq!(mgr.current_theme().await.name, "Dark");
+    }
+
+    #[tokio::test]
+    async fn test_theme_switch_invalid_name() {
+        let bus = make_bus();
+        let mgr = ThemeManager::new(bus);
+
+        let result = mgr.set_theme("nonexistent").await;
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_color_scheme_switch() {
+        let bus = make_bus();
+        let mgr = ThemeManager::new(bus.clone());
+
+        // 默认是 Default Dark
+        assert_eq!(mgr.current_color_scheme().await.name, "Default Dark");
+
+        // 切换到 Monokai
+        mgr.set_color_scheme("Monokai").await.unwrap();
+        assert_eq!(mgr.current_color_scheme().await.name, "Monokai");
+
+        // 切换到 Dracula
+        mgr.set_color_scheme("Dracula").await.unwrap();
+        assert_eq!(mgr.current_color_scheme().await.name, "Dracula");
+    }
+
+    #[tokio::test]
+    async fn test_color_scheme_switch_invalid_name() {
+        let bus = make_bus();
+        let mgr = ThemeManager::new(bus);
+
+        let result = mgr.set_color_scheme("nonexistent").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_themes() {
+        let bus = make_bus();
+        let mgr = ThemeManager::new(bus);
+
+        let themes = mgr.list_themes().await;
+        assert!(themes.contains(&"Dark".to_string()));
+        assert!(themes.contains(&"Light".to_string()));
+        assert_eq!(themes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_color_schemes() {
+        let bus = make_bus();
+        let mgr = ThemeManager::new(bus);
+
+        let schemes = mgr.list_color_schemes().await;
+        assert!(schemes.contains(&"Monokai".to_string()));
+        assert!(schemes.contains(&"Dracula".to_string()));
+        assert!(schemes.contains(&"Nord".to_string()));
+        assert!(schemes.contains(&"Solarized Dark".to_string()));
+        assert!(schemes.contains(&"Default Dark".to_string()));
+        assert_eq!(schemes.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_import_color_scheme() {
+        let bus = make_bus();
+        let mgr = ThemeManager::new(bus.clone());
+
+        let custom = TerminalColorScheme {
+            name: "MyScheme".to_string(),
+            ansi_colors: [0u32; 16],
+            default_fg: 0xffffff,
+            default_bg: 0x000000,
+            cursor_fg: 0xffffff,
+            cursor_bg: 0x00ff00,
+            selection_fg: 0xffffff,
+            selection_bg: 0x0000ff,
+        };
+
+        mgr.import_color_scheme(custom.clone()).await.unwrap();
+
+        // 现在列表里应该多一个
+        let schemes = mgr.list_color_schemes().await;
+        assert!(schemes.contains(&"MyScheme".to_string()));
+        assert_eq!(schemes.len(), 7);
+
+        // 可以切换到它
+        mgr.set_color_scheme("MyScheme").await.unwrap();
+        assert_eq!(mgr.current_color_scheme().await.name, "MyScheme");
+    }
+}
