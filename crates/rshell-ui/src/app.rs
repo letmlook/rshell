@@ -58,6 +58,20 @@ pub struct RshellApp {
 
     /// 会话列表（rshell_api::types::SessionInfo, 与 SessionView 共享, 状态在 handle_event 增量更新）
     sessions: Vec<rshell_api::types::SessionInfo>,
+
+    /// 待显示的主机密钥信任对话框 (None = 不显示)
+    pending_host_key_prompt: Option<HostKeyPromptData>,
+}
+
+/// 待显示的主机密钥信任对话框数据
+#[derive(Clone)]
+struct HostKeyPromptData {
+    decision_id: Uuid,
+    host: String,
+    port: u16,
+    key_type: String,
+    fingerprint: String,
+    public_key_blob: String,
 }
 
 /// 当前激活的中央面板
@@ -119,6 +133,7 @@ impl RshellApp {
             tunnel_view,
             plugin_view,
             sessions: Vec::new(),
+            pending_host_key_prompt: None,
         };
         // 启动时拉所有列表 (后端立即 publish XSnapshot 事件)
         app.refresh_all_lists();
@@ -245,6 +260,24 @@ impl RshellApp {
                 }
                 AppEvent::TransferFailed { task_id, error } => {
                     tracing::error!("Transfer failed: {} - {}", task_id, error);
+                }
+                AppEvent::HostKeyMismatch {
+                    decision_id,
+                    host,
+                    port,
+                    key_type,
+                    expected: _,
+                    received,
+                    public_key_blob,
+                } if !decision_id.is_nil() => {
+                    self.pending_host_key_prompt = Some(HostKeyPromptData {
+                        decision_id: *decision_id,
+                        host: host.clone(),
+                        port: *port,
+                        key_type: key_type.clone(),
+                        fingerprint: received.clone(),
+                        public_key_blob: public_key_blob.clone(),
+                    });
                 }
                 AppEvent::ClipboardCopy { text } => {
                     // 后端请求拷贝文本到系统剪贴板。
@@ -538,6 +571,7 @@ impl Render for RshellApp {
                     .border_color(rgb(0x3d3d4d))
                     .child(self.transfer_view.clone()),
             )
+            .children(self.render_host_key_dialog_overlay(cx))
     }
 }
 
@@ -630,5 +664,156 @@ impl RshellApp {
             PanelKind::Tunnels => div().size_full().child(self.tunnel_view.clone()).into_any(),
             PanelKind::Plugins => div().size_full().child(self.plugin_view.clone()).into_any(),
         }
+    }
+
+    /// 渲染主机密钥信任对话框 modal overlay (None 时返回空 Vec)
+    fn render_host_key_dialog_overlay(
+        &mut self,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let Some(p) = self.pending_host_key_prompt.clone() else {
+            return vec![];
+        };
+        let decision_id = p.decision_id;
+
+        let overlay = div()
+            .absolute()
+            .inset_0()
+            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.7))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .id(("hostkey-modal", 0usize))
+                    .w(px(540.0))
+                    .bg(rgb(0x1e1e2e))
+                    .border_1()
+                    .border_color(rgb(0x45475a))
+                    .rounded(px(8.0))
+                    .p(px(20.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .text_color(rgb(0xcdd6f4))
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("信任主机密钥"),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(0xbac2de))
+                            .text_sm()
+                            .child(format!("主机: {}:{}", p.host, p.port)),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(0xbac2de))
+                            .text_xs()
+                            .child(format!("类型: {}", p.key_type)),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(0xbac2de))
+                            .text_xs()
+                            .font_family("monospace")
+                            .child(format!("指纹: {}", p.fingerprint)),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(0x808080))
+                            .text_xs()
+                            .child("请校验 fingerprint 是否与服务器一致 (ssh-keygen -lf <key>)"),
+                    )
+                    .child(
+                        div()
+                            .mt(px(8.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(self.hostkey_btn("hostkey-trust-once", "信任一次", false, decision_id, cx))
+                            .child(self.hostkey_btn("hostkey-trust-perm", "永久信任", true, decision_id, cx))
+                            .child(self.hostkey_btn_red("hostkey-reject", "拒绝", false, decision_id, cx)),
+                    ),
+            );
+        vec![gpui::IntoElement::into_any_element(overlay)]
+    }
+
+    fn hostkey_btn(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        permanent: bool,
+        decision_id: uuid::Uuid,
+        cx: &mut gpui::Context<Self>,
+    ) -> gpui::AnyElement {
+        // permanent=true 表示"永久信任"(accept=true,permanent=true)
+        // permanent=false + accept 由 on_click 闭包决定 (信任一次 accept=true,perm=false; 拒绝 accept=false)
+        let accept = label != "拒绝";
+        gpui::IntoElement::into_any_element(
+            div()
+                .id((id, 0usize))
+                .flex_1()
+                .h(px(36.0))
+                .bg(rgb(0x3b82f6))
+                .rounded(px(4.0))
+                .text_color(rgb(0xffffff))
+                .text_sm()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x2563eb)))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if let Some(bridge) = cx.try_global::<crate::bridge::AppBridge>() {
+                        bridge.send_command(rshell_api::AppCommand::DecideHostKey {
+                            decision_id,
+                            accept,
+                            permanent,
+                        });
+                    }
+                    this.pending_host_key_prompt = None;
+                }))
+                .child(label),
+        )
+    }
+
+    fn hostkey_btn_red(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        permanent: bool,
+        decision_id: uuid::Uuid,
+        cx: &mut gpui::Context<Self>,
+    ) -> gpui::AnyElement {
+        let accept = label != "拒绝";
+        gpui::IntoElement::into_any_element(
+            div()
+                .id((id, 0usize))
+                .flex_1()
+                .h(px(36.0))
+                .bg(rgb(0xdc2626))
+                .rounded(px(4.0))
+                .text_color(rgb(0xffffff))
+                .text_sm()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0xb91c1c)))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if let Some(bridge) = cx.try_global::<crate::bridge::AppBridge>() {
+                        bridge.send_command(rshell_api::AppCommand::DecideHostKey {
+                            decision_id,
+                            accept,
+                            permanent,
+                        });
+                    }
+                    this.pending_host_key_prompt = None;
+                }))
+                .child(label),
+        )
     }
 }
