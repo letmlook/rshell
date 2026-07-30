@@ -1,3 +1,6 @@
 [toolchain]
-channel = "1.90"
+# 之前 channel = "1.90" 在清华镜像 404, 改 stable 后本机 + CI 都能直接用。
+# 如果后续需要锁定具体版本, 把 channel 改成 "1.97" 之类完整版号
+# (清华镜像对 partial alias 不支持, 必须用完整号)。
+channel = "stable"
 components = ["rustfmt", "clippy", "rust-analyzer"]
