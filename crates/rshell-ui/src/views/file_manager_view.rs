@@ -152,16 +152,22 @@ impl FileManagerView {
 }
 
 impl Render for FileManagerView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let local_path_str = self.local_path.to_string_lossy().to_string();
         let remote_path_str = self.remote_path.clone();
+        let session_id_local = self.session_id;
+        let session_id_remote = self.session_id;
+        // 闭包所需: clone selected_local/remote + files 列表
+        // removed local_files_clone: 直接 iter self.local_files
+        // removed remote_files_clone
+        // removed local_path_clone
+        // removed remote_path_clone
 
         div()
             .size_full()
             .bg(rgb(0x1e1e2e))
             .flex()
             .flex_col()
-            // 工具栏
             .child(
                 div()
                     .h(px(40.0))
@@ -172,22 +178,54 @@ impl Render for FileManagerView {
                     .gap(px(8.0))
                     .child(
                         div()
+                            .id(("file-upload-btn", 0usize))
                             .bg(rgb(0x3b82f6))
                             .px(px(12.0))
                             .py(px(6.0))
                             .rounded(px(4.0))
                             .text_color(rgb(0xffffff))
                             .text_sm()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x2563eb)))
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                let Some(sid) = session_id_local else { return };
+                                let Some(local) = this.get_selected_local_path() else { return };
+                                let remote = this.get_selected_remote_path().unwrap_or_default();
+                                if let Some(bridge) = cx.try_global::<crate::bridge::AppBridge>() {
+                                    bridge.send_command(rshell_api::AppCommand::EnqueueUpload {
+                                        local,
+                                        remote,
+                                        session_id: sid,
+                                    });
+                                }
+                            }))
                             .child("↑ 上传"),
                     )
                     .child(
                         div()
+                            .id(("file-download-btn", 0usize))
                             .bg(rgb(0x10b981))
                             .px(px(12.0))
                             .py(px(6.0))
                             .rounded(px(4.0))
                             .text_color(rgb(0xffffff))
                             .text_sm()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x059669)))
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                let Some(sid) = session_id_remote else { return };
+                                let Some(remote) = this.get_selected_remote_path() else { return };
+                                let local = this
+                                    .get_selected_local_path()
+                                    .unwrap_or_else(|| this.local_path.clone());
+                                if let Some(bridge) = cx.try_global::<crate::bridge::AppBridge>() {
+                                    bridge.send_command(rshell_api::AppCommand::EnqueueDownload {
+                                        remote,
+                                        local,
+                                        session_id: sid,
+                                    });
+                                }
+                            }))
                             .child("↓ 下载"),
                     ),
             )

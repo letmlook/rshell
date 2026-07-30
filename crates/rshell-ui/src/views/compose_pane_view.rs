@@ -110,27 +110,50 @@ impl Render for ComposePaneView {
                             .child("撰写窗格"),
                     )
                     .child(div().flex_1())
-                    // 目标选择
+                    // 目标选择 — 点击 cycle_target
                     .child(
                         div()
+                            .id(("compose-target-chip", 0usize))
                             .bg(rgb(0x313244))
                             .rounded(px(4.0))
                             .px(px(8.0))
                             .py(px(4.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(|this, _, _window, _cx| {
+                                this.cycle_target();
+                            }))
                             .child(
                                 div()
                                     .text_color(rgb(0x89b4fa))
                                     .text_xs()
-                                    .child(format!("目标: {}", target_desc)),
+                                    .child(format!("目标: {} (点切换)", target_desc)),
                             ),
                     )
                     // 发送按钮
                     .child(
                         div()
+                            .id(("compose-send-btn", 0usize))
                             .bg(rgb(0x3b82f6))
                             .rounded(px(4.0))
                             .px(px(12.0))
                             .py(px(4.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x2563eb)))
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                let content = this.content(cx);
+                                if content.trim().is_empty() {
+                                    return;
+                                }
+                                if let Some(bridge) = cx.try_global::<crate::bridge::AppBridge>() {
+                                    bridge.send_command(
+                                        rshell_api::AppCommand::SendComposeText {
+                                            content,
+                                            target: this.target.clone(),
+                                        },
+                                    );
+                                }
+                            }))
                             .child(
                                 div()
                                     .text_color(rgb(0xffffff))
