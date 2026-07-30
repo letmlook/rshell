@@ -102,6 +102,10 @@ pub enum AppEvent {
         session_id: Uuid,
         action_summary: String,
     },
+    /// 待重建隧道列表变化 (从磁盘恢复但未在本次进程启动)
+    PendingTunnelsSnapshot {
+        rules: Vec<(Uuid, crate::types::PortForwardRule)>,
+    },
     /// 脚本执行结果
     ScriptFinished {
         session_id: Uuid,

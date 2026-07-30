@@ -237,6 +237,17 @@ impl CommandDispatcher {
             AppCommand::CloseTunnel { tunnel_id } => {
                 self.tunnel_manager.close_tunnel(tunnel_id).await?;
             }
+            AppCommand::ListPendingTunnels => {
+                let pending = self.tunnel_manager.restore_pending_rules().await;
+                info!(count = pending.len(), "UI requested pending tunnels");
+                self.event_bus
+                    .publish(rshell_api::AppEvent::PendingTunnelsSnapshot { rules: pending });
+            }
+            AppCommand::RestoreTunnel { session_id, rule } => {
+                // UI 端确认启动一条 pending 隧道
+                let ssh_client = self.session_service.get_ssh_client(session_id).await.ok();
+                self.tunnel_manager.create_tunnel(session_id, rule, ssh_client).await?;
+            }
             AppCommand::SuspendTunnel { tunnel_id } => {
                 self.tunnel_manager.suspend_tunnel(tunnel_id).await?;
             }

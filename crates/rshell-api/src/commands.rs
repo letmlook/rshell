@@ -59,6 +59,11 @@ pub enum AppCommand {
     /// 关闭隧道
     CloseTunnel { tunnel_id: Uuid },
 
+    /// 列出待重建隧道 (从磁盘恢复, 本次进程未启动 listener)
+    ListPendingTunnels,
+    /// 把一条 pending 规则升级为活动隧道 (UI 端"启动"按钮)
+    RestoreTunnel { session_id: Uuid, rule: PortForwardRule },
+
     // ===== 快速命令 =====
     /// 执行快速命令
     ExecuteQuickCommand { command_id: Uuid, target_sessions: Vec<Uuid> },
