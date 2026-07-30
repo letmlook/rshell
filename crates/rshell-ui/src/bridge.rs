@@ -128,7 +128,7 @@ pub fn init_backend() -> (AppBridge, ()) {
                 let host_key_manager = Arc::new(HostKeyManager::new(known_hosts_path, event_bus_for_thread.clone()));
                 let theme_manager = Arc::new(ThemeManager::new(event_bus_for_thread.clone()));
 
-                let dispatcher = CommandDispatcher::new(
+                let dispatcher = CommandDispatcher::new(rshell_core::command_dispatcher::Services {
                     session_service,
                     terminal_service,
                     transfer_service,
@@ -138,9 +138,9 @@ pub fn init_backend() -> (AppBridge, ()) {
                     tunnel_manager,
                     host_key_manager,
                     theme_manager,
-                    event_bus_for_thread.clone(),
+                    event_bus: event_bus_for_thread.clone(),
                     host_key_registry,
-                );
+                });
 
                 // 初始化 dispatcher
                 dispatcher.initialize().await;

@@ -30,6 +30,28 @@ use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
+/// 外部注入的服务/注册表 bundle
+///
+/// 把 `CommandDispatcher::new` 之前散落的 11 个参数收到一个 struct 里,
+/// 减少新服务接入时的改动面,也方便测试时构造一个 mock Services。
+///
+/// 内部用的 4 个 (`quick_command_service` / `compose_service` /
+/// `script_engine` / `sync_input_service` / `plugin_loader`) 由 dispatcher
+/// 自行从 `event_bus` 创建,不需要外部注入。
+pub struct Services {
+    pub session_service: Arc<SessionService>,
+    pub terminal_service: Arc<TerminalService>,
+    pub transfer_service: Arc<TransferService>,
+    pub trigger_engine: Arc<TriggerEngine>,
+    pub key_manager: Arc<KeyManager>,
+    pub master_password: Arc<MasterPassword>,
+    pub tunnel_manager: Arc<TunnelManager>,
+    pub host_key_manager: Arc<HostKeyManager>,
+    pub theme_manager: Arc<ThemeManager>,
+    pub event_bus: Arc<EventBus>,
+    pub host_key_registry: Arc<crate::security::host_key_decision::HostKeyDecisionRegistry>,
+}
+
 /// 命令分发器
 pub struct CommandDispatcher {
     session_service: Arc<SessionService>,
@@ -57,20 +79,21 @@ impl CommandDispatcher {
     /// 接受一组"已在外部创建好"的服务/注册表。trigger_engine 必须在外部创建并共享,
     /// 因为 SessionService 后台 recv 循环也需要它做 trigger 匹配 ——
     /// 用同一个 Arc,确保用户通过 `CreateTrigger` 加进去的项对 recv 循环立即可见。
-    #[allow(clippy::too_many_arguments)] // 显式服务 bundle,留给 #25 后续重构
-    pub fn new(
-        session_service: Arc<SessionService>,
-        terminal_service: Arc<TerminalService>,
-        transfer_service: Arc<TransferService>,
-        trigger_engine: Arc<TriggerEngine>,
-        key_manager: Arc<KeyManager>,
-        master_password: Arc<MasterPassword>,
-        tunnel_manager: Arc<TunnelManager>,
-        host_key_manager: Arc<HostKeyManager>,
-        theme_manager: Arc<ThemeManager>,
-        event_bus: Arc<EventBus>,
-        host_key_registry: Arc<crate::security::host_key_decision::HostKeyDecisionRegistry>,
-    ) -> Self {
+    pub fn new(services: Services) -> Self {
+        let Services {
+            session_service,
+            terminal_service,
+            transfer_service,
+            trigger_engine,
+            key_manager,
+            master_password,
+            tunnel_manager,
+            host_key_manager,
+            theme_manager,
+            event_bus,
+            host_key_registry,
+        } = services;
+
         let quick_command_service = Arc::new(QuickCommandService::new(event_bus.clone()));
         let compose_service = Arc::new(ComposeService::new(event_bus.clone()));
         // rhai::Engine is !Send+!Sync by design; ScriptEngine is only ever touched
