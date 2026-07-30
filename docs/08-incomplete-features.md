@@ -223,3 +223,38 @@
 ## 进度跟踪
 
 每完成一项，update 此文件对应行 `state: done` + commit message 引用本文件 id。
+
+## 已完成 (本轮 commit 0.1.0+ 收尾)
+
+| id | 模块 | commit | 备注 |
+|----|------|--------|------|
+| #4 | telnet NAWS resize | `97df88f` | RFC 1073 字节级 + 测试 |
+| #5 | trigger engine 接入 recv | `97df88f` | 4 个 trigger action 派发 |
+| #9 | NAWS 协商 + DO 命令 | (同上) | telnet `connect` 时主动 DO |
+| #10 | trigger / quick_command / sync_input 单测 | `97df88f` | 0 → 20 测试 |
+| #11 | terminal buffer 60Hz 节流 | `97df88f` | ticker + dirty flag |
+| #12 | host key 决策端到端 | `81341af` | HostKeyDecisionSink trait + registry |
+| #14 | SSH direct-tcpip | `42e699a` | russh channel_open_direct_tcpip |
+| #15 | RDP 状态机测试 | `01b2859` | TLS/NLA/pump 仍需真 server |
+| #16 | tunnel 持久化 | `81ee342` | tunnels.toml + 2 测试 |
+| #17 | rhai host API | `d6681b0` | 5 个新 fn + 8 测试 |
+| #20 | WASM 字符串 marshalling | `2ec2941` | linear memory 写入/读出 |
+| #22 | SessionService 测试 | `a00bfb4` | 13 测试覆盖 CRUD + lock-leak |
+| #23 | Telnet/Serial 测试 | `62980f8` | 11 测试覆盖配置不变性 |
+| #25 | CommandDispatcher bundle | `9abc0e4` | Services struct 替代 11 参数 |
+| #26 | toolchain 修 | `e1e673d` | channel = stable (避开 1.90 alias 404) |
+| 17 | terminal_view 1 行清理 | `97df88f` | upper.is_ascii_uppercase() |
+
+## 留作 follow-up
+
+| id | 原因 |
+|----|------|
+| #1 RDP TLS/NLA/frame pump | 需要真 RDP server 验证 |
+| #3 RemoteForward + DynamicForward (SOCKS) | 本轮仅做 LocalForward 基础 |
+| #7 隧道 rules 启动时**自动**重建 | 本轮只持久化 + 暴露 restore_pending_rules, 自动重建需 UI 端 |
+| #8 RDP resize 真实现 | 依赖 #1 ActiveStage |
+| #9 Windows ConPTY | 当前 `WindowsPty` 用 cmd.exe stdin/stdout 管道, 不是真 ConPTY, 整层重写 |
+| #18/19 ConPTY 整层 + RDP 协议 | 关联大改, 独立大轮次 |
+| #24 ViewModel 单测 | 本机无 GPUI runtime (CLAUDE.md 已注明), 需要真 GPUI 环境 |
+| #27 view event routing 改 gpui subscribe | 同上 |
+| 18 | `proc-macro-error2 v2.0.1` future-incompat 上游 | 等上游 |
