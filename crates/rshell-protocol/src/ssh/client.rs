@@ -626,6 +626,30 @@ impl SshClient {
 
         Ok(channel)
     }
+
+    /// 打开一个 `direct-tcpip` 通道（RFC 4254 §7.2）
+    ///
+    /// 用于 SSH 隧道 / 端口转发：让服务器代为连接 `host:port`，
+    /// 之后把客户端 TCP 流和该 channel 做双向 copy 即可。
+    ///
+    /// 调用方负责：
+    /// 1. 拿到 channel 后调 `.make_reader()` / `.make_writer()` 拿 AsyncRead/AsyncWrite
+    /// 2. 用 `tokio::io::copy_bidirectional` 在 `TcpStream` 和 channel 之间搬运
+    /// 3. 关闭时调 `channel.eof()` + `channel.close()`
+    pub async fn open_direct_tcpip(
+        &self,
+        host: &str,
+        port: u32,
+    ) -> Result<russh::Channel<russh::client::Msg>, ProtocolError> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or(ProtocolError::ConnectionClosed)?;
+        handle
+            .channel_open_direct_tcpip(host, port, "127.0.0.1", 0)
+            .await
+            .map_err(|e| ProtocolError::ConnectionFailed(format!("direct-tcpip open failed: {}", e)))
+    }
 }
 
 #[async_trait::async_trait]

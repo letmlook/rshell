@@ -76,11 +76,12 @@ impl TunnelManager {
         let tunnels = self.tunnels.clone();
         let rule_for_task = rule.clone();
         let tunnel_id_for_task = tunnel_id;
-        // ssh_client 暂仅用于日志(显示是否走 SSH 关联);真正的 SSH direct-tcpip
-        // 通道转发尚未接入,见俄函数头注释。loop 外面预判 is_some(),避免
-        // Option<Arc> 在循环内不能 Copy 的问题。
-        let via_ssh = ssh_client.is_some();
-        drop(ssh_client);
+        // ssh_client 实际参与转发:
+        // - Some: 每条接入连接通过 SSH direct-tcpip 通道转发(russh::Channel<Msg>),
+        //   数据流走 server,不直连目标主机。
+        // - None: 直连目标主机(plain TCP 代理,用于 Telnet/Serial session 的隧道)。
+        // Arc<RwLock<...>> 跨 loop 迭代需要 clone;Option 不 Copy。
+        let ssh_client_ref = ssh_client;
 
         // 启动监听任务
         let handle = tokio::spawn(async move {
@@ -103,27 +104,71 @@ impl TunnelManager {
                         let tid = tunnel_id_for_task;
 
                         // 为每条连接 spawn 一个转发任务
+                        let ssh_client_for_task = ssh_client_ref.clone();
                         tokio::spawn(async move {
-                            match TcpStream::connect(format!("{}:{}", remote_host, remote_port)).await {
-                                Ok(mut remote) => {
-                                    let (mut ri, mut wi) = inbound.split();
-                                    let (mut ro, mut wo) = remote.split();
-                                    let c2s = tokio::io::copy(&mut ri, &mut wo);
-                                    let s2c = tokio::io::copy(&mut ro, &mut wi);
-                                    let (c2s_res, s2c_res) = tokio::join!(c2s, s2c);
-                                    if let Err(e) = c2s_res {
-                                        warn!("Tunnel {}: client→remote copy error: {}", tid, e);
-                                    }
-                                    if let Err(e) = s2c_res {
-                                        warn!("Tunnel {}: remote→client copy error: {}", tid, e);
+                            let res = match ssh_client_for_task {
+                                Some(ssh) => {
+                                    // 真 SSH direct-tcpip: 拿 Channel<Msg>,跟 inbound TCP 做双向 copy
+                                    let channel = {
+                                        let client = ssh.read().await;
+                                        client
+                                            .open_direct_tcpip(&remote_host, remote_port as u32)
+                                            .await
+                                    };
+                                    match channel {
+                                        Ok(mut ch) => {
+                                            let (mut ri, mut wi) = inbound.split();
+                                            // 顺序关键: 先 make_writer(&self) 再 make_reader(&mut self),
+                                            // 避免持有 &mut self 时再借 &self 失败。
+                                            let mut wo = ch.make_writer();
+                                            let mut ro = ch.make_reader();
+                                            let c2s = tokio::io::copy(&mut ri, &mut wo);
+                                            let s2c = tokio::io::copy(&mut ro, &mut wi);
+                                            let (c2s_res, s2c_res) = tokio::join!(c2s, s2c);
+                                            // ro/wo 持 ch 的借用,显式 drop 后才能调 ch.eof()
+                                            drop(ro);
+                                            drop(wo);
+                                            let _ = ch.eof().await;
+                                            if let Err(e) = c2s_res {
+                                                warn!("Tunnel {}: client→remote (ssh) copy error: {}", tid, e);
+                                            }
+                                            if let Err(e) = s2c_res {
+                                                warn!("Tunnel {}: remote→client (ssh) copy error: {}", tid, e);
+                                            }
+                                            Ok(())
+                                        }
+                                        Err(e) => Err(format!(
+                                            "ssh direct-tcpip {}:{} failed: {}",
+                                            remote_host, remote_port, e
+                                        )),
                                     }
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        "Tunnel {} (via_ssh={}): TCP connect to {}:{} failed: {}",
-                                        tid, via_ssh, remote_host, remote_port, e
-                                    );
+                                None => {
+                                    // Plain TCP 代理(非 SSH session 的隧道)
+                                    match TcpStream::connect(format!("{}:{}", remote_host, remote_port)).await {
+                                        Ok(mut remote) => {
+                                            let (mut ri, mut wi) = inbound.split();
+                                            let (mut ro, mut wo) = remote.split();
+                                            let c2s = tokio::io::copy(&mut ri, &mut wo);
+                                            let s2c = tokio::io::copy(&mut ro, &mut wi);
+                                            let (c2s_res, s2c_res) = tokio::join!(c2s, s2c);
+                                            if let Err(e) = c2s_res {
+                                                warn!("Tunnel {}: client→remote (tcp) copy error: {}", tid, e);
+                                            }
+                                            if let Err(e) = s2c_res {
+                                                warn!("Tunnel {}: remote→client (tcp) copy error: {}", tid, e);
+                                            }
+                                            Ok(())
+                                        }
+                                        Err(e) => Err(format!(
+                                            "TCP connect to {}:{} failed: {}",
+                                            remote_host, remote_port, e
+                                        )),
+                                    }
                                 }
+                            };
+                            if let Err(msg) = res {
+                                warn!("Tunnel {}: {}", tid, msg);
                             }
 
                             // 连接关闭后更新计数
