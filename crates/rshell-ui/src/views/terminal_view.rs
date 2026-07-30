@@ -152,6 +152,26 @@ impl Render for TerminalView {
             .font_family("Consolas")
             .text_size(gpui::px(self.cell_height))
             .track_focus(&self.focus_handle)
+            // 右键 -> 复制当前 session 的 buffer (后端 CopySelection 命令
+            // 提取 alacritty 的当前 selection 字符串; 我们这里只是 dispatch,
+            // 不必真在 view 里维护 selection start/end 坐标 — 后端 snapshot
+            // 里有当前已选文本, 之前是空 selection
+            .on_mouse_down(gpui::MouseButton::Right, move |_event: &gpui::MouseDownEvent, _window, cx: &mut App| {
+                {
+                    let bridge = cx.global::<AppBridge>().clone();
+                    let session_id = cx
+                        .try_global::<TerminalInputState>()
+                        .map(|s| s.session_id)
+                        .unwrap_or_else(uuid::Uuid::nil);
+                    if session_id.is_nil() {
+                        return;
+                    }
+                    // CopySelection 让后端去取 buffer selection; 用户要在
+                    // 终端里选区 (左键拖动) 后右键才有效. 这个路径对全屏应用
+                    // 是简化版, 实际 copy 走 "全选 + 复制" 流程.
+                    bridge.send_command(AppCommand::CopySelection { session_id });
+                }
+            })
             .on_key_down(|event, _window, app: &mut App| {
                 // 转换 keystroke → 字节序列
                 let key = event.keystroke.key.as_str();
