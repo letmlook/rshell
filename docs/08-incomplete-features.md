@@ -246,6 +246,7 @@
 | #26 | toolchain 修 | `e1e673d` | channel = stable (避开 1.90 alias 404) |
 | #29 | SOCKS5 DynamicForward | `09f7b8b` | 4 测试覆盖 IPv4/Domain/BIND/bad_ver |
 | 17 | terminal_view 1 行清理 | `97df88f` | upper.is_ascii_uppercase() |
+| UI 全部 13 view 接通 on_click | `0ecf1d3` ~ `355b59d` | 7 commit (5 ListX 后端 + 8 view on_click: session/tab/quick-cmd/theme/tunnel/key/plugin/transfer/app root + compose + file_manager) |
 
 ## 留作 follow-up
 
