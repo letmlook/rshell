@@ -129,3 +129,150 @@ impl TriggerEngine {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rshell_api::types::{Trigger, TriggerAction, TriggerCondition};
+    use std::sync::Arc;
+
+    fn make_engine() -> TriggerEngine {
+        TriggerEngine::new(Arc::new(EventBus::new()))
+    }
+
+    fn make_trigger(name: &str, condition: TriggerCondition, action: TriggerAction) -> Trigger {
+        Trigger {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            enabled: true,
+            condition,
+            action,
+        }
+    }
+
+    #[test]
+    fn test_exact_match_fires() {
+        let eng = make_engine();
+        let t = make_trigger(
+            "login",
+            TriggerCondition::ExactMatch("welcome".to_string()),
+            TriggerAction::ShowNotification("user logged in".to_string()),
+        );
+        eng.create_trigger(t.clone()).unwrap();
+        let sid = Uuid::new_v4();
+        let matches = eng.check_output("hello world welcome back", sid).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].trigger_id, t.id);
+    }
+
+    #[test]
+    fn test_exact_match_misses() {
+        let eng = make_engine();
+        eng.create_trigger(make_trigger(
+            "login",
+            TriggerCondition::ExactMatch("welcome".to_string()),
+            TriggerAction::Disconnect,
+        ))
+        .unwrap();
+        let matches = eng.check_output("goodbye", Uuid::new_v4()).unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_regex_match_fires() {
+        let eng = make_engine();
+        let t = make_trigger(
+            "error",
+            TriggerCondition::RegexAppear(r"(?i)error\s+\d+".to_string()),
+            TriggerAction::ShowNotification("error code".to_string()),
+        );
+        eng.create_trigger(t.clone()).unwrap();
+        let matches = eng.check_output("Got error 42 from server", Uuid::new_v4()).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].trigger_id, t.id);
+    }
+
+    #[test]
+    fn test_invalid_regex_does_not_panic() {
+        let eng = make_engine();
+        eng.create_trigger(make_trigger(
+            "bad",
+            // 未闭合的括号,Regex::new 必失败
+            TriggerCondition::RegexAppear("(unclosed".to_string()),
+            TriggerAction::Disconnect,
+        ))
+        .unwrap();
+        let matches = eng.check_output("anything", Uuid::new_v4()).unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_disabled_trigger_does_not_fire() {
+        let eng = make_engine();
+        let mut t = make_trigger(
+            "off",
+            TriggerCondition::ExactMatch("x".to_string()),
+            TriggerAction::Disconnect,
+        );
+        t.enabled = false;
+        eng.create_trigger(t).unwrap();
+        let matches = eng.check_output("xxx", Uuid::new_v4()).unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_toggle_trigger_flips_enabled() {
+        let eng = make_engine();
+        let t = make_trigger(
+            "t",
+            TriggerCondition::ExactMatch("x".to_string()),
+            TriggerAction::Disconnect,
+        );
+        let id = eng.create_trigger(t).unwrap();
+        eng.toggle_trigger(id).unwrap();
+        let listed = eng.list_triggers().unwrap();
+        assert!(!listed.iter().find(|t| t.id == id).unwrap().enabled);
+        eng.toggle_trigger(id).unwrap();
+        let listed = eng.list_triggers().unwrap();
+        assert!(listed.iter().find(|t| t.id == id).unwrap().enabled);
+    }
+
+    #[test]
+    fn test_delete_trigger_removes_it() {
+        let eng = make_engine();
+        let id = eng
+            .create_trigger(make_trigger(
+                "d",
+                TriggerCondition::ExactMatch("x".to_string()),
+                TriggerAction::Disconnect,
+            ))
+            .unwrap();
+        eng.delete_trigger(id).unwrap();
+        assert!(eng.list_triggers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_delete_missing_returns_not_found() {
+        let eng = make_engine();
+        let err = eng.delete_trigger(Uuid::new_v4()).unwrap_err();
+        assert!(format!("{err}").contains("not found"));
+    }
+
+    #[test]
+    fn test_notify_fired_publishes_event() {
+        let bus = Arc::new(EventBus::new());
+        let eng = TriggerEngine::new(bus.clone());
+        let received = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let r = received.clone();
+        bus.subscribe(move |event| {
+            if let AppEvent::TriggerFired { action_summary, .. } = event {
+                r.lock().unwrap().push(action_summary.clone());
+            }
+        });
+        let tid = Uuid::new_v4();
+        let sid = Uuid::new_v4();
+        eng.notify_fired(tid, sid, "smoke");
+        let msgs = received.lock().unwrap();
+        assert_eq!(msgs.as_slice(), &["smoke".to_string()]);
+    }
+}

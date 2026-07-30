@@ -111,3 +111,112 @@ impl QuickCommandService {
         Ok(targets)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rshell_api::types::{QuickCommand, QuickCommandScope};
+    use std::sync::Arc;
+
+    fn make_svc() -> QuickCommandService {
+        QuickCommandService::new(Arc::new(EventBus::new()))
+    }
+
+    fn make_cmd(name: &str, text: &str, scope: QuickCommandScope) -> QuickCommand {
+        QuickCommand {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            command: text.to_string(),
+            send_enter: false,
+            description: String::new(),
+            scope,
+            hotkey: None,
+            group: None,
+        }
+    }
+
+    #[test]
+    fn test_create_and_list() {
+        let svc = make_svc();
+        let id = svc
+            .create_command(make_cmd("ls", "ls -la", QuickCommandScope::AllSessions))
+            .unwrap();
+        let all = svc.list_commands().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, id);
+        assert_eq!(all[0].name, "ls");
+    }
+
+    #[test]
+    fn test_get_command_text_without_enter() {
+        let svc = make_svc();
+        let id = svc
+            .create_command(make_cmd("ls", "ls -la", QuickCommandScope::AllSessions))
+            .unwrap();
+        assert_eq!(svc.get_command_text(id).unwrap(), b"ls -la".to_vec());
+    }
+
+    #[test]
+    fn test_get_command_text_with_enter() {
+        let svc = make_svc();
+        let mut cmd = make_cmd("ls", "ls -la", QuickCommandScope::AllSessions);
+        cmd.send_enter = true;
+        let id = svc.create_command(cmd).unwrap();
+        assert_eq!(svc.get_command_text(id).unwrap(), b"ls -la\n".to_vec());
+    }
+
+    #[test]
+    fn test_resolve_target_sessions_current() {
+        let svc = make_svc();
+        let id = svc
+            .create_command(make_cmd("c", "x", QuickCommandScope::CurrentSession))
+            .unwrap();
+        let active = Uuid::new_v4();
+        let all = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let targets = svc.resolve_target_sessions(id, Some(active), &all).unwrap();
+        assert_eq!(targets, vec![active]);
+    }
+
+    #[test]
+    fn test_resolve_target_sessions_current_without_active_errors() {
+        let svc = make_svc();
+        let id = svc
+            .create_command(make_cmd("c", "x", QuickCommandScope::CurrentSession))
+            .unwrap();
+        let err = svc.resolve_target_sessions(id, None, &[]).unwrap_err();
+        assert!(format!("{err}").contains("No active session"));
+    }
+
+    #[test]
+    fn test_resolve_target_sessions_all() {
+        let svc = make_svc();
+        let id = svc
+            .create_command(make_cmd("c", "x", QuickCommandScope::AllSessions))
+            .unwrap();
+        let all = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let targets = svc.resolve_target_sessions(id, None, &all).unwrap();
+        assert_eq!(targets, all);
+    }
+
+    #[test]
+    fn test_resolve_target_sessions_selected() {
+        let svc = make_svc();
+        let pick = vec![Uuid::new_v4()];
+        let id = svc
+            .create_command(make_cmd(
+                "c",
+                "x",
+                QuickCommandScope::SelectedSessions(pick.clone()),
+            ))
+            .unwrap();
+        let targets = svc.resolve_target_sessions(id, None, &[]).unwrap();
+        assert_eq!(targets, pick);
+    }
+
+    #[test]
+    fn test_delete_missing_returns_not_found() {
+        let svc = make_svc();
+        let err = svc.delete_command(Uuid::new_v4()).unwrap_err();
+        assert!(format!("{err}").contains("not found"));
+    }
+}

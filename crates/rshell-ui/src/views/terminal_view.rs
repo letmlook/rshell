@@ -111,9 +111,9 @@ impl TerminalView {
         if has_control {
             if let Some(c) = key_char.and_then(|s| s.chars().next()) {
                 if c.is_ascii_alphabetic() {
-                    let upper = c.to_ascii_uppercase() as u8;
+                    let upper = c.to_ascii_uppercase();
                     if upper.is_ascii_uppercase() {
-                        return vec![upper - b'A' + 1];
+                        return vec![upper as u8 - b'A' + 1];
                     }
                 }
             }

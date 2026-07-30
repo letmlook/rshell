@@ -72,3 +72,49 @@ impl SyncInputService {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn make_svc() -> SyncInputService {
+        SyncInputService::new(Arc::new(EventBus::new()))
+    }
+
+    #[test]
+    fn test_toggle_sets_sessions() {
+        let svc = make_svc();
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        svc.toggle_sync_input(vec![s1, s2]).unwrap();
+        let got = svc.get_sync_sessions().unwrap();
+        assert_eq!(got, vec![s1, s2]);
+        assert!(svc.is_sync_active().unwrap());
+    }
+
+    #[test]
+    fn test_toggle_empty_disables() {
+        let svc = make_svc();
+        svc.toggle_sync_input(vec![Uuid::new_v4()]).unwrap();
+        svc.toggle_sync_input(vec![]).unwrap();
+        assert!(!svc.is_sync_active().unwrap());
+        assert!(svc.get_sync_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_subscribe_publishes_change_event() {
+        let bus = Arc::new(EventBus::new());
+        let svc = SyncInputService::new(bus.clone());
+        let got = Arc::new(std::sync::Mutex::new(0u32));
+        let g = got.clone();
+        bus.subscribe(move |event| {
+            if matches!(event, AppEvent::SyncInputSessionsChanged { .. }) {
+                *g.lock().unwrap() += 1;
+            }
+        });
+        svc.toggle_sync_input(vec![Uuid::new_v4()]).unwrap();
+        svc.toggle_sync_input(vec![]).unwrap();
+        assert_eq!(*got.lock().unwrap(), 2);
+    }
+}

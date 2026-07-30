@@ -272,8 +272,9 @@ impl Connection for TelnetConnection {
         self.stream = Some(stream);
         self.state = TelnetState::Connected;
 
-        // 主动请求 Suppress Go Ahead
+        // 主动请求 Suppress Go Ahead 与 Window Size (NAWS, RFC 1073)
         self.send_command(TelnetCommand::DO, Some(TelnetOption::SuppressGoAhead)).await?;
+        self.send_command(TelnetCommand::DO, Some(TelnetOption::WindowSize)).await?;
 
         info!("Telnet connection established to {}:{}", self.host, self.port);
         Ok(())
@@ -327,10 +328,26 @@ impl Connection for TelnetConnection {
         Ok(copy_len)
     }
 
-    async fn resize(&mut self, _cols: u16, _rows: u16) -> Result<(), ProtocolError> {
-        // Telnet 协议通过 NAWS 选项协商窗口大小
-        // 简化实现：暂不支持
-        debug!("Telnet resize not yet implemented");
+    async fn resize(&mut self, cols: u16, rows: u16) -> Result<(), ProtocolError> {
+        // NAWS (RFC 1073): IAC SB NAWS <16-bit cols> <16-bit rows> IAC SE
+        // 16-bit 字段以 big-endian 传输。
+        // 如果服务器没启用 NAWS,字节序列会被忽略,这是 RFC 允许的 graceful 行为。
+        let stream = match self.stream.as_mut() {
+            Some(s) => s,
+            None => return Ok(()), // 未连接,resize 静默忽略
+        };
+        let payload = [
+            TelnetCommand::IAC as u8,
+            TelnetCommand::SB as u8,
+            TelnetOption::WindowSize as u8,
+            (cols >> 8) as u8, cols as u8,
+            (rows >> 8) as u8, rows as u8,
+            TelnetCommand::IAC as u8,
+            TelnetCommand::SE as u8,
+        ];
+        stream.write_all(&payload).await
+            .map_err(|e| ProtocolError::ProtocolError(format!("Failed to send NAWS: {}", e)))?;
+        debug!("Telnet: NAWS sent ({}x{})", cols, rows);
         Ok(())
     }
 }
