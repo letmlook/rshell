@@ -33,3 +33,11 @@ rust-toolchain.toml.bak
 # 本地配置
 .env
 .env.local
+
+# Node / 前端 (Tauri 2.0)
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Tauri 构建产物 (src-tauri/target/ 由子目录 .gitignore 兜底)

@@ -18,9 +18,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-VERSION="$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+VERSION="$(grep -E '^version[[:space:]]*=' src-tauri/Cargo.toml | head -1 | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
 if [[ -z "$VERSION" ]]; then
-    echo "ERROR: cannot read version from Cargo.toml" >&2
+    echo "ERROR: cannot read version from src-tauri/Cargo.toml" >&2
     exit 1
 fi
 

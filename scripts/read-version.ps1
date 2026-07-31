@@ -4,10 +4,10 @@
 # Outputs the version on stdout. Exits 0 on success, 1 if not found.
 
 $ErrorActionPreference = "Stop"
-$content = Get-Content -Path (Join-Path $PSScriptRoot "..\Cargo.toml") -Raw -ErrorAction Stop
+$content = Get-Content -Path (Join-Path $PSScriptRoot "..\src-tauri\Cargo.toml") -Raw -ErrorAction Stop
 $match = [regex]::Match($content, '(?m)^version\s*=\s*"([^"]+)"')
 if (-not $match.Success) {
-    Write-Error "cannot read version from Cargo.toml"
+    Write-Error "cannot read version from src-tauri/Cargo.toml"
     exit 1
 }
 $version = $match.Groups[1].Value
