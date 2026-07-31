@@ -64,6 +64,8 @@ pub struct RshellApp {
 
     new_session_form: Option<NewSessionFormData>,
     new_session_form_state: std::rc::Rc<std::cell::Cell<Option<NewSessionFormData>>>,
+    /// 5 个 InputState (name/host/port/username/password) for new session dialog
+    new_session_inputs: [Option<gpui::Entity<gpui_component::input::InputState>>; 5],
     edit_session_form: Option<EditSessionFormData>,
     generate_key_form: Option<GenerateKeyFormData>,
     import_key_form: Option<ImportKeyFormData>,
@@ -169,6 +171,7 @@ impl RshellApp {
             pending_host_key_prompt: None,
             new_session_form: None,
             new_session_form_state: std::rc::Rc::new(std::cell::Cell::new(None)),
+            new_session_inputs: [None, None, None, None, None],
             edit_session_form: None,
             generate_key_form: None,
             import_key_form: None,
@@ -442,9 +445,20 @@ impl RshellApp {
 }
 
 impl Render for RshellApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         // 处理后端事件（路由到 ViewModel）
         self.process_events(cx);
+        // 懒建 new session 5 个 InputState
+        if self.new_session_form.is_some() && self.new_session_inputs[0].is_none() {
+            let placeholders = ["Session 名称", "主机 (如 example.com)", "端口 (默认 22)", "用户名", "密码 (可选)"];
+            for (i, ph) in placeholders.iter().enumerate() {
+                let state = cx.new(|cx: &mut gpui::Context<gpui_component::input::InputState>| {
+                    gpui_component::input::InputState::new(window, cx)
+                        .placeholder(*ph)
+                });
+                self.new_session_inputs[i] = Some(state);
+            }
+        }
 
         div()
             .size_full()
@@ -642,8 +656,8 @@ impl RshellApp {
     fn render_edit_session_form_overlay(&mut self, cx: &mut gpui::Context<Self>) -> Vec<gpui::AnyElement> {
         let Some(f) = self.edit_session_form.clone() else { return vec![]; };
         self.render_simple_modal("编辑会话",
-            vec![("名称", f.name.clone(), "es-name"), ("主机", f.host.clone(), "es-host"),
-                  ("端口", f.port.clone(), "es-port"), ("用户名", f.username.clone(), "es-user")],
+            vec![("名称", &f.name, "es-name", None), ("主机", &f.host, "es-host", None),
+                  ("端口", &f.port, "es-port", None), ("用户名", &f.username, "es-user", None)],
             cx, |this, cx| {
                 let f = this.edit_session_form.clone().unwrap();
                 let port = f.port.parse::<u16>().unwrap_or(22);
@@ -666,8 +680,8 @@ impl RshellApp {
     fn render_generate_key_form_overlay(&mut self, cx: &mut gpui::Context<Self>) -> Vec<gpui::AnyElement> {
         let Some(f) = self.generate_key_form.clone() else { return vec![]; };
         self.render_simple_modal("生成 SSH 密钥",
-            vec![("名称", f.name.clone(), "gk-name"), ("类型", f.key_type.clone(), "gk-type"),
-                  ("密码", if f.has_passphrase { "是".to_string() } else { "否".to_string() }, "gk-pass")],
+            vec![("名称", &f.name, "gk-name", None), ("类型", &f.key_type, "gk-type", None),
+                  ("密码", if f.has_passphrase { "是" } else { "否" }, "gk-pass", None)],
             cx, |this, cx| {
                 let f = this.generate_key_form.clone().unwrap();
                 let key_type = match f.key_type.as_str() {
@@ -690,7 +704,7 @@ impl RshellApp {
     fn render_import_key_form_overlay(&mut self, cx: &mut gpui::Context<Self>) -> Vec<gpui::AnyElement> {
         let Some(f) = self.import_key_form.clone() else { return vec![]; };
         self.render_simple_modal("导入私钥",
-            vec![("路径", f.path.clone(), "ik-path"), ("密码", f.passphrase.clone(), "ik-pass")],
+            vec![("路径", &f.path, "ik-path", None), ("密码", &f.passphrase, "ik-pass", None)],
             cx, |this, cx| {
                 let f = this.import_key_form.clone().unwrap();
                 if let Some(b) = cx.try_global::<crate::bridge::AppBridge>() {
@@ -710,8 +724,8 @@ impl RshellApp {
     fn render_quick_command_form_overlay(&mut self, cx: &mut gpui::Context<Self>) -> Vec<gpui::AnyElement> {
         let Some(f) = self.quick_command_form.clone() else { return vec![]; };
         self.render_simple_modal("新建快速命令",
-            vec![("名称", f.name.clone(), "qc-name"), ("命令", f.command.clone(), "qc-cmd"),
-                  ("作用范围", f.scope.clone(), "qc-scope")],
+            vec![("名称", &f.name, "qc-name", None), ("命令", &f.command, "qc-cmd", None),
+                  ("作用范围", &f.scope, "qc-scope", None)],
             cx, |this, cx| {
                 let f = this.quick_command_form.clone().unwrap();
                 let scope = match f.scope.as_str() {
@@ -738,9 +752,9 @@ impl RshellApp {
     fn render_tunnel_form_overlay(&mut self, cx: &mut gpui::Context<Self>) -> Vec<gpui::AnyElement> {
         let Some(f) = self.tunnel_form.clone() else { return vec![]; };
         self.render_simple_modal("新建隧道 (LocalForward)",
-            vec![("名称", f.name.clone(), "tf-name"), ("绑定地址", f.bind_address.clone(), "tf-bind"),
-                  ("绑定端口", f.bind_port.clone(), "tf-bind-port"), ("远程主机", f.remote_host.clone(), "tf-remote"),
-                  ("远程端口", f.remote_port.clone(), "tf-remote-port")],
+            vec![("名称", &f.name, "tf-name", None), ("绑定地址", &f.bind_address, "tf-bind", None),
+                  ("绑定端口", &f.bind_port, "tf-bind-port", None), ("远程主机", &f.remote_host, "tf-remote", None),
+                  ("远程端口", &f.remote_port, "tf-remote-port", None)],
             cx, |this, cx| {
                 let f = this.tunnel_form.clone().unwrap();
                 let session_id = this.active_session_id;
@@ -761,7 +775,7 @@ impl RshellApp {
     fn render_simple_modal(
         &mut self,
         title: &'static str,
-        fields: Vec<(&'static str, String, &'static str)>,
+        fields: Vec<(&'static str, &str, &'static str, Option<&gpui::Entity<gpui_component::input::InputState>>)>,
         cx: &mut gpui::Context<Self>,
         on_confirm: impl Fn(&mut Self, &mut gpui::Context<Self>) + 'static,
     ) -> Vec<gpui::AnyElement> {
@@ -770,8 +784,8 @@ impl RshellApp {
         let mut body = div()
             .text_color(rgb(0xcdd6f4)).text_lg().font_weight(gpui::FontWeight::BOLD)
             .child(title);
-        for (label, value, id) in &fields {
-            body = body.child(Self::form_field(label, value.clone(), id));
+        for (label, _value, id, input_state) in &fields {
+            body = body.child(Self::form_field(label, *input_state, id));
         }
         let overlay = div()
             .absolute().inset_0()
@@ -1072,7 +1086,7 @@ impl RshellApp {
         &mut self,
         cx: &mut gpui::Context<Self>,
     ) -> Vec<gpui::AnyElement> {
-        let Some(f) = self.new_session_form.clone() else {
+        let Some(_f) = self.new_session_form.clone() else {
             return vec![];
         };
         let overlay = div()
@@ -1101,11 +1115,11 @@ impl RshellApp {
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("新建会话"),
                     )
-                    .child(Self::form_field("名称", f.name.clone(), "session-name"))
-                    .child(Self::form_field("主机", f.host.clone(), "session-host"))
-                    .child(Self::form_field("端口", f.port.clone(), "session-port"))
-                    .child(Self::form_field("用户名", f.username.clone(), "session-user"))
-                    .child(Self::form_field("密码", f.password.clone(), "session-pass"))
+                    .child(Self::form_field("名称", self.new_session_inputs[0].as_ref(), "session-name"))
+                    .child(Self::form_field("主机", self.new_session_inputs[1].as_ref(), "session-host"))
+                    .child(Self::form_field("端口", self.new_session_inputs[2].as_ref(), "session-port"))
+                    .child(Self::form_field("用户名", self.new_session_inputs[3].as_ref(), "session-user"))
+                    .child(Self::form_field("密码", self.new_session_inputs[4].as_ref(), "session-pass"))
                     .child(
                         div()
                             .text_color(rgb(0x6c7086))
@@ -1119,37 +1133,49 @@ impl RshellApp {
                             .items_center()
                             .gap(px(8.0))
                             .child(self.form_btn_cancel(cx))
-                            .child(self.form_btn_create(cx, &f)),
+                            .child(self.form_btn_create(cx, &self.new_session_inputs)),
                     ),
             );
         vec![gpui::IntoElement::into_any_element(overlay)]
     }
 
-    fn form_field(label: &'static str, value: String, id: &'static str) -> gpui::AnyElement {
+    fn form_field(label: &'static str, state: Option<&gpui::Entity<gpui_component::input::InputState>>, id: &'static str) -> gpui::AnyElement {
+        // 有 state -> 真 Input (可编辑); 无 state -> fallback 只读 div
+        let input_div = if let Some(s) = state {
+            gpui::div()
+                .id((id, 0usize))
+                .h(px(28.0))
+                .bg(gpui::rgb(0x313244))
+                .rounded(px(3.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .child(gpui_component::input::Input::new(s))
+        } else {
+            gpui::div()
+                .id((id, 0usize))
+                .h(px(28.0))
+                .bg(gpui::rgb(0x313244))
+                .rounded(px(3.0))
+                .px(px(8.0))
+                .text_color(gpui::rgb(0xcdd6f4))
+                .text_sm()
+                .flex()
+                .items_center()
+                .child(String::new())
+        };
         gpui::IntoElement::into_any_element(
-            div()
+            gpui::div()
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
                 .child(
-                    div()
-                        .text_color(rgb(0xbac2de))
+                    gpui::div()
+                        .text_color(gpui::rgb(0xbac2de))
                         .text_xs()
                         .child(label),
                 )
-                .child(
-                    div()
-                        .id((id, 0usize))
-                        .h(px(28.0))
-                        .bg(rgb(0x313244))
-                        .rounded(px(3.0))
-                        .px(px(8.0))
-                        .text_color(rgb(0xcdd6f4))
-                        .text_sm()
-                        .flex()
-                        .items_center()
-                        .child(value),
-                ),
+                .child(input_div),
         )
     }
 
@@ -1178,13 +1204,10 @@ impl RshellApp {
     fn form_btn_create(
         &self,
         cx: &mut gpui::Context<Self>,
-        f: &NewSessionFormData,
+        inputs: &[Option<gpui::Entity<gpui_component::input::InputState>>; 5],
     ) -> gpui::AnyElement {
-        let name = f.name.clone();
-        let host = f.host.clone();
-        let port = f.port.clone();
-        let username = f.username.clone();
-        let password = f.password.clone();
+        // clone 5 个 Entity (Entity 内部 Arc, clone 廉价)
+        let inputs_arr: [Option<gpui::Entity<gpui_component::input::InputState>>; 5] = inputs.clone();
         gpui::IntoElement::into_any_element(
             div()
                 .id(("new-session-create", 0usize))
@@ -1200,7 +1223,19 @@ impl RshellApp {
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(0x059669)))
                 .on_click(cx.listener(move |this, _, _window, cx| {
-                    let port_num = port.parse::<u16>().unwrap_or(22);
+                    // 从 InputState 读实际输入 (不依赖 NewSessionFormData 默认值)
+                    let mut vals: [String; 5] = std::array::from_fn(|_| String::new());
+                    for (i, opt) in inputs_arr.iter().enumerate() {
+                        if let Some(s) = opt {
+                            vals[i] = s.read(cx).value().to_string();
+                        }
+                    }
+                    let name = if vals[0].is_empty() { format!("Session {}", this.sessions.len() + 1) } else { vals[0].clone() };
+                    let host = vals[1].clone();
+                    let port_str = vals[2].clone();
+                    let username = vals[3].clone();
+                    let password = vals[4].clone();
+                    let port_num = port_str.parse::<u16>().unwrap_or(22);
                     let config = rshell_api::types::SessionConfig {
                         id: uuid::Uuid::new_v4(),
                         name: name.clone(),
