@@ -1,0 +1,113 @@
+# RShell - Tauri 2.0 workspace manifest
+#
+# 仓库根不再有 Cargo.toml;Rust workspace 在 src-tauri/ 内。
+# 前端代码在仓库根 src/ (Vite + React + TS)。
+
+[workspace]
+members = [
+    ".",                        # rshell 自身作为二进制包
+    "crates/rshell-api",
+    "crates/rshell-core",
+    "crates/rshell-protocol",
+    "crates/rshell-infra",
+    "crates/rshell-plugin-sdk",
+    "crates/xtask",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "Apache-2.0"
+repository = "https://github.com/letmlook/rshell"
+
+[workspace.dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# 错误处理
+thiserror = "2"
+anyhow = "1"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 工具
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+
+# 测试
+mockall = "0.13"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+tokio-test = "0.4"
+
+# Tauri 2.0
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-fs = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
+
+# 内部 crate (path deps 由 workspace 自动解析)
+rshell-api = { path = "crates/rshell-api" }
+rshell-core = { path = "crates/rshell-core" }
+rshell-protocol = { path = "crates/rshell-protocol" }
+rshell-infra = { path = "crates/rshell-infra" }
+rshell-plugin-sdk = { path = "crates/rshell-plugin-sdk" }
+
+# ────────────────────────────────────────────────────────────────────────
+# 主二进制包 rshell (Tauri 壳)
+# ────────────────────────────────────────────────────────────────────────
+
+[package]
+name = "rshell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RShell - 跨平台远程终端和 SFTP 客户端 (Tauri 2.0 + WebView)"
+
+[lib]
+name = "rshell_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "rshell"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin-fs = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
+tauri-plugin-shell = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+
+rshell-api = { workspace = true }
+rshell-core = { workspace = true }
+rshell-protocol = { workspace = true }
+rshell-infra = { workspace = true }
+rshell-plugin-sdk = { workspace = true }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
