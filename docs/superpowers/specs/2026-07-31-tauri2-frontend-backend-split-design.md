@@ -1,6 +1,6 @@
 # Tauri 2.0 架构下 RShell 前后端功能划分设计
 
-> **文档版本**：v1.0
+> **文档版本**：v1.1（v1.1 追加 §10 前端技术栈变更：React → Vue 3 + Element Plus）
 > **编写日期**：2026-07-31
 > **基线 commit**：`6d2aac9`（`chore(docs): update CLAUDE.md, build scripts, .gitignore for Tauri`）
 > **关联文档**：`docs/03-detailed-design.md`、`docs/05-development-standards.md`、`docs/06-test-strategy.md`、`docs/08-incomplete-features.md`
@@ -17,14 +17,14 @@ RShell 正在从 GPUI 迁移到 Tauri 2.0。截至基线 commit，迁移已完�
 | Rust workspace 迁入 `src-tauri/` | `src-tauri/Cargo.toml` 为 workspace 根，根 `Cargo.toml` 已删除 |
 | GPUI 前端已删除 | `crates/rshell-ui/`（4671 行）不再存在 |
 | Tauri 壳骨架 | `src-tauri/src/{main,lib}.rs`，注册了三个官方插件 |
-| React 前端脚手架 | `src/`（27 个文件）+ `package.json` + `vite.config.ts` |
+| React 前端脚手架 | `src/`（27 个文件）+ `package.json` + `vite.config.ts` —— **已于 §10 决定废弃，改用 Vue 3**（`src/ipc/` 三个文件保留） |
 | TS 类型手工镜像 | `src/ipc/types.ts`（547 行） |
 | invoke 包装层 | `src/ipc/client.ts`（208 行，覆盖全部命令） |
 | 事件订阅层 | `src/ipc/events.ts`（160 行，17 个事件分支） |
 
-**尚未完成的核心工作**：`src-tauri/src/lib.rs` 仍只有一个占位 `hello` 命令（`lib.rs:21,39`），没有 `AppState`、没有 `CommandDispatcher` 接入、没有任何真实命令、没有 emit 桥、没有 Channel。前端 `TerminalPanel.tsx:54-62` 写死了假的 `ls -la` 输出。
+**尚未完成的核心工作**：`src-tauri/src/lib.rs` 仍只有一个占位 `hello` 命令（`lib.rs:21,39`），没有 `AppState`、没有 `CommandDispatcher` 接入、没有任何真实命令、没有 emit 桥、没有 Channel。前端侧则将整体换栈为 Vue 3（§10），仅 `src/ipc/` 三个文件保留。
 
-**换句话说：两端的壳都立起来了，中间的桥一根没搭。**
+**换句话说：后端壳立起来了，前端要重搭，中间的桥一根没搭。**
 
 本文档定义这座桥的形状，以及桥两端各自承担什么职责。不含实施代码。
 
@@ -54,11 +54,11 @@ RShell 正在从 GPUI 迁移到 Tauri 2.0。截至基线 commit，迁移已完�
 ### 1.1 三层职责
 
 ```
-┌─ 前端 (React + TS, 仓库根 src/) ─────────────────────────┐
+┌─ 前端 (Vue 3 + Element Plus + TS, 仓库根 src/) ───────────┐
 │  渲染 · 交互 · 呈现态                                      │
 │  · xterm.js：网格 / 选区 / 搜索 / 滚动回看                  │
-│  · 布局：标签页 / 分屏 / 面板尺寸（localStorage 持久化）      │
-│  · zustand：后端快照 + 本地 UI 态（排序 / 过滤 / 展开折叠）    │
+│  · 布局：dockview-vue 自由拖拽 dock（布局 JSON 持久化）      │
+│  · pinia：后端快照 + 本地 UI 态（排序 / 过滤 / 展开折叠）      │
 │  · 剪贴板读写 · 快捷键分发 · scheme → ITheme/CSS 变量映射    │
 └──────────────────────────┬───────────────────────────────┘
         invoke(细粒度命令)   │   Channel<Vec<u8>>（每 session 一条）
@@ -161,7 +161,7 @@ Ok(Some(data)) => {
 | `TerminalBufferSnapshot` 及 Cell/CellFlags 系列类型 | `api/types.rs` | 删除 |
 | `alacritty_terminal` 依赖 | `core/Cargo.toml` | 移除 |
 | 前端 `onTerminalBufferUpdated` 分支 | `src/ipc/events.ts:42,85-89` | 删除 |
-| 前端假输出 | `src/views/TerminalPanel.tsx:54-62` | 替换为真实 Channel 接入 |
+| 前端假输出 | `src/views/TerminalPanel.tsx:54-62`（该文件于 §10.4 整体删除） | 新 Vue 终端组件直接接 Channel，不再有假输出 |
 
 ### 2.3 简化后的 recv 循环
 
@@ -367,8 +367,8 @@ enum TermSink {
 | 隧道 listener | 后端 `TunnelManager` | `list_tunnels()` | 规则保留、listener 丢失 |
 | 当前主题名 / 配色名 | 后端 `ThemeManager` | `list_themes()` | 保留 |
 | **主题颜色 → CSS 变量** | **前端** | 由 scheme 计算 | 丢失（应然） |
-| **布局 / 分屏 / 标签顺序** | **前端** localStorage | — | 保留（前端自管） |
-| **排序 / 过滤 / 展开折叠** | **前端** zustand | — | 丢失（应然） |
+| **布局 / 分屏 / 标签顺序** | **前端** dockview 布局 JSON → localStorage | — | 保留（前端自管） |
+| **排序 / 过滤 / 展开折叠** | **前端** pinia | — | 丢失（应然） |
 
 **铁律**：任何状态只有一个所有者。终端尺寸是唯一双写项，处理方式为"前端权威、后端仅记录并转发给 PTY/SSH"，冲突时以前端最后一次 `resize` 为准。
 
@@ -434,7 +434,7 @@ recv 循环 → check_output(原始字节) → 命中
 |------|---------|---------|
 | 剪贴板 / 复制选区 | xterm.js 自持选区，后端无需知道选区存在 | 删除 `AppCommand::CopySelection`、`AppEvent::ClipboardCopy`；前端直接 `navigator.clipboard` 或 `tauri-plugin-clipboard-manager` |
 | 主题 / 配色的渲染映射 | 颜色值 → CSS 变量 / xterm `ITheme` 是纯呈现 | 后端只持久化"当前主题名 + 自定义方案列表"；`core/theme/mod.rs`（392 行）瘦身为配置读写 |
-| 列表排序 / 过滤 / 展开折叠 | 纯呈现态，无需持久化 | 后端只返回原始 `Vec`；前端 zustand 管展开态 / 排序列 / 过滤词。无需新增契约 |
+| 列表排序 / 过滤 / 展开折叠 | 纯呈现态，无需持久化 | 后端只返回原始 `Vec`；前端 pinia 管展开态 / 排序列 / 过滤词。无需新增契约 |
 | 快捷键分发 | keydown → 对应 invoke，前端天然位置 | 后端只存 keymap 配置 JSON |
 
 前端 `src/ipc/client.ts:78` 的 `copySelection` 需随之删除。
@@ -467,7 +467,7 @@ recv 循环 → check_output(原始字节) → 命中
 | `CommandOutcome` 契约 | 每个读命令返回正确变体 | `cargo test -p rshell-core` | **新增**；直接覆盖 §3.2 的死循环 |
 | IPC 薄壳 | 宏展开正确、`CoreError → IpcError` 映射 | `cargo test`（`src-tauri`） | 薄壳无逻辑，测试量小 |
 | 类型同步 | TS 类型与 Rust 一致 | `ts-rs` + CI `git diff --exit-code` | 编译期保障，零维护成本 |
-| 前端单元 | store reducer、scheme → ITheme 映射 | Vitest（**切片 0 引入**，§9 裁定 #5） | 纯函数，易测 |
+| 前端单元 | store（pinia）逻辑、scheme → ITheme 映射 | Vitest + `@vue/test-utils`（**切片 0 引入**，§9 裁定 #5） | 纯函数，易测 |
 | E2E | 连接真 SSH → 出字 → 传文件 | `tauri-driver` + WebDriver + Docker sshd | 填上现在空的 `tests/e2e/` |
 
 **E2E 前置条件**：`tests/fixtures/` 放 `docker-compose.yml` 起 `linuxserver/openssh-server`，固定端口 + 固定测试密钥。没有真实 SSH 目标，`docs/08` 的 #2（host key 决策）、#3（direct-tcpip 隧道）永远无法验证。
@@ -498,16 +498,20 @@ recv 循环 → check_output(原始字节) → 命中
 
 **核心论据**：本项目最大风险不在代码量，而在**从未有过运行时验证**。垂直切片是唯一能在数天内把"能不能跑"变成已知的方案。
 
-### 7.2 切片 0：可行性证伪（最优先，数小时内出结论）
+### 7.2 切片 0：可行性证伪 + 前端换栈（最优先）
 
 按风险从高到低逐个证伪：
 
 1. `rhai = { features = ["sync"] }` + `cargo check -p rshell-core` → 验证 `CommandDispatcher: Send + Sync`
-2. 一个真实命令跑通 `invoke` 往返（替掉占位 `hello`）
-3. 一条 `Channel<Vec<u8>>` 推 1 MB 假数据到 xterm.js，测量吞吐并**记录为基线**
-4. 引入 Vitest 基座（§9 裁定 #5），跑通一个 store 的样例测试
+   **已于 2026-07-31 提前实测通过**：`cargo test -p rshell-core` 74/74 passed，且 `assert_send_sync::<CommandDispatcher>()` 编译通过。D5 由假设升级为既成事实，此步在实施时只需复现。
+2. 前端清空重建为 Vue 3 + Element Plus（§10.3 依赖调整 + §10.4 删除清单）
+3. 一个真实命令跑通 `invoke` 往返（替掉占位 `hello`）
+4. 一条 `Channel<Vec<u8>>` 推 1 MB 假数据到 xterm.js，测量吞吐并**记录为基线**
+5. 引入 Vitest + `@vue/test-utils` 基座（§9 裁定 #5），跑通一个 pinia store 的样例测试
 
-任何一条不通，回到设计而非硬做。第 1 条失败 → 降级到 §1.2 的备选方案。
+任何一条不通，回到设计而非硬做。第 1 条已通过，故 §1.2 的降级路径实际上不会被触发。
+
+**顺带修一个既存 bug**：`src-tauri/.gitignore` 内含 `src-tauri/target/`，但嵌套 `.gitignore` 的路径相对其所在目录解析，实际匹配的是不存在的 `src-tauri/src-tauri/target/`。因此 `src-tauri/target/`（构建产物）未被忽略，`cargo build` 后会有大量未跟踪文件污染 `git status`。改为 `target/` 即可。
 
 ### 7.3 切片 1：连接 + 出字（最窄垂直路）
 
@@ -516,7 +520,7 @@ recv 循环 → check_output(原始字节) → 命中
 | 后端壳 | `state.rs`（`AppState`）、`error.rs`（`IpcError`）、`terminal.rs`（`TerminalChannels`）、`events.rs`（EventBus → emit 桥） |
 | 命令 | `connect_session` / `disconnect_session` / `send_input` / `resize_terminal` / `attach_terminal` / `list_sessions` |
 | 契约 | `CommandOutcome` 骨架（先只需 `None` / `Sessions`） |
-| 前端 | `TerminalPanel.tsx` 去掉假输出（`:54-62`），接 Channel + `term.onData` → `send_input`；引入 `@xterm/addon-webgl`（§9 裁定 #3，含 `onContextLoss` 回退处理） |
+| 前端 | 新建 Vue 终端组件（`src/components/TerminalPane.vue`），`onMounted` 建 xterm → `attach_terminal` 接 Channel、`term.onData` → `send_input`；引入 `@xterm/addon-webgl`（§9 裁定 #3，含 `onContextLoss` 回退处理）；以 `dockview-vue` 承载面板（§9 裁定 #1） |
 
 **完成判据：真的连上一台 SSH 服务器，敲 `ls` 看到真实输出。** 这将是本项目第一次运行时验证。
 
@@ -526,7 +530,7 @@ recv 循环 → check_output(原始字节) → 命中
 - 删除 §3.3 的 9 个事件及前端对应分支
 - 删除 §5 的 `CopySelection` / `ClipboardCopy`
 - 引入 `ts-rs`，比对并替换手工 `types.ts`
-- 引入 `@xterm/addon-search`，接上 `TerminalPanel.tsx:93-105` 的静态搜索栏（§9 裁定 #2）
+- 引入 `@xterm/addon-search`，为终端组件接上搜索能力（§9 裁定 #2）
 
 放在切片 1 之后是有意的：**先证明新路能走，再拆旧桥**。
 
@@ -534,7 +538,7 @@ recv 循环 → check_output(原始字节) → 命中
 
 | 顺序 | 功能域 | 排序理由 |
 |------|--------|---------|
-| 3 | 会话 CRUD + 主题 + `dockview` 布局 | 纯 CRUD，验证 `CommandOutcome` 全貌；同期引入 `dockview` 替换自实现 `TabBar`（§9 裁定 #1） |
+| 3 | 会话 CRUD + 主题 | 纯 CRUD，验证 `CommandOutcome` 全貌（dockview-vue 已在切片 1 引入，见 §10） |
 | 4 | Host key 决策 | 修 `docs/08` #2；切片 1 连接非首次主机时就会撞上 |
 | 5 | SFTP 传输 + 文件浏览 | 第二大功能；验证 Channel 之外的高频事件（进度） |
 | 6 | 密钥管理 + 主密码 | 安全域；"私钥不过 IPC"的边界在此固化 |
@@ -568,15 +572,95 @@ recv 循环 → check_output(原始字节) → 命中
 
 | # | 问题 | 裁定 | 落到哪个切片 |
 |---|------|------|------------|
-| 1 | 前端布局组件选型 | **引入 `dockview`** 做多标签 + 分屏，替代自实现的 `TabBar.tsx` | 切片 3 |
-| 2 | xterm 搜索 addon | **引入 `@xterm/addon-search`**，接上 `TerminalPanel.tsx:93-105` 的静态搜索栏 | 切片 2 |
+| 1 | 前端布局组件选型 | **引入 `dockview-vue`** 做自由拖拽 dock（§10 换栈后由 React 版改为 Vue 版），提前到切片 1 | 切片 1 |
+| 2 | xterm 搜索 addon | **引入 `@xterm/addon-search`**，接上搜索栏 | 切片 2 |
 | 3 | WebGL 渲染 | **引入 `@xterm/addon-webgl`**（不再取决于吞吐测量结果） | 切片 1 |
 | 4 | capabilities 细粒度化 | **先按默认来**（`capabilities/default.json` 不动），后续开发中按需增加条目 | 按需 |
-| 5 | Vitest 引入时机 | **一开始就引入**（切片 0 即建立前端测试基座） | 切片 0 |
+| 5 | Vitest 引入时机 | **一开始就引入**（切片 0 即建立前端测试基座），配 `@vue/test-utils` | 切片 0 |
 
 裁定带来的两处设计调整：
 
 - **#3 提前到切片 1**：WebGL addon 不再作为"吞吐不足时的补救"，而是初始配置的一部分。切片 0 步骤 3 的吞吐测量仍然做，但目的从"决定是否引入 WebGL"变为"记录基线性能数据"。需注意 `addon-webgl` 在部分环境下会 fallback 到 canvas，须处理 `onContextLoss` 事件。
 - **#5 提前到切片 0**：前端测试基座与 Rust 侧的可行性证伪同期建立，使切片 1 起每个切片都能同时满足 §6.3 的不变量 1（`cargo test`）与新增的前端测试要求。
 
-`package.json` 因此需新增依赖：`@xterm/addon-search`、`@xterm/addon-webgl`、`dockview`（切片 3 前）、`vitest` + `@testing-library/react` + `jsdom`（devDependencies，切片 0）。
+具体依赖清单见 §10.3。
+
+---
+
+## 10. 前端技术栈变更：React → Vue 3 + Element Plus
+
+**决定日期**：2026-07-31（§9 裁定之后）
+**触发原因**：用户决定重新设计 UI 界面，且要求自由拖拽 dock 布局。
+
+### 10.1 变更内容
+
+| 项 | 原（commit `ef29010`） | 现 |
+|----|----------------------|-----|
+| 框架 | React 18.3 | **Vue 3.5** |
+| 组件库 | 无（995 行自实现 + 1097 行 tokens.css） | **Element Plus 2.14** |
+| 状态管理 | zustand 5 | **pinia** |
+| dock 布局 | 原定 `dockview`（React 版） | **`dockview-vue` 7.0.4** |
+| 测试 | Vitest + `@testing-library/react` | Vitest + **`@vue/test-utils`** |
+| 终端 | `@xterm/xterm` 6 | 不变（框架无关） |
+| 构建 | Vite 5 + `@vitejs/plugin-react` | Vite 5 + **`@vitejs/plugin-vue`** |
+
+### 10.2 为何此变更不影响本文档 §1–§8 的核心设计
+
+前后端契约（§3）、数据流（§4）、状态所有权（§4.2）、切片顺序（§7）**全部与前端框架无关**——它们约束的是 IPC 边界和后端行为。受影响的仅是前端侧的实现载体：
+
+- §1.1 分层图的前端块（已更新）
+- §4.2 状态所有权表中 "zustand" → "pinia"、"localStorage" → "dockview 布局 JSON"（已更新）
+- §5 灰色地带裁定不变（剪贴板 / 主题映射 / 排序过滤 / 快捷键仍归前端）
+- §6.2 前端单元测试工具（已更新）
+
+**`src/ipc/` 三个文件（`types.ts` 547 行、`client.ts` 208 行、`events.ts` 160 行）是纯 TypeScript，不含任何框架代码，全部保留复用。** 这是 §1.3 边界铁律 2（前端只通过 `invoke`/`listen`/`Channel` 接触后端）带来的直接收益——IPC 层与 UI 框架解耦，换框架不必重写契约层。
+
+### 10.3 依赖清单（切片 0 一次性调整 package.json）
+
+**移除**：`react`、`react-dom`、`@types/react`、`@types/react-dom`、`@vitejs/plugin-react`、`zustand`
+
+**新增（dependencies）**：
+```
+vue@^3.5              element-plus@^2.14      pinia@^3
+dockview-vue@^7.0.4   @element-plus/icons-vue
+@xterm/addon-search   @xterm/addon-webgl      （§9 裁定 #2/#3）
+```
+
+**新增（devDependencies）**：
+```
+@vitejs/plugin-vue    vue-tsc                 @vue/test-utils
+vitest                jsdom                   （§9 裁定 #5）
+```
+
+**保留**：`@xterm/xterm`、`@xterm/addon-fit`、`@tauri-apps/api`、`@tauri-apps/plugin-{fs,dialog,shell}`、`@tauri-apps/cli`、`typescript`、`vite`
+
+### 10.4 删除清单（切片 0 执行）
+
+```
+删除  src/App.tsx
+删除  src/main.tsx              （重建为 Vue 版）
+删除  src/components/*.tsx      （4 个：MenuBar / Modal / StatusBar / Toolbar）
+删除  src/views/*.tsx           （12 个）
+删除  src/store/*.ts            （4 个，zustand → pinia 重建）
+删除  src/styles/tokens.css     （1097 行，UI 重新设计后另立）
+保留  src/ipc/types.ts
+保留  src/ipc/client.ts
+保留  src/ipc/events.ts
+```
+
+同时需调整：`vite.config.ts`（react → vue 插件）、`tsconfig.json`（`jsx: react-jsx` 移除，改用 `vue-tsc`）、`index.html`（挂载点不变）、`package.json` 的 `typecheck` 脚本（`tsc -b` → `vue-tsc --noEmit`）。
+
+### 10.5 已验证的可行性
+
+| 验证项 | 结果 |
+|-------|------|
+| `dockview-vue` 是否真支持 Vue 3 | ✅ v7.0.4，peer `vue ^3.4.0`，官方 Vue 绑定，支持 `<script setup>`，面板经 `:components` prop 注册 |
+| 自由拖拽 dock 能力 | ✅ 与 React 版同源（共享 `dockview-core`），支持拖拽分组、序列化布局 |
+| xterm.js 在 Vue 下可用 | ✅ 框架无关，用原生 API + `onMounted`/`onBeforeUnmount` 管理生命周期 |
+| Element Plus 版本 | ✅ 2.14.3 |
+
+### 10.6 对 §7 切片计划的影响
+
+切片 0 增加"前端清空重建"步骤（原本只有 Vitest 基座）；切片 1 的前端侧改为 Vue SFC，并提前引入 `dockview-vue`（原 §9 裁定 #1 定在切片 3，因 UI 重新设计而提前——新 UI 从一开始就基于 dock 布局搭建，避免先写一套再拆）。
+
+切片 2 及之后的后端工作**不受影响**。
