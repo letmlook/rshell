@@ -467,7 +467,7 @@ recv 循环 → check_output(原始字节) → 命中
 | `CommandOutcome` 契约 | 每个读命令返回正确变体 | `cargo test -p rshell-core` | **新增**；直接覆盖 §3.2 的死循环 |
 | IPC 薄壳 | 宏展开正确、`CoreError → IpcError` 映射 | `cargo test`（`src-tauri`） | 薄壳无逻辑，测试量小 |
 | 类型同步 | TS 类型与 Rust 一致 | `ts-rs` + CI `git diff --exit-code` | 编译期保障，零维护成本 |
-| 前端单元 | store reducer、scheme → ITheme 映射 | Vitest（**需新增依赖**） | 纯函数，易测 |
+| 前端单元 | store reducer、scheme → ITheme 映射 | Vitest（**切片 0 引入**，§9 裁定 #5） | 纯函数，易测 |
 | E2E | 连接真 SSH → 出字 → 传文件 | `tauri-driver` + WebDriver + Docker sshd | 填上现在空的 `tests/e2e/` |
 
 **E2E 前置条件**：`tests/fixtures/` 放 `docker-compose.yml` 起 `linuxserver/openssh-server`，固定端口 + 固定测试密钥。没有真实 SSH 目标，`docs/08` 的 #2（host key 决策）、#3（direct-tcpip 隧道）永远无法验证。
@@ -479,8 +479,9 @@ recv 循环 → check_output(原始字节) → 命中
 1. `cargo test` 全绿，且**测试数不减少**
 2. `cargo clippy --workspace --all-targets` 零 warning
 3. `npm run typecheck` 零错误
-4. 应用**可运行**，不留半成品状态
-5. `AppCommand`/`AppEvent` 的每次增删同步更新 `ts-rs` 导出
+4. `npm run test` 全绿（Vitest，切片 0 起生效）
+5. 应用**可运行**，不留半成品状态
+6. `AppCommand`/`AppEvent` 的每次增删同步更新 `ts-rs` 导出
 
 ---
 
@@ -503,7 +504,8 @@ recv 循环 → check_output(原始字节) → 命中
 
 1. `rhai = { features = ["sync"] }` + `cargo check -p rshell-core` → 验证 `CommandDispatcher: Send + Sync`
 2. 一个真实命令跑通 `invoke` 往返（替掉占位 `hello`）
-3. 一条 `Channel<Vec<u8>>` 推 1 MB 假数据到 xterm.js，量吞吐
+3. 一条 `Channel<Vec<u8>>` 推 1 MB 假数据到 xterm.js，测量吞吐并**记录为基线**
+4. 引入 Vitest 基座（§9 裁定 #5），跑通一个 store 的样例测试
 
 任何一条不通，回到设计而非硬做。第 1 条失败 → 降级到 §1.2 的备选方案。
 
@@ -514,7 +516,7 @@ recv 循环 → check_output(原始字节) → 命中
 | 后端壳 | `state.rs`（`AppState`）、`error.rs`（`IpcError`）、`terminal.rs`（`TerminalChannels`）、`events.rs`（EventBus → emit 桥） |
 | 命令 | `connect_session` / `disconnect_session` / `send_input` / `resize_terminal` / `attach_terminal` / `list_sessions` |
 | 契约 | `CommandOutcome` 骨架（先只需 `None` / `Sessions`） |
-| 前端 | `TerminalPanel.tsx` 去掉假输出（`:54-62`），接 Channel + `term.onData` → `send_input` |
+| 前端 | `TerminalPanel.tsx` 去掉假输出（`:54-62`），接 Channel + `term.onData` → `send_input`；引入 `@xterm/addon-webgl`（§9 裁定 #3，含 `onContextLoss` 回退处理） |
 
 **完成判据：真的连上一台 SSH 服务器，敲 `ls` 看到真实输出。** 这将是本项目第一次运行时验证。
 
@@ -524,6 +526,7 @@ recv 循环 → check_output(原始字节) → 命中
 - 删除 §3.3 的 9 个事件及前端对应分支
 - 删除 §5 的 `CopySelection` / `ClipboardCopy`
 - 引入 `ts-rs`，比对并替换手工 `types.ts`
+- 引入 `@xterm/addon-search`，接上 `TerminalPanel.tsx:93-105` 的静态搜索栏（§9 裁定 #2）
 
 放在切片 1 之后是有意的：**先证明新路能走，再拆旧桥**。
 
@@ -531,7 +534,7 @@ recv 循环 → check_output(原始字节) → 命中
 
 | 顺序 | 功能域 | 排序理由 |
 |------|--------|---------|
-| 3 | 会话 CRUD + 主题 | 纯 CRUD，验证 `CommandOutcome` 全貌 |
+| 3 | 会话 CRUD + 主题 + `dockview` 布局 | 纯 CRUD，验证 `CommandOutcome` 全貌；同期引入 `dockview` 替换自实现 `TabBar`（§9 裁定 #1） |
 | 4 | Host key 决策 | 修 `docs/08` #2；切片 1 连接非首次主机时就会撞上 |
 | 5 | SFTP 传输 + 文件浏览 | 第二大功能；验证 Channel 之外的高频事件（进度） |
 | 6 | 密钥管理 + 主密码 | 安全域；"私钥不过 IPC"的边界在此固化 |
@@ -559,12 +562,21 @@ recv 循环 → check_output(原始字节) → 命中
 
 ---
 
-## 9. 未决问题
+## 9. 已裁定的原未决问题
 
-以下问题不阻塞切片 0/1，但需在对应切片前确认：
+原列为未决的 5 项已于 2026-07-31 全部裁定：
 
-1. **前端布局组件选型**：`package.json` 当前只有 `@xterm/xterm` + `@xterm/addon-fit`。多标签 + 分屏是否引入 `dockview`，或沿用现有 `TabBar.tsx` 自实现？（切片 3 前决定）
-2. **xterm 搜索 addon**：`TerminalPanel.tsx:93-105` 的搜索栏是静态 UI，需 `@xterm/addon-search`。（切片 1 或 2）
-3. **WebGL 渲染**：是否引入 `@xterm/addon-webgl` 提升大量输出时的渲染性能。（切片 0 步骤 3 的吞吐测量结果决定）
-4. **capabilities 细粒度化**：`src-tauri/capabilities/default.json` 当前是默认配置；D2 选细粒度命令的收益之一是可按命令授权，具体策略待定。（切片 6 安全域时决定）
-5. **Vitest 引入时机**：前端目前无测试框架。（切片 2 或 3）
+| # | 问题 | 裁定 | 落到哪个切片 |
+|---|------|------|------------|
+| 1 | 前端布局组件选型 | **引入 `dockview`** 做多标签 + 分屏，替代自实现的 `TabBar.tsx` | 切片 3 |
+| 2 | xterm 搜索 addon | **引入 `@xterm/addon-search`**，接上 `TerminalPanel.tsx:93-105` 的静态搜索栏 | 切片 2 |
+| 3 | WebGL 渲染 | **引入 `@xterm/addon-webgl`**（不再取决于吞吐测量结果） | 切片 1 |
+| 4 | capabilities 细粒度化 | **先按默认来**（`capabilities/default.json` 不动），后续开发中按需增加条目 | 按需 |
+| 5 | Vitest 引入时机 | **一开始就引入**（切片 0 即建立前端测试基座） | 切片 0 |
+
+裁定带来的两处设计调整：
+
+- **#3 提前到切片 1**：WebGL addon 不再作为"吞吐不足时的补救"，而是初始配置的一部分。切片 0 步骤 3 的吞吐测量仍然做，但目的从"决定是否引入 WebGL"变为"记录基线性能数据"。需注意 `addon-webgl` 在部分环境下会 fallback 到 canvas，须处理 `onContextLoss` 事件。
+- **#5 提前到切片 0**：前端测试基座与 Rust 侧的可行性证伪同期建立，使切片 1 起每个切片都能同时满足 §6.3 的不变量 1（`cargo test`）与新增的前端测试要求。
+
+`package.json` 因此需新增依赖：`@xterm/addon-search`、`@xterm/addon-webgl`、`dockview`（切片 3 前）、`vitest` + `@testing-library/react` + `jsdom`（devDependencies，切片 0）。
