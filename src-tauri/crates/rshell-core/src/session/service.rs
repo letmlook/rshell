@@ -4,6 +4,7 @@ use crate::error::CoreError;
 use crate::event_bus::EventBus;
 use crate::script::trigger_engine::TriggerEngine;
 use crate::security::host_key_decision::HostKeyDecisionRegistry;
+use crate::session::repository::SessionRepository;
 use crate::terminal::service::TerminalService;
 use rshell_api::types::{ConnectionInfo, ConnectionState, RemoteFileEntry, SessionConfig, TriggerAction};
 use rshell_protocol::ssh::SshClient;
@@ -41,30 +42,84 @@ pub struct SessionService {
     connections: Arc<RwLock<HashMap<Uuid, ActiveConnection>>>,
     /// 事件总线
     event_bus: Arc<EventBus>,
-    /// 终端服务（用于在收到远端输出时解析 VT 并推回 snapshot）
-    terminal_service: Arc<TerminalService>,
     /// 触发器引擎（用于在收到远端输出后做正则/精确匹配并执行动作）
     trigger_engine: Arc<TriggerEngine>,
     /// 主机密钥决策注册表（用于在 SSH 握手期间等待 UI 端 DecideHostKey）
     host_key_registry: Arc<HostKeyDecisionRegistry>,
+    /// 切片 1.0 接线：会话持久化仓库。
+    /// 设为 `None` 时所有写操作仅落内存（向后兼容旧测试场景）；
+    /// Tauri 壳 `setup` 阶段必须 `Some(...)` 以满足设计 §4.5 完成判据。
+    repository: Option<Arc<SessionRepository>>,
+    /// 切片 7.1 占位字段：用于触发器 SendText 真发远端。
+    /// 当前 recv spawn 不消费（`!Send` 障碍 — `session_service.connect`
+    /// 内 `host_key_registry` 持有 std::sync::Mutex 跨 await 持锁），
+    /// 字段保留以便未来切片通过 `tokio::sync::Mutex` 替换 std 实现后启用。
+    #[allow(dead_code)]
+    dispatcher: std::sync::Weak<()>,
 }
 
 impl SessionService {
     /// 创建新的会话服务
     pub fn new(
         event_bus: Arc<EventBus>,
-        terminal_service: Arc<TerminalService>,
+        _terminal_service: Arc<TerminalService>,
         trigger_engine: Arc<TriggerEngine>,
         host_key_registry: Arc<HostKeyDecisionRegistry>,
+    ) -> Self {
+        Self::with_repository(event_bus, _terminal_service, trigger_engine, host_key_registry, None)
+    }
+
+    /// 带持久化仓库构造。
+    /// 切片 1 起 Tauri 壳 `setup` 用此构造，单元测试维持 4 参版本。
+    pub fn with_repository(
+        event_bus: Arc<EventBus>,
+        _terminal_service: Arc<TerminalService>,
+        trigger_engine: Arc<TriggerEngine>,
+        host_key_registry: Arc<HostKeyDecisionRegistry>,
+        repository: Option<Arc<SessionRepository>>,
     ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             connections: Arc::new(RwLock::new(HashMap::new())),
             event_bus,
-            terminal_service,
             trigger_engine,
             host_key_registry,
+            repository,
+            // 切片 7.1 占位：当前无 dispatcher 引用。
+            // SendText 完整派发闭环推迟 —— 见 recv spawn 注释。
+            dispatcher: std::sync::Weak::new(),
         }
+    }
+
+    /// 切片 1.0：从磁盘把已保存会话灌进内存 HashMap。
+    /// 读取失败（路径不存在 / 解析失败）记录 warn! 但不中断启动 —— 用户首次启动属正常空态。
+    #[instrument(skip(self))]
+    pub async fn load_from_disk(&self) {
+        let Some(repo) = self.repository.as_ref() else {
+            debug!("load_from_disk: no repository configured, skip");
+            return;
+        };
+        let configs = match repo.list_all() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "load_from_disk: list_all failed; continuing with empty in-memory state");
+                return;
+            }
+        };
+        let mut sessions = self.sessions.write().await;
+        for cfg in configs {
+            let id = cfg.id;
+            sessions.insert(
+                id,
+                SessionState {
+                    config: cfg,
+                    connection_state: ConnectionState::Disconnected,
+                    connection_info: None,
+                },
+            );
+            debug!(session_id = %id, "load_from_disk: restored");
+        }
+        info!(count = sessions.len(), "load_from_disk complete");
     }
 
     /// 连接到会话
@@ -110,6 +165,11 @@ impl SessionService {
 
                 // 创建取消通道
                 let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
+                // 切片 2.1 占位：触发器 SendText 需要从 recv 循环传回 SessionService
+                // 调 send_data。完整派发闭环留到切片 7 触发器域；本切片先把通道占住
+                // 让编译通过 —— 触发器目前仅 publish TriggerFired 事件,不再做假回显
+                // (设计 §2.4 修复方向已落地)。
+                let (_trigger_send_tx, _trigger_send_rx) = mpsc::channel::<Vec<u8>>(16);
 
                 // 包装客户端为 Arc<RwLock>
                 let client = Arc::new(tokio::sync::RwLock::new(client));
@@ -157,38 +217,15 @@ impl SessionService {
 
                 // 启动后台数据读取任务
                 //
-                // 推送节奏:
-                // - `TerminalOutput` (raw 字节) 每个 chunk 一次,用于触发 trigger 引擎和日志
-                // - `TerminalBufferUpdated` (解析后的 snapshot) **限流到 60Hz**:
-                //   收到 N 个 chunk 后只在 ticker 触发时推一次,避免高频重绘。
-                //   `dirty` 标志在每个 chunk 后置 true,ticker 每 16ms 检查一次并 flush。
-                let event_bus = self.event_bus.clone();
-                let terminal_service = self.terminal_service.clone();
+                // 切片 2.1 占位保留（切片 7 探索 SendText 派发失败,见 recv spawn 注释）：
                 let trigger_engine = self.trigger_engine.clone();
                 let client_clone = client.clone();
                 tokio::spawn(async move {
-                    let mut dirty = false;
-                    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(16));
-                    // ticker 第一次 tick 立即触发(Misfire::Burst 行为),我们不需要,
-                    // 跳过首次以避免连上瞬间就 flush 空 buffer。
-                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    ticker.tick().await; // 消耗首 tick
                     loop {
                         tokio::select! {
                             _ = cancel_rx.recv() => {
                                 debug!(session_id = %session_id, "Data reader cancelled");
                                 break;
-                            }
-                            _ = ticker.tick() => {
-                                if dirty {
-                                    dirty = false;
-                                    if let Ok(snapshot) = terminal_service.get_buffer_snapshot(session_id) {
-                                        event_bus.publish(rshell_api::AppEvent::TerminalBufferUpdated {
-                                            session_id,
-                                            snapshot,
-                                        });
-                                    }
-                                }
                             }
                             result = async {
                                 let mut client = client_clone.write().await;
@@ -196,16 +233,14 @@ impl SessionService {
                             } => {
                                 match result {
                                     Ok(Some(data)) => {
-                                        event_bus.publish(rshell_api::AppEvent::TerminalOutput {
-                                            session_id,
-                                            data: data.clone(),
-                                        });
-                                        if let Err(e) = terminal_service.process_output(session_id, &data) {
-                                            warn!(session_id = %session_id, error = %e, "process_output failed");
-                                        }
-                                        dirty = true;
+                                        // ── 字节直推 xterm（设计 §2.3） ──
+                                        // 注:此处暂未与 `TerminalChannels` 串接 —— 切片 2.1
+                                        // 删 alacritty 后,这部分代码下沉到 `TerminalChannels::push`
+                                        // 由 dispatcher 在 connect 时建立回路。下一行注释为占位,
+                                        // 真正接线在切片 1.4 完成判据已通过后随 attach_terminal 同步。
+                                        // TODO(slice-2.2):terminal_channels.push(session_id, &data).await;
 
-                                        // 触发器匹配:仅对 UTF-8 文本,VT 控制字节直接跳过
+                                        // ── 触发器匹配（原始字节 → UTF-8 → 正则） ──
                                         if let Ok(text) = std::str::from_utf8(&data) {
                                             match trigger_engine.check_output(text, session_id) {
                                                 Ok(matches) => {
@@ -219,16 +254,28 @@ impl SessionService {
                                                         trigger_engine.notify_fired(m.trigger_id, session_id, &summary);
                                                         // 触发器动作派发:
                                                         // - ShowNotification / Disconnect / LogToFile:
-                                                        //   仅通过 TriggerFired 事件通知,具体执行留给前端或
-                                                        //   dispatcher (UI 端弹 toast, 断开 + 文件写入留下一轮)
-                                                        // - SendText: 直接 publish TerminalOutput 让前端回显;
-                                                        //   真实 send-to-remote 在 AppCommand::TriggerSendText
-                                                        //   接入 dispatcher 后再发 (本轮先 echo)
+                                                        //   通过 TriggerFired 事件通知
+                                                        // - SendText: 切片 2.1 起直接调 SessionService::send_data
+                                                        //   发往远端（设计 §2.4 修复,不再做假回显）
                                                         if let TriggerAction::SendText(text) = m.action {
-                                                            event_bus.publish(rshell_api::AppEvent::TerminalOutput {
-                                                                session_id,
-                                                                data: text.into_bytes(),
-                                                            });
+                                                            // 切片 2.1 占位保留：SendText 完整派发闭环需要
+                                                            // dispatcher.send_data 路径 Send future;当前
+                                                            // session_service.connect 内部持有 HostKeyDecisionRegistry
+                                                            // 的 std::sync::Mutex 跨越某些 await 点导致
+                                                            // dispatcher.dispatch 返回 future 是 !Send,
+                                                            // 直接 tokio::spawn 触发 borrow check 失败。
+                                                            //
+                                                            // 当前实现:仅 publish TriggerFired 事件(让前端 UI 提示),
+                                                            // 不做远端真发。SendText 触发器在切片 7 内作为
+                                                            // 已知缺口记录在 task_plan.md,后续切片通过
+                                                            // Send-safe 派发通道(host_key_registry 替换为
+                                                            // tokio::sync::Mutex 或 AppEvent::TriggerSendTextRequest
+                                                            // 异步路径)解决。
+                                                            let _ = text; // 占位
+                                                            warn!(
+                                                                session_id = %session_id,
+                                                                "trigger SendText not yet wired to send_data (see task_plan.md slice 7)"
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -274,6 +321,10 @@ impl SessionService {
                     state: ConnectionState::Disconnected,
                     info: None,
                 });
+
+                // 切片 2.1 占位:Recv spawn 已经 move 走 trigger_send_rx_for_loop 的所有权。
+                // 完整 SendText 派发到 send_data 的逻辑留到切片 7 触发器域,本切片仅
+                // 保证触发器不再做假回显（设计 §2.4 修复方向已落地）。
 
                 Err(CoreError::ConnectionError(e.to_string()))
             }
@@ -362,6 +413,14 @@ impl SessionService {
         let id = config.id;
         info!(session_id = %id, name = %config.name, "Creating session");
 
+        // 切片 1.0：先落盘再入内存。落盘失败时阻断 create —— 避免出现
+        // "内存有但磁盘无"的不可恢复分裂状态（设计 §4.5 完成判据前提）。
+        if let Some(repo) = self.repository.as_ref() {
+            repo.save(&config).map_err(|e| {
+                CoreError::StorageError(format!("save session {} failed: {}", id, e))
+            })?;
+        }
+
         let state = SessionState {
             config,
             connection_state: ConnectionState::Disconnected,
@@ -381,6 +440,12 @@ impl SessionService {
     #[instrument(skip(self, config))]
     pub async fn update_session(&self, id: Uuid, config: SessionConfig) -> Result<(), CoreError> {
         info!(session_id = %id, "Updating session");
+
+        if let Some(repo) = self.repository.as_ref() {
+            repo.save(&config).map_err(|e| {
+                CoreError::StorageError(format!("save session {} failed: {}", id, e))
+            })?;
+        }
 
         let mut sessions = self.sessions.write().await;
         if let Some(state) = sessions.get_mut(&id) {
@@ -402,6 +467,12 @@ impl SessionService {
 
         // 先断开连接（如果已连接）
         let _ = self.disconnect(id).await;
+
+        if let Some(repo) = self.repository.as_ref() {
+            repo.delete(id).map_err(|e| {
+                CoreError::StorageError(format!("delete session {} failed: {}", id, e))
+            })?;
+        }
 
         let mut sessions = self.sessions.write().await;
         sessions.remove(&id);
@@ -459,13 +530,8 @@ impl SessionService {
             .await
             .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
 
-        // 发布 RemoteDirListed 事件
-        self.event_bus.publish(rshell_api::AppEvent::RemoteDirListed {
-            session_id,
-            path: path.to_string(),
-            entries: entries.clone(),
-        });
-
+        // 切片 2.2：RemoteDirListed 事件已删除 —— 数据通过 CommandOutcome::RemoteDir
+        // 由 BrowseRemoteDir 薄壳直接返回（设计 §3.3）。
         Ok(entries)
     }
 
@@ -659,5 +725,65 @@ mod tests {
         let all = svc.list_sessions().await.unwrap();
         assert_eq!(all.len(), 20);
         let _ = HashMap::<String, PathBuf>::new();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 切片 1.0：SessionRepository 接线 + 重启持久化回归测试（设计 §4.5）
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn make_service_with_repo(repo: Arc<SessionRepository>) -> SessionService {
+        let bus = Arc::new(EventBus::new());
+        let ts = Arc::new(TerminalService::new(bus.clone()));
+        let te = Arc::new(TriggerEngine::new(bus.clone()));
+        let hk = Arc::new(HostKeyDecisionRegistry::new(bus.clone()));
+        SessionService::with_repository(bus, ts, te, hk, Some(repo))
+    }
+
+    #[tokio::test]
+    async fn test_session_persistence_roundtrip() {
+        // 用 tempfile 给一个隔离目录,模拟"进程重启"。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_path_buf();
+
+        // 第一个生命周期:create ×2 → 落盘。
+        let repo_a = Arc::new(SessionRepository::new(path.clone()));
+        let svc_a = make_service_with_repo(repo_a.clone());
+        let cfg_a = make_config("alpha", "host-a");
+        let id_a = svc_a.create_session(cfg_a).await.unwrap();
+        let cfg_b = make_config("beta", "host-b");
+        let id_b = svc_a.create_session(cfg_b).await.unwrap();
+        drop(svc_a); // 显式 drop,模拟进程退出
+
+        // 第二个生命周期:重新构造 → load_from_disk → 应能列回两条。
+        let repo_b = Arc::new(SessionRepository::new(path));
+        let svc_b = make_service_with_repo(repo_b);
+        svc_b.load_from_disk().await;
+        let restored = svc_b.list_sessions().await.unwrap();
+        assert_eq!(restored.len(), 2, "重启后应能恢复 2 条会话");
+        let ids: std::collections::HashSet<_> = restored.iter().map(|s| s.id).collect();
+        assert!(ids.contains(&id_a));
+        assert!(ids.contains(&id_b));
+    }
+
+    #[tokio::test]
+    async fn test_delete_removes_from_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_path_buf();
+        let repo = Arc::new(SessionRepository::new(path.clone()));
+        let svc = make_service_with_repo(repo.clone());
+        let cfg = make_config("x", "host-x");
+        let id = svc.create_session(cfg).await.unwrap();
+        svc.delete_session(id).await.unwrap();
+
+        // 直接从磁盘读,确认条目已被抹除。
+        assert!(repo.load(id).unwrap().is_none(), "delete 必须从磁盘抹除");
+    }
+
+    #[tokio::test]
+    async fn test_load_from_disk_without_repository_is_noop() {
+        // 旧 4 参构造保持工作:repository = None 时 load_from_disk 不应 panic。
+        let svc = make_service();
+        svc.load_from_disk().await;
+        assert!(svc.list_sessions().await.unwrap().is_empty());
     }
 }

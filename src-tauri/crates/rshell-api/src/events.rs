@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::{ActiveTunnelInfo, AppTheme, ConnectionInfo, ConnectionState, RemoteFileEntry, ScriptResult, SshKeyInfo, TerminalColorScheme, TunnelState};
+use crate::types::{ActiveTunnelInfo, AppTheme, ConnectionInfo, ConnectionState, ScriptResult, SshKeyInfo, TerminalColorScheme, TunnelState};
 
 /// 后端发布的所有事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,16 +20,11 @@ pub enum AppEvent {
     },
 
     // ===== 终端输出 =====
-    /// 终端输出数据（高频事件）
-    TerminalOutput { session_id: Uuid, data: Vec<u8> },
     /// 终端标题改变
     TerminalTitleChanged { session_id: Uuid, title: String },
-    /// 终端缓冲区更新（解析 VT 后的完整快照，前端可直接渲染）
-    ///
-    /// 后端在收到 `TerminalOutput` 后用 `alacritty_terminal` 解析 VT 序列，
-    /// 生成 `TerminalBufferSnapshot` 通过本事件推回前端。事件频率受
-    /// `TerminalService` 节流（当前每 chunk 一次；生产环境应做 60Hz 节流）。
-    TerminalBufferUpdated { session_id: Uuid, snapshot: crate::types::TerminalBufferSnapshot },
+    // 注：原始字节通过 Tauri `Channel<Vec<u8>>` 直接推到前端 xterm（设计 §1 D1）
+    // —— 切片 2.1 起删除 `TerminalOutput` 与 `TerminalBufferUpdated` 事件,
+    // 详见 `docs/superpowers/specs/2026-07-31-tauri2-frontend-backend-split-design.md` §2.2
 
     // ===== 会话数据变化 =====
     /// 会话列表改变（前端需重新拉取）
@@ -57,14 +52,6 @@ pub enum AppEvent {
     TransferTaskCompleted { task_id: Uuid },
     /// 传输任务已失败
     TransferTaskFailed { task_id: Uuid, error: String },
-
-    // ===== 远程目录浏览 =====
-    /// 远程目录列表返回
-    RemoteDirListed {
-        session_id: Uuid,
-        path: String,
-        entries: Vec<RemoteFileEntry>,
-    },
 
     // ===== 隧道状态 =====
     /// 隧道状态改变
@@ -138,10 +125,6 @@ pub enum AppEvent {
     /// 配色方案列表更新
     ColorSchemeListChanged,
 
-    // ===== 剪贴板事件 =====
-    /// 用户请求拷贝文本到系统剪贴板（前端应调 arboard / nopclipboard 写入）
-    ClipboardCopy { text: String },
-
     // ===== 插件事件 =====
     /// 插件列表已更新
     PluginListUpdated,
@@ -150,20 +133,7 @@ pub enum AppEvent {
     /// 插件加载失败
     PluginLoadFailed { plugin_id: String, error: String },
 
-    // ===== 快照事件 (响应 ListX 命令) =====
-    /// 会话列表快照 — 响应 ListSessions
-    SessionsSnapshot { sessions: Vec<crate::types::SessionConfig> },
-    /// 活动隧道列表快照 — 响应 ListTunnels
-    TunnelsSnapshot { tunnels: Vec<crate::types::ActiveTunnelInfo> },
-    /// SSH 密钥列表快照 — 响应 ListKeys
-    KeysSnapshot { keys: Vec<crate::types::SshKeyInfo> },
-    /// 插件列表快照 — 响应 ListPlugins
-    PluginsSnapshot { plugins: Vec<crate::types::PluginInfo> },
-    /// 主题/配色方案列表快照 — 响应 ListThemes
-    ThemesSnapshot {
-        current_theme: String,
-        current_scheme: String,
-        available_themes: Vec<String>,
-        available_schemes: Vec<String>,
-    },
+    // 切片 2.2 删除：7 个 *Snapshot 事件 + ClipboardCopy + RemoteDirListed —— 设计 §3.3
+    //   "ListX" 读命令统一改为返回 CommandOutcome 变体（不通过事件总线带数据）。
+    //   剪贴板上移前端 xterm 自持选区(设计 §5)。
 }

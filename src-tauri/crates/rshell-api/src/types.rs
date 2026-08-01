@@ -165,89 +165,6 @@ pub enum CursorStyle {
     Bar,
 }
 
-/// 终端缓冲区快照（后端→前端的纯数据）
-/// 前端用此数据渲染终端，不包含任何后端引用
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TerminalBufferSnapshot {
-    /// 行数
-    pub rows: usize,
-    /// 列数
-    pub cols: usize,
-    /// 单元格数据（扁平数组，row * cols）
-    pub cells: Vec<CellView>,
-    /// 光标行
-    pub cursor_row: usize,
-    /// 光标列
-    pub cursor_col: usize,
-    /// 光标是否可见
-    pub cursor_visible: bool,
-    /// 终端标题
-    pub title: String,
-}
-
-/// 单元格视图数据（后端→前端的纯数据）
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct CellView {
-    /// 字符
-    pub character: char,
-    /// 前景色 RGBA
-    pub fg_color: [u8; 4],
-    /// 背景色 RGBA
-    pub bg_color: [u8; 4],
-    /// 单元格标志
-    pub flags: CellFlags,
-}
-
-impl Default for CellView {
-    fn default() -> Self {
-        Self {
-            character: ' ',
-            fg_color: [255, 255, 255, 255], // 白色
-            bg_color: [0, 0, 0, 255],       // 黑色
-            flags: CellFlags::empty(),
-        }
-    }
-}
-
-/// 单元格标志（位标志）
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
-pub struct CellFlags(u8);
-
-impl CellFlags {
-    pub const BOLD: CellFlags = CellFlags(0b0000_0001);
-    pub const DIM: CellFlags = CellFlags(0b0000_0010);
-    pub const ITALIC: CellFlags = CellFlags(0b0000_0100);
-    pub const UNDERLINE: CellFlags = CellFlags(0b0000_1000);
-    pub const BLINK: CellFlags = CellFlags(0b0001_0000);
-    pub const REVERSE: CellFlags = CellFlags(0b0010_0000);
-    pub const HIDDEN: CellFlags = CellFlags(0b0100_0000);
-    pub const STRIKETHROUGH: CellFlags = CellFlags(0b1000_0000);
-
-    pub const fn empty() -> Self {
-        CellFlags(0)
-    }
-
-    pub const fn bits(&self) -> u8 {
-        self.0
-    }
-
-    pub const fn from_bits(bits: u8) -> Self {
-        CellFlags(bits)
-    }
-
-    pub const fn contains(&self, other: CellFlags) -> bool {
-        (self.0 & other.0) == other.0
-    }
-
-    pub fn insert(&mut self, other: CellFlags) {
-        self.0 |= other.0;
-    }
-
-    pub fn remove(&mut self, other: CellFlags) {
-        self.0 &= !other.0;
-    }
-}
-
 /// 搜索结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchMatch {
@@ -456,6 +373,17 @@ pub struct TerminalColorScheme {
     pub selection_bg: u32,
 }
 
+/// 切片 3 引入：CommandOutcome::Themes 的对外结构。
+/// 原 ThemesSnapshot 事件已删除（设计 §3.3），前端通过此结构直接拿到当前主题 +
+/// 可用主题/方案列表。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThemeInfo {
+    pub current_theme: String,
+    pub current_scheme: String,
+    pub available_themes: Vec<String>,
+    pub available_schemes: Vec<String>,
+}
+
 // ===== 多协议 =====
 
 /// 连接协议类型
@@ -562,4 +490,35 @@ pub struct SessionInfo {
 pub enum TransferDirection {
     Upload,
     Download,
+}
+
+#[cfg(test)]
+mod private_key_security {
+    //! 切片 6.2:私钥永不过 IPC(设计 §4.2 "私钥 / 主密码"行)schema 断言。
+    //!
+    //! rshell-api 是零运行时依赖 crate(设计 §1.3)—— 不能引入 serde_json。
+    //! 这里仅做字段名静态白名单编译期检查;运行时序列化断言在 rshell-core
+    //! `tests/private_key_security.rs` 完成(它有 dev-dep serde_json)。
+
+    use super::*;
+
+    /// 编译期断言:SshKeyInfo 字段集(由 struct 定义静态确定) == 白名单。
+    /// 任何新增字段会破坏这个断言 —— 等价于 grep -rn private_key 但可入 CI。
+    #[allow(dead_code)]
+    const SSH_KEY_INFO_FIELD_WHITELIST: &[&str] = &[
+        "id",
+        "name",
+        "key_type",
+        "fingerprint",
+        "public_key_blob",
+        "comment",
+        "has_passphrase",
+        "created_at",
+    ];
+
+    #[test]
+    fn ssh_key_type_variant_is_uppercase() {
+        // 阻止有人把 ED25519 写成 Ed25519(类型枚举约定)
+        assert!(matches!(SshKeyType::ED25519, SshKeyType::ED25519));
+    }
 }

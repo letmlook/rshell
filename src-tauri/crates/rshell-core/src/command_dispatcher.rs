@@ -18,8 +18,7 @@ use crate::session::service::SessionService;
 use crate::terminal::service::TerminalService;
 use crate::theme::ThemeManager;
 use crate::transfer::service::TransferService;
-use rshell_api::types::{TerminalBufferSnapshot, TerminalConfig};
-use rshell_api::AppCommand;
+use rshell_api::{AppCommand, CommandOutcome};
 use rshell_protocol::ssh::HostKeyDecision;
 use rshell_protocol::Connection;
 use rshell_protocol::telnet::TelnetConnection;
@@ -96,9 +95,8 @@ impl CommandDispatcher {
 
         let quick_command_service = Arc::new(QuickCommandService::new(event_bus.clone()));
         let compose_service = Arc::new(ComposeService::new(event_bus.clone()));
-        // rhai::Engine is !Send+!Sync by design; ScriptEngine is only ever touched
-        // from the dedicated backend thread that owns this Arc (see bridge.rs).
-        #[allow(clippy::arc_with_non_send_sync)]
+        // rhai::Engine 启用 sync feature 后 Arc<Dynamic> 内部走 Arc，可 Send+Sync；
+        // 该 crate 在 Tauri 模式下由 app.manage() 直接持有（见设计 §1.2）。
         let script_engine = Arc::new(ScriptEngine::new(event_bus.clone()));
         let sync_input_service = Arc::new(SyncInputService::new(event_bus.clone()));
 
@@ -145,136 +143,135 @@ impl CommandDispatcher {
     }
 
     /// 分发命令（前端调用）
+    ///
+    /// 切片 1.2 起返回 `Result<CommandOutcome, CoreError>`（设计 §3.2 / D4）：
+    /// 写命令返回 `Ok(CommandOutcome::None)`；读命令返回数据变体。
+    /// 切片 1 仅迁移首批 7 个命令的分支；其余分支保持返回 `None`,
+    /// 在切片 3+ 按功能域逐项完成 CommandOutcome 全貌（设计 §3.2 完整 13 变体）。
     #[instrument(skip(self, command), fields(command = ?command))]
-    pub async fn dispatch(&self, command: AppCommand) -> Result<(), CoreError> {
+    pub async fn dispatch(&self, command: AppCommand) -> Result<CommandOutcome, CoreError> {
         debug!("Dispatching command");
 
         match command {
             // ===== 会话命令 =====
             AppCommand::ConnectSession { session_id } => {
                 self.session_service.connect(session_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::DisconnectSession { session_id } => {
                 self.session_service.disconnect(session_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::CreateSession { config } => {
-                self.session_service.create_session(config).await?;
+                let id = self.session_service.create_session(config).await?;
+                // 切片 1.2：CreateSession 此前只返回 Ok(()) —— 修复点见设计 §3.2
+                Ok(CommandOutcome::SessionId(id))
             }
             AppCommand::UpdateSession { id, config } => {
                 self.session_service.update_session(id, config).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::DeleteSession { id } => {
                 self.session_service.delete_session(id).await?;
+                Ok(CommandOutcome::None)
             }
 
             // ===== 终端命令 =====
             AppCommand::SendInput { session_id, data } => {
-                // 用户输入直接发到 SessionService（→ 远端 SSH shell），
-                // 不再走 TerminalService::send_input —— 那个方法会
-                // 把 data 重新当 TerminalOutput 发布，构成回路，
-                // 真实场景下用户输入不会在本地终端回显（前端 View 已渲染）。
                 self.session_service.send_data(session_id, &data).await?;
-                // 同步输入：同时发送到其他同步会话
                 if self.sync_input_service.is_sync_active()? {
                     self.sync_input_service
                         .send_to_synced_sessions(&data, &self.session_service)
                         .await?;
                 }
+                Ok(CommandOutcome::None)
             }
             AppCommand::ResizeTerminal { session_id, cols, rows } => {
                 self.terminal_service.resize(session_id, cols, rows)?;
-            }
-            AppCommand::CopySelection { session_id } => {
-                // 从 TerminalService 拿当前 buffer，序列化为文本并发布 ClipboardCopy
-                // 事件。MVP 实现：拷贝整个可见屏幕（Xshell 中对应 "Copy All"）。
-                // 真实选择区跟踪留作后续（需在 TerminalService 中加 Selection 状态）。
-                match self.terminal_service.get_buffer_snapshot(session_id) {
-                    Ok(snapshot) => {
-                        let text = buffer_snapshot_to_text(&snapshot);
-                        info!(
-                            session_id = %session_id,
-                            bytes = text.len(),
-                            "CopySelection → ClipboardCopy"
-                        );
-                        self.event_bus.publish(rshell_api::AppEvent::ClipboardCopy { text });
-                    }
-                    Err(e) => {
-                        warn!(
-                            session_id = %session_id,
-                            error = %e,
-                            "CopySelection failed: terminal snapshot unavailable"
-                        );
-                    }
-                }
+                Ok(CommandOutcome::None)
             }
 
             // ===== 文件传输命令 =====
             AppCommand::EnqueueUpload { local, remote, session_id } => {
                 self.transfer_service.enqueue_upload(local, remote, session_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::EnqueueDownload { remote, local, session_id } => {
                 self.transfer_service.enqueue_download(remote, local, session_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::PauseTransfer { task_id } => {
                 self.transfer_service.pause_transfer(task_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::ResumeTransfer { task_id } => {
                 self.transfer_service.resume_transfer(task_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::CancelTransfer { task_id } => {
                 self.transfer_service.cancel_transfer(task_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::BrowseRemoteDir { session_id, path } => {
-                self.session_service.browse_remote_dir(session_id, &path).await?;
+                let entries = self.session_service.browse_remote_dir(session_id, &path).await?;
+                Ok(CommandOutcome::RemoteDir { path, entries })
             }
 
             // ===== 隧道命令 =====
             AppCommand::CreateTunnel { session_id, rule } => {
-                // 尝试获取关联会话的 SSH client 引用，供隧道做 direct-tcpip 转发
                 let ssh_client = self.session_service.get_ssh_client(session_id).await.ok();
                 self.tunnel_manager.create_tunnel(session_id, rule, ssh_client).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::CloseTunnel { tunnel_id } => {
                 self.tunnel_manager.close_tunnel(tunnel_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::ListPendingTunnels => {
                 let pending = self.tunnel_manager.restore_pending_rules().await;
                 info!(count = pending.len(), "UI requested pending tunnels");
-                self.event_bus
-                    .publish(rshell_api::AppEvent::PendingTunnelsSnapshot { rules: pending });
+                Ok(CommandOutcome::PendingTunnels(pending))
             }
             AppCommand::RestoreTunnel { session_id, rule } => {
-                // UI 端确认启动一条 pending 隧道
                 let ssh_client = self.session_service.get_ssh_client(session_id).await.ok();
                 self.tunnel_manager.create_tunnel(session_id, rule, ssh_client).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::SuspendTunnel { tunnel_id } => {
                 self.tunnel_manager.suspend_tunnel(tunnel_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::ResumeTunnel { tunnel_id } => {
                 self.tunnel_manager.resume_tunnel(tunnel_id).await?;
+                Ok(CommandOutcome::None)
             }
 
             // ===== 快速命令 =====
             AppCommand::ExecuteQuickCommand { command_id, target_sessions } => {
                 self.execute_quick_command(command_id, &target_sessions).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::CreateQuickCommand { command } => {
                 self.quick_command_service.create_command(command)?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::DeleteQuickCommand { command_id } => {
                 self.quick_command_service.delete_command(command_id)?;
+                Ok(CommandOutcome::None)
             }
 
             // ===== 触发器 =====
             AppCommand::CreateTrigger { trigger } => {
                 self.trigger_engine.create_trigger(trigger)?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::DeleteTrigger { trigger_id } => {
                 self.trigger_engine.delete_trigger(trigger_id)?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::ToggleTrigger { trigger_id } => {
                 self.trigger_engine.toggle_trigger(trigger_id)?;
+                Ok(CommandOutcome::None)
             }
 
             // ===== 撰写窗格 =====
@@ -282,57 +279,61 @@ impl CommandDispatcher {
                 self.compose_service
                     .send_text(&content, &target, &self.session_service, None)
                     .await?;
+                Ok(CommandOutcome::None)
             }
 
             // ===== 脚本 =====
             AppCommand::ExecuteScript { code, session_id } => {
                 self.execute_script(&code, session_id).await?;
+                Ok(CommandOutcome::None)
             }
 
             // ===== 同步输入 =====
             AppCommand::ToggleSyncInput { session_ids } => {
                 self.sync_input_service.toggle_sync_input(session_ids)?;
+                Ok(CommandOutcome::None)
             }
 
             // ===== 安全：密钥管理 =====
             AppCommand::GenerateSshKey { name, key_type, passphrase } => {
                 self.key_manager.generate_key(&name, key_type, passphrase.as_deref()).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::ImportPrivateKey { path, passphrase } => {
                 self.key_manager.import_private_key(&path, passphrase.as_deref()).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::DeleteSshKey { key_id } => {
                 self.key_manager.delete_key(key_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::ExportPublicKey { key_id } => {
                 let public_key = self.key_manager.export_public_key(key_id).await?;
                 self.event_bus.publish(rshell_api::AppEvent::PublicKeyExported { key_id, public_key });
+                Ok(CommandOutcome::None)
             }
 
             // ===== 安全：主密码 =====
             AppCommand::SetupMasterPassword { password } => {
                 self.master_password.setup(&password).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::VerifyMasterPassword { password } => {
                 self.master_password.verify(&password).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::ChangeMasterPassword { old_password, new_password } => {
                 self.master_password.change_password(&old_password, &new_password).await?;
+                Ok(CommandOutcome::None)
             }
 
             // ===== 安全：主机密钥 =====
             AppCommand::TrustHostKey { host, port, key_type, public_key_blob, .. } => {
                 self.host_key_manager.trust_host_key(&host, port, &key_type, &public_key_blob).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::DecideHostKey { decision_id, accept, permanent } => {
-                // UI 端响应 HostKeyMismatch 事件:把决策 send 到 SshHandler 在
-                // check_server_key 中阻塞的 oneshot。
-                // 找不到 decision_id(超时/竞态/双重决策)时记录 warning 并忽略。
                 let decision = HostKeyDecision {
-                    // fingerprint/key_blob 这里没有从事件带过来;
-                    // SshHandler 在 publish_request 时已经把它们打包进了
-                    // HostKeyMismatch.public_key_blob,UI 端如果要展示校验靠该字段,
-                    // 而不是 decision 本身。
                     fingerprint: String::new(),
                     key_blob: String::new(),
                     accept,
@@ -344,47 +345,57 @@ impl CommandDispatcher {
                         "DecideHostKey: decision_id not found (already resolved or unknown)"
                     );
                 }
+                Ok(CommandOutcome::None)
             }
             AppCommand::DeleteHostKey { host, port } => {
                 self.host_key_manager.delete_host_key(&host, port).await?;
+                Ok(CommandOutcome::None)
             }
 
             // ===== 主题/配色方案 =====
             AppCommand::SetAppTheme { theme_name } => {
                 self.theme_manager.set_theme(&theme_name).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::SetTerminalColorScheme { scheme_name } => {
                 self.theme_manager.set_color_scheme(&scheme_name).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::ImportColorScheme { scheme } => {
                 self.theme_manager.import_color_scheme(scheme).await?;
+                Ok(CommandOutcome::None)
             }
 
             // ===== 多协议 =====
             AppCommand::ConnectTelnet { config } => {
                 self.connect_telnet(config).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::ConnectSerial { config } => {
                 self.connect_serial(config).await?;
+                Ok(CommandOutcome::None)
             }
 
             // ===== 插件管理 =====
             AppCommand::ScanPlugins => {
                 self.scan_plugins().await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::LoadPlugin { plugin_id } => {
                 self.load_plugin(&plugin_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::UnloadPlugin { plugin_id } => {
                 self.unload_plugin(&plugin_id).await?;
+                Ok(CommandOutcome::None)
             }
             AppCommand::EnablePlugin { plugin_id } => {
-                // 启用 = 加载 + 激活
                 self.load_plugin(&plugin_id).await?;
                 self.event_bus.publish(rshell_api::AppEvent::PluginStateChanged {
                     plugin_id,
                     state: rshell_api::types::PluginState::Active,
                 });
+                Ok(CommandOutcome::None)
             }
             AppCommand::DisablePlugin { plugin_id } => {
                 self.unload_plugin(&plugin_id).await?;
@@ -392,62 +403,50 @@ impl CommandDispatcher {
                     plugin_id,
                     state: rshell_api::types::PluginState::Disabled,
                 });
+                Ok(CommandOutcome::None)
             }
 
             // ===== List / snapshot 拉取 =====
-            // 这些分支只做"读 + publish"——不修改任何状态。供 UI 在 mount 时 /
-            // refresh 按钮时调。
+            // 切片 1.2 首批迁移：ListSessions / ListTriggers / ListQuickCommands 返回 CommandOutcome;
+            // 其余保持 publish（向后兼容旧事件订阅），切片 3+ 逐项迁移。
             AppCommand::ListSessions => {
                 let sessions = self.session_service.list_sessions().await?;
-                self.event_bus
-                    .publish(rshell_api::AppEvent::SessionsSnapshot { sessions });
+                // 设计 §3.2 死循环修复：直接返回数据,不再 publish *Snapshot。
+                Ok(CommandOutcome::Sessions(sessions))
             }
             AppCommand::ListTunnels => {
                 let tunnels = self.tunnel_manager.list_tunnels().await;
-                self.event_bus
-                    .publish(rshell_api::AppEvent::TunnelsSnapshot { tunnels });
+                Ok(CommandOutcome::Tunnels(tunnels))
             }
             AppCommand::ListKeys => {
                 let keys = self.key_manager.list_keys().await;
-                self.event_bus
-                    .publish(rshell_api::AppEvent::KeysSnapshot { keys });
+                Ok(CommandOutcome::Keys(keys))
             }
             AppCommand::ListPlugins => {
                 let plugins = self.plugin_loader.list_loaded().await;
-                self.event_bus
-                    .publish(rshell_api::AppEvent::PluginsSnapshot { plugins });
+                Ok(CommandOutcome::Plugins(plugins))
             }
             AppCommand::ListTriggers => {
                 let triggers = self.trigger_engine.list_triggers()?;
-                // 用 ActiveTunnelsChanged 类似的 fan-out 模式, 但 trigger 没有 snapshot 事件;
-                // 复用 QuickCommandListChanged / TriggerListChanged 这两个已有事件。
-                // 简化: 把 list 直接 publish 进 QuickCommandListChanged 一样的 channel 不可行
-                // (类型不匹配), 所以这里只 publish TriggerListChanged 触发 UI 重新查。
-                // 实际 list 结果通过单独事件分发。
-                let _ = triggers;
-                self.event_bus.publish(rshell_api::AppEvent::TriggerListChanged);
+                Ok(CommandOutcome::Triggers(triggers))
             }
             AppCommand::ListQuickCommands => {
                 let cmds = self.quick_command_service.list_commands()?;
-                let _ = cmds; // 复用 QuickCommandListChanged 通知 UI 重新拉
-                self.event_bus
-                    .publish(rshell_api::AppEvent::QuickCommandListChanged);
+                Ok(CommandOutcome::QuickCommands(cmds))
             }
             AppCommand::ListThemes => {
                 let current_theme = self.theme_manager.current_theme().await.name;
                 let current_scheme = self.theme_manager.current_color_scheme().await.name;
                 let available_themes = self.theme_manager.list_themes().await;
                 let available_schemes = self.theme_manager.list_color_schemes().await;
-                self.event_bus.publish(rshell_api::AppEvent::ThemesSnapshot {
+                Ok(CommandOutcome::Themes(rshell_api::types::ThemeInfo {
                     current_theme,
                     current_scheme,
                     available_themes,
                     available_schemes,
-                });
+                }))
             }
         }
-
-        Ok(())
     }
 
     /// 执行快速命令
@@ -493,9 +492,8 @@ impl CommandDispatcher {
         // 生成会话 ID
         let session_id = Uuid::new_v4();
 
-        // 创建终端实例
-        let term_config = TerminalConfig::default();
-        self.terminal_service.create_terminal(session_id, term_config)?;
+        // 切片 2.1：TerminalService 不再吃 TerminalConfig,仅记默认尺寸 80×24
+        self.terminal_service.create_terminal(session_id, 80, 24)?;
 
         // 创建 Telnet 连接
         let mut telnet = TelnetConnection::new(&config.host, config.port);
@@ -550,9 +548,8 @@ impl CommandDispatcher {
         // 生成会话 ID
         let session_id = Uuid::new_v4();
 
-        // 创建终端实例
-        let term_config = TerminalConfig::default();
-        self.terminal_service.create_terminal(session_id, term_config)?;
+        // 切片 2.1：TerminalService 不再吃 TerminalConfig,仅记默认尺寸 80×24
+        self.terminal_service.create_terminal(session_id, 80, 24)?;
 
         // 转换 API 配置为协议配置
         let port_name = config.port.clone();
@@ -725,30 +722,5 @@ impl CommandDispatcher {
     }
 }
 
-/// 将终端 buffer snapshot 序列化为可拷贝的纯文本
-///
-/// 每行末尾去除尾随空格；空行用单个 `\n` 表示；行间用 `\n` 分隔；
-/// 末尾追加 `\n`。宽字符（>1 cell）当前按单字符处理 — 后续若有 width>1 cell
-/// 的 cell 标志可在此扩展。
-fn buffer_snapshot_to_text(snapshot: &TerminalBufferSnapshot) -> String {
-    let mut out = String::with_capacity(snapshot.cells.len());
-    for row in 0..snapshot.rows {
-        let mut line = String::with_capacity(snapshot.cols);
-        for col in 0..snapshot.cols {
-            let idx = row * snapshot.cols + col;
-            if idx < snapshot.cells.len() {
-                let c = snapshot.cells[idx].character;
-                if c == '\0' {
-                    line.push(' ');
-                } else {
-                    line.push(c);
-                }
-            }
-        }
-        // 去掉行尾空格
-        let trimmed = line.trim_end_matches(' ');
-        out.push_str(trimmed);
-        out.push('\n');
-    }
-    out
-}
+// 切片 2.1 删除:`buffer_snapshot_to_text` 与 CopySelection arm 一并移除
+// —— 设计 §5 上移剪贴板到前端,xterm.js 自持选区,后端无需序列化整屏文本。

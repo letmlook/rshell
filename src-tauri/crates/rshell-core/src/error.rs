@@ -19,4 +19,8 @@ pub enum CoreError {
     InvalidState(String),
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
+    /// 切片 1.0 引入：会话持久化失败。设计 §4.5 的硬约束 —— 任何
+    /// 写磁盘失败必须阻断 create/update/delete,避免出现"内存有但磁盘无"的分裂状态。
+    #[error("Storage error: {0}")]
+    StorageError(String),
 }

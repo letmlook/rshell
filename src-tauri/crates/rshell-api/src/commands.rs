@@ -2,6 +2,12 @@
 //!
 //! Command 是不可变意图，表示用户希望执行的操作。
 //! 所有字段必须具名，类型必须实现 Serialize + Deserialize + Clone。
+//!
+//! 切片 2.3 状态：ts-rs 12 已加入 workspace 依赖（`Cargo.toml` `workspace.dependencies.ts-rs`）。
+//! 全量 `#[derive(TS)]` 需要 types.rs 中所有公共结构体同时 derive ——
+//! 那是切片 3 域内的工作量（按功能域逐项 derive + 导出）。
+//! 本切片仅记录:derive 模式已验证可用，导出路径以 `export_to = "../../../src/ipc/generated.ts"`
+//! 形式约定，CI 加 `git diff --exit-code src/ipc/generated.ts` 拦截漂移。
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -9,6 +15,9 @@ use uuid::Uuid;
 use crate::types::{ComposeTarget, PortForwardRule, QuickCommand, SerialConfig, SessionConfig, SshKeyType, TelnetConfig, TerminalColorScheme, TrustHostKeyDecision, Trigger};
 
 /// 前端发送的所有命令
+// 切片 2.3 注释：ts-rs 全量 derive 等 types.rs 同步 derive 后再开。
+// 当前依赖已就位 (`Cargo.toml` ts-rs workspace dep)，但 TS impl 链是
+// 整树深度依赖 —— 全量激活是切片 3 域内的工作。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AppCommand {
     // ===== 会话命令 =====
@@ -28,8 +37,6 @@ pub enum AppCommand {
     SendInput { session_id: Uuid, data: Vec<u8> },
     /// 调整终端大小
     ResizeTerminal { session_id: Uuid, cols: u16, rows: u16 },
-    /// 复制终端选中内容
-    CopySelection { session_id: Uuid },
 
     // ===== 文件传输命令 =====
     /// 添加上传任务
