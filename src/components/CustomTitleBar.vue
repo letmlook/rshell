@@ -135,8 +135,8 @@ onBeforeUnmount(() => {
 .titlebar-left {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 0 12px;
+  gap: 12px;
+  padding: 0 8px;
   flex-shrink: 0;
 }
 
@@ -159,10 +159,11 @@ onBeforeUnmount(() => {
   gap: 4px;
 }
 .menu-item {
-  padding: 4px 10px;
+  padding: 0 8px;
   border-radius: 4px;
   cursor: pointer;
   user-select: none;
+  line-height: 36px;
 }
 .menu-item:hover {
   background: rgba(255, 255, 255, 0.06);
@@ -187,7 +188,7 @@ onBeforeUnmount(() => {
 }
 
 .window-btn {
-  width: 46px;
+  width: 36px;
   height: 36px;
   display: flex;
   align-items: center;

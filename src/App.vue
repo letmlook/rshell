@@ -115,29 +115,46 @@ onMounted(async () => {
 .rshell-shell {
   display: flex;
   flex-direction: column;
+  width: 100vw;
   height: 100vh;
   margin: 0;
+  padding: 0;
   background: var(--rshell-bg, #1e2228);
   color: var(--rshell-fg, #e6e6e6);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
   overflow: hidden;
+  box-sizing: border-box;
 }
+
 .body {
-  flex: 1;
+  flex: 1 1 0;
   display: flex;
   min-height: 0;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  box-sizing: border-box;
 }
+
 .main-area {
-  flex: 1;
-  position: relative;
+  flex: 1 1 0;
   background: var(--rshell-bg, #1e2228);
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
 }
+
 .empty {
   display: flex;
   align-items: center;
   justify-content: center;
   height: 100%;
+  margin: 0;
+  padding: 0;
 }
 .empty-content {
   text-align: center;
