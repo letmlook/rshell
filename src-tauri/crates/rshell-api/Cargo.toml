@@ -10,4 +10,5 @@ description = "RShell API 边界层 - Command/Event 定义（零运行时依赖�
 [dependencies]
 serde = { workspace = true }
 uuid = { workspace = true }
+ts-rs = { workspace = true, features = ["serde-compat"] }
 # 注意：不依赖 GPUI、tokio 或其他运行时

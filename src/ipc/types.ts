@@ -116,33 +116,8 @@ export interface TerminalConfig {
 
 export type CursorStyle = "Block" | "Underline" | "Bar";
 
-export interface TerminalBufferSnapshot {
-  rows: number;
-  cols: number;
-  cells: CellView[];
-  cursor_row: number;
-  cursor_col: number;
-  cursor_visible: boolean;
-  title: string;
-}
-
-export interface CellView {
-  character: string;
-  fg_color: [number, number, number, number]; // RGBA u8 数组
-  bg_color: [number, number, number, number];
-  flags: number; // u8 位标志
-}
-
-export const CellFlag = {
-  BOLD: 0b0000_0001,
-  DIM: 0b0000_0010,
-  ITALIC: 0b0000_0100,
-  UNDERLINE: 0b0000_1000,
-  BLINK: 0b0001_0000,
-  REVERSE: 0b0010_0000,
-  HIDDEN: 0b0100_0000,
-  STRIKETHROUGH: 0b1000_0000,
-} as const;
+// 切片 2.2 删除：TerminalBufferSnapshot / CellView / CellFlag —
+// 设计 §2.2 alacritty 缓冲净删除,xterm.js 自渲染,前端不再需要快照与单元格结构。
 
 export interface SearchMatch {
   row: number;
@@ -342,7 +317,7 @@ export type AppCommand =
   // 终端
   | { SendInput: { session_id: Uuid; data: number[] } }
   | { ResizeTerminal: { session_id: Uuid; cols: number; rows: number } }
-  | { CopySelection: { session_id: Uuid } }
+  // 切片 2.2 删除（设计 §5）：CopySelection 上移前端 xterm 自持选区
   // 传输
   | { EnqueueUpload: { local: PathBuf; remote: string; session_id: Uuid } }
   | { EnqueueDownload: { remote: string; local: PathBuf; session_id: Uuid } }
@@ -429,9 +404,9 @@ export type AppEvent =
       };
     }
   // 终端
-  | { TerminalOutput: { session_id: Uuid; data: number[] } }
   | { TerminalTitleChanged: { session_id: Uuid; title: string } }
-  | { TerminalBufferUpdated: { session_id: Uuid; snapshot: TerminalBufferSnapshot } }
+  // 切片 2.2 删除：TerminalOutput / TerminalBufferUpdated —— 设计 §2.2
+  // 原始字节经 Channel<Vec<u8>> 直推 xterm.js,事件总线不再承担高频路径
   // 会话
   | { SessionListChanged: null }
   | { SessionUpdated: { session_id: Uuid } }
@@ -456,14 +431,6 @@ export type AppEvent =
     }
   | { TransferTaskCompleted: { task_id: Uuid } }
   | { TransferTaskFailed: { task_id: Uuid; error: string } }
-  // 远程目录
-  | {
-      RemoteDirListed: {
-        session_id: Uuid;
-        path: string;
-        entries: RemoteFileEntry[];
-      };
-    }
   // 隧道
   | { TunnelStateChanged: { tunnel_id: Uuid; state: TunnelState } }
   // 安全
@@ -489,7 +456,6 @@ export type AppEvent =
         action_summary: string;
       };
     }
-  | { PendingTunnelsSnapshot: { rules: [Uuid, PortForwardRule][] } }
   | { ScriptFinished: { session_id: Uuid; result: ScriptResult } }
   | { SyncInputSessionsChanged: { session_ids: Uuid[] } }
   // 密钥
@@ -505,25 +471,17 @@ export type AppEvent =
   | { ThemeChanged: { theme: AppTheme } }
   | { ColorSchemeChanged: { scheme: TerminalColorScheme } }
   | { ColorSchemeListChanged: null }
-  // 剪贴板
-  | { ClipboardCopy: { text: string } }
   // 插件
   | { PluginListUpdated: null }
   | { PluginStateChanged: { plugin_id: string; state: PluginState } }
-  | { PluginLoadFailed: { plugin_id: string; error: string } }
-  // 快照
-  | { SessionsSnapshot: { sessions: SessionConfig[] } }
-  | { TunnelsSnapshot: { tunnels: ActiveTunnelInfo[] } }
-  | { KeysSnapshot: { keys: SshKeyInfo[] } }
-  | { PluginsSnapshot: { plugins: PluginInfo[] } }
-  | {
-      ThemesSnapshot: {
-        current_theme: string;
-        current_scheme: string;
-        available_themes: string[];
-        available_schemes: string[];
-      };
-    };
+  | { PluginLoadFailed: { plugin_id: string; error: string } };
+  // 切片 2.2 删除（设计 §3.3 / §5 / §2.2）：
+  //   - RemoteDirListed / PendingTunnelsSnapshot / SessionsSnapshot /
+  //     TunnelsSnapshot / KeysSnapshot / PluginsSnapshot / ThemesSnapshot
+  //   - ClipboardCopy
+  //   - TerminalOutput / TerminalBufferUpdated / TerminalBufferSnapshot / CellView / CellFlag
+  // 数据改由 CommandOutcome 直接返回（§3.2 修复死循环 + §3.3 消除二义性）;
+  // 剪贴板/缓冲上移前端。
 
 // ============================================================================
 // 工具:把判别式 union 扁平化成 {variant_name: payload} 用于 invoke 参数
