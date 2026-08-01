@@ -55,6 +55,15 @@ function openNewSession() {
   dialogVisible.value = true;
 }
 
+function openPanel(name: string) {
+  activePanel.value = name;
+  panelExpanded.value = true;
+}
+
+function toggleSidebar() {
+  panelExpanded.value = !panelExpanded.value;
+}
+
 onMounted(async () => {
   await store.refresh();
   await store.subscribeEvents();
@@ -64,7 +73,18 @@ onMounted(async () => {
 
 <template>
   <div class="rshell-shell">
-    <CustomTitleBar @new-session="openNewSession" />
+    <CustomTitleBar
+      @new-session="openNewSession"
+      @toggle-sidebar="toggleSidebar"
+      @open-key-manager="openPanel('keys')"
+      @open-theme-panel="openPanel('settings')"
+      @open-plugin-panel="openPanel('settings')"
+      @open-transfer-queue="openPanel('tools')"
+      @open-quick-commands="openPanel('tools')"
+      @open-triggers="openPanel('tools')"
+      @open-tunnels="openPanel('tools')"
+      @about="openPanel('settings')"
+    />
 
     <div class="body">
       <ActivityBar
