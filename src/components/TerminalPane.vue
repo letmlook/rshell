@@ -12,6 +12,7 @@
  */
 import { onMounted, onBeforeUnmount, ref } from "vue";
 import { Terminal } from "@xterm/xterm";
+import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { SearchAddon } from "@xterm/addon-search";
@@ -50,6 +51,42 @@ function closeSearch() {
   if (search) search.clearDecorations();
 }
 
+/**
+ * 从 :root 读取 v2 token,合成 xterm ITheme。
+ * 任何 token 未设值(SSR / 测试环境)时回退到石墨底默认值。
+ */
+function readXtermThemeFromCssVars(): ITheme {
+  const css = (name: string, fallback: string) => {
+    if (typeof document === "undefined") return fallback;
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || fallback;
+  };
+  return {
+    background: css("--rs-bg", "#0e1116"),
+    foreground: css("--rs-fg", "#e6edf3"),
+    cursor: css("--rs-accent", "#58a6ff"),
+    cursorAccent: css("--rs-bg", "#0e1116"),
+    selectionBackground: css("--rs-row-selected", "#1f3658"),
+    selectionForeground: css("--rs-fg", "#e6edf3"),
+    black: css("--rs-p-graphite-3", "#2a313c"),
+    red: "#f85149",
+    green: "#3fb950",
+    yellow: "#d29922",
+    blue: css("--rs-accent", "#58a6ff"),
+    magenta: "#bc8cff",
+    cyan: "#39c5cf",
+    white: "#adbac7",
+    brightBlack: "#6e7681",
+    brightRed: "#ff7b72",
+    brightGreen: "#56d364",
+    brightYellow: "#e3b341",
+    brightBlue: css("--rs-accent", "#58a6ff"),
+    brightMagenta: "#d2a8ff",
+    brightCyan: "#56d4dd",
+    brightWhite: "#e6edf3",
+  };
+}
+
 function onWindowKeydown(e: KeyboardEvent) {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
     e.preventDefault();
@@ -63,10 +100,11 @@ onMounted(async () => {
   if (!containerRef.value) return;
 
   term = new Terminal({
-    fontFamily: 'Menlo, Consolas, "DejaVu Sans Mono", monospace',
+    fontFamily: 'JetBrains Mono, Menlo, Consolas, "DejaVu Sans Mono", monospace',
     fontSize: 13,
     cursorBlink: true,
     scrollback: 10000,
+    theme: readXtermThemeFromCssVars(),
   });
 
   fit = new FitAddon();

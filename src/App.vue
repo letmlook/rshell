@@ -1,25 +1,28 @@
 <script setup lang="ts">
 /**
- * RShell 主布局 —— 切片 10 全新设计
+ * RShell 主布局 —— v2 重设计 (Xshell + Xftp 融合)
  *
- * 结构(对应 tauri.conf.json decorations: false):
+ * 结构:
  *   ┌─────────────────────────────────────────────┐
- *   │ CustomTitleBar  (36px, 含拖动区 + 窗口控制)  │
- *   ├──────┬─────────────┬──────────────────────────┤
- *   │Activ-│ SidePanel   │ main-area               │
- *   │ityBar│ (二级面板,  │  - Dockview 多终端       │
- *   │ (220)│ 可折叠)     │  - 状态栏                │
- *   ├──────┴─────────────┴──────────────────────────┤
- *   │ StatusBar (24px)                             │
+ *   │ CustomTitleBar  (32px, 拖动 + 窗口控制)      │
+ *   ├─────────────────────────────────────────────┤
+ *   │ WorkspaceToolbar  (40px, switcher + 条件按钮)│
+ *   ├──────────┬──────────────────────────────────┤
+ *   │Activity  │ Workspace Content Area            │
+ *   │Bar       │  - Terminal: Dockview 多终端      │
+ *   │(48px)    │  - Transfer: 双窗格 + 传输面板    │
+ *   ├──────────┴──────────────────────────────────┤
+ *   │ StatusBar  (24px, 12 字段)                   │
  *   └─────────────────────────────────────────────┘
  *
- * 浮层:HostKeyMismatchDialog / TransferQueue /
- *       MasterPasswordDialog / SessionCreateDialog
+ * 浮层:SessionCreateDialog / HostKeyMismatchDialog /
+ *       MasterPasswordDialog / TransferQueue
  */
-import { onMounted, ref, markRaw } from "vue";
+import { onMounted, ref, markRaw, computed } from "vue";
 import { DockviewVue } from "dockview-vue";
 import "dockview-vue/dist/styles/dockview.css";
 import TerminalPane from "./components/TerminalPane.vue";
+import TransferWorkspace from "./components/transfer/TransferWorkspace.vue";
 import SessionCreateDialog from "./components/SessionCreateDialog.vue";
 import HostKeyMismatchDialog from "./components/HostKeyMismatchDialog.vue";
 import TransferQueue from "./components/TransferQueue.vue";
@@ -28,6 +31,8 @@ import CustomTitleBar from "./components/CustomTitleBar.vue";
 import ActivityBar from "./components/ActivityBar.vue";
 import SidePanel from "./components/SidePanel.vue";
 import StatusBar from "./components/StatusBar.vue";
+import WorkspaceToolbar, { type WorkspaceKind } from "./components/WorkspaceToolbar.vue";
+import TransferPanel from "./components/TransferPanel.vue";
 import { useSessionsStore } from "./stores/sessions";
 import { useHostKeyStore } from "./stores/hostKey";
 import type { Uuid } from "./ipc/types";
@@ -38,6 +43,11 @@ const dialogVisible = ref(false);
 const activeTerminal = ref<Uuid | null>(null);
 const activePanel = ref("sessions");
 const panelExpanded = ref(true);
+
+const workspace = ref<WorkspaceKind>("terminal");
+const syncEnabled = ref(false);
+const transferPanelExpanded = ref(true);
+const activeTransferSession = ref<Uuid | null>(null);
 
 const components = markRaw({ TerminalPane: TerminalPane as never });
 
@@ -64,6 +74,28 @@ function toggleSidebar() {
   panelExpanded.value = !panelExpanded.value;
 }
 
+function pickWorkspace(w: WorkspaceKind) {
+  workspace.value = w;
+  if (w === "transfer" && !activeTransferSession.value && store.currentId) {
+    activeTransferSession.value = store.currentId;
+  }
+}
+
+function onOpenSftp(id: Uuid) {
+  workspace.value = "transfer";
+  activeTransferSession.value = id;
+}
+
+function onOpenTerminal(_id: Uuid, _path: string) {
+  workspace.value = "terminal";
+}
+
+const currentConnectionState = computed(() => {
+  const id = activeTerminal.value;
+  if (!id) return "disconnected";
+  return store.connectionState.get(id) ?? "disconnected";
+});
+
 onMounted(async () => {
   await store.refresh();
   await store.subscribeEvents();
@@ -86,6 +118,22 @@ onMounted(async () => {
       @about="openPanel('settings')"
     />
 
+    <WorkspaceToolbar
+      :workspace="workspace"
+      :connection-state="currentConnectionState"
+      :sync-enabled="syncEnabled"
+      :transfer-panel-expanded="transferPanelExpanded"
+      :on-new-session="openNewSession"
+      @change-workspace="pickWorkspace"
+      @sync-toggle="syncEnabled = !syncEnabled"
+      @upload="() => {}"
+      @download="() => {}"
+      @new-folder="() => {}"
+      @delete="() => {}"
+      @refresh="store.refresh()"
+      @toggle-transfer-panel="transferPanelExpanded = !transferPanelExpanded"
+    />
+
     <div class="body">
       <ActivityBar
         v-model:active="activePanel"
@@ -95,30 +143,61 @@ onMounted(async () => {
         v-if="panelExpanded"
         :active="activePanel"
         @select-session="selectSession"
+        @open-sftp="onOpenSftp"
+        @open-terminal="onOpenTerminal"
       />
 
       <main class="main-area">
-        <DockviewVue
-          v-if="activeTerminal"
-          :components="components"
-          style="width: 100%; height: 100%"
-        >
-          <template #terminal="{ params }">
-            <TerminalPane :session-id="params.sessionId" />
-          </template>
-        </DockviewVue>
-        <div v-else class="empty">
-          <div class="empty-content">
-            <div class="empty-icon">⌬</div>
-            <h2>RShell</h2>
-            <p>从左侧「会话」面板新建或选择一个 SSH 会话</p>
-            <el-button type="primary" @click="openNewSession">新建会话</el-button>
+        <!-- Terminal Workspace -->
+        <template v-if="workspace === 'terminal'">
+          <DockviewVue
+            v-if="activeTerminal"
+            :components="components"
+            style="width: 100%; height: 100%"
+          >
+            <template #terminal="{ params }">
+              <TerminalPane :session-id="params.sessionId" />
+            </template>
+          </DockviewVue>
+          <div v-else class="empty">
+            <div class="empty-content">
+              <div class="empty-icon">⌬</div>
+              <h2>RShell</h2>
+              <p>从左侧「会话」面板新建或选择一个 SSH 会话</p>
+              <el-button type="primary" @click="openNewSession">新建会话</el-button>
+            </div>
           </div>
-        </div>
+        </template>
+
+        <!-- Transfer Workspace -->
+        <template v-else>
+          <div class="transfer-area">
+            <TransferWorkspace
+              v-if="activeTransferSession"
+              :session-id="activeTransferSession"
+              :sync-enabled="syncEnabled"
+              style="flex: 1; min-height: 0"
+            />
+            <div v-else class="empty">
+              <div class="empty-content">
+                <div class="empty-icon">⇄</div>
+                <h2>传输工作区</h2>
+                <p>从左侧「会话」右键 → 打开 SFTP,或先连接一个会话</p>
+                <el-button type="primary" :disabled="!activeTerminal" @click="onOpenSftp(activeTerminal!)">
+                  使用当前会话
+                </el-button>
+              </div>
+            </div>
+            <TransferPanel
+              :expanded="transferPanelExpanded"
+              @toggle="transferPanelExpanded = !transferPanelExpanded"
+            />
+          </div>
+        </template>
       </main>
     </div>
 
-    <StatusBar />
+    <StatusBar :workspace="workspace" />
 
     <SessionCreateDialog
       :visible="dialogVisible"
@@ -139,9 +218,9 @@ onMounted(async () => {
   height: 100vh;
   margin: 0;
   padding: 0;
-  background: var(--rshell-bg, #1e2228);
-  color: var(--rshell-fg, #e6e6e6);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+  background: var(--rs-bg);
+  color: var(--rs-fg);
+  font-family: var(--rs-font-ui);
   overflow: hidden;
   box-sizing: border-box;
 }
@@ -159,41 +238,51 @@ onMounted(async () => {
 
 .main-area {
   flex: 1 1 0;
-  background: var(--rshell-bg, #1e2228);
+  background: var(--rs-bg);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   margin: 0;
   padding: 0;
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+}
+
+.transfer-area {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
 }
 
 .empty {
   display: flex;
   align-items: center;
   justify-content: center;
-  height: 100%;
+  flex: 1;
   margin: 0;
   padding: 0;
 }
 .empty-content {
   text-align: center;
-  color: var(--rshell-fg-muted, #9097a3);
+  color: var(--rs-fg-muted);
 }
 .empty-icon {
   font-size: 64px;
-  color: var(--el-color-primary);
+  color: var(--rs-accent);
   opacity: 0.6;
-  margin-bottom: 16px;
+  margin-bottom: var(--rs-s-4);
 }
 .empty-content h2 {
-  margin: 0 0 8px;
-  font-size: 20px;
+  margin: 0 0 var(--rs-s-2);
+  font-size: var(--rs-fs-2xl);
   font-weight: 500;
-  color: var(--rshell-fg, #e6e6e6);
+  color: var(--rs-fg);
 }
 .empty-content p {
-  margin: 0 0 20px;
-  font-size: 13px;
+  margin: 0 0 var(--rs-s-4);
+  font-size: var(--rs-fs-md);
 }
 </style>

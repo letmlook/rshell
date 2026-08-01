@@ -20,6 +20,8 @@ void props; // props 通过模板 attr 隐式消费(避免 unused 警告)
 
 const emit = defineEmits<{
   (e: "select-session", id: string): void;
+  (e: "open-sftp", id: string): void;
+  (e: "open-terminal", id: string, path: string): void;
 }>();
 
 const titles: Record<string, string> = {
@@ -40,6 +42,8 @@ const titles: Record<string, string> = {
       <SessionList
         v-if="active === 'sessions'"
         @select="(id) => emit('select-session', id)"
+        @open-sftp="(id) => emit('open-sftp', id)"
+        @open-terminal="(id, p) => emit('open-terminal', id, p)"
       />
       <template v-else-if="active === 'files'">
         <div class="placeholder">

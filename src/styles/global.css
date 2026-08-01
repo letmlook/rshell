@@ -1,12 +1,18 @@
 /**
- * 全局布局基础 —— 切片 10 修订
+ * 全局布局基础 —— v2 重设计
  *
  * 原则:
  * - html/body/#app 0 边距,占满 100vw × 100vh(由 index.html 内联 style 确保)
  * - 任何 .rshell-shell 容器都不应再有 margin/padding;边框/留白由子组件控制
  * - 禁止整体水平/垂直滚动条:overflow: hidden 在所有"骨架"元素上
  * - box-sizing: border-box 全局化,让 height/width 严格匹配
+ *
+ * v2 变化:
+ * - 引入 tokens.css(在任何其它 CSS 之前)
+ * - 默认背景/前景/字体直接走 token
  */
+
+@import "./tokens.css";
 
 * {
   box-sizing: border-box;
@@ -23,15 +29,37 @@ body,
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-    sans-serif;
-  background: var(--rshell-bg, #1e2228);
-  color: var(--rshell-fg, #e6e6e6);
+  font-family: var(--rs-font-ui);
+  background: var(--rs-bg);
+  color: var(--rs-fg);
+  font-size: var(--rs-fs-md);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* 移除 Element Plus 默认 body 边距(部分版本仍残留 8px) */
+/* Element Plus 局部 reset */
 .el-card__body,
 .el-dialog__body,
 .el-message-box__content {
   padding: 0;
+}
+
+/* 全局滚动条:统一深色风格,不刺眼 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--rs-p-graphite-5);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--rs-p-graphite-6);
+  background-clip: content-box;
+  border: 2px solid transparent;
 }

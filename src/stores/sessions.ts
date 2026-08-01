@@ -12,6 +12,7 @@ import {
   createSession,
   connectSession,
   disconnectSession,
+  deleteSession,
 } from "../ipc/client";
 import { listen } from "@tauri-apps/api/event";
 
@@ -66,6 +67,11 @@ export const useSessionsStore = defineStore("sessions", () => {
     connectionState.value = new Map(connectionState.value);
   }
 
+  async function deleteSessionById(id: Uuid) {
+    await deleteSession(id);
+    await refresh();
+  }
+
   /** 订阅后端事件总线,实时更新 connectionState(设计 §4.3 流程 A)。*/
   async function subscribeEvents() {
     await listen<{ kind: string; session_id?: Uuid; state?: string }>(
@@ -98,6 +104,7 @@ export const useSessionsStore = defineStore("sessions", () => {
     create,
     connect,
     disconnect,
+    delete: deleteSessionById,
     subscribeEvents,
   };
 });

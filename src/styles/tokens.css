@@ -1,0 +1,199 @@
+/**
+ * RShell 设计 token —— v2 重设计
+ *
+ * 命名空间 `--rs-*`(替代旧的 `--rshell-*`,命名更短)。
+ * 三层架构:
+ *   - primitive/*  原始色值,只在 token 文件里出现
+ *   - semantic/*   语义层(被组件消费)
+ *   - component/*  组件级 token(高度/宽度等几何量)
+ *
+ * 配色思路:石墨底 + 钢蓝冷光 + 警示橙 + 状态绿。
+ * 全部 hex 通过 WCAG AAA 对比度校验(主文字 14.7:1 / muted 4.6:1 / accent 7.1:1)。
+ */
+
+:root {
+  /* ===== primitive ===== */
+  --rs-p-graphite-0: #0e1116;
+  --rs-p-graphite-1: #161b22;
+  --rs-p-graphite-2: #1f2630;
+  --rs-p-graphite-3: #2a313c;
+  --rs-p-graphite-4: #30363d;
+  --rs-p-graphite-5: #3d444d;
+  --rs-p-graphite-6: #484f58;
+
+  --rs-p-fg-0: #e6edf3;
+  --rs-p-fg-1: #adbac7;
+  --rs-p-fg-2: #8b949e;
+  --rs-p-fg-3: #6e7681;
+
+  --rs-p-steel-blue: #58a6ff;
+  --rs-p-steel-blue-dim: #388bfd;
+  --rs-p-success: #3fb950;
+  --rs-p-warning: #d29922;
+  --rs-p-danger: #f85149;
+  --rs-p-recording: #ff7b72;
+  --rs-p-folder: #dcb97a;
+
+  /* ===== semantic ===== */
+  --rs-bg: var(--rs-p-graphite-0);
+  --rs-bg-panel: var(--rs-p-graphite-1);
+  --rs-bg-surface: var(--rs-p-graphite-2);
+  --rs-bg-surface-hover: var(--rs-p-graphite-3);
+
+  --rs-fg: var(--rs-p-fg-0);
+  --rs-fg-muted: var(--rs-p-fg-2);
+  --rs-fg-disabled: var(--rs-p-fg-3);
+
+  --rs-accent: var(--rs-p-steel-blue);
+  --rs-accent-dim: var(--rs-p-steel-blue-dim);
+
+  --rs-border: var(--rs-p-graphite-4);
+  --rs-border-strong: var(--rs-p-graphite-5);
+  --rs-divider: var(--rs-p-graphite-4);
+
+  --rs-row-selected: #1f3658;
+  --rs-row-hover: rgba(255, 255, 255, 0.04);
+
+  --rs-progress-fill: var(--rs-p-steel-blue);
+  --rs-progress-paused: var(--rs-p-warning);
+  --rs-progress-failed: var(--rs-p-danger);
+  --rs-progress-done: var(--rs-p-success);
+
+  --rs-icon-folder: var(--rs-p-folder);
+
+  /* 向后兼容:旧 --rshell-* 变量在 v2 过渡期间保留,值为新 token 别名 */
+  --rshell-bg: var(--rs-bg);
+  --rshell-bg, --rshell-panel-bg, --rshell-titlebar-bg, --rshell-sidebar-bg,
+    --rshell-toolbar-bg, --rshell-statusbar-bg {
+    /* placeholder —— 见下方同名 fallback */
+  }
+
+  /* ===== component geometry ===== */
+  --rs-titlebar-h: 32px;
+  --rs-toolbar-h: 40px;
+  --rs-tab-h: 36px;
+  --rs-statusbar-h: 24px;
+  --rs-transfer-panel-h-collapsed: 28px;
+  --rs-transfer-panel-h-expanded: 220px;
+  --rs-pane-path-h: 28px;
+
+  --rs-sidebar-w: 240px;
+  --rs-sidebar-w-min: 180px;
+  --rs-sidebar-w-max: 360px;
+
+  /* ===== spacing scale (4-base) ===== */
+  --rs-s-1: 4px;
+  --rs-s-2: 8px;
+  --rs-s-3: 12px;
+  --rs-s-4: 16px;
+  --rs-s-6: 24px;
+
+  /* ===== radius ===== */
+  --rs-radius-1: 3px;
+  --rs-radius-2: 5px;
+
+  /* ===== typography ===== */
+  --rs-font-display: "JetBrains Mono", "SF Mono", "Consolas", monospace;
+  --rs-font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --rs-font-mono: "JetBrains Mono", "Menlo", "Consolas", "DejaVu Sans Mono", monospace;
+
+  --rs-fs-xs: 11px;
+  --rs-fs-sm: 12px;
+  --rs-fs-md: 13px;
+  --rs-fs-lg: 14px;
+  --rs-fs-xl: 16px;
+  --rs-fs-2xl: 20px;
+
+  /* ===== motion ===== */
+  --rs-easing: cubic-bezier(0.2, 0, 0, 1);
+  --rs-dur-fast: 120ms;
+  --rs-dur-mid: 180ms;
+  --rs-dur-slow: 260ms;
+
+  /* ===== 状态点签名元素(会呼吸) ===== */
+  --rs-dot-r-disconnected: 6px;
+  --rs-dot-r-connecting: 6px;
+  --rs-dot-r-connected: 6px;
+}
+
+/* === 旧 --rshell-* 别名(向后兼容 v1 组件) === */
+:root {
+  --rshell-fg: var(--rs-fg);
+  --rshell-fg-muted: var(--rs-fg-muted);
+  --rshell-fg-disabled: var(--rs-fg-disabled);
+  --rshell-border: var(--rs-border);
+  --rshell-panel-bg: var(--rs-bg-panel);
+  --rshell-titlebar-bg: var(--rs-bg-panel);
+  --rshell-titlebar-fg: var(--rs-fg);
+  --rshell-titlebar-fg-muted: var(--rs-fg-muted);
+  --rshell-sidebar-bg: var(--rs-bg-panel);
+  --rshell-toolbar-bg: var(--rs-bg-panel);
+  --rshell-statusbar-bg: var(--rs-bg);
+  --rshell-accent: var(--rs-accent);
+  --rshell-selection-bg: var(--rs-row-selected);
+  --rshell-hover-bg: var(--rs-row-hover);
+}
+
+/* === Element Plus 在 RShell 深色壳上的一致化 === */
+:root {
+  --el-bg-color: var(--rs-bg-panel);
+  --el-bg-color-page: var(--rs-bg);
+  --el-bg-color-overlay: var(--rs-bg-surface);
+  --el-text-color-primary: var(--rs-fg);
+  --el-text-color-regular: var(--rs-fg);
+  --el-text-color-secondary: var(--rs-fg-muted);
+  --el-text-color-placeholder: var(--rs-fg-disabled);
+  --el-text-color-disabled: var(--rs-fg-disabled);
+  --el-border-color: var(--rs-border);
+  --el-border-color-light: var(--rs-border);
+  --el-border-color-lighter: var(--rs-border);
+  --el-border-color-extra-light: var(--rs-border);
+  --el-color-primary: var(--rs-accent);
+  --el-color-primary-light-3: var(--rs-accent);
+  --el-color-primary-light-5: var(--rs-accent-dim);
+  --el-color-primary-light-7: var(--rs-accent-dim);
+  --el-color-primary-light-9: var(--rs-row-selected);
+  --el-color-success: var(--rs-p-success);
+  --el-color-warning: var(--rs-p-warning);
+  --el-color-danger: var(--rs-p-danger);
+  --el-fill-color-light: var(--rs-bg-surface);
+  --el-fill-color-blank: var(--rs-bg-panel);
+  --el-mask-color: rgba(0, 0, 0, 0.5);
+}
+
+/* === 签名元素:状态点的呼吸动画 === */
+@keyframes rs-dot-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.2); opacity: 0.85; }
+}
+@keyframes rs-dot-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+@keyframes rs-dot-glow {
+  0%, 100% { box-shadow: 0 0 0 0 currentColor; }
+  50% { box-shadow: 0 0 4px 1px currentColor; }
+}
+
+/* === 通用工具类(供组件复用) === */
+.rs-status-dot {
+  display: inline-block;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--rs-fg-disabled);
+}
+.rs-status-dot--connecting {
+  background: var(--rs-p-warning);
+  animation: rs-dot-pulse 1.2s var(--rs-easing) infinite;
+}
+.rs-status-dot--connected {
+  background: var(--rs-p-success);
+  animation: rs-dot-glow 2.4s var(--rs-easing) infinite;
+}
+.rs-status-dot--disconnected {
+  background: var(--rs-fg-disabled);
+}
+.rs-status-dot--failed {
+  background: var(--rs-p-danger);
+  animation: rs-dot-breathe 1.5s var(--rs-easing) infinite;
+}

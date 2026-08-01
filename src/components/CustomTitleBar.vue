@@ -256,13 +256,13 @@ defineExpose({
 .titlebar {
   display: flex;
   align-items: stretch;
-  height: 36px;
-  background: var(--rshell-titlebar-bg, #1f2329);
-  color: var(--rshell-titlebar-fg, #e6e6e6);
-  border-bottom: 1px solid var(--rshell-border, #2c313a);
+  height: var(--rs-titlebar-h);
+  background: var(--rs-bg-panel);
+  color: var(--rs-fg);
+  border-bottom: 1px solid var(--rs-border);
   user-select: none;
   -webkit-user-select: none;
-  font-size: 12px;
+  font-size: var(--rs-fs-sm);
   margin: 0;
   padding: 0;
   flex-shrink: 0;
