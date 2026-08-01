@@ -24,10 +24,10 @@ npm run build                     # 产出 dist/ 给 Tauri 加载
 npm run typecheck                 # vue-tsc --noEmit
 npm test                          # Vitest (jsdom 环境, js + ts)
 
-# Tauri 集成开发 (需要 tauri-cli: cargo install tauri-cli --version "^2.0")
+# Tauri 集成开发 (需要 @tauri-apps/cli: npm i -D @tauri-apps/cli)
 cd src-tauri
-cargo tauri dev                   # 同时跑 Rust + 前端,开窗口
-cargo tauri build                 # 打包成安装包
+npm run tauri:dev              # 同时跑 Rust + 前端,开窗口 (Tauri CLI 2.x)
+npm run tauri:build            # 打包成安装包
 
 # Lint / format
 cargo clippy --workspace --all-targets
