@@ -357,7 +357,7 @@ enum TermSink {
 
 | 状态 | 唯一所有者 | 前端获取方式 | 断电后 |
 |------|-----------|-------------|--------|
-| 会话配置 | 后端 `SessionRepository`（TOML） | `list_sessions()` | 保留 |
+| 会话配置 | 后端 `SessionRepository`（TOML） | `list_sessions()` | 保留（**⚠️ 见 §4.5：目前未接线，实际仅内存**） |
 | 连接状态机 | 后端 `SessionService.sessions` | `ConnectionStateChanged` | 丢失（应然） |
 | **终端屏幕内容** | **前端 xterm.js** | 自行维护 | 丢失（应然） |
 | 终端尺寸 | 双方（**前端权威**） | 前端 fit → `resize_terminal` | 丢失 |
@@ -410,6 +410,28 @@ recv 循环 → check_output(原始字节) → 命中
 ```
 
 触发器必须留在后端，因为它需要扫描**全部**字节流；前端只能看到 xterm 渲染后的结果。
+
+### 4.5 会话持久化尚未接线（切片 1 必须先修）
+
+**实测发现**（2026-07-31）：`SessionRepository`（`core/session/repository.rs`，46 行，封装了 `SessionStore` 的 save/load/delete/list_all）**是死代码**——全仓库除自身定义外无任何引用：
+
+```
+$ grep -rn "SessionRepository" src-tauri/crates/ --include=*.rs
+repository.rs:11:pub struct SessionRepository {
+repository.rs:15:impl SessionRepository {
+（无其他引用）
+```
+
+`SessionService` 只把会话存在内存 `HashMap` 里（`service.rs:371-372` 的 `sessions.insert`），`create_session` 不落盘、启动时不加载。
+
+**后果**：进程重启后 `list_sessions()` 返回空列表。因此**切片 1 的完成判据"连上真 SSH 服务器看到 `ls`"在当前代码下不可达**——前端拿不到任何可连接的会话，而 `CreateSession` 建的会话下次启动就消失。
+
+**修复方案**（切片 1 内，先于终端接线）：
+1. `SessionService::new` 增加 `Arc<SessionRepository>` 参数
+2. 新增 `SessionService::load_from_disk()`，在 Tauri `setup` 阶段调用，把 `repository.list_all()` 灌进 `sessions` HashMap
+3. `create_session` / `update_session` / `delete_session` 三处在改内存后同步调 `repository.save()` / `delete()`
+
+这条本应属于既有功能缺口，但因为它直接阻塞切片 1 的验证目标，必须在切片 1 内解决，不能推迟。
 
 ### 4.4 错误与失败路径
 
@@ -517,12 +539,13 @@ recv 循环 → check_output(原始字节) → 命中
 
 | 侧 | 工作 |
 |----|------|
+| **持久化** | **接线 `SessionRepository`（§4.5）—— 必须最先做，否则无可连接会话** |
 | 后端壳 | `state.rs`（`AppState`）、`error.rs`（`IpcError`）、`terminal.rs`（`TerminalChannels`）、`events.rs`（EventBus → emit 桥） |
-| 命令 | `connect_session` / `disconnect_session` / `send_input` / `resize_terminal` / `attach_terminal` / `list_sessions` |
-| 契约 | `CommandOutcome` 骨架（先只需 `None` / `Sessions`） |
-| 前端 | 新建 Vue 终端组件（`src/components/TerminalPane.vue`），`onMounted` 建 xterm → `attach_terminal` 接 Channel、`term.onData` → `send_input`；引入 `@xterm/addon-webgl`（§9 裁定 #3，含 `onContextLoss` 回退处理）；以 `dockview-vue` 承载面板（§9 裁定 #1） |
+| 命令 | `create_session` / `list_sessions` / `connect_session` / `disconnect_session` / `send_input` / `resize_terminal` / `attach_terminal` |
+| 契约 | `CommandOutcome` 骨架（先只需 `None` / `Sessions` / `SessionId`） |
+| 前端 | 新建 Vue 终端组件（`src/components/TerminalPane.vue`），`onMounted` 建 xterm → `attach_terminal` 接 Channel、`term.onData` → `send_input`；引入 `@xterm/addon-webgl`（§9 裁定 #3，含 `onContextLoss` 回退处理）；以 `dockview-vue` 承载面板（§9 裁定 #1）；一个最简"新建会话"表单（Element Plus）以便造出可连接目标 |
 
-**完成判据：真的连上一台 SSH 服务器，敲 `ls` 看到真实输出。** 这将是本项目第一次运行时验证。
+**完成判据：真的连上一台 SSH 服务器，敲 `ls` 看到真实输出，且重启应用后会话仍在。** 这将是本项目第一次运行时验证。
 
 ### 7.4 切片 2：清理
 
