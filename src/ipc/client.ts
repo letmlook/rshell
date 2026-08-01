@@ -50,11 +50,13 @@ async function call<T = unknown>(cmd: AppCommand): Promise<T> {
 }
 
 // ===== 会话 =====
-
-export const listSessions = () => call<{ sessions: SessionConfig[] }>({ ListSessions: null });
+//
+// 切片 1.2 起：后端 `list_sessions` 改用 §3.4 直接返回 `Vec<SessionConfig>`,
+// 不再包 `{ sessions: [...] }`。`create_session` 直接返回 `Uuid`(新会话 id)。
+export const listSessions = () => call<SessionConfig[]>({ ListSessions: null });
 
 export const createSession = (config: SessionConfig) =>
-  call<{ session: SessionConfig }>({ CreateSession: { config } });
+  call<Uuid>({ CreateSession: { config } });
 
 export const updateSession = (id: Uuid, config: SessionConfig) =>
   call({ UpdateSession: { id, config } });
@@ -75,8 +77,16 @@ export const sendInput = (session_id: Uuid, data: Uint8Array | number[]) =>
 export const resizeTerminal = (session_id: Uuid, cols: number, rows: number) =>
   call({ ResizeTerminal: { session_id, cols, rows } });
 
-export const copySelection = (session_id: Uuid) =>
-  call({ CopySelection: { session_id } });
+// 切片 2.2 删除（设计 §5）：CopySelection 上移到前端 ——
+// xterm.js 自持选区,后端不再发 ClipboardCopy 事件,前端用 navigator.clipboard
+// 或 tauri-plugin-clipboard-manager 直接写入。
+
+export interface ThemeInfo {
+  current_theme: string;
+  current_scheme: string;
+  available_themes: string[];
+  available_schemes: string[];
+}
 
 // ===== 文件传输 =====
 
@@ -145,14 +155,16 @@ export const importPrivateKey = (path: PathBuf, passphrase: string | null) =>
   call({ ImportPrivateKey: { path, passphrase } });
 export const deleteSshKey = (key_id: Uuid) => call({ DeleteSshKey: { key_id } });
 export const exportPublicKey = (key_id: Uuid) => call({ ExportPublicKey: { key_id } });
-export const listKeys = () => call<{ keys: unknown[] }>({ ListKeys: null });
+// 切片 3 修正：ListKeys 直接返回数组（切片 2.2 死循环修复后契约对齐）
+export const listKeys = () => call<unknown[]>({ ListKeys: null });
 
 // ===== 主密码 =====
 
 export const setupMasterPassword = (password: string) =>
   call({ SetupMasterPassword: { password } });
+// 切片 3 修正：VerifyMasterPassword 直接返回 bool（切片 2.2 CommandOutcome::Verified）
 export const verifyMasterPassword = (password: string) =>
-  call<{ success: boolean }>({ VerifyMasterPassword: { password } });
+  call<boolean>({ VerifyMasterPassword: { password } });
 export const changeMasterPassword = (old_password: string, new_password: string) =>
   call({ ChangeMasterPassword: { old_password, new_password } });
 
@@ -187,6 +199,8 @@ export const listThemes = () =>
     available_themes: string[];
     available_schemes: string[];
   }>({ ListThemes: null });
+
+// 切片 4：decideHostKey —— 已在下方"主机密钥"分区声明（line 196）
 
 // ===== 多协议 =====
 
