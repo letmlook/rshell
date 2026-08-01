@@ -13,13 +13,13 @@
     "windows": [
       {
         "title": "RShell",
-        "width": 1200,
-        "height": 800,
-        "minWidth": 800,
+        "width": 1280,
+        "height": 820,
+        "minWidth": 960,
         "minHeight": 600,
         "resizable": true,
         "fullscreen": false,
-        "decorations": true
+        "decorations": false
       }
     ],
     "security": {
