@@ -1,5 +1,5 @@
 import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
+import vue from "@vitejs/plugin-vue";
 
 // Vite config tailored for Tauri:
 // - server.port 1420 must match tauri.conf.json devUrl
@@ -7,7 +7,7 @@ import react from "@vitejs/plugin-react";
 // - envPrefix includes TAURI_ so @tauri-apps/api can read TAURI_* at runtime
 // - server.strictPort: fail fast if 1420 is taken (Tauri dev won't find it)
 export default defineConfig({
-  plugins: [react()],
+  plugins: [vue()],
   clearScreen: false,
   server: {
     port: 1420,
@@ -22,5 +22,10 @@ export default defineConfig({
     target: "es2022",
     minify: "esbuild",
     sourcemap: true,
+  },
+  test: {
+    environment: "jsdom",
+    globals: false,
+    include: ["tests/unit/**/*.spec.ts"],
   },
 });
