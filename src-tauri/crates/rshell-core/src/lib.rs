@@ -25,3 +25,12 @@ pub use command_dispatcher::CommandDispatcher;
 pub use error::CoreError;
 pub use event_bus::EventBus;
 pub use theme::ThemeManager;
+
+#[cfg(test)]
+mod send_sync_asserts {
+    use super::CommandDispatcher;
+
+    // 设计 §1.2：D5 决议要求 Arc<CommandDispatcher> 在 Tauri State 中可共享；
+    // rhai 启用 `sync` feature 后必须满足 Send + Sync。编译期断言保证不退化。
+    static_assertions::assert_impl_all!(CommandDispatcher: Send, Sync);
+}
