@@ -91,7 +91,7 @@ defineExpose({
 </script>
 
 <template>
-  <header class="titlebar" :class="{ 'is-maximized': isMaximized }">
+  <header class="titlebar" :class="{ 'is-maximized': isMaximized }" style="app-region: drag">
     <!-- 左:logo + 主菜单 -->
     <div class="titlebar-left">
       <div class="logo">
@@ -181,9 +181,17 @@ defineExpose({
         {{ currentLabel || (store.current?.name ?? "RShell — 远程终端客户端") }}
       </span>
     </div>
-
-    <!-- 右:窗口控件 -->
     <div class="titlebar-right">
+      <button
+        class="window-btn"
+        title="最小化"
+        aria-label="最小化"
+        @click="minimize"
+      >
+        <svg width="12" height="12" viewBox="0 0 12 12">
+          <rect x="2" y="5.5" width="8" height="1" fill="currentColor" />
+        </svg>
+      </button>
       <button
         class="window-btn"
         :title="isMaximized ? '还原' : '最大化'"
@@ -202,18 +210,21 @@ defineExpose({
           />
         </svg>
         <svg v-else width="12" height="12" viewBox="0 0 12 12">
-          <rect x="2.5" y="3.5" width="6" height="6" fill="none" stroke="currentColor" stroke-width="1" />
-          <path d="M3.5 3.5 V2 H10.5 V8.5 H9" fill="none" stroke="currentColor" stroke-width="1" />
-        </svg>
-      </button>
-      <button
-        class="window-btn"
-        title="最小化"
-        aria-label="最小化"
-        @click="minimize"
-      >
-        <svg width="12" height="12" viewBox="0 0 12 12">
-          <rect x="2" y="5.5" width="8" height="1" fill="currentColor" />
+          <rect
+            x="3.5"
+            y="3.5"
+            width="6"
+            height="6"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1"
+          />
+          <path
+            d="M3.5 3.5 V2 H10.5 V8.5 H9"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1"
+          />
         </svg>
       </button>
       <button
@@ -257,6 +268,8 @@ defineExpose({
   gap: 4px;
   padding: 0 8px;
   flex-shrink: 0;
+  /* 子元素恢复点击,Tauri 才会把 click 派发给 button */
+  app-region: no-drag;
 }
 
 .logo {
@@ -329,6 +342,7 @@ defineExpose({
   display: flex;
   align-items: stretch;
   flex-shrink: 0;
+  app-region: no-drag;
 }
 
 .window-btn {
