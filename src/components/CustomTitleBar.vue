@@ -91,9 +91,9 @@ defineExpose({
 </script>
 
 <template>
-  <header class="titlebar" :class="{ 'is-maximized': isMaximized }" style="app-region: drag">
+  <header class="titlebar" :class="{ 'is-maximized': isMaximized }" data-tauri-drag-region>
     <!-- 左:logo + 主菜单 -->
-    <div class="titlebar-left">
+    <div class="titlebar-left" data-tauri-drag-region="false">
       <div class="logo">
         <span class="logo-mark">⌬</span>
         <span class="logo-text">RShell</span>
@@ -174,14 +174,14 @@ defineExpose({
     <!-- 中:可拖动区域 + 当前会话标签 -->
     <div
       class="titlebar-center"
-      style="app-region: drag"
+      data-tauri-drag-region
       @dblclick="onDragDoubleClick"
     >
       <span class="current-label">
         {{ currentLabel || (store.current?.name ?? "RShell — 远程终端客户端") }}
       </span>
     </div>
-    <div class="titlebar-right">
+    <div class="titlebar-right" data-tauri-drag-region="false">
       <button
         class="window-btn"
         title="最小化"
@@ -268,8 +268,6 @@ defineExpose({
   gap: 4px;
   padding: 0 8px;
   flex-shrink: 0;
-  /* 子元素恢复点击,Tauri 才会把 click 派发给 button */
-  app-region: no-drag;
 }
 
 .logo {
@@ -342,7 +340,6 @@ defineExpose({
   display: flex;
   align-items: stretch;
   flex-shrink: 0;
-  app-region: no-drag;
 }
 
 .window-btn {
