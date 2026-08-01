@@ -10,7 +10,7 @@ export default defineConfig({
   plugins: [vue()],
   clearScreen: false,
   server: {
-    port: 1420,
+    port: 51820,
     strictPort: true,
     host: "127.0.0.1",
     watch: {
