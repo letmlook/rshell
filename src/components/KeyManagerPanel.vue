@@ -19,6 +19,8 @@ import {
 } from "../ipc/client";
 import type { SshKeyType, Uuid } from "../ipc/types";
 
+const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
+
 interface KeyRow {
   id: Uuid;
   name: string;
@@ -95,7 +97,7 @@ onMounted(refresh);
 
 <template>
   <section class="key-manager">
-    <header>
+    <header v-if="!props.embedded">
       <h3>SSH 密钥 ({{ keys.length }})</h3>
       <el-button-group size="small">
         <el-button @click="refresh" :loading="loading">刷新</el-button>

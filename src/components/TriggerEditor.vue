@@ -9,6 +9,8 @@ import { onMounted, ref } from "vue";
 import { listTriggers, createTrigger, deleteTrigger, toggleTrigger } from "../ipc/client";
 import type { Trigger, Uuid } from "../ipc/types";
 
+const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
+
 function triggerPattern(t: Trigger): string {
   const c = t.condition as { RegexAppear?: string; ExactMatch?: string };
   if (c.RegexAppear !== undefined) return c.RegexAppear;
@@ -73,7 +75,7 @@ onMounted(refresh);
 
 <template>
   <section class="trigger-editor">
-    <header>
+    <header v-if="!props.embedded">
       <h3>触发器 ({{ items.length }})</h3>
       <el-button size="small" :loading="loading" @click="refresh">刷新</el-button>
     </header>

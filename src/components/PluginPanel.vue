@@ -8,6 +8,8 @@
 import { onMounted, ref } from "vue";
 import { listPlugins, scanPlugins, loadPlugin, unloadPlugin, enablePlugin, disablePlugin } from "../ipc/client";
 
+const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
+
 interface PluginInfo {
   id: string;
   name: string;
@@ -87,7 +89,7 @@ onMounted(refresh);
 
 <template>
   <section class="plugin-panel">
-    <header>
+    <header v-if="!props.embedded">
       <h3>插件 ({{ items.length }})</h3>
       <el-button-group size="small">
         <el-button @click="refresh" :loading="loading">刷新</el-button>

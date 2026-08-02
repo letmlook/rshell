@@ -9,6 +9,8 @@
 import { onMounted } from "vue";
 import { useThemeStore } from "../stores/theme";
 
+const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
+
 const store = useThemeStore();
 
 onMounted(async () => {
@@ -18,7 +20,7 @@ onMounted(async () => {
 
 <template>
   <aside class="theme-panel">
-    <h3>主题</h3>
+    <h3 v-if="!props.embedded">主题</h3>
     <p v-if="store.error" class="error">{{ store.error }}</p>
     <section>
       <label>应用主题</label>

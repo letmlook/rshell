@@ -10,6 +10,8 @@ import { onMounted, ref } from "vue";
 import { listTunnels, createTunnel, closeTunnel } from "../ipc/client";
 import type { Uuid, PortForwardRule, ActiveTunnelInfo } from "../ipc/types";
 
+const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
+
 const items = ref<ActiveTunnelInfo[]>([]);
 const loading = ref(false);
 const error = ref<string | null>(null);
@@ -74,7 +76,7 @@ onMounted(refresh);
 
 <template>
   <section class="tunnel-panel">
-    <header>
+    <header v-if="!props.embedded">
       <h3>端口转发 ({{ items.length }})</h3>
       <el-button size="small" :loading="loading" @click="refresh">刷新</el-button>
     </header>

@@ -22,6 +22,8 @@ const emit = defineEmits<{
   (e: "open-terminal", id: Uuid, path: string): void;
 }>();
 
+const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
+
 const store = useSessionsStore();
 
 interface TreeNode {
@@ -119,7 +121,7 @@ function ctxDelete() {
 
 <template>
   <div class="session-tree">
-    <div class="tree-header">
+    <div v-if="!props.embedded" class="tree-header">
       <h3>会话 ({{ store.items.length }})</h3>
       <div class="header-actions">
         <el-tooltip content="新建会话" placement="top">

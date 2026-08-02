@@ -8,6 +8,8 @@ import { onMounted, ref } from "vue";
 import { listQuickCommands, executeQuickCommand } from "../ipc/client";
 import type { Uuid } from "../ipc/types";
 
+const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
+
 interface QuickCommand {
   id: Uuid;
   name: string;
@@ -49,7 +51,7 @@ onMounted(refresh);
 
 <template>
   <section class="quick-commands">
-    <header>
+    <header v-if="!props.embedded">
       <h3>快速命令 ({{ items.length }})</h3>
       <el-button size="small" :loading="loading" @click="refresh">刷新</el-button>
     </header>
