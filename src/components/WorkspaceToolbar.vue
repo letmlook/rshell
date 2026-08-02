@@ -392,7 +392,7 @@ function pickWorkspace(w: WorkspaceKind) {
 }
 
 .context-cluster { display: flex; align-items: center; gap: 2px; min-width: 0; }
-.context-btn { gap: 4px; }
+.context-btn { width: auto; min-width: 28px; height: 28px; padding: 0 10px; gap: 4px; white-space: nowrap; }
 .context-btn.is-on { color: var(--rs-accent); background: var(--rs-row-selected); }
 .tb-btn:focus-visible,
 .ws-btn:focus-visible { outline: 2px solid var(--rs-accent); outline-offset: -2px; }
