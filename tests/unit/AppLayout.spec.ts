@@ -41,6 +41,7 @@ describe("App layout", () => {
     HostKeyMismatchDialog: { name: "HostKeyMismatchDialog", template: "<div />" },
     TransferQueue: { name: "TransferQueue", template: "<div />" },
     MasterPasswordDialog: { name: "MasterPasswordDialog", template: "<div />" },
+    "el-button": { template: "<button />" },
   };
 
   it("opens and hides the mounted sidebar without destroying its subtree", async () => {
