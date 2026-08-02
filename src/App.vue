@@ -16,7 +16,7 @@
  *   └─────────────────────────────────────────────┘
  *
  * 浮层:SessionCreateDialog / HostKeyMismatchDialog /
- *       MasterPasswordDialog / TransferQueue
+ *       MasterPasswordDialog
  */
 import { onBeforeUnmount, onMounted, ref, markRaw, computed } from "vue";
 import { DockviewVue } from "dockview-vue";
@@ -25,7 +25,6 @@ import TerminalPane from "./components/TerminalPane.vue";
 import TransferWorkspace from "./components/transfer/TransferWorkspace.vue";
 import SessionCreateDialog from "./components/SessionCreateDialog.vue";
 import HostKeyMismatchDialog from "./components/HostKeyMismatchDialog.vue";
-import TransferQueue from "./components/TransferQueue.vue";
 import MasterPasswordDialog from "./components/MasterPasswordDialog.vue";
 import CustomTitleBar from "./components/CustomTitleBar.vue";
 import SidePanel from "./components/SidePanel.vue";
@@ -246,7 +245,6 @@ onBeforeUnmount(() => {
       @created="(id) => selectSession(id)"
     />
     <HostKeyMismatchDialog />
-    <TransferQueue />
     <MasterPasswordDialog />
   </div>
 </template>
