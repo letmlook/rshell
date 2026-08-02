@@ -41,3 +41,4 @@ dist/
 *.tsbuildinfo
 
 # Tauri 构建产物 (src-tauri/target/ 由子目录 .gitignore 兜底)
+.worktrees/
