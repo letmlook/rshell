@@ -18,7 +18,7 @@
  * 浮层:SessionCreateDialog / HostKeyMismatchDialog /
  *       MasterPasswordDialog / TransferQueue
  */
-import { onMounted, ref, markRaw, computed } from "vue";
+import { onBeforeUnmount, onMounted, ref, markRaw, computed } from "vue";
 import { DockviewVue } from "dockview-vue";
 import "dockview-vue/dist/styles/dockview.css";
 import TerminalPane from "./components/TerminalPane.vue";
@@ -28,11 +28,18 @@ import HostKeyMismatchDialog from "./components/HostKeyMismatchDialog.vue";
 import TransferQueue from "./components/TransferQueue.vue";
 import MasterPasswordDialog from "./components/MasterPasswordDialog.vue";
 import CustomTitleBar from "./components/CustomTitleBar.vue";
-import ActivityBar from "./components/ActivityBar.vue";
 import SidePanel from "./components/SidePanel.vue";
 import StatusBar from "./components/StatusBar.vue";
-import WorkspaceToolbar, { type WorkspaceKind, type PanelKind } from "./components/WorkspaceToolbar.vue";
+import WorkspaceToolbar, {
+  type WorkspaceKind,
+  type PanelKind,
+} from "./components/WorkspaceToolbar.vue";
 import TransferPanel from "./components/TransferPanel.vue";
+import {
+  DEFAULT_SIDEBAR_WIDTH,
+  clampSidebarWidth,
+  maxSidebarWidthForViewport,
+} from "./utils/workspaceLayout";
 import { useSessionsStore } from "./stores/sessions";
 import { useHostKeyStore } from "./stores/hostKey";
 import type { Uuid } from "./ipc/types";
@@ -49,7 +56,37 @@ const syncEnabled = ref(false);
 const transferPanelExpanded = ref(true);
 const activeTransferSession = ref<Uuid | null>(null);
 
+const sidebarWidth = ref(DEFAULT_SIDEBAR_WIDTH);
+const viewportWidth = ref(
+  typeof window === "undefined" ? 1280 : window.innerWidth,
+);
+
+const sidebarMaxWidth = computed(() =>
+  maxSidebarWidthForViewport(viewportWidth.value),
+);
+
 const components = markRaw({ TerminalPane: TerminalPane as never });
+
+function setSidebarWidth(width: number) {
+  sidebarWidth.value = clampSidebarWidth(width, sidebarMaxWidth.value);
+}
+
+function onViewportResize() {
+  viewportWidth.value = window.innerWidth;
+  sidebarWidth.value = clampSidebarWidth(
+    sidebarWidth.value,
+    sidebarMaxWidth.value,
+  );
+}
+
+function selectPanel(panel: PanelKind) {
+  activePanel.value = panel;
+  panelExpanded.value = true;
+}
+
+function toggleSidebar(expanded?: boolean) {
+  panelExpanded.value = expanded ?? !panelExpanded.value;
+}
 
 async function selectSession(id: Uuid) {
   activeTerminal.value = id;
@@ -68,10 +105,6 @@ function openNewSession() {
 function openPanel(name: PanelKind) {
   activePanel.value = name;
   panelExpanded.value = true;
-}
-
-function toggleSidebar() {
-  panelExpanded.value = !panelExpanded.value;
 }
 
 function pickWorkspace(w: WorkspaceKind) {
@@ -97,9 +130,14 @@ const currentConnectionState = computed(() => {
 });
 
 onMounted(async () => {
+  window.addEventListener("resize", onViewportResize);
   await store.refresh();
   await store.subscribeEvents();
   await hostKeyStore.subscribeEvents();
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("resize", onViewportResize);
 });
 </script>
 
@@ -127,8 +165,8 @@ onMounted(async () => {
       :transfer-panel-expanded="transferPanelExpanded"
       :on-new-session="openNewSession"
       @change-workspace="pickWorkspace"
-      @select-panel="(p) => { activePanel = p; panelExpanded = true; }"
-      @toggle-sidebar="(expanded) => { panelExpanded = expanded; }"
+      @select-panel="selectPanel"
+      @toggle-sidebar="toggleSidebar"
       @sync-toggle="syncEnabled = !syncEnabled"
       @upload="() => {}"
       @download="() => {}"
@@ -139,13 +177,12 @@ onMounted(async () => {
     />
 
     <div class="body">
-      <ActivityBar
-        v-model:active="activePanel"
-        v-model:expanded="panelExpanded"
-      />
       <SidePanel
-        v-if="panelExpanded"
         :active="activePanel"
+        :width="sidebarWidth"
+        :max-width="sidebarMaxWidth"
+        :expanded="panelExpanded"
+        @update:width="setSidebarWidth"
         @select-session="selectSession"
         @open-sftp="onOpenSftp"
         @open-terminal="onOpenTerminal"
@@ -153,7 +190,7 @@ onMounted(async () => {
 
       <main class="main-area">
         <!-- Terminal Workspace -->
-        <template v-if="workspace === 'terminal'">
+        <div v-show="workspace === 'terminal'" class="workspace-layer terminal-layer">
           <DockviewVue
             v-if="activeTerminal"
             :components="components"
@@ -171,10 +208,10 @@ onMounted(async () => {
               <el-button type="primary" @click="openNewSession">新建会话</el-button>
             </div>
           </div>
-        </template>
+        </div>
 
         <!-- Transfer Workspace -->
-        <template v-else>
+        <div v-show="workspace === 'transfer'" class="workspace-layer transfer-layer">
           <div class="transfer-area">
             <TransferWorkspace
               v-if="activeTransferSession"
@@ -197,7 +234,7 @@ onMounted(async () => {
               @toggle="transferPanelExpanded = !transferPanelExpanded"
             />
           </div>
-        </template>
+        </div>
       </main>
     </div>
 
@@ -260,6 +297,10 @@ onMounted(async () => {
   height: 100%;
   min-height: 0;
 }
+
+.workspace-layer { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+.terminal-layer,
+.transfer-layer { display: flex; flex-direction: column; }
 
 .empty {
   display: flex;

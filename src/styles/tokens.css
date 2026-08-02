@@ -77,9 +77,12 @@
   --rs-transfer-panel-h-expanded: 220px;
   --rs-pane-path-h: 28px;
 
-  --rs-sidebar-w: 240px;
-  --rs-sidebar-w-min: 180px;
+  --rs-sidebar-w: 280px;
+  --rs-sidebar-w-min: 200px;
   --rs-sidebar-w-max: 360px;
+  --rs-sidebar-resize-step: 8px;
+  --rs-sidebar-separator-w: 6px;
+  --rs-panel-header-h: 32px;
 
   /* ===== spacing scale (4-base) ===== */
   --rs-s-1: 4px;
