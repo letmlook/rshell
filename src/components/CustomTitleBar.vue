@@ -91,14 +91,9 @@ defineExpose({
 </script>
 
 <template>
-  <header
-    class="titlebar"
-    :class="{ 'is-maximized': isMaximized }"
-    data-tauri-drag-region
-    style="-webkit-app-region: drag"
-  >
+  <header class="titlebar" :class="{ 'is-maximized': isMaximized }">
     <!-- 左:logo + 主菜单 -->
-    <div class="titlebar-left" data-tauri-drag-region="false" style="-webkit-app-region: no-drag">
+    <div class="titlebar-left" data-tauri-drag-region="false">
       <div class="logo">
         <span class="logo-mark">⌬</span>
         <span class="logo-text">RShell</span>
@@ -178,16 +173,15 @@ defineExpose({
 
     <!-- 中:可拖动区域 + 当前会话标签 -->
     <div
-      class="titlebar-center"
+      class="titlebar-center is-draggable"
       data-tauri-drag-region
-      style="-webkit-app-region: drag"
       @dblclick="onDragDoubleClick"
     >
       <span class="current-label">
         {{ currentLabel || (store.current?.name ?? "RShell — 远程终端客户端") }}
       </span>
     </div>
-    <div class="titlebar-right" data-tauri-drag-region="false" style="-webkit-app-region: no-drag">
+    <div class="titlebar-right" data-tauri-drag-region="false">
       <button
         class="window-btn"
         title="最小化"
@@ -266,6 +260,16 @@ defineExpose({
   margin: 0;
   padding: 0;
   flex-shrink: 0;
+}
+
+/* 唯一的可拖动区:中心标签;其余用 no-drag 类锁住。 */
+.titlebar .is-draggable {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+.titlebar [data-tauri-drag-region="false"] {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .titlebar-left {
