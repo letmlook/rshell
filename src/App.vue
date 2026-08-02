@@ -31,7 +31,7 @@ import CustomTitleBar from "./components/CustomTitleBar.vue";
 import ActivityBar from "./components/ActivityBar.vue";
 import SidePanel from "./components/SidePanel.vue";
 import StatusBar from "./components/StatusBar.vue";
-import WorkspaceToolbar, { type WorkspaceKind } from "./components/WorkspaceToolbar.vue";
+import WorkspaceToolbar, { type WorkspaceKind, type PanelKind } from "./components/WorkspaceToolbar.vue";
 import TransferPanel from "./components/TransferPanel.vue";
 import { useSessionsStore } from "./stores/sessions";
 import { useHostKeyStore } from "./stores/hostKey";
@@ -41,7 +41,7 @@ const store = useSessionsStore();
 const hostKeyStore = useHostKeyStore();
 const dialogVisible = ref(false);
 const activeTerminal = ref<Uuid | null>(null);
-const activePanel = ref("sessions");
+const activePanel = ref<PanelKind>("sessions");
 const panelExpanded = ref(true);
 
 const workspace = ref<WorkspaceKind>("terminal");
@@ -65,7 +65,7 @@ function openNewSession() {
   dialogVisible.value = true;
 }
 
-function openPanel(name: string) {
+function openPanel(name: PanelKind) {
   activePanel.value = name;
   panelExpanded.value = true;
 }
@@ -121,10 +121,14 @@ onMounted(async () => {
     <WorkspaceToolbar
       :workspace="workspace"
       :connection-state="currentConnectionState"
+      :active-panel="activePanel"
+      :sidebar-expanded="panelExpanded"
       :sync-enabled="syncEnabled"
       :transfer-panel-expanded="transferPanelExpanded"
       :on-new-session="openNewSession"
       @change-workspace="pickWorkspace"
+      @select-panel="(p) => { activePanel = p; panelExpanded = true; }"
+      @toggle-sidebar="(expanded) => { panelExpanded = expanded; }"
       @sync-toggle="syncEnabled = !syncEnabled"
       @upload="() => {}"
       @download="() => {}"

@@ -14,10 +14,13 @@
 import { computed } from "vue";
 
 export type WorkspaceKind = "terminal" | "transfer";
+export type PanelKind = "sessions" | "files" | "keys" | "tools" | "settings";
 
 const props = defineProps<{
   workspace: WorkspaceKind;
   connectionState: string;
+  activePanel?: PanelKind;
+  sidebarExpanded: boolean;
   /** Terminal 工具栏额外暴露的快捷动作(由 App.vue 传入) */
   onNewSession?: () => void;
   onConnect?: () => void;
@@ -40,7 +43,26 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "change-workspace", w: WorkspaceKind): void;
+  (e: "select-panel", panel: PanelKind): void;
+  (e: "toggle-sidebar", expanded: boolean): void;
 }>();
+
+const contextItems: Array<{ id: PanelKind; label: string; icon: string }> = [
+  { id: "sessions", label: "会话", icon: "▤" },
+  { id: "files", label: "文件", icon: "▥" },
+  { id: "keys", label: "密钥", icon: "⚷" },
+  { id: "tools", label: "工具", icon: "⚒" },
+  { id: "settings", label: "设置", icon: "⚙" },
+];
+
+function selectPanel(panel: PanelKind) {
+  emit("select-panel", panel);
+  emit("toggle-sidebar", true);
+}
+
+function toggleSidebar() {
+  emit("toggle-sidebar", !props.sidebarExpanded);
+}
 
 const statusLabel = computed(() => {
   const s = props.connectionState;
@@ -94,6 +116,23 @@ function pickWorkspace(w: WorkspaceKind) {
     </div>
 
     <div class="sep" aria-hidden="true" />
+
+    <!-- Context cluster: 上下文面板 (会话/文件/密钥/工具/设置) -->
+    <div class="context-cluster" role="group" aria-label="上下文面板">
+      <button
+        v-for="item in contextItems"
+        :key="item.id"
+        :data-testid="`context-${item.id}`"
+        class="tb-btn context-btn"
+        :class="{ 'is-on': activePanel === item.id }"
+        :title="item.label"
+        :aria-label="item.label"
+        @click="selectPanel(item.id)"
+      >
+        <span aria-hidden="true">{{ item.icon }}</span>
+        <span class="context-label">{{ item.label }}</span>
+      </button>
+    </div>
 
     <!-- 2. 通用按钮 -->
     <div class="cluster">
@@ -159,7 +198,7 @@ function pickWorkspace(w: WorkspaceKind) {
           :class="{ 'is-on': syncEnabled }"
           :title="syncEnabled ? '同步浏览(已开启)' : '同步浏览(关闭)'"
           aria-label="同步浏览"
-          aria-pressed="false"
+          :aria-pressed="syncEnabled"
           @click="onSyncToggle"
         >
           <svg width="14" height="14" viewBox="0 0 16 16">
@@ -216,6 +255,16 @@ function pickWorkspace(w: WorkspaceKind) {
 
     <!-- 右:连接状态摘要(浮在最右,工具栏里其它操作不会越界) -->
     <div class="spacer" />
+    <button
+      data-testid="toggle-sidebar"
+      class="tb-btn"
+      title="显示/隐藏侧栏"
+      aria-label="显示/隐藏侧栏"
+      :aria-pressed="sidebarExpanded"
+      @click="toggleSidebar"
+    >
+      <span aria-hidden="true">{{ sidebarExpanded ? "«" : "»" }}</span>
+    </button>
     <div class="status">
       <span class="rs-status-dot" :class="`rs-status-dot--${connectionState}`" aria-hidden="true" />
       <span class="status-text">{{ statusLabel }}</span>
@@ -340,5 +389,15 @@ function pickWorkspace(w: WorkspaceKind) {
 .rs-status-dot {
   width: 8px;
   height: 8px;
+}
+
+.context-cluster { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.context-btn { gap: 4px; }
+.context-btn.is-on { color: var(--rs-accent); background: var(--rs-row-selected); }
+.tb-btn:focus-visible,
+.ws-btn:focus-visible { outline: 2px solid var(--rs-accent); outline-offset: -2px; }
+@media (max-width: 900px) {
+  .context-label { display: none; }
+  .status-text { max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
 </style>
