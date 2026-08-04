@@ -1,9 +1,9 @@
 //! RShell Tauri 壳入口（切片 1.1）
 //!
 //! 接线后端壳四件套（设计 §1.1 / §3 / §4.1）：
-//! - `state.rs` 中的 `AppState`：注入 `Arc<CommandDispatcher>` + `Arc<TerminalChannels>`
+//! - `state.rs` 中的 `AppState`：注入 `Arc<CommandDispatcher>` + `SharedTerminalChannels`
 //! - `events.rs` 中的 `spawn_bridge`：EventBus.subscribe → `app.emit("rshell://event")` 桥
-//! - `terminal.rs` 中的 `TerminalChannels`：每会话双态 sink
+//! - `rshell-core::terminal::channels` 中的 `TerminalChannels`：每会话双态 sink
 //! - `error.rs` 中的 `IpcError`：CoreError → IPC 错误映射
 //!
 //! 切片 1.2 在 `commands.rs` 中加首批 7 个 `#[tauri::command]` 薄壳 +
@@ -13,7 +13,6 @@ mod commands;
 mod error;
 mod events;
 mod state;
-mod terminal;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,12 +27,12 @@ use rshell_core::security::tunnel_manager::TunnelManager;
 use rshell_core::session::repository::SessionRepository;
 use rshell_core::session::service::SessionService;
 use rshell_core::terminal::service::TerminalService;
+use rshell_core::terminal::SharedTerminalChannels;
 use rshell_core::theme::ThemeManager;
 use rshell_core::transfer::service::TransferService;
 use rshell_core::CommandDispatcher;
 use state::AppState;
 use tauri::Manager;
-use terminal::TerminalChannels;
 use tracing::info;
 
 /// 数据根目录：`dirs::data_local_dir()/rshell/`
@@ -71,13 +70,20 @@ pub fn run() {
             let trigger_engine = Arc::new(TriggerEngine::new(event_bus.clone()));
             let host_key_registry = Arc::new(HostKeyDecisionRegistry::new(event_bus.clone()));
 
+            // ── TerminalChannels(设计 §4.1 双态 sink) ──
+            // 提前建好:既给 SessionService 用(SSH recv 字节直推),
+            // 又给 attach_terminal 命令用(前端 mount xterm 时 attach Channel)。
+            let terminal_channels: SharedTerminalChannels =
+                Arc::new(rshell_core::terminal::TerminalChannels::new());
+
             let session_repository = Arc::new(SessionRepository::with_default_path());
-            let session_service = Arc::new(SessionService::with_repository(
+            let session_service = Arc::new(SessionService::with_full(
                 event_bus.clone(),
                 terminal_service.clone(),
                 trigger_engine.clone(),
                 host_key_registry.clone(),
                 Some(session_repository),
+                Some(terminal_channels.clone()),
             ));
 
             let transfer_service = Arc::new(TransferService::new(event_bus.clone()));
@@ -118,7 +124,6 @@ pub fn run() {
             events::subscribe_bridge(event_bus.clone(), app.handle().clone());
 
             // ── 6. AppState ─────────────────────────────────────────────
-            let terminal_channels = Arc::new(TerminalChannels::new());
             app.manage(AppState {
                 dispatcher,
                 terminal_channels,
@@ -144,7 +149,7 @@ pub fn run() {
             commands::list_keys,
             commands::list_themes,
             commands::verify_master_password,
-            commands::set_theme,
+            commands::set_app_theme,
             commands::set_terminal_color_scheme,
             commands::enqueue_upload,
             commands::enqueue_download,

@@ -24,6 +24,10 @@ chrono = { workspace = true }
 ssh-key = { version = "0.6", features = ["ed25519", "rsa", "ecdsa", "encryption"] }
 dirs = "5"
 toml = "0.8"
+# 2026-08-04 临时妥协:让 `terminal::channels` 模块能直接使用 tauri::ipc::Channel,
+# SessionService 才能在 SSH recv 循环里 push 字节给前端 xterm。
+# 重构方向:把 Channel 抽象成 trait,壳层提供实现。
+tauri = { version = "2", default-features = false }
 
 [dev-dependencies]
 mockall = { workspace = true }

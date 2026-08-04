@@ -1,16 +1,16 @@
 //! 终端字节流路由 —— 设计 §4.1 双态 sink
 //!
-//! 解决时序缺口：recv 循环在 `connect()` 内 `tokio::spawn` 启动，而 Tauri `Channel`
+//! 解决时序缺口:recv 循环在 `connect()` 内 `tokio::spawn` 启动,而 Tauri `Channel`
 //! 由前端组件 `onMounted` 时创建。两者时序无保证。
 //!
-//! 解法：后端持每会话双态 sink，未 attach 期间字节进入 `Buffering`，attach 时
-//! 一次性 flush 并切换为 `Attached(Channel)`。Channel 失效（HMR / 窗口重载）时退回
-//! `Buffering`，**不断开 SSH 连接** —— 这是设计 §4.4 的"前后端故障域隔离"。
+//! 解法:后端持每会话双态 sink,未 attach 期间字节进入 `Buffering`,attach 时
+//! 一次性 flush 并切换为 `Attached(Channel)`。Channel 失效(HMR / 窗口重载)时退回
+//! `Buffering`,**不断开 SSH 连接** —— 这是设计 §4.4 的"前后端故障域隔离"。
 //!
-//! 切片 1.1：模块已就位但 `TerminalChannels` 暂未被薄壳调用（切片 1.2 的
-//! `attach_terminal` 命令会接入 push/attach）。dead_code 警告属预期。
-
-#![allow(dead_code)]
+//! 模块位置:原 `src-tauri/src/terminal.rs`,2026-08-04 提升到 `rshell-core` 以让
+//! `SessionService` 在 recv 循环里 push 字节。临时妥协:`rshell-core` 直接依赖
+//! `tauri::ipc::Channel`。重构方向:把 Channel 抽象为 trait,壳层提供实现;
+//! 在分层修复完成前本模块对外暴露的 API 保持稳定。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -20,13 +20,13 @@ use tokio::sync::RwLock;
 use tracing::warn;
 use uuid::Uuid;
 
-/// 256 KiB 积压上限。超过则丢弃最旧字节并 warn!（设计 §4.1 规则 1）
+/// 256 KiB 积压上限。超过则丢弃最旧字节并 warn!(设计 §4.1 规则 1)
 const BUFFER_CAP_BYTES: usize = 256 * 1024;
 
 enum TermSink {
     /// 未 attach —— 字节累积。VecDeque 容量超限后丢弃最旧。
     Buffering(VecDeque<u8>),
-    /// 已 attach —— 字节直推 Channel；send 失败退回 Buffering。
+    /// 已 attach —— 字节直推 Channel;send 失败退回 Buffering。
     Attached(Channel<Vec<u8>>),
 }
 
@@ -47,8 +47,8 @@ impl TerminalChannels {
         }
     }
 
-    /// recv 循环无条件写入。未注册会话静默丢弃 + warn（防御性：recv 启动早于 attach）。
-    /// 已注册会话若仍处于 Buffering，累积；Attached 则直推，失败退回 Buffering。
+    /// recv 循环无条件写入。未注册会话静默丢弃 + warn(防御性:recv 启动早于 attach)。
+    /// 已注册会话若仍处于 Buffering,累积;Attached 则直推,失败退回 Buffering。
     pub async fn push(&self, session_id: Uuid, data: &[u8]) {
         let mut inner = self.inner.write().await;
         let entry = inner.entry(session_id).or_insert_with(|| {
@@ -69,7 +69,7 @@ impl TerminalChannels {
             }
             TermSink::Attached(ch) => {
                 // Channel.send 失败 = 前端 HMR/重载导致 Channel 句柄失效。
-                // 按设计 §4.1 规则 3：退回 Buffering,不中断后端 SSH 连接。
+                // 按设计 §4.1 规则 3:退回 Buffering,不中断后端 SSH 连接。
                 if ch.send(data.to_vec()).is_err() {
                     warn!(
                         session_id = %session_id,
@@ -137,7 +137,7 @@ fn append_capped(buf: &mut VecDeque<u8>, data: &[u8], cap: usize) -> usize {
     dropped
 }
 
-/// 切片 1.1 的辅助类型:把 Arc<TerminalChannels> 与各命令共享。
+/// 跨 crate 共享的类型别名。
 pub type SharedTerminalChannels = Arc<TerminalChannels>;
 
 #[cfg(test)]
@@ -151,7 +151,7 @@ mod tests {
         tc.push(id, b"hello ").await;
         tc.push(id, b"world").await;
 
-        // 构造一个不真正发送的 Channel 很难（Channel 是 Tauri 类型），
+        // 构造一个不真正发送的 Channel 很难(Channel 是 Tauri 类型),
         // 这里用 detach 后 push 应仍走 buffering 路径验证状态机。
         tc.push(id, b"!").await;
         let summary = tc.debug_summary().await;
@@ -166,7 +166,10 @@ mod tests {
         let tc = TerminalChannels::new();
         let id = Uuid::new_v4();
         // 灌入 2 × 上限
-        let big: Vec<u8> = (0..(BUFFER_CAP_BYTES * 2) as u8).cycle().take(BUFFER_CAP_BYTES * 2).collect();
+        let big: Vec<u8> = (0..(BUFFER_CAP_BYTES * 2) as u8)
+            .cycle()
+            .take(BUFFER_CAP_BYTES * 2)
+            .collect();
         tc.push(id, &big).await;
         // 内层状态应是 Buffering 且长度为 cap
         let summary = tc.debug_summary().await;

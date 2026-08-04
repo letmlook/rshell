@@ -41,7 +41,11 @@ macro_rules! cmd {
     // 有参版本:第一个 arm 用于简单负载(如 SessionId),
     // 第二个 arm 用于具名负载(如 SessionConfig)。
     ($name:ident($($arg:ident: $ty:ty),*) -> $out:ident($ret:ty) = $variant:expr) => {
-        #[tauri::command]
+        // rename_all = "snake_case":Tauri 2 默认把形参从 snake_case 转
+        // camelCase 暴露给前端,但本项目前端 `src/ipc/client.ts` 一律发
+        // snake_case 字段名(与 rshell-api AppCommand 一致)。
+        // 关闭默认重命名,使前后端共用 snake_case 契约。
+        #[tauri::command(rename_all = "snake_case")]
         pub async fn $name(
             $($arg: $ty,)*
             state: State<'_, AppState>,
@@ -70,21 +74,24 @@ macro_rules! cmd {
 
 // 写命令:返回 None（薄壳统一返回 CommandOutcome::None,序列化后为空 JSON）
 // 用宏不易表达"返回 ()",改写为直接函数体。
-#[tauri::command]
+//
+// 所有形参遵循 snake_case 命名 —— `rename_all = "snake_case"` 关闭 Tauri 2
+// 默认的 camelCase 重命名,使前后端共用 snake_case 契约(与 rshell-api 一致)。
+#[tauri::command(rename_all = "snake_case")]
 pub async fn connect_session(session_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state.dispatcher.dispatch(AppCommand::ConnectSession { session_id }).await
         .map_err(IpcError::from)?;
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn disconnect_session(session_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state.dispatcher.dispatch(AppCommand::DisconnectSession { session_id }).await
         .map_err(IpcError::from)?;
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn update_session(
     id: Uuid,
     config: SessionConfig,
@@ -95,14 +102,14 @@ pub async fn update_session(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn delete_session(id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state.dispatcher.dispatch(AppCommand::DeleteSession { id }).await
         .map_err(IpcError::from)?;
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn send_input(
     session_id: Uuid,
     data: Vec<u8>,
@@ -113,7 +120,7 @@ pub async fn send_input(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn resize_terminal(
     session_id: Uuid,
     cols: u16,
@@ -126,7 +133,7 @@ pub async fn resize_terminal(
 }
 
 // CreateSession:从 dispatch 返回的 SessionId(Uuid) 中取出 inner Uuid
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn create_session(
     config: SessionConfig,
     state: State<'_, AppState>,
@@ -149,7 +156,7 @@ cmd!(list_sessions() -> Sessions(Vec<SessionConfig>) = AppCommand::ListSessions)
 // 决策结构:rshell_protocol::ssh::HostKeyDecision { fingerprint, key_blob, accept, permanent }
 // —— dispatcher 的 DecideHostKey 分支已处理(切片 1.2)。permanent=true 时
 // known_hosts 写入留到切片 6 密钥管理域;本切片仅做一次性唤醒。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn decide_host_key(
     decision_id: Uuid,
     accept: bool,
@@ -170,7 +177,7 @@ pub async fn decide_host_key(
 
 // ===== 切片 5: SFTP 传输薄壳 =====
 // 写命令:返回 ()（slice 5.1 切片 5.3 验证取消/暂停链路）
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn enqueue_upload(
     local: String,
     remote: String,
@@ -189,7 +196,7 @@ pub async fn enqueue_upload(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn enqueue_download(
     remote: String,
     local: String,
@@ -208,7 +215,7 @@ pub async fn enqueue_download(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn pause_transfer(task_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -218,7 +225,7 @@ pub async fn pause_transfer(task_id: Uuid, state: State<'_, AppState>) -> Result
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn resume_transfer(task_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -228,7 +235,7 @@ pub async fn resume_transfer(task_id: Uuid, state: State<'_, AppState>) -> Resul
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn cancel_transfer(task_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -240,7 +247,7 @@ pub async fn cancel_transfer(task_id: Uuid, state: State<'_, AppState>) -> Resul
 
 // browse_remote_dir —— dispatcher 当前返回 None(切片 3 迁移,CommandOutcome::RemoteDir
 // 完整接通留到切片 5+)。本切片先注册占位薄壳保证 IPC 路由可用。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn browse_remote_dir(
     session_id: Uuid,
     path: String,
@@ -258,7 +265,7 @@ pub async fn browse_remote_dir(
 use rshell_api::types::SshKeyType;
 
 // generate_ssh_key
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn generate_ssh_key(
     name: String,
     key_type: SshKeyType,
@@ -274,7 +281,7 @@ pub async fn generate_ssh_key(
 }
 
 // import_private_key
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn import_private_key(
     path: String,
     passphrase: Option<String>,
@@ -291,7 +298,7 @@ pub async fn import_private_key(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn delete_ssh_key(key_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -301,7 +308,7 @@ pub async fn delete_ssh_key(key_id: Uuid, state: State<'_, AppState>) -> Result<
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn setup_master_password(
     password: String,
     state: State<'_, AppState>,
@@ -314,7 +321,7 @@ pub async fn setup_master_password(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn change_master_password(
     old_password: String,
     new_password: String,
@@ -329,7 +336,7 @@ pub async fn change_master_password(
 }
 
 // trust_host_key —— permanent=true 走 host_key_manager.trust_host_key 持久化
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn trust_host_key(
     host: String,
     port: u16,
@@ -356,7 +363,7 @@ pub async fn trust_host_key(
 use rshell_api::types::{QuickCommand, Trigger};
 
 // 写命令:返回 ()
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn execute_quick_command(
     command_id: Uuid,
     target_sessions: Vec<Uuid>,
@@ -373,7 +380,7 @@ pub async fn execute_quick_command(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn create_quick_command(
     command: QuickCommand,
     state: State<'_, AppState>,
@@ -386,7 +393,7 @@ pub async fn create_quick_command(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn delete_quick_command(
     command_id: Uuid,
     state: State<'_, AppState>,
@@ -399,7 +406,7 @@ pub async fn delete_quick_command(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn create_trigger(trigger: Trigger, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -409,7 +416,7 @@ pub async fn create_trigger(trigger: Trigger, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn delete_trigger(trigger_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -419,7 +426,7 @@ pub async fn delete_trigger(trigger_id: Uuid, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn toggle_trigger(trigger_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -429,7 +436,7 @@ pub async fn toggle_trigger(trigger_id: Uuid, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn execute_script(
     code: String,
     session_id: Uuid,
@@ -449,7 +456,7 @@ pub async fn execute_script(
 // / restore_tunnel / suspend_tunnel / resume_tunnel。
 use rshell_api::types::PortForwardRule;
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn create_tunnel(
     session_id: Uuid,
     rule: PortForwardRule,
@@ -463,7 +470,7 @@ pub async fn create_tunnel(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn close_tunnel(tunnel_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -473,7 +480,7 @@ pub async fn close_tunnel(tunnel_id: Uuid, state: State<'_, AppState>) -> Result
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn restore_tunnel(
     session_id: Uuid,
     rule: PortForwardRule,
@@ -487,7 +494,7 @@ pub async fn restore_tunnel(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn suspend_tunnel(tunnel_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -497,7 +504,7 @@ pub async fn suspend_tunnel(tunnel_id: Uuid, state: State<'_, AppState>) -> Resu
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn resume_tunnel(tunnel_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -511,7 +518,7 @@ pub async fn resume_tunnel(tunnel_id: Uuid, state: State<'_, AppState>) -> Resul
 // 注:ListPlugins 在切片 2.2 已迁移到 CommandOutcome。
 // 本切片按用户校核（2026-07-31 决策）：仅做 IPC 接入，WasmSandbox 仍是 scaffold，
 // 实际加载 / 执行返回 `IpcError { kind: "internal", message: "plugin sandbox not yet implemented" }`。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn scan_plugins(state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -521,7 +528,7 @@ pub async fn scan_plugins(state: State<'_, AppState>) -> Result<(), IpcError> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn load_plugin(plugin_id: String, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -531,7 +538,7 @@ pub async fn load_plugin(plugin_id: String, state: State<'_, AppState>) -> Resul
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn unload_plugin(plugin_id: String, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -541,7 +548,7 @@ pub async fn unload_plugin(plugin_id: String, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn enable_plugin(plugin_id: String, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -551,7 +558,7 @@ pub async fn enable_plugin(plugin_id: String, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn disable_plugin(plugin_id: String, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
@@ -569,7 +576,7 @@ cmd!(list_keys() -> Keys(Vec<SshKeyInfo>) = AppCommand::ListKeys);
 cmd!(list_themes() -> Themes(ThemeInfo) = AppCommand::ListThemes);
 
 // VerifyMasterPassword:返回 bool
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn verify_master_password(
     password: String,
     state: State<'_, AppState>,
@@ -586,8 +593,8 @@ pub async fn verify_master_password(
 }
 
 // SetAppTheme / SetTerminalColorScheme:写命令,返回 ()
-#[tauri::command]
-pub async fn set_theme(theme_name: String, state: State<'_, AppState>) -> Result<(), IpcError> {
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_app_theme(theme_name: String, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
         .dispatch(AppCommand::SetAppTheme { theme_name })
@@ -596,7 +603,7 @@ pub async fn set_theme(theme_name: String, state: State<'_, AppState>) -> Result
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn set_terminal_color_scheme(
     scheme_name: String,
     state: State<'_, AppState>,
@@ -612,7 +619,7 @@ pub async fn set_terminal_color_scheme(
 // attach_terminal —— 设计 §4.1
 // 把 Channel<Vec<u8>> 注册到 TerminalChannels,flush 积压后切换为 Attached 模式。
 // 该命令**不走 dispatcher**(Channel 是壳层基础设施,不需要业务逻辑)。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn attach_terminal(
     session_id: Uuid,
     on_data: Channel<Vec<u8>>,
@@ -631,7 +638,7 @@ pub async fn attach_terminal(
 /// 切片 0.3 临时命令 —— 通过 Channel 推 1 MiB 假字节。
 ///
 /// 切片 1.4 完成判据走完后删除。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn push_one_mb(channel: Channel<Vec<u8>>) -> Result<usize, String> {
     use tracing::info;
     const CHUNK: usize = 16 * 1024;
@@ -674,7 +681,7 @@ mod tests {
             stringify!(list_keys),
             stringify!(list_themes),
             stringify!(verify_master_password),
-            stringify!(set_theme),
+            stringify!(set_app_theme),
             stringify!(set_terminal_color_scheme),
         ];
     }

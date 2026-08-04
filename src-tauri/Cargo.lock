@@ -5201,6 +5201,7 @@ dependencies = [
  "serde_json",
  "ssh-key",
  "static_assertions",
+ "tauri",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",

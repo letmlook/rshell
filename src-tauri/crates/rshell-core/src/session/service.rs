@@ -6,6 +6,7 @@ use crate::script::trigger_engine::TriggerEngine;
 use crate::security::host_key_decision::HostKeyDecisionRegistry;
 use crate::session::repository::SessionRepository;
 use crate::terminal::service::TerminalService;
+use crate::terminal::SharedTerminalChannels;
 use rshell_api::types::{ConnectionInfo, ConnectionState, RemoteFileEntry, SessionConfig, TriggerAction};
 use rshell_protocol::ssh::SshClient;
 use rshell_protocol::ssh::sftp::SftpClient;
@@ -56,6 +57,9 @@ pub struct SessionService {
     /// 字段保留以便未来切片通过 `tokio::sync::Mutex` 替换 std 实现后启用。
     #[allow(dead_code)]
     dispatcher: std::sync::Weak<()>,
+    /// 终端字节 sink：recv 循环把 SSH 字节推给前端 xterm（设计 §4.1）。
+    /// 设为可选以保留旧测试场景（直接构造 SessionService 不带 sink）。
+    terminal_channels: Option<SharedTerminalChannels>,
 }
 
 impl SessionService {
@@ -78,6 +82,26 @@ impl SessionService {
         host_key_registry: Arc<HostKeyDecisionRegistry>,
         repository: Option<Arc<SessionRepository>>,
     ) -> Self {
+        Self::with_full(
+            event_bus,
+            _terminal_service,
+            trigger_engine,
+            host_key_registry,
+            repository,
+            None,
+        )
+    }
+
+    /// 完整构造：额外注入 TerminalChannels（设计 §4.1 字节 sink）。
+    /// Tauri 壳 `setup` 阶段使用。测试场景维持 5 参 `with_repository`。
+    pub fn with_full(
+        event_bus: Arc<EventBus>,
+        _terminal_service: Arc<TerminalService>,
+        trigger_engine: Arc<TriggerEngine>,
+        host_key_registry: Arc<HostKeyDecisionRegistry>,
+        repository: Option<Arc<SessionRepository>>,
+        terminal_channels: Option<SharedTerminalChannels>,
+    ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -88,6 +112,7 @@ impl SessionService {
             // 切片 7.1 占位：当前无 dispatcher 引用。
             // SendText 完整派发闭环推迟 —— 见 recv spawn 注释。
             dispatcher: std::sync::Weak::new(),
+            terminal_channels,
         }
     }
 
@@ -220,6 +245,9 @@ impl SessionService {
                 // 切片 2.1 占位保留（切片 7 探索 SendText 派发失败,见 recv spawn 注释）：
                 let trigger_engine = self.trigger_engine.clone();
                 let client_clone = client.clone();
+                // recv 循环需要把 SSH 字节推到 TerminalChannels;
+                // 这里 clone Arc 让 spawn 闭包拥有自己的句柄,避开 self 借用。
+                let terminal_channels = self.terminal_channels.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -233,12 +261,12 @@ impl SessionService {
                             } => {
                                 match result {
                                     Ok(Some(data)) => {
-                                        // ── 字节直推 xterm（设计 §2.3） ──
-                                        // 注:此处暂未与 `TerminalChannels` 串接 —— 切片 2.1
-                                        // 删 alacritty 后,这部分代码下沉到 `TerminalChannels::push`
-                                        // 由 dispatcher 在 connect 时建立回路。下一行注释为占位,
-                                        // 真正接线在切片 1.4 完成判据已通过后随 attach_terminal 同步。
-                                        // TODO(slice-2.2):terminal_channels.push(session_id, &data).await;
+                                        // ── 字节直推 xterm（设计 §2.3 / §4.1） ──
+                                        // 通过 TerminalChannels 推到前端 xterm:
+                                        // attach 之前自动 Buffering,attach 时一次性 flush。
+                                        if let Some(tc) = &terminal_channels {
+                                            tc.push(session_id, &data).await;
+                                        }
 
                                         // ── 触发器匹配（原始字节 → UTF-8 → 正则） ──
                                         if let Ok(text) = std::str::from_utf8(&data) {
