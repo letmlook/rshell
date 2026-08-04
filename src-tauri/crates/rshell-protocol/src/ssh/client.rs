@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use rshell_api::types::{AuthMethod, SessionConfig};
 use ssh_key::HashAlg;
-use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -41,7 +40,7 @@ pub struct HostKeyDecision {
 /// `SshHandler::check_server_key` 是**同步** trait 方法，不能直接 `.await`。
 /// 但 UI 端需要异步响应决策——所以 `SshClient` 接受一个 `Arc<dyn HostKeyDecisionSink>`：
 /// 未知 key 时调用 `register_decision` 注册一个等待项、拿到一个 oneshot::Receiver，
-/// 再 `publish_request` 让 UI 看到、最后 `Handle::current().block_on(rx)` 等待。
+/// 再 `publish_request` 让 UI 看到、最后在 `check_server_key` 的 async body 内 `.await` 等。
 ///
 /// 协议层（`rshell-protocol`）不依赖 `rshell-core`,所以这里用 trait object 解耦;
 /// `rshell-core::security::host_key_decision::HostKeyDecisionRegistry` 是 trait 的
@@ -231,8 +230,8 @@ impl russh::client::Handler for SshHandler {
         }
 
         // ===== 未在 known_hosts 中找到匹配条目 → 等待 UI 决策 =====
-        // `check_server_key` 是同步 trait 方法，但 tokio runtime 已在底层线程上运行，
-        // 用 Handle::current().block_on 把 oneshot::recv 丢进 runtime。
+        // `check_server_key` 是 async trait 方法,rx 是 tokio oneshot,直接 .await;
+        // 30s 超时避免 UI 无响应时永久挂住 russh 连接。
         let Some(sink) = self.host_key_sink.clone() else {
             // 没有 sink:保守策略,直接拒绝。协议层单元测试场景下走这条路径。
             warn!(
@@ -261,10 +260,16 @@ impl russh::client::Handler for SshHandler {
             public_key_blob: key_blob,
         });
 
-        // 3. 同步等待 UI 端通过 AppCommand::DecideHostKey 唤醒
-        let user_decided = Handle::current().block_on(rx);
+        // 3. 等待 UI 端通过 AppCommand::DecideHostKey 唤醒。
+        // `check_server_key` 已经是 async,rx 是 tokio oneshot,直接 .await。
+        // 30s 超时,避免用户在 UI 上无响应时永久挂住 russh 连接。
+        let user_decided = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            rx,
+        )
+        .await;
         match user_decided {
-            Ok(decision) => {
+            Ok(Ok(decision)) => {
                 if decision.accept {
                     // TrustOnce 或 TrustPermanent 都被接受，russh 继续握手。
                     // TrustPermanent 的写入由调用方（SessionService::connect）处理。
@@ -285,7 +290,7 @@ impl russh::client::Handler for SshHandler {
                 );
                 Err(anyhow::anyhow!("User rejected host key for {}:{}", self.host, self.port))
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 warn!(
                     host = %self.host,
                     port = self.port,
@@ -294,6 +299,18 @@ impl russh::client::Handler for SshHandler {
                 );
                 Err(anyhow::anyhow!(
                     "Host key decision channel closed for {}:{}",
+                    self.host, self.port
+                ))
+            }
+            Err(_) => {
+                warn!(
+                    host = %self.host,
+                    port = self.port,
+                    fingerprint = %fp,
+                    "Host key decision timed out after 30s — rejecting"
+                );
+                Err(anyhow::anyhow!(
+                    "Host key decision timed out for {}:{}",
                     self.host, self.port
                 ))
             }
