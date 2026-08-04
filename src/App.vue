@@ -41,10 +41,12 @@ import {
 } from "./utils/workspaceLayout";
 import { useSessionsStore } from "./stores/sessions";
 import { useHostKeyStore } from "./stores/hostKey";
+import { useThemeStore } from "./stores/theme";
 import type { Uuid } from "./ipc/types";
 
 const store = useSessionsStore();
 const hostKeyStore = useHostKeyStore();
+const themeStore = useThemeStore();
 const dialogVisible = ref(false);
 const activeTerminal = ref<Uuid | null>(null);
 const activePanel = ref<PanelKind>("sessions");
@@ -133,6 +135,11 @@ onMounted(async () => {
   await store.refresh();
   await store.subscribeEvents();
   await hostKeyStore.subscribeEvents();
+  // 主题启动恢复:拉一次当前主题名,并订阅 ThemeChanged/ColorSchemeChanged
+  // 事件以接收颜色集并写入 :root。仅在 ThemePanel 挂载时拉取会导致首屏
+  // 应用不应用主题,因此在 App 启动时统一初始化。
+  await themeStore.refresh();
+  await themeStore.subscribeEvents();
 });
 
 onBeforeUnmount(() => {

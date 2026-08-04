@@ -5,17 +5,15 @@
  * 选择应用主题 + 终端配色方案。前端管展开态/排序列/过滤词（设计 §5）；
  * scheme → CSS 变量映射（见 utils/themeCss.ts）由前端计算，避免后端发整
  * 套颜色 JSON。
+ *
+ * 注意：store.refresh() + subscribeEvents() 由 App.vue 启动时统一调用，
+ * 这里不再重复触发，否则第二次 invoke('list_themes') 是无意义的往返。
  */
-import { onMounted } from "vue";
 import { useThemeStore } from "../stores/theme";
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
 
 const store = useThemeStore();
-
-onMounted(async () => {
-  await store.refresh();
-});
 </script>
 
 <template>

@@ -16,6 +16,26 @@ vi.mock("../../src/stores/sessions", () => ({
 vi.mock("../../src/stores/hostKey", () => ({
   useHostKeyStore: () => ({ subscribeEvents: vi.fn().mockResolvedValue(undefined) }),
 }));
+vi.mock("../../src/stores/theme", () => ({
+  useThemeStore: () => ({
+    currentTheme: "default",
+    currentScheme: "default",
+    availableThemes: [],
+    availableSchemes: [],
+    loading: false,
+    error: null,
+    currentColors: null,
+    refresh: vi.fn().mockResolvedValue(undefined),
+    applyTheme: vi.fn().mockResolvedValue(undefined),
+    applyScheme: vi.fn().mockResolvedValue(undefined),
+    applyColors: vi.fn(),
+    applyTerminalPalette: vi.fn(),
+    subscribeEvents: vi.fn().mockResolvedValue(vi.fn()),
+    unsubscribeEvents: vi.fn(),
+    registerXterm: vi.fn(),
+    unregisterXterm: vi.fn(),
+  }),
+}));
 
 describe("App layout", () => {
   const childStubs = {

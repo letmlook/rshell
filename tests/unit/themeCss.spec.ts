@@ -53,9 +53,16 @@ describe("rgbaToCss", () => {
 });
 
 describe("themeColorSetToCssVars", () => {
-  it("emits all 9 CSS variables", () => {
+  it("emits both v2 --rs-* and v1 --rshell-* namespaces", () => {
     const vars = themeColorSetToCssVars(black);
-    expect(Object.keys(vars)).toHaveLength(9);
+    // v2 主语义层（驱动 Element Plus + 现代组件）
+    expect(vars["--rs-bg"]).toBe("#000000");
+    expect(vars["--rs-fg"]).toBe("#ffffff");
+    expect(vars["--rs-accent"]).toBe("#0066cc");
+    expect(vars["--rs-border"]).toBe("#cccccc");
+    expect(vars["--rs-bg-panel"]).toBe("#101010");
+    expect(vars["--rs-row-selected"]).toBe("#4060a0");
+    // v1 旧别名层（供仍直接消费 --rshell-* 的组件）
     expect(vars["--rshell-bg"]).toBe("#000000");
     expect(vars["--rshell-fg"]).toBe("#ffffff");
     expect(vars["--rshell-accent"]).toBe("#0066cc");

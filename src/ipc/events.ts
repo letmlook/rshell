@@ -9,8 +9,10 @@
 //   - TerminalBufferUpdated 与 TerminalOutput（设计 §2.2：alacritty 净删除 → xterm 全接管）
 //   - ClipboardCopy（设计 §5 上移剪贴板到前端 xterm 自持选区）
 
-import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppEvent } from "./types";
+
+export type { UnlistenFn };
 
 export const EVENT_CHANNEL = "rshell://event";
 
@@ -56,6 +58,8 @@ export type EventDispatcher = {
     received: string;
     public_key_blob: string;
   }) => void;
+  onThemeChanged?: (theme: import("./types").AppTheme) => void;
+  onColorSchemeChanged?: (scheme: import("./types").TerminalColorScheme) => void;
 };
 
 export function makeDispatcher(dispatcher: EventDispatcher): EventHandler {
@@ -95,6 +99,16 @@ export function makeDispatcher(dispatcher: EventDispatcher): EventHandler {
       case "HostKeyMismatch": {
         const e = (event as Extract<AppEvent, { HostKeyMismatch: unknown }>).HostKeyMismatch;
         dispatcher.onHostKeyMismatch?.(e);
+        break;
+      }
+      case "ThemeChanged": {
+        const e = (event as Extract<AppEvent, { ThemeChanged: unknown }>).ThemeChanged;
+        dispatcher.onThemeChanged?.(e.theme);
+        break;
+      }
+      case "ColorSchemeChanged": {
+        const e = (event as Extract<AppEvent, { ColorSchemeChanged: unknown }>).ColorSchemeChanged;
+        dispatcher.onColorSchemeChanged?.(e.scheme);
         break;
       }
       default:

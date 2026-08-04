@@ -20,10 +20,13 @@ import { Channel } from "@tauri-apps/api/core";
 import { invoke } from "@tauri-apps/api/core";
 import { sendInput, resizeTerminal } from "../ipc/client";
 import type { Uuid } from "../ipc/types";
+import { useThemeStore } from "../stores/theme";
 
 const props = defineProps<{
   sessionId?: Uuid;
 }>();
+
+const themeStore = useThemeStore();
 
 const containerRef = ref<HTMLDivElement | null>(null);
 const searchBarVisible = ref(false);
@@ -107,6 +110,9 @@ onMounted(async () => {
     theme: readXtermThemeFromCssVars(),
   });
 
+  // 注册到主题 store —— 主题切换时由 store 统一刷新 term.options.theme
+  themeStore.registerXterm(term);
+
   fit = new FitAddon();
   term.loadAddon(fit);
 
@@ -139,9 +145,11 @@ onMounted(async () => {
   };
 
   try {
+    // 后端 #[tauri::command(rename_all = "snake_case")]:形参名直接用 snake_case
+    // 与 rshell-api 契约一致。
     await invoke("attach_terminal", {
-      sessionId: props.sessionId,
-      onData: channel,
+      session_id: props.sessionId,
+      on_data: channel,
     });
   } catch (e) {
     console.error("[TerminalPane] attach_terminal failed", e);
@@ -184,7 +192,10 @@ onBeforeUnmount(() => {
   detachSizeObserver?.();
   detachSizeObserver = null;
   window.removeEventListener("keydown", onWindowKeydown);
-  term?.dispose();
+  if (term) {
+    themeStore.unregisterXterm(term);
+    term.dispose();
+  }
   term = null;
   channel = null;
 });
