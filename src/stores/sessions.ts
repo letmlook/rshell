@@ -14,7 +14,7 @@ import {
   disconnectSession,
   deleteSession,
 } from "../ipc/client";
-import { listen } from "@tauri-apps/api/event";
+import { makeDispatcher, subscribeAppEvents, type UnlistenFn } from "../ipc/events";
 
 type ConnectionStateValue = "disconnected" | "connecting" | "connected" | "failed";
 
@@ -26,6 +26,8 @@ export const useSessionsStore = defineStore("sessions", () => {
   const masterPasswordRequired = ref(false); // 切片 6：监听 MasterPasswordRequired 事件
   const loading = ref(false);
   const error = ref<string | null>(null);
+
+  let unlisten: UnlistenFn | null = null;
 
   const current = computed<SessionConfig | null>(() =>
     currentId.value ? items.value.find((s) => s.id === currentId.value) ?? null : null,
@@ -72,23 +74,32 @@ export const useSessionsStore = defineStore("sessions", () => {
     await refresh();
   }
 
-  /** 订阅后端事件总线,实时更新 connectionState(设计 §4.3 流程 A)。*/
-  async function subscribeEvents() {
-    await listen<{ kind: string; session_id?: Uuid; state?: string }>(
-      "rshell://event",
-      (e) => {
-        const payload = e.payload;
-        if (
-          payload.kind === "ConnectionStateChanged" &&
-          payload.session_id &&
-          payload.state
-        ) {
-          const normalized = payload.state.toLowerCase() as ConnectionStateValue;
-          connectionState.value.set(payload.session_id, normalized);
+  /**
+   * 订阅后端事件总线,实时更新 connectionState(设计 §4.3 流程 A)。
+   *
+   * 注意:`AppEvent` 是 serde external-tagged enum,前端拿到的 payload 是
+   * `{"ConnectionStateChanged": {...}}` 形态,不是 `{"kind": "...", ...}`。
+   * 走 `makeDispatcher` 才能正确按 tag 解包。
+   */
+  async function subscribeEvents(): Promise<UnlistenFn> {
+    if (unlisten) return unlisten;
+    unlisten = await subscribeAppEvents(
+      makeDispatcher({
+        onConnectionStateChanged: (session_id, state) => {
+          const normalized = state.toLowerCase() as ConnectionStateValue;
+          connectionState.value.set(session_id, normalized);
           connectionState.value = new Map(connectionState.value);
-        }
-      },
+        },
+      }),
     );
+    return unlisten;
+  }
+
+  function unsubscribeEvents() {
+    if (unlisten) {
+      unlisten();
+      unlisten = null;
+    }
   }
 
   return {
@@ -106,5 +117,6 @@ export const useSessionsStore = defineStore("sessions", () => {
     disconnect,
     delete: deleteSessionById,
     subscribeEvents,
+    unsubscribeEvents,
   };
 });

@@ -2,12 +2,15 @@
  * hostKey pinia store —— 切片 4
  *
  * 持有当前活跃的 HostKeyMismatch 请求 + 决策动作。
- * 后端经 `EventBus` → `app.emit("rshell://event")` 推 `HostKeyMismatch` 事件;
- * 本 store 监听后弹对话框,用户决策后调 `decideHostKey(decision_id, accept, permanent)`。
+ * 后端经 `EventBus` → `app.emit("rshell://event")` 推 `AppEvent`:
+ * 由于 `AppEvent` 是 serde 默认 external-tagged enum,前端拿到的 payload 是
+ * `{"HostKeyMismatch": {decision_id, host, ...}}` 形态 —— 必须经
+ * `makeDispatcher` 解包才能拿到内层字段,不能直接在 listener 里读
+ * `payload.decision_id`。用户决策后调 `decideHostKey(decision_id, accept, permanent)`。
  */
 import { defineStore } from "pinia";
 import { ref } from "vue";
-import { listen } from "@tauri-apps/api/event";
+import { makeDispatcher, subscribeAppEvents, type UnlistenFn } from "../ipc/events";
 import { decideHostKey } from "../ipc/client";
 
 export interface HostKeyRequest {
@@ -24,13 +27,25 @@ export const useHostKeyStore = defineStore("hostKey", () => {
   const current = ref<HostKeyRequest | null>(null);
   const history = ref<HostKeyRequest[]>([]); // 已处理但留作审计
 
-  async function subscribeEvents() {
-    await listen<HostKeyRequest>("rshell://event", (msg) => {
-      const payload = msg.payload;
-      if (payload && "decision_id" in payload && "received" in payload) {
-        current.value = payload;
-      }
-    });
+  let unlisten: UnlistenFn | null = null;
+
+  async function subscribeEvents(): Promise<UnlistenFn> {
+    if (unlisten) return unlisten;
+    unlisten = await subscribeAppEvents(
+      makeDispatcher({
+        onHostKeyMismatch: (data) => {
+          current.value = data as HostKeyRequest;
+        },
+      }),
+    );
+    return unlisten;
+  }
+
+  function unsubscribeEvents() {
+    if (unlisten) {
+      unlisten();
+      unlisten = null;
+    }
   }
 
   async function trustOnce() {
@@ -61,5 +76,14 @@ export const useHostKeyStore = defineStore("hostKey", () => {
     current.value = null;
   }
 
-  return { current, history, subscribeEvents, trustOnce, trustPermanent, reject, dismiss };
+  return {
+    current,
+    history,
+    subscribeEvents,
+    unsubscribeEvents,
+    trustOnce,
+    trustPermanent,
+    reject,
+    dismiss,
+  };
 });
