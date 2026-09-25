@@ -1,5 +1,7 @@
 # macOS Existing-Feature Hardening Implementation Plan
 
+> Historical execution plan (2026-09-25). The original steps below are preserved for traceability, not as the current support matrix. For implementation status and observed verification as of 2026-09-26, see [project status](../../02-project-plan.md) and [macOS validation](../../09-macos-validation.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 **Goal:** Deliver a macOS-verifiable RShell whose visible features are real, whose unsupported RDP and Remote Forward capabilities are absent, and whose documentation describes the Tauri/Vue product.

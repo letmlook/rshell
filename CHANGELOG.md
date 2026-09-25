@@ -1,106 +1,22 @@
-# 更新日志
+# Changelog
 
-本项目的所有重要变更都会记录在此文件中。
+## 0.1.0 — macOS hardening (2026-09-26)
 
-格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
-版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
+- 当前桌面实现统一为 Tauri 2、Vue 3、TypeScript、xterm.js 和 Rust。
+- 删除 RDP 运行时、公共类型和直接依赖；旧 RDP 协议输入被拒绝。
+- SSH 隧道限定为 Local/Dynamic，旧 Remote 规则保留并跳过；建立监听前必须取得 SSH 连接。
+- SFTP 工作区接入真实目录和传输服务，补齐创建目录、普通文件删除与队列结果，移除假文件列表和无效操作按钮。
+- 接通 SSH 输出到终端 Channel，避免接收等待占用发送锁，并转发终端尺寸。
+- Telnet/Serial 纳入会话生命周期，补齐终端 I/O 与断开；Telnet 增加分片协商处理和本地回环测试。
+- 主机密钥决策改为异步等待，永久信任落盘，已知密钥解析和变化指纹显示得到修正。
+- 快速命令和触发器补齐动作、错误反馈、事件订阅及本地保存；Rhai 宿主函数调用真实会话服务。
+- 应用主题与终端配色使用后端实际颜色，清理重复和过期事件监听器。
+- 插件清单使用 TOML 解析，WASM 模块加载前实际编译校验，列表包含已发现模块。
+- 修复 macOS 初始化期间嵌套运行时导致的启动崩溃。
+- 补齐标题栏拖动权限，去除与 Tauri 原生逻辑重复的双击最大化处理，补充对应回归。
+- 升级 Vite/Vitest 与受影响的传递依赖，清理本轮 npm audit 告警；macOS 构建脚本改为调用 Tauri。
+- 更新当前产品、架构、开发、测试和验证文档。
 
----
+本条记录描述代码变化，不代表所有外部环境均已完成验收。实际证据见 [macOS 验证记录](docs/09-macos-validation.md)。
 
-## [Unreleased]
-
-### Changed — 完成 v0.1.0 完整化
-
-#### 工具链
-- 升级 `rust-toolchain.toml` 至 Rust 1.90（registry 已要求 ≥1.86）；同步更新 `Cargo.toml` workspace `rust-version`、`CLAUDE.md`、`README.md`、`docs/07-project-setup-guide.md`。
-- 升级 `alacritty_terminal` 0.24 → 0.25 以匹配新版 rustix API；修复 `rshell-infra` PTY Unix 实现缺失的 `std::io::{Read, Write}` 导入。
-
-#### 新增
-- **`crates/xtask/`**：clap 驱动的任务运行器，子命令 `fmt` / `lint` / `test` / `dev` / `build` / `xtask-help`。`.cargo/config.toml` 中已存在的 `cargo xtask` 别名现在真正可用。
-- **SSH 主机密钥校验**：`SshHandler::check_server_key` 现在按 OpenSSH 标准 `known_hosts` 格式（`<host_pattern> <keytype> <base64-key>`）严格匹配 host[:port] + SHA256 指纹，未知主机**拒绝连接**（之前是静默接受）。`HostKeyManager` 重写为 OpenSSH 文件格式，与 `ssh-keygen` 等工具互操作。
-- **Serial（`crates/rshell-protocol/src/serial/mod.rs`）**：基于 `serialport` 4.9 实现真实串口通信。`open` / `write` / `read` / `list_ports` 全部就绪；阻塞 I/O 通过 `tokio::task::spawn_blocking` 包装；`SerialPort`（非 `Sync`）由 `Arc<Mutex<Box<dyn SerialPort>>>` 持有。
-- **RDP（`crates/rshell-protocol/src/rdp/mod.rs`）**：基于 `ironrdp` 0.14 + `ironrdp-tokio` 0.8 + `ironrdp-connector` 0.8 + `ironrdp-async` 0.8 + `ironrdp-pdu` 0.7。TCP + `TokioFramed` + `connect_begin` 完成 X.224 协商。`RdpFrame` 通过独立 mpsc 通道对外提供。⚠️ TLS 升级 + NLA 认证 + ActiveStage 帧渲染留作后续工作（标记在 README「已知问题」中）。
-- **WASM 沙箱（`crates/rshell-plugin-sdk/src/sandbox.rs`）**：基于 `wasmtime` 27（Cranelift JIT）。Engine 启动 `consume_fuel`；`Store::set_fuel` 近似 `max_execution_time_ms` 限制执行时间；`Module::new` / `Instance::new` / `Func::call` 全部走通；测试通过 `(2, 3) == 5` 的 WAT `add` 函数验证。
-
-#### 重构
-- **`crates/rshell-ui/src/views/*`**：6 个 View 的构造器从 `new(_window, _cx)` 统一为 `new(cx)` 以适配 `cx.new(|cx| ...)` 挂载闭包。
-- **`crates/rshell-ui/src/app.rs`**：`RshellApp` 现在持有 10 个 `gpui::Entity<View>` 字段（FileManager / Session / Terminal / Transfer / Key / Theme / QuickCommands / Compose / Tunnel / Plugin），新增 `PanelKind` 枚举 + `render_active_panel()` 路由方法。侧边栏"会话树"占位 → 真实 `SessionView`；底部"传输队列"占位 → 真实 `TransferView`；中央"终端输出区域"占位 → 真实 `TerminalView`。
-- **`crates/rshell-ui/src/views/terminal_view.rs`**：增强为支持 `CellFlags`（bold / italic / underline / strikethrough）渲染、绝对定位光标覆盖层、`Selection` 数据结构 + 选区高亮。
-
-### 待办
-- RDP TLS / NLA / ActiveStage 帧渲染（基础设施已就位，等待真实 RDP 服务端测试；见 README「已知问题」§2）
-- GPUI 视图层改动需要真实 GPUI 运行时验证（本机缺 Metal 工具链）
-
----
-
-## [Unreleased-2]
-
-### Changed — 完成 v0.1.0+ 完整化（第二轮）
-
-#### 新增
-- **`TerminalView` 焦点 + 键盘**：`FocusHandle` + `.track_focus()` + `.on_key_down()` 完整接线；`keystroke_to_bytes()` 把 GP Keystroke 转为 SSH 期望字节流（Enter → `\r`、方向键 → ANSI、`Ctrl+letter` → `0x01-0x1a`、`Alt+letter` → ESC + char）；通过新增的 `TerminalInputState` global 让 listener 拿到当前激活 session id，把按键转为 `AppCommand::SendInput` 发往后端。
-- **gpui_component Input 替换占位**：`ComposePaneView` 与 `QuickCommandsView` 现在持有 `Entity<InputState>` 并通过 `gpui_component::input::Input` 渲染真实可输入文本框。`main.rs` 调用 `gpui_component::init(cx)` 一次。
-- **`AppEvent::ClipboardCopy`** 新事件 + `CommandDispatcher` 的 `CopySelection` 真正实现：从 `TerminalService::get_buffer_snapshot` 拉 buffer，`buffer_snapshot_to_text` 辅助函数按行序列化（去除行尾空格），发布 `ClipboardCopy { text }`。
-- **RDP 状态机细化**：`RdpState` 新增 `X224Only`（X.224 完成 / TLS 未做）与 `Active`（TLS + 能力交换完成）；`RdpConfig::enable_nla: bool` 留作后续 CredSSP 入口；`tokio-rustls = "0.26"` + `ironrdp-graphics = "0.5"` 加入直接依赖以便未来接入 TLS 升级与帧渲染。
-
-#### 重构
-- **`RshellApp::process_events(cx)`** 现已通过 `cx.update` 把 `AppEvent` 路由到 `session_vm` / `terminal_vm` / `transfer_vm` 三个核心 ViewModel；新增 `open_tab_for_session` 在连接成功时自动开 tab。
-- **3 个核心 ViewModel** 字段加入 `RshellApp`：`session_vm: Entity<SessionViewModel>` / `terminal_vm: Entity<TerminalViewModel>` / `transfer_vm: Entity<TransferViewModel>`，在 `RshellApp::new` 中构造。
-- **`main.rs`** 调用 `cx.set_global(bridge.clone())` 让 view 层通过 `cx.global::<AppBridge>()` 拿到桥接；调用 `gpui_component::init(cx)` 注册组件样式。
-
----
-
-## [0.1.0] - 2026-07-29
-
-### 已完成（Initial Commit）
-
-RShell 项目初始提交，包含完整的 workspace 结构、协议设计与基础服务实现。
-
-#### 工作区与工具链
-- Cargo workspace 初始化（6 个 crate）
-- 锁定 Rust 工具链至 1.80（含 rustfmt / clippy 组件）
-- 启用 release profile LTO、`codegen-units = 1`、`strip`
-- 启用 `.cargo/config.toml` 中的 `xtask` 别名（xtask crate 待落地）
-
-#### crate 结构
-- **`rshell-api`**：零运行时依赖的前后端边界层，定义 `AppCommand` / `AppEvent` 及共享数据类型
-- **`rshell-infra`**：基础设施 — AES 加密（ring）、TOML 持久化、跨平台 PTY 抽象
-- **`rshell-protocol`**：SSH（russh 0.48 + russh-sftp）、Telnet、Serial、RDP 协议，统一 `Connection` trait
-- **`rshell-core`**：后端业务逻辑 — 终端（alacritty_terminal）、会话、传输、安全、脚本（rhai）、主题、事件总线、命令分发器
-- **`rshell-plugin-sdk`**：插件 SDK — `RShellPlugin` trait、`PluginLoader`、`WasmSandbox`（脚手架）
-- **`rshell-ui`**：GPUI 前端 — 应用入口、`AppBridge`、根组件 `RshellApp`、View / ViewModel
-
-#### 架构
-- 严格的前后端分离：后端代码不引用 `gpui`，前端 View 通过 `rshell-api` 的 Command/Event 与后端通信
-- 后端运行在专用 OS 线程上（rhai ScriptEngine 非 Send），前端通过 `mpsc::UnboundedSender<AppCommand>` 与共享 `Mutex<Vec<AppEvent>>` 与之交互
-- `EventBus`（基于 `RwLock<Vec<(id, Box<dyn Fn>)>>`）作为后端→前端的事件通道
-- `CommandDispatcher` 集中路由所有 `AppCommand` 到对应 Service
-
-#### 已实现功能（v0.1.0 范围）
-- SSH 连接（含密码 / 公钥 / 键盘交互认证）
-- 终端 VT 解析与缓冲（基于 alacritty_terminal）
-- 多标签会话管理
-- 会话 CRUD + 持久化（TOML）
-- SFTP 上传 / 下载队列
-- 快速命令、撰写窗格、同步输入、触发器
-- SSH 密钥生成 / 导入 / 导出 / 删除
-- 主密码保护
-- 主机密钥信任管理
-- 端口转发隧道（Local / Remote / Dynamic）
-- 应用主题与终端配色方案切换
-- 浅色 / 深色 / 跟随系统主题
-- 插件扫描 / 加载 / 卸载 / 启用 / 禁用框架
-
-#### 文档
-- 设计文档：`docs/01-xshell-xftp-feature-research.md` ~ `docs/07-project-setup-guide.md`
-- UI 设计预览：`docs/ui-design-preview.html`
-- 开源文档：`README.md`、`LICENSE`、`CONTRIBUTING.md`、`CLAUDE.md`
-
-#### 已知未完成（脚手架）
-- `WasmSandbox`（`rshell-plugin-sdk/src/sandbox.rs`）— 尚未集成 wasmtime
-- `rdp/` 模块 — 仅声明
-- `AppCommand::CopySelection` — 分发器明确标注未实现
-- `cargo xtask` 别名 — xtask crate 尚未加入 workspace
-
-[Unreleased]: https://github.com/letmlook/rshell/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/letmlook/rshell/releases/tag/v0.1.0
+早期原型和已替换架构的变更记录可通过 Git 历史查看，不再作为当前功能承诺。
