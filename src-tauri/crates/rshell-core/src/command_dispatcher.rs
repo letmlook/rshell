@@ -6,7 +6,7 @@
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
 use crate::script::compose::ComposeService;
-use crate::script::engine::{ScriptContext, ScriptEngine};
+use crate::script::engine::{ScriptContext, ScriptEngine, ScriptHost};
 use crate::script::quick_command::QuickCommandService;
 use crate::script::sync_input::SyncInputService;
 use crate::script::trigger_engine::TriggerEngine;
@@ -20,9 +20,6 @@ use crate::theme::ThemeManager;
 use crate::transfer::service::TransferService;
 use rshell_api::{AppCommand, CommandOutcome};
 use rshell_protocol::ssh::HostKeyDecision;
-use rshell_protocol::Connection;
-use rshell_protocol::telnet::TelnetConnection;
-use rshell_protocol::serial::{SerialConnection, SerialConfig as ProtocolSerialConfig};
 use rshell_plugin_sdk::loader::PluginLoader;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +46,26 @@ pub struct Services {
     pub theme_manager: Arc<ThemeManager>,
     pub event_bus: Arc<EventBus>,
     pub host_key_registry: Arc<crate::security::host_key_decision::HostKeyDecisionRegistry>,
+}
+
+struct CoreScriptHost {
+    sessions: Arc<SessionService>,
+    quick_commands: Arc<QuickCommandService>,
+}
+
+impl ScriptHost for CoreScriptHost {
+    fn send_text(&self, session_id: Uuid, text: &str) -> Result<(), CoreError> {
+        tokio::runtime::Handle::current().block_on(self.sessions.send_data(session_id, text.as_bytes()))
+    }
+
+    fn list_sessions(&self) -> Result<Vec<Uuid>, CoreError> {
+        Ok(tokio::runtime::Handle::current().block_on(self.sessions.list_sessions())?.into_iter().map(|s| s.id).collect())
+    }
+
+    fn execute_quick_command(&self, command_id: Uuid, session_id: Uuid) -> Result<(), CoreError> {
+        let data = self.quick_commands.get_command_text(command_id)?;
+        tokio::runtime::Handle::current().block_on(self.sessions.send_data(session_id, &data))
+    }
 }
 
 /// 命令分发器
@@ -93,18 +110,20 @@ impl CommandDispatcher {
             host_key_registry,
         } = services;
 
-        let quick_command_service = Arc::new(QuickCommandService::new(event_bus.clone()));
+        let data_dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("rshell");
+        let quick_command_service = Arc::new(QuickCommandService::with_path(
+            event_bus.clone(), data_dir.join("quick-commands.json"),
+        ));
         let compose_service = Arc::new(ComposeService::new(event_bus.clone()));
         // rhai::Engine 启用 sync feature 后 Arc<Dynamic> 内部走 Arc，可 Send+Sync；
         // 该 crate 在 Tauri 模式下由 app.manage() 直接持有（见设计 §1.2）。
-        let script_engine = Arc::new(ScriptEngine::new(event_bus.clone()));
+        let script_engine = Arc::new(ScriptEngine::with_host(event_bus.clone(), Arc::new(CoreScriptHost {
+            sessions: session_service.clone(), quick_commands: quick_command_service.clone(),
+        })));
         let sync_input_service = Arc::new(SyncInputService::new(event_bus.clone()));
 
         // 插件目录：用户数据目录/plugins
-        let plugins_dir = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("rshell")
-            .join("plugins");
+        let plugins_dir = data_dir.join("plugins");
         let plugin_loader = Arc::new(PluginLoader::new(plugins_dir));
 
         Self {
@@ -128,7 +147,7 @@ impl CommandDispatcher {
     }
 
     /// 初始化传输服务的 SSH 客户端提供函数
-    pub async fn initialize(&self) {
+    pub fn initialize(&self) {
         let session_service = self.session_service.clone();
         let provider = Arc::new(
             move |session_id: Uuid| -> std::pin::Pin<
@@ -139,7 +158,7 @@ impl CommandDispatcher {
                 Box::pin(async move { svc.get_ssh_client(session_id).await })
             },
         );
-        self.transfer_service.set_ssh_client_provider(provider).await;
+        self.transfer_service.set_ssh_client_provider(provider);
     }
 
     /// 分发命令（前端调用）
@@ -188,6 +207,9 @@ impl CommandDispatcher {
             }
             AppCommand::ResizeTerminal { session_id, cols, rows } => {
                 self.terminal_service.resize(session_id, cols, rows)?;
+                if matches!(self.session_service.get_state(session_id).await, Ok(rshell_api::types::ConnectionState::Connected)) {
+                    self.session_service.resize_terminal(session_id, cols as u32, rows as u32).await?;
+                }
                 Ok(CommandOutcome::None)
             }
 
@@ -345,17 +367,30 @@ impl CommandDispatcher {
                 Ok(CommandOutcome::None)
             }
             AppCommand::DecideHostKey { decision_id, accept, permanent } => {
+                let request = self.host_key_registry.request_info(decision_id)
+                    .ok_or_else(|| CoreError::NotFound(format!("Host key decision {decision_id} is no longer pending")))?;
+                if accept && permanent {
+                    let mut parts = request.public_key_blob.split_whitespace();
+                    let key_type = parts.next().ok_or_else(|| CoreError::InvalidState("Host key type is missing".into()))?;
+                    let key_blob = parts.next().ok_or_else(|| CoreError::InvalidState("Host key blob is missing".into()))?;
+                    if let Err(error) = self.host_key_manager.trust_host_key(
+                        &request.host, request.port, key_type, key_blob,
+                    ).await {
+                        self.host_key_registry.resolve(decision_id, HostKeyDecision {
+                            fingerprint: request.fingerprint.clone(), key_blob: request.public_key_blob.clone(),
+                            accept: false, permanent: false,
+                        });
+                        return Err(error);
+                    }
+                }
                 let decision = HostKeyDecision {
-                    fingerprint: String::new(),
-                    key_blob: String::new(),
+                    fingerprint: request.fingerprint,
+                    key_blob: request.public_key_blob,
                     accept,
                     permanent,
                 };
                 if !self.host_key_registry.resolve(decision_id, decision) {
-                    warn!(
-                        decision_id = %decision_id,
-                        "DecideHostKey: decision_id not found (already resolved or unknown)"
-                    );
+                    return Err(CoreError::NotFound(format!("Host key decision {decision_id} is no longer pending")));
                 }
                 Ok(CommandOutcome::None)
             }
@@ -378,16 +413,6 @@ impl CommandDispatcher {
                 Ok(CommandOutcome::None)
             }
 
-            // ===== 多协议 =====
-            AppCommand::ConnectTelnet { config } => {
-                self.connect_telnet(config).await?;
-                Ok(CommandOutcome::None)
-            }
-            AppCommand::ConnectSerial { config } => {
-                self.connect_serial(config).await?;
-                Ok(CommandOutcome::None)
-            }
-
             // ===== 插件管理 =====
             AppCommand::ScanPlugins => {
                 self.scan_plugins().await?;
@@ -401,23 +426,6 @@ impl CommandDispatcher {
                 self.unload_plugin(&plugin_id).await?;
                 Ok(CommandOutcome::None)
             }
-            AppCommand::EnablePlugin { plugin_id } => {
-                self.load_plugin(&plugin_id).await?;
-                self.event_bus.publish(rshell_api::AppEvent::PluginStateChanged {
-                    plugin_id,
-                    state: rshell_api::types::PluginState::Active,
-                });
-                Ok(CommandOutcome::None)
-            }
-            AppCommand::DisablePlugin { plugin_id } => {
-                self.unload_plugin(&plugin_id).await?;
-                self.event_bus.publish(rshell_api::AppEvent::PluginStateChanged {
-                    plugin_id,
-                    state: rshell_api::types::PluginState::Disabled,
-                });
-                Ok(CommandOutcome::None)
-            }
-
             // ===== List / snapshot 拉取 =====
             // 切片 1.2 首批迁移：ListSessions / ListTriggers / ListQuickCommands 返回 CommandOutcome;
             // 其余保持 publish（向后兼容旧事件订阅），切片 3+ 逐项迁移。
@@ -435,7 +443,7 @@ impl CommandDispatcher {
                 Ok(CommandOutcome::Keys(keys))
             }
             AppCommand::ListPlugins => {
-                let plugins = self.plugin_loader.list_loaded().await;
+                let plugins = self.plugin_loader.list_plugins().await;
                 Ok(CommandOutcome::Plugins(plugins))
             }
             AppCommand::ListTriggers => {
@@ -447,13 +455,15 @@ impl CommandDispatcher {
                 Ok(CommandOutcome::QuickCommands(cmds))
             }
             AppCommand::ListThemes => {
-                let current_theme = self.theme_manager.current_theme().await.name;
-                let current_scheme = self.theme_manager.current_color_scheme().await.name;
+                let theme = self.theme_manager.current_theme().await;
+                let palette = self.theme_manager.current_color_scheme().await;
                 let available_themes = self.theme_manager.list_themes().await;
                 let available_schemes = self.theme_manager.list_color_schemes().await;
                 Ok(CommandOutcome::Themes(rshell_api::types::ThemeInfo {
-                    current_theme,
-                    current_scheme,
+                    current_theme: theme.name,
+                    current_scheme: palette.name.clone(),
+                    current_colors: theme.colors,
+                    current_palette: palette,
                     available_themes,
                     available_schemes,
                 }))
@@ -470,9 +480,7 @@ impl CommandDispatcher {
         let data = self.quick_command_service.get_command_text(command_id)?;
 
         for session_id in target_sessions {
-            if let Err(e) = self.session_service.send_data(*session_id, &data).await {
-                debug!(session_id = %session_id, error = %e, "Failed to send quick command");
-            }
+            self.session_service.send_data(*session_id, &data).await?;
         }
 
         info!(command_id = %command_id, targets = target_sessions.len(), "Quick command executed");
@@ -487,142 +495,23 @@ impl CommandDispatcher {
             variables: std::collections::HashMap::new(),
         };
 
-        let result = self.script_engine.execute_string(code, &context)?;
+        let engine = self.script_engine.clone();
+        let code = code.to_owned();
+        let result = tokio::task::spawn_blocking(move || engine.execute_string(&code, &context))
+            .await.map_err(|e| CoreError::Internal(e.to_string()))??;
 
         self.event_bus.publish(rshell_api::AppEvent::ScriptFinished {
             session_id,
-            result,
+            result: result.clone(),
         });
 
-        Ok(())
-    }
-
-    /// 连接 Telnet 会话
-    async fn connect_telnet(&self, config: rshell_api::types::TelnetConfig) -> Result<(), CoreError> {
-        info!("Connecting Telnet to {}:{}", config.host, config.port);
-
-        // 生成会话 ID
-        let session_id = Uuid::new_v4();
-
-        // 切片 2.1：TerminalService 不再吃 TerminalConfig,仅记默认尺寸 80×24
-        self.terminal_service.create_terminal(session_id, 80, 24)?;
-
-        // 创建 Telnet 连接
-        let mut telnet = TelnetConnection::new(&config.host, config.port);
-        if !config.terminal_type.is_empty() {
-            telnet.set_terminal_type(&config.terminal_type);
-        }
-
-        // 发布连接中状态
-        self.event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-            session_id,
-            state: rshell_api::types::ConnectionState::Connecting,
-            info: None,
-        });
-
-        // 连接
-        match telnet.connect().await {
-            Ok(()) => {
-                info!(session_id = %session_id, "Telnet connected");
-
-                self.event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-                    session_id,
-                    state: rshell_api::types::ConnectionState::Connected,
-                    info: Some(rshell_api::types::ConnectionInfo {
-                        protocol: rshell_api::types::Protocol::Telnet,
-                        host: config.host,
-                        port: config.port,
-                        state: rshell_api::types::ConnectionState::Connected,
-                        bytes_sent: 0,
-                        bytes_received: 0,
-                        latency_ms: None,
-                    }),
-                });
-            }
-            Err(e) => {
-                warn!(session_id = %session_id, error = %e, "Telnet connect failed");
-                self.event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-                    session_id,
-                    state: rshell_api::types::ConnectionState::Disconnected,
-                    info: None,
-                });
-                return Err(CoreError::ConnectionError(e.to_string()));
-            }
+        if !result.success {
+            return Err(CoreError::InvalidState(result.error.unwrap_or_else(|| "Script failed".into())));
         }
 
         Ok(())
     }
 
-    /// 连接串口会话
-    async fn connect_serial(&self, config: rshell_api::types::SerialConfig) -> Result<(), CoreError> {
-        info!("Connecting Serial to {}", config.port);
-
-        // 生成会话 ID
-        let session_id = Uuid::new_v4();
-
-        // 切片 2.1：TerminalService 不再吃 TerminalConfig,仅记默认尺寸 80×24
-        self.terminal_service.create_terminal(session_id, 80, 24)?;
-
-        // 转换 API 配置为协议配置
-        let port_name = config.port.clone();
-        let serial_config = ProtocolSerialConfig {
-            port: config.port,
-            baud_rate: config.baud_rate,
-            data_bits: config.data_bits,
-            stop_bits: config.stop_bits,
-            parity: match config.parity {
-                rshell_api::types::SerialParity::None => rshell_protocol::serial::SerialParity::None,
-                rshell_api::types::SerialParity::Even => rshell_protocol::serial::SerialParity::Even,
-                rshell_api::types::SerialParity::Odd => rshell_protocol::serial::SerialParity::Odd,
-            },
-            flow_control: match config.flow_control {
-                rshell_api::types::SerialFlowControl::None => rshell_protocol::serial::SerialFlowControl::None,
-                rshell_api::types::SerialFlowControl::Software => rshell_protocol::serial::SerialFlowControl::Software,
-                rshell_api::types::SerialFlowControl::Hardware => rshell_protocol::serial::SerialFlowControl::Hardware,
-            },
-        };
-
-        let mut serial = SerialConnection::new(serial_config);
-
-        // 发布连接中状态
-        self.event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-            session_id,
-            state: rshell_api::types::ConnectionState::Connecting,
-            info: None,
-        });
-
-        // 连接
-        match serial.connect().await {
-            Ok(()) => {
-                info!(session_id = %session_id, "Serial connected");
-
-                self.event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-                    session_id,
-                    state: rshell_api::types::ConnectionState::Connected,
-                    info: Some(rshell_api::types::ConnectionInfo {
-                        protocol: rshell_api::types::Protocol::Serial,
-                        host: port_name,
-                        port: 0,
-                        state: rshell_api::types::ConnectionState::Connected,
-                        bytes_sent: 0,
-                        bytes_received: 0,
-                        latency_ms: None,
-                    }),
-                });
-            }
-            Err(e) => {
-                warn!(session_id = %session_id, error = %e, "Serial connect failed");
-                self.event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-                    session_id,
-                    state: rshell_api::types::ConnectionState::Disconnected,
-                    info: None,
-                });
-                return Err(CoreError::ConnectionError(e.to_string()));
-            }
-        }
-
-        Ok(())
-    }
 
     /// 扫描插件
     async fn scan_plugins(&self) -> Result<(), CoreError> {
@@ -635,6 +524,7 @@ impl CommandDispatcher {
             }
             Err(e) => {
                 warn!("Plugin scan failed: {}", e);
+                return Err(CoreError::Internal(format!("Plugin scan failed: {}", e)));
             }
         }
 
@@ -677,6 +567,7 @@ impl CommandDispatcher {
             }
             Err(e) => {
                 warn!("Plugin unload failed: {}", e);
+                return Err(CoreError::Internal(format!("Plugin unload failed: {}", e)));
             }
         }
 

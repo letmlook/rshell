@@ -63,10 +63,6 @@
 
   /* 向后兼容:旧 --rshell-* 变量在 v2 过渡期间保留,值为新 token 别名 */
   --rshell-bg: var(--rs-bg);
-  --rshell-bg, --rshell-panel-bg, --rshell-titlebar-bg, --rshell-sidebar-bg,
-    --rshell-toolbar-bg, --rshell-statusbar-bg {
-    /* placeholder —— 见下方同名 fallback */
-  }
 
   /* ===== component geometry ===== */
   --rs-titlebar-h: 32px;

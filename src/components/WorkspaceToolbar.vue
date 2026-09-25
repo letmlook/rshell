@@ -19,6 +19,7 @@ export type PanelKind = "sessions" | "files" | "keys" | "tools" | "settings";
 const props = defineProps<{
   workspace: WorkspaceKind;
   connectionState: string;
+  terminalAvailable?: boolean;
   activePanel?: PanelKind;
   sidebarExpanded: boolean;
   /** Terminal 工具栏额外暴露的快捷动作(由 App.vue 传入) */
@@ -27,8 +28,6 @@ const props = defineProps<{
   onDisconnect?: () => void;
   onFind?: () => void;
   onClearScreen?: () => void;
-  onScreenshot?: () => void;
-  onRecord?: () => void;
   /** Transfer 工具栏 */
   onSyncToggle?: () => void;
   onUpload?: () => void;
@@ -154,14 +153,14 @@ function pickWorkspace(w: WorkspaceKind) {
     <!-- 3. Workspace 条件按钮 -->
     <template v-if="workspace === 'terminal'">
       <div class="cluster">
-        <button class="tb-btn" title="连接" aria-label="连接" @click="onConnect">
+        <button class="tb-btn" title="连接" aria-label="连接" :disabled="!terminalAvailable || connectionState === 'connected' || connectionState === 'connecting'" @click="onConnect">
           <svg width="14" height="14" viewBox="0 0 16 16">
             <path d="M11 3.5 L14 8 L11 12.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
             <path d="M14 8 H4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
             <path d="M2 12 V4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
           </svg>
         </button>
-        <button class="tb-btn" title="断开" aria-label="断开" @click="onDisconnect">
+        <button class="tb-btn" title="断开" aria-label="断开" :disabled="connectionState !== 'connected'" @click="onDisconnect">
           <svg width="14" height="14" viewBox="0 0 16 16">
             <path d="M11 3.5 L14 8 L11 12.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" transform="rotate(180 8 8)" />
             <path d="M14 8 H4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
@@ -171,27 +170,16 @@ function pickWorkspace(w: WorkspaceKind) {
       </div>
       <div class="sep" aria-hidden="true" />
       <div class="cluster">
-        <button class="tb-btn" title="查找 (Ctrl+F)" aria-label="查找" @click="onFind">
+        <button class="tb-btn" title="查找 (Ctrl+F)" aria-label="查找" :disabled="!terminalAvailable" @click="onFind">
           <svg width="14" height="14" viewBox="0 0 16 16">
             <circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4" />
             <path d="M10.5 10.5 L14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
           </svg>
         </button>
-        <button class="tb-btn" title="清屏 (Ctrl+L)" aria-label="清屏" @click="onClearScreen">
+        <button class="tb-btn" title="清屏" aria-label="清屏" :disabled="!terminalAvailable" @click="onClearScreen">
           <svg width="14" height="14" viewBox="0 0 16 16">
             <rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.2" />
             <path d="M5 6 L11 6 M5 9 L9 9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
-          </svg>
-        </button>
-        <button class="tb-btn" title="截图" aria-label="截图" @click="onScreenshot">
-          <svg width="14" height="14" viewBox="0 0 16 16">
-            <rect x="1.5" y="3.5" width="13" height="9" rx="1" fill="none" stroke="currentColor" stroke-width="1.2" />
-            <circle cx="8" cy="8" r="2.4" fill="none" stroke="currentColor" stroke-width="1.2" />
-          </svg>
-        </button>
-        <button class="tb-btn" title="录制" aria-label="录制" @click="onRecord">
-          <svg width="14" height="14" viewBox="0 0 16 16">
-            <circle cx="8" cy="8" r="4" fill="currentColor" />
           </svg>
         </button>
       </div>

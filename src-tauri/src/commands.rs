@@ -8,7 +8,7 @@
 //! - `update_session` / `delete_session`
 //! - `send_input` / `resize_terminal` / `attach_terminal`
 
-use rshell_api::types::{RemoteFileEntry, SessionConfig, TransferTaskInfo};
+use rshell_api::types::{ComposeTarget, PluginInfo, RemoteFileEntry, SessionConfig, TerminalColorScheme, TransferTaskInfo};
 use rshell_api::{AppCommand, CommandOutcome};
 use tauri::ipc::Channel;
 use tauri::State;
@@ -375,6 +375,8 @@ pub async fn trust_host_key(
 
 // ===== 切片 7: 触发器/快速命令/脚本薄壳 =====
 use rshell_api::types::{QuickCommand, Trigger};
+cmd!(list_quick_commands() -> QuickCommands(Vec<QuickCommand>) = AppCommand::ListQuickCommands);
+cmd!(list_triggers() -> Triggers(Vec<Trigger>) = AppCommand::ListTriggers);
 
 // 写命令:返回 ()
 #[tauri::command]
@@ -528,10 +530,38 @@ pub async fn resume_tunnel(tunnel_id: Uuid, state: State<'_, AppState>) -> Resul
     Ok(())
 }
 
-// ===== 切片 9: 插件 CRUD 薄壳 =====
-// 注:ListPlugins 在切片 2.2 已迁移到 CommandOutcome。
-// 本切片按用户校核（2026-07-31 决策）：仅做 IPC 接入，WasmSandbox 仍是 scaffold，
-// 实际加载 / 执行返回 `IpcError { kind: "internal", message: "plugin sandbox not yet implemented" }`。
+// ===== 插件命令 =====
+cmd!(list_plugins() -> Plugins(Vec<PluginInfo>) = AppCommand::ListPlugins);
+
+#[tauri::command]
+pub async fn send_compose_text(content: String, target: ComposeTarget, state: State<'_, AppState>) -> Result<(), IpcError> {
+    state.dispatcher.dispatch(AppCommand::SendComposeText { content, target }).await.map_err(IpcError::from)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toggle_sync_input(session_ids: Vec<Uuid>, state: State<'_, AppState>) -> Result<(), IpcError> {
+    state.dispatcher.dispatch(AppCommand::ToggleSyncInput { session_ids }).await.map_err(IpcError::from)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn export_public_key(key_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
+    state.dispatcher.dispatch(AppCommand::ExportPublicKey { key_id }).await.map_err(IpcError::from)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_host_key(host: String, port: u16, state: State<'_, AppState>) -> Result<(), IpcError> {
+    state.dispatcher.dispatch(AppCommand::DeleteHostKey { host, port }).await.map_err(IpcError::from)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn import_color_scheme(scheme: TerminalColorScheme, state: State<'_, AppState>) -> Result<(), IpcError> {
+    state.dispatcher.dispatch(AppCommand::ImportColorScheme { scheme }).await.map_err(IpcError::from)?;
+    Ok(())
+}
 #[tauri::command]
 pub async fn scan_plugins(state: State<'_, AppState>) -> Result<(), IpcError> {
     state
@@ -562,25 +592,6 @@ pub async fn unload_plugin(plugin_id: String, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
-#[tauri::command]
-pub async fn enable_plugin(plugin_id: String, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state
-        .dispatcher
-        .dispatch(AppCommand::EnablePlugin { plugin_id })
-        .await
-        .map_err(IpcError::from)?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn disable_plugin(plugin_id: String, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state
-        .dispatcher
-        .dispatch(AppCommand::DisablePlugin { plugin_id })
-        .await
-        .map_err(IpcError::from)?;
-    Ok(())
-}
 use rshell_api::types::{ActiveTunnelInfo, PendingTunnelInfo, SshKeyInfo, ThemeInfo};
 
 cmd!(list_tunnels() -> Tunnels(Vec<ActiveTunnelInfo>) = AppCommand::ListTunnels);
@@ -611,7 +622,7 @@ pub async fn verify_master_password(
 
 // SetAppTheme / SetTerminalColorScheme:写命令,返回 ()
 #[tauri::command]
-pub async fn set_theme(theme_name: String, state: State<'_, AppState>) -> Result<(), IpcError> {
+pub async fn set_app_theme(theme_name: String, state: State<'_, AppState>) -> Result<(), IpcError> {
     state
         .dispatcher
         .dispatch(AppCommand::SetAppTheme { theme_name })
@@ -698,7 +709,7 @@ mod tests {
             stringify!(list_keys),
             stringify!(list_themes),
             stringify!(verify_master_password),
-            stringify!(set_theme),
+            stringify!(set_app_theme),
             stringify!(set_terminal_color_scheme),
         ];
     }

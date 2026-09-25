@@ -1,37 +1,23 @@
 <script setup lang="ts">
-/**
- * PluginPanel —— 切片 9（最后一片）
- *
- * 仅做 IPC 接入（WasmSandbox 仍是 scaffold）：列表 + 启用/禁用 + 状态徽章。
- * 真实插件加载/执行留待后续切片（wasmtime 集成尚未实现）。
- */
 import { onMounted, ref } from "vue";
-import { listPlugins, scanPlugins, loadPlugin, unloadPlugin, enablePlugin, disablePlugin } from "../ipc/client";
+import { listPlugins, scanPlugins, loadPlugin, unloadPlugin } from "../ipc/client";
+import type { PluginInfo } from "../ipc/types";
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
-
-interface PluginInfo {
-  id: string;
-  name: string;
-  version: string;
-  state: { Active?: unknown; Disabled?: unknown; Loaded?: unknown; Unloaded?: unknown };
-  path: string;
-}
 
 const items = ref<PluginInfo[]>([]);
 const loading = ref(false);
 const error = ref<string | null>(null);
 
 function stateLabel(p: PluginInfo): string {
-  const k = Object.keys(p.state || {})[0];
-  return k || "—";
+  return ({ Discovered: "已发现", Loaded: "已加载", Active: "已启用", Disabled: "已禁用", Error: "错误" })[p.state];
 }
 
 async function refresh() {
   loading.value = true;
   error.value = null;
   try {
-    items.value = (await listPlugins()) as unknown as PluginInfo[];
+    items.value = await listPlugins();
   } catch (e) {
     error.value = String(e);
   } finally {
@@ -42,24 +28,6 @@ async function refresh() {
 async function scan() {
   try {
     await scanPlugins();
-    await refresh();
-  } catch (e) {
-    error.value = String(e);
-  }
-}
-
-async function enable(id: string) {
-  try {
-    await enablePlugin(id);
-    await refresh();
-  } catch (e) {
-    error.value = String(e);
-  }
-}
-
-async function disable(id: string) {
-  try {
-    await disablePlugin(id);
     await refresh();
   } catch (e) {
     error.value = String(e);
@@ -84,7 +52,7 @@ async function unload(id: string) {
   }
 }
 
-onMounted(refresh);
+onMounted(scan);
 </script>
 
 <template>
@@ -97,11 +65,7 @@ onMounted(refresh);
       </el-button-group>
     </header>
 
-    <p class="hint">
-      ℹ️ WasmSandbox 当前为 scaffold；加载/执行调用返回
-      <code>IpcError { kind: "internal" }</code>。
-      实际 wasmtime 集成待后续切片。
-    </p>
+    <p class="hint">仅加载受信任的本地 WASM 插件。插件目录位于应用数据目录的 plugins 下。</p>
     <p v-if="error" class="error">{{ error }}</p>
 
     <el-empty v-if="items.length === 0" description="暂未发现插件" />
@@ -111,17 +75,15 @@ onMounted(refresh);
       <el-table-column prop="version" label="版本" width="80" />
       <el-table-column label="状态" width="100">
         <template #default="{ row }">
-          <el-tag size="small" :type="stateLabel(row) === 'Active' ? 'success' : 'info'">
+          <el-tag size="small" :type="row.state === 'Active' ? 'success' : 'info'">
             {{ stateLabel(row) }}
           </el-tag>
         </template>
       </el-table-column>
       <el-table-column label="操作" width="220">
         <template #default="{ row }">
-          <el-button size="small" @click="load(row.id)">加载</el-button>
-          <el-button size="small" @click="unload(row.id)">卸载</el-button>
-          <el-button size="small" type="primary" @click="enable(row.id)">启用</el-button>
-          <el-button size="small" type="danger" @click="disable(row.id)">禁用</el-button>
+          <el-button v-if="row.state === 'Discovered' || row.state === 'Disabled'" size="small" @click="load(row.id)">加载</el-button>
+          <el-button v-if="row.state === 'Loaded' || row.state === 'Active'" size="small" @click="unload(row.id)">卸载</el-button>
         </template>
       </el-table-column>
     </el-table>

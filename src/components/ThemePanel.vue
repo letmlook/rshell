@@ -3,8 +3,7 @@
  * ThemePanel —— 切片 3
  *
  * 选择应用主题 + 终端配色方案。前端管展开态/排序列/过滤词（设计 §5）；
- * scheme → CSS 变量映射（见 utils/themeCss.ts）由前端计算，避免后端发整
- * 套颜色 JSON。
+ * 使用后端返回的真实主题色和终端配色，前端只负责 CSS/xterm 映射。
  */
 import { onMounted } from "vue";
 import { useThemeStore } from "../stores/theme";
@@ -24,7 +23,7 @@ onMounted(async () => {
     <p v-if="store.error" class="error">{{ store.error }}</p>
     <section>
       <label>应用主题</label>
-      <el-select v-model="store.currentTheme" @change="store.applyTheme" :loading="store.loading">
+      <el-select :model-value="store.currentTheme" @change="store.applyTheme" :loading="store.loading">
         <el-option
           v-for="name in store.availableThemes"
           :key="name"
@@ -35,7 +34,7 @@ onMounted(async () => {
     </section>
     <section>
       <label>终端配色方案</label>
-      <el-select v-model="store.currentScheme" @change="store.applyScheme" :loading="store.loading">
+      <el-select :model-value="store.currentScheme" @change="store.applyScheme" :loading="store.loading">
         <el-option
           v-for="name in store.availableSchemes"
           :key="name"

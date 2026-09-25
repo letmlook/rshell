@@ -19,6 +19,8 @@ pub struct SessionConfig {
     pub port: u16,
     pub protocol: Protocol,
     pub auth_method: AuthMethod,
+    #[serde(default)]
+    pub serial_config: Option<SerialConfig>,
 }
 
 /// 协议类型
@@ -407,6 +409,8 @@ pub struct TerminalColorScheme {
 pub struct ThemeInfo {
     pub current_theme: String,
     pub current_scheme: String,
+    pub current_colors: ThemeColors,
+    pub current_palette: TerminalColorScheme,
     pub available_themes: Vec<String>,
     pub available_schemes: Vec<String>,
 }

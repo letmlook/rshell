@@ -63,6 +63,7 @@ pub struct TelnetConnection {
     suppress_go_ahead: bool,
     /// 是否启用了 Echo（服务器端回显）
     server_echo: bool,
+    pending_bytes: Vec<u8>,
 }
 
 impl TelnetConnection {
@@ -76,6 +77,7 @@ impl TelnetConnection {
             state: TelnetState::Disconnected,
             suppress_go_ahead: false,
             server_echo: false,
+            pending_bytes: Vec::new(),
         }
     }
 
@@ -178,13 +180,18 @@ impl TelnetConnection {
 
     /// 处理接收到的数据，过滤 Telnet 命令
     async fn process_data(&mut self, data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+        let mut combined = std::mem::take(&mut self.pending_bytes);
+        combined.extend_from_slice(data);
+        let data = combined.as_slice();
         let mut output = Vec::new();
         let mut response = Vec::new();
         let mut i = 0;
 
         while i < data.len() {
             if data[i] == TelnetCommand::IAC as u8 {
+                let command_start = i;
                 if i + 1 >= data.len() {
+                    self.pending_bytes.extend_from_slice(&data[command_start..]);
                     break;
                 }
 
@@ -198,6 +205,8 @@ impl TelnetConnection {
                             i += 1;
                             let resp = self.handle_command(TelnetCommand::DO, opt).await?;
                             response.extend(resp);
+                        } else {
+                            self.pending_bytes.extend_from_slice(&data[command_start..]);
                         }
                     }
                     x if x == TelnetCommand::DONT as u8 => {
@@ -206,6 +215,8 @@ impl TelnetConnection {
                             i += 1;
                             let resp = self.handle_command(TelnetCommand::DONT, opt).await?;
                             response.extend(resp);
+                        } else {
+                            self.pending_bytes.extend_from_slice(&data[command_start..]);
                         }
                     }
                     x if x == TelnetCommand::WILL as u8 => {
@@ -214,6 +225,8 @@ impl TelnetConnection {
                             i += 1;
                             let resp = self.handle_command(TelnetCommand::WILL, opt).await?;
                             response.extend(resp);
+                        } else {
+                            self.pending_bytes.extend_from_slice(&data[command_start..]);
                         }
                     }
                     x if x == TelnetCommand::WONT as u8 => {
@@ -222,16 +235,23 @@ impl TelnetConnection {
                             i += 1;
                             let resp = self.handle_command(TelnetCommand::WONT, opt).await?;
                             response.extend(resp);
+                        } else {
+                            self.pending_bytes.extend_from_slice(&data[command_start..]);
                         }
                     }
                     x if x == TelnetCommand::SB as u8 => {
                         // 跳过子协商直到 SE
+                        let mut completed = false;
                         while i < data.len() {
                             if data[i] == TelnetCommand::IAC as u8 && i + 1 < data.len() && data[i + 1] == TelnetCommand::SE as u8 {
                                 i += 2;
+                                completed = true;
                                 break;
                             }
                             i += 1;
+                        }
+                        if !completed {
+                            self.pending_bytes.extend_from_slice(&data[command_start..]);
                         }
                     }
                     x if x == TelnetCommand::IAC as u8 => {
@@ -251,7 +271,8 @@ impl TelnetConnection {
         // 发送响应命令
         if !response.is_empty() {
             if let Some(stream) = self.stream.as_mut() {
-                let _ = stream.write_all(&response).await;
+                stream.write_all(&response).await
+                    .map_err(|e| ProtocolError::ProtocolError(format!("Failed to negotiate Telnet options: {e}")))?;
             }
         }
 
@@ -312,7 +333,10 @@ impl Connection for TelnetConnection {
         let stream = self.stream.as_mut()
             .ok_or_else(|| ProtocolError::ConnectionFailed("Not connected".to_string()))?;
 
-        let mut raw_buf = vec![0u8; buf.len() * 2]; // 预留空间给命令过滤
+        // Command filtering never expands plain output beyond the raw input.
+        // Limit reads to the caller's capacity so no decoded bytes are discarded.
+        if buf.is_empty() { return Ok(0); }
+        let mut raw_buf = vec![0u8; buf.len()];
         let n = stream.read(&mut raw_buf).await
             .map_err(|e| ProtocolError::ProtocolError(format!("Failed to recv: {}", e)))?;
 
@@ -356,6 +380,20 @@ impl Connection for TelnetConnection {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn recv_preserves_output_larger_than_callers_buffer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut connection = TelnetConnection::new("127.0.0.1", listener.local_addr().unwrap().port());
+        connection.connect().await.unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(b"abcdefgh").await.unwrap();
+        socket.shutdown().await.unwrap();
+        let mut all = Vec::new();
+        let mut buf = [0; 4];
+        while let Ok(n) = connection.recv(&mut buf).await { all.extend_from_slice(&buf[..n]); }
+        assert_eq!(all, b"abcdefgh");
+    }
+
     #[test]
     fn test_new_connection_defaults() {
         let c = TelnetConnection::new("example.com", 23);
@@ -381,6 +419,15 @@ mod tests {
         let r = c.send_command(TelnetCommand::DO, Some(TelnetOption::SuppressGoAhead)).await;
         assert!(r.is_err());
         assert!(format!("{}", r.unwrap_err()).contains("Not connected"));
+    }
+
+    #[tokio::test]
+    async fn fragmented_telnet_command_is_not_rendered_or_lost() {
+        let mut connection = TelnetConnection::new("example", 23);
+        assert!(connection.process_data(&[255]).await.unwrap().is_empty());
+        assert_eq!(connection.pending_bytes, vec![255]);
+        assert_eq!(connection.process_data(&[253, 3, b'A']).await.unwrap(), b"A");
+        assert!(connection.pending_bytes.is_empty());
     }
 
     #[test]

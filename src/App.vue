@@ -20,6 +20,7 @@
  */
 import { onBeforeUnmount, onMounted, ref, markRaw, computed } from "vue";
 import { DockviewVue } from "dockview-vue";
+import { ElMessage, ElNotification } from "element-plus";
 import "dockview-vue/dist/styles/dockview.css";
 import TerminalPane from "./components/TerminalPane.vue";
 import TransferWorkspace from "./components/transfer/TransferWorkspace.vue";
@@ -27,7 +28,7 @@ import SessionCreateDialog from "./components/SessionCreateDialog.vue";
 import HostKeyMismatchDialog from "./components/HostKeyMismatchDialog.vue";
 import MasterPasswordDialog from "./components/MasterPasswordDialog.vue";
 import CustomTitleBar from "./components/CustomTitleBar.vue";
-import SidePanel from "./components/SidePanel.vue";
+import SidePanel, { type ToolSubview, type SettingsSubview } from "./components/SidePanel.vue";
 import StatusBar from "./components/StatusBar.vue";
 import WorkspaceToolbar, {
   type WorkspaceKind,
@@ -44,13 +45,19 @@ import {
 } from "./utils/workspaceLayout";
 import { useSessionsStore } from "./stores/sessions";
 import { useHostKeyStore } from "./stores/hostKey";
+import { useThemeStore } from "./stores/theme";
 import type { Uuid } from "./ipc/types";
 
 const store = useSessionsStore();
 const hostKeyStore = useHostKeyStore();
+const themeStore = useThemeStore();
 const dialogVisible = ref(false);
 const activeTerminal = ref<Uuid | null>(null);
 const activePanel = ref<PanelKind>("sessions");
+const requestedToolSubview = ref<ToolSubview>("quick-commands");
+const requestedSettingsSubview = ref<SettingsSubview>("theme");
+const toolSubviewRequest = ref(0);
+const settingsSubviewRequest = ref(0);
 const panelExpanded = ref(true);
 
 const workspace = ref<WorkspaceKind>("terminal");
@@ -61,6 +68,7 @@ const transferWorkspace = ref<InstanceType<typeof TransferWorkspace> | null>(nul
 const transferCapabilities = ref({ upload: false, download: false, createFolder: false, delete: false, refresh: false, sync: false });
 const transferItems = ref<TransferItem[]>([]);
 let unlistenTransfers: (() => void) | null = null;
+let mounted = false;
 
 function toTransferItem(task: TransferTaskInfo): TransferItem {
   const phase: Record<TransferTaskInfo["state"], TransferPhase> = {
@@ -76,6 +84,7 @@ function toTransferItem(task: TransferTaskInfo): TransferItem {
     local: task.local_path,
     remote: task.remote_path,
     speed: 0,
+    error: task.error_message,
   };
 }
 
@@ -119,10 +128,11 @@ function toggleSidebar(expanded?: boolean) {
 async function selectSession(id: Uuid) {
   activeTerminal.value = id;
   store.currentId = id;
+  if (store.connectionState.get(id) === "connected" || store.connectionState.get(id) === "connecting") return;
   try {
     await store.connect(id);
   } catch (e) {
-    console.error("connect failed", e);
+    ElMessage.error(`连接失败：${String(e)}`);
   }
 }
 
@@ -135,6 +145,18 @@ function openPanel(name: PanelKind) {
   panelExpanded.value = true;
 }
 
+function openToolSubview(name: ToolSubview) {
+  requestedToolSubview.value = name;
+  toolSubviewRequest.value++;
+  openPanel("tools");
+}
+
+function openSettingsSubview(name: SettingsSubview) {
+  requestedSettingsSubview.value = name;
+  settingsSubviewRequest.value++;
+  openPanel("settings");
+}
+
 function pickWorkspace(w: WorkspaceKind) {
   workspace.value = w;
   if (w === "transfer" && !activeTransferSession.value && store.currentId) {
@@ -145,10 +167,29 @@ function pickWorkspace(w: WorkspaceKind) {
 function onOpenSftp(id: Uuid) {
   workspace.value = "transfer";
   activeTransferSession.value = id;
+  void selectSession(id);
 }
 
 function onOpenTerminal(_id: Uuid, _path: string) {
   workspace.value = "terminal";
+  void selectSession(_id);
+}
+
+async function connectCurrent() {
+  if (!store.currentId) return;
+  try { await store.connect(store.currentId); }
+  catch (error) { ElMessage.error(`连接失败：${String(error)}`); }
+}
+
+async function disconnectCurrent() {
+  if (!store.currentId) return;
+  try { await store.disconnect(store.currentId); }
+  catch (error) { ElMessage.error(`断开失败：${String(error)}`); }
+}
+
+function terminalAction(action: "find" | "clear") {
+  if (!activeTerminal.value) return;
+  window.dispatchEvent(new CustomEvent("rshell:terminal-action", { detail: { sessionId: activeTerminal.value, action } }));
 }
 
 const currentConnectionState = computed(() => {
@@ -158,23 +199,44 @@ const currentConnectionState = computed(() => {
 });
 
 onMounted(async () => {
+  mounted = true;
   window.addEventListener("resize", onViewportResize);
   await store.refresh();
+  if (!mounted) return;
   await store.subscribeEvents();
+  if (!mounted) return;
   await hostKeyStore.subscribeEvents();
+  if (!mounted) return;
+  await themeStore.refresh();
+  if (!mounted) return;
+  await themeStore.subscribeEvents();
+  if (!mounted) return;
   await refreshTransfers();
+  if (!mounted) return;
   try {
-    unlistenTransfers = await subscribeAppEvents((event) => {
+    const stop = await subscribeAppEvents((event) => {
       if (event === "TransferQueueChanged" || (typeof event === "object" && event !== null && (
         "TransferCompleted" in event || "TransferFailed" in event || "TransferProgress" in event
       ))) void refreshTransfers();
+      if (typeof event !== "string" && "TriggerFired" in event && event.TriggerFired.action_summary.startsWith("notify: ")) {
+        ElNotification({ title: "触发器通知", message: event.TriggerFired.action_summary.slice(8) });
+      }
+      if (typeof event !== "string" && "TriggerActionFailed" in event) {
+        ElNotification.error({ title: "触发器执行失败", message: event.TriggerActionFailed.error });
+      }
     });
+    if (mounted) unlistenTransfers = stop;
+    else stop();
   } catch (error) { console.error("无法订阅传输队列", error); }
 });
 
 onBeforeUnmount(() => {
+  mounted = false;
   window.removeEventListener("resize", onViewportResize);
   unlistenTransfers?.();
+  store.disposeEvents();
+  hostKeyStore.disposeEvents();
+  themeStore.disposeEvents();
 });
 </script>
 
@@ -184,18 +246,18 @@ onBeforeUnmount(() => {
       @new-session="openNewSession"
       @toggle-sidebar="toggleSidebar"
       @open-key-manager="openPanel('keys')"
-      @open-theme-panel="openPanel('settings')"
-      @open-plugin-panel="openPanel('settings')"
-      @open-transfer-queue="openPanel('tools')"
-      @open-quick-commands="openPanel('tools')"
-      @open-triggers="openPanel('tools')"
-      @open-tunnels="openPanel('tools')"
-      @about="openPanel('settings')"
+      @open-theme-panel="openSettingsSubview('theme')"
+      @open-plugin-panel="openSettingsSubview('plugins')"
+      @open-transfer-queue="pickWorkspace('transfer'); transferPanelExpanded = true"
+      @open-quick-commands="openToolSubview('quick-commands')"
+      @open-triggers="openToolSubview('triggers')"
+      @open-tunnels="openToolSubview('tunnels')"
     />
 
     <WorkspaceToolbar
       :workspace="workspace"
       :connection-state="currentConnectionState"
+      :terminal-available="!!activeTerminal"
       :active-panel="activePanel"
       :sidebar-expanded="panelExpanded"
       :sync-enabled="syncEnabled"
@@ -207,6 +269,10 @@ onBeforeUnmount(() => {
       :can-refresh-files="transferCapabilities.refresh"
       :can-sync-files="transferCapabilities.sync"
       :on-new-session="openNewSession"
+      :on-connect="connectCurrent"
+      :on-disconnect="disconnectCurrent"
+      :on-find="() => terminalAction('find')"
+      :on-clear-screen="() => terminalAction('clear')"
       @change-workspace="pickWorkspace"
       @select-panel="selectPanel"
       @toggle-sidebar="toggleSidebar"
@@ -222,6 +288,10 @@ onBeforeUnmount(() => {
     <div class="body">
       <SidePanel
         :active="activePanel"
+        :tool-subview="requestedToolSubview"
+        :settings-subview="requestedSettingsSubview"
+        :tool-subview-request="toolSubviewRequest"
+        :settings-subview-request="settingsSubviewRequest"
         :active-session-id="store.currentId"
         :active-session-connected="!!store.currentId && store.connectionState.get(store.currentId) === 'connected'"
         :width="sidebarWidth"
@@ -229,6 +299,7 @@ onBeforeUnmount(() => {
         :expanded="panelExpanded"
         @update:width="setSidebarWidth"
         @select-session="selectSession"
+        @new-session="openNewSession"
         @open-sftp="onOpenSftp"
         @open-terminal="onOpenTerminal"
       />

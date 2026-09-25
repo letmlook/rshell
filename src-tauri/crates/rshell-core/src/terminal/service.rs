@@ -11,6 +11,8 @@ use std::sync::{Arc, RwLock};
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
+type OutputSender = tokio::sync::mpsc::UnboundedSender<(Uuid, Vec<u8>)>;
+
 /// 终端服务 —— 仅持"已知会话 + 最近一次报告尺寸",无 alacritty 状态机。
 ///
 /// 切片 2.1 落地：原 328 行 → 当前 ~60 行。`resize` 由 `dispatcher` 接收前端
@@ -19,13 +21,25 @@ use uuid::Uuid;
 pub struct TerminalService {
     /// 已知会话 id 与最近一次报告尺寸
     sizes: Arc<RwLock<HashMap<Uuid, (u16, u16)>>>,
+    output_sender: Arc<RwLock<Option<OutputSender>>>,
 }
 
 impl TerminalService {
     pub fn new(_event_bus: Arc<crate::event_bus::EventBus>) -> Self {
         Self {
             sizes: Arc::new(RwLock::new(HashMap::new())),
+            output_sender: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub fn set_output_sender(&self, sender: OutputSender) {
+        *self.output_sender.write().expect("output sender lock poisoned") = Some(sender);
+    }
+
+    pub fn push_output(&self, session_id: Uuid, data: Vec<u8>) -> Result<(), CoreError> {
+        let sink = self.output_sender.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let sender = sink.as_ref().ok_or_else(|| CoreError::InvalidState("Terminal output sink is not configured".into()))?;
+        sender.send((session_id, data)).map_err(|_| CoreError::InvalidState("Terminal output sink is closed".into()))
     }
 
     /// 登记会话终端;启动时由 setup 或首条 recv 字节触发。
@@ -55,6 +69,10 @@ impl TerminalService {
         Ok(())
     }
 
+    pub fn size(&self, terminal_id: Uuid) -> Option<(u16, u16)> {
+        self.sizes.read().ok()?.get(&terminal_id).copied()
+    }
+
     /// 诊断用：当前已知会话尺寸快照。
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<(Uuid, u16, u16)> {
@@ -81,5 +99,15 @@ mod tests {
 
         svc.destroy_terminal(id).unwrap();
         assert!(svc.snapshot().is_empty());
+    }
+
+    #[test]
+    fn output_sender_routes_bytes_without_reencoding() {
+        let service = TerminalService::new(Arc::new(EventBus::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        service.set_output_sender(tx);
+        let session_id = Uuid::new_v4();
+        service.push_output(session_id, vec![0, 0xff, b'\n']).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), (session_id, vec![0, 0xff, b'\n']));
     }
 }

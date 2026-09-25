@@ -7,6 +7,7 @@
 //! 以避免阻塞后端 runtime 的事件循环。
 
 use std::io::{Read, Write};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -106,6 +107,8 @@ pub struct SerialConnection {
     config: SerialConfig,
     state: SerialState,
     port: Option<Arc<Mutex<Box<dyn SerialPort>>>>,
+    read_task: Option<task::JoinHandle<(std::io::Result<usize>, Vec<u8>)>>,
+    pending_bytes: VecDeque<u8>,
 }
 
 impl SerialConnection {
@@ -115,6 +118,8 @@ impl SerialConnection {
             config,
             state: SerialState::Disconnected,
             port: None,
+            read_task: None,
+            pending_bytes: VecDeque::new(),
         }
     }
 
@@ -180,6 +185,12 @@ impl Connection for SerialConnection {
 
     async fn disconnect(&mut self) -> Result<(), ProtocolError> {
         info!("Disconnecting serial port {}", self.config.port);
+        if let Some(read) = self.read_task.take() {
+            // A blocking read cannot be cancelled. Join the bounded (100ms) read
+            // before releasing the port, so no detached reader survives disconnect.
+            let _ = read.await;
+        }
+        self.pending_bytes.clear();
         // 显式 take，避免 Drop 时的阻塞 syscall 在 async 上下文中运行
         if let Some(_port) = self.port.take() {
             // drop 在 task 上下文中是同步的；SerialPort 的 drop 通常立即返回
@@ -220,17 +231,33 @@ impl Connection for SerialConnection {
             ));
         }
 
-        // 同步 read：SerialPort 设有 100ms timeout，足够短不会卡住 runtime。
-        // 真实的高并发场景应该把 recv 放到 spawn_blocking 里循环读取并通过 mpsc
-        // 投递 — 当前实现保留 Connection trait 的同步语义。
-        let mut port = self
-            .port
-            .as_ref()
-            .ok_or(ProtocolError::ConnectionClosed)?
-            .lock()
-            .unwrap();
-        match port.read(buf) {
-            Ok(n) => Ok(n),
+        if buf.is_empty() { return Ok(0); }
+        if !self.pending_bytes.is_empty() {
+            let count = buf.len().min(self.pending_bytes.len());
+            for byte in &mut buf[..count] { *byte = self.pending_bytes.pop_front().unwrap(); }
+            return Ok(count);
+        }
+        if self.read_task.is_none() {
+            let port = self.port.as_ref().ok_or(ProtocolError::ConnectionClosed)?.clone();
+            let capacity = buf.len();
+            self.read_task = Some(task::spawn_blocking(move || {
+                let mut bytes = vec![0u8; capacity];
+                let result = port.lock().unwrap().read(&mut bytes);
+                (result, bytes)
+            }));
+        }
+        // Await by reference: cancelling recv leaves the task owned by this
+        // connection, and the next recv consumes the same result exactly once.
+        let completed = self.read_task.as_mut().expect("read task initialized").await;
+        self.read_task = None;
+        let (result, bytes) = completed.map_err(|e| ProtocolError::ProtocolError(format!("join error: {e}")))?;
+        match result {
+            Ok(n) => {
+                let count = n.min(buf.len());
+                buf[..count].copy_from_slice(&bytes[..count]);
+                self.pending_bytes.extend(&bytes[count..n]);
+                Ok(count)
+            },
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(0),
             Err(e) => Err(ProtocolError::ProtocolError(format!("read failed: {}", e))),
         }
@@ -252,6 +279,25 @@ unsafe impl Send for SerialConnection {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_recv_preserves_inflight_read_and_bytes() {
+        let mut connection = SerialConnection::new(SerialConfig::default());
+        connection.state = SerialState::Connected;
+        let (ready, wait) = tokio::sync::oneshot::channel();
+        connection.read_task = Some(tokio::spawn(async move {
+            wait.await.unwrap();
+            (Ok(3), b"abc".to_vec())
+        }));
+        let mut buffer = [0u8; 2];
+        assert!(tokio::time::timeout(Duration::from_millis(5), connection.recv(&mut buffer)).await.is_err());
+        ready.send(()).unwrap();
+        assert_eq!(connection.recv(&mut buffer).await.unwrap(), 2);
+        assert_eq!(&buffer, b"ab");
+        assert_eq!(connection.recv(&mut buffer).await.unwrap(), 1);
+        assert_eq!(buffer[0], b'c');
+        assert!(connection.read_task.is_none());
+    }
 
     #[tokio::test]
     async fn test_serial_config_default() {

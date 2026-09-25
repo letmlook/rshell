@@ -25,6 +25,7 @@ use crate::event_bus::EventBus;
 #[derive(Clone)]
 pub struct HostKeyDecisionRegistry {
     inner: Arc<Mutex<HashMap<Uuid, oneshot::Sender<HostKeyDecision>>>>,
+    requests: Arc<Mutex<HashMap<Uuid, HostKeyDecisionRequest>>>,
     /// 事件总线（用于在 `publish_request` 时投递 `HostKeyMismatch` 给 UI 端）
     event_bus: Arc<EventBus>,
 }
@@ -34,6 +35,7 @@ impl HostKeyDecisionRegistry {
     pub fn new(event_bus: Arc<EventBus>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            requests: Arc::new(Mutex::new(HashMap::new())),
             event_bus,
         }
     }
@@ -57,6 +59,7 @@ impl HostKeyDecisionRegistry {
     /// 找不到 decision_id（UI 端超时/竞态/双重决策）时返回 false,调用方
     /// 应当视为 reject。
     pub fn resolve(&self, decision_id: Uuid, decision: HostKeyDecision) -> bool {
+        self.requests.lock().expect("HostKeyDecisionRegistry mutex poisoned").remove(&decision_id);
         let mut map = self
             .inner
             .lock()
@@ -69,6 +72,16 @@ impl HostKeyDecisionRegistry {
             false
         }
     }
+
+    pub fn request_info(&self, decision_id: Uuid) -> Option<HostKeyDecisionRequest> {
+        self.requests.lock().expect("HostKeyDecisionRegistry mutex poisoned")
+            .get(&decision_id).cloned()
+    }
+
+    pub fn cancel(&self, decision_id: Uuid) {
+        self.inner.lock().expect("HostKeyDecisionRegistry mutex poisoned").remove(&decision_id);
+        self.requests.lock().expect("HostKeyDecisionRegistry mutex poisoned").remove(&decision_id);
+    }
 }
 
 impl HostKeyDecisionSink for HostKeyDecisionRegistry {
@@ -77,15 +90,21 @@ impl HostKeyDecisionSink for HostKeyDecisionRegistry {
     }
 
     fn publish_request(&self, info: HostKeyDecisionRequest) {
+        self.requests.lock().expect("HostKeyDecisionRegistry mutex poisoned")
+            .insert(info.decision_id, info.clone());
         self.event_bus.publish(AppEvent::HostKeyMismatch {
             decision_id: info.decision_id,
             host: info.host,
             port: info.port,
             key_type: info.key_type,
-            expected: String::new(),
+            expected: info.expected,
             received: info.fingerprint,
             public_key_blob: info.public_key_blob,
         });
+    }
+
+    fn cancel_decision(&self, decision_id: Uuid) {
+        self.cancel(decision_id);
     }
 }
 
@@ -174,8 +193,10 @@ mod tests {
             port: 22,
             key_type: "Ed25519".to_string(),
             fingerprint: "SHA256:xxx".to_string(),
+            expected: String::new(),
             public_key_blob: "ssh-ed25519 AAAA...".to_string(),
         });
+        assert_eq!(reg.request_info(id).unwrap().public_key_blob, "ssh-ed25519 AAAA...");
         let evt = got.lock().unwrap().clone().unwrap();
         if let AppEvent::HostKeyMismatch {
             decision_id,

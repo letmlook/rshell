@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::api::{PluginManifest, PluginType, PluginState};
+use crate::sandbox::{SandboxConfig, WasmModule, WasmSandbox};
 
 /// 插件加载错误
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +22,8 @@ pub enum LoadError {
     Io(#[from] std::io::Error),
     #[error("Parse error: {0}")]
     Parse(String),
+    #[error("WASM error: {0}")]
+    Wasm(String),
 }
 
 /// 已加载的插件实例
@@ -38,6 +41,7 @@ pub struct PluginLoader {
     discovered: Arc<RwLock<HashMap<String, PluginManifest>>>,
     /// 已加载的插件
     loaded: Arc<RwLock<HashMap<String, LoadedPlugin>>>,
+    sandbox: Arc<WasmSandbox>,
 }
 
 impl PluginLoader {
@@ -47,6 +51,8 @@ impl PluginLoader {
             plugins_dir,
             discovered: Arc::new(RwLock::new(HashMap::new())),
             loaded: Arc::new(RwLock::new(HashMap::new())),
+            sandbox: Arc::new(WasmSandbox::new(SandboxConfig::default())
+                .expect("default WASM sandbox configuration must be valid")),
         }
     }
 
@@ -60,6 +66,7 @@ impl PluginLoader {
         }
 
         let entries = std::fs::read_dir(&self.plugins_dir)?;
+        let mut discovered_now = HashMap::new();
 
         for entry in entries {
             let entry = entry?;
@@ -70,10 +77,13 @@ impl PluginLoader {
                 if manifest_path.exists() {
                     match self.parse_manifest(&manifest_path) {
                         Ok(manifest) => {
+                            if path.file_name().and_then(|name| name.to_str()) != Some(manifest.name.as_str()) {
+                                warn!("Plugin directory and manifest name differ: {:?}", path);
+                                continue;
+                            }
                             info!("Discovered plugin: {} v{}", manifest.name, manifest.version);
                             manifests.push(manifest.clone());
-                            let mut discovered = self.discovered.write().await;
-                            discovered.insert(manifest.name.clone(), manifest);
+                            discovered_now.insert(manifest.name.clone(), manifest);
                         }
                         Err(e) => {
                             warn!("Failed to parse manifest at {:?}: {}", manifest_path, e);
@@ -83,6 +93,8 @@ impl PluginLoader {
             }
         }
 
+        *self.discovered.write().await = discovered_now;
+
         Ok(manifests)
     }
 
@@ -91,43 +103,12 @@ impl PluginLoader {
         let content = std::fs::read_to_string(path)
             .map_err(|e| LoadError::Parse(format!("Failed to read manifest: {}", e)))?;
 
-        // 简化实现：使用 TOML 格式解析
-        // 实际需要 toml crate
-        // 这里用简单的键值对解析
-        let mut name = String::new();
-        let mut version = String::from("0.1.0");
-        let mut author = String::new();
-        let mut description = String::new();
-
-        for line in content.lines() {
-            let line = line.trim();
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = value.trim().trim_matches('"');
-                match key {
-                    "name" => name = value.to_string(),
-                    "version" => version = value.to_string(),
-                    "author" => author = value.to_string(),
-                    "description" => description = value.to_string(),
-                    _ => {}
-                }
-            }
-        }
-
-        if name.is_empty() {
+        let manifest: PluginManifest = toml::from_str(&content)
+            .map_err(|e| LoadError::Parse(e.to_string()))?;
+        if manifest.name.is_empty() {
             return Err(LoadError::Parse("Plugin name is required".to_string()));
         }
-
-        Ok(PluginManifest {
-            name,
-            version,
-            author,
-            description,
-            plugin_type: PluginType::Builtin, // 默认
-            extensions: Vec::new(),
-            permissions: Vec::new(),
-            min_rshell_version: "0.1.0".to_string(),
-        })
+        Ok(manifest)
     }
 
     /// 加载指定插件
@@ -139,6 +120,16 @@ impl PluginLoader {
         drop(discovered);
 
         let plugin_path = self.plugins_dir.join(plugin_id);
+        if manifest.plugin_type != PluginType::Wasm {
+            return Err(LoadError::InvalidPlugin("Only WASM plugins are supported".into()));
+        }
+        let mut module = WasmModule::from_file(plugin_path.join("plugin.wasm"))
+            .map_err(|e| LoadError::Wasm(e.to_string()))?;
+        module.name = plugin_id.to_string();
+        let sandbox = Arc::clone(&self.sandbox);
+        tokio::task::spawn_blocking(move || sandbox.load(&module))
+            .await.map_err(|e| LoadError::Wasm(e.to_string()))?
+            .map_err(|e| LoadError::Wasm(e.to_string()))?;
 
         let loaded_plugin = LoadedPlugin {
             manifest: manifest.clone(),
@@ -157,6 +148,7 @@ impl PluginLoader {
     pub async fn unload_plugin(&self, plugin_id: &str) -> Result<(), LoadError> {
         let mut loaded = self.loaded.write().await;
         if loaded.remove(plugin_id).is_some() {
+            self.sandbox.unload(plugin_id);
             info!("Plugin unloaded: {}", plugin_id);
             Ok(())
         } else {
@@ -179,45 +171,50 @@ impl PluginLoader {
         self.loaded.read().await.get(plugin_id).map(|p| p.state.clone())
     }
 
-    /// 列出已加载的插件(转换为 rshell_api::types::PluginInfo 列表)
-    pub async fn list_loaded(&self) -> Vec<rshell_api::types::PluginInfo> {
+    /// List both discovered and loaded plugins for the UI.
+    pub async fn list_plugins(&self) -> Vec<rshell_api::types::PluginInfo> {
         let guard = self.loaded.read().await;
-        let values: Vec<LoadedPlugin> = guard.values().cloned().collect();
+        let values: HashMap<String, LoadedPlugin> = guard.iter().map(|(id, plugin)| (id.clone(), plugin.clone())).collect();
         drop(guard);
-        values
-            .into_iter()
-            .map(|p| {
-                let permissions: Vec<String> = p
-                    .manifest
+        let discovered = self.discovered.read().await;
+        let mut plugins: Vec<_> = discovered.values()
+            .map(|manifest| {
+                let permissions: Vec<String> = manifest
                     .permissions
                     .iter()
                     .map(|perm| format!("{:?}", perm))
                     .collect();
-                let extensions: Vec<String> = p
-                    .manifest
+                let extensions: Vec<String> = manifest
                     .extensions
                     .iter()
                     .map(|ext| format!("{:?}", ext))
                     .collect();
-                let state = match p.state {
+                let state = match values.get(&manifest.name).map(|p| &p.state).unwrap_or(&PluginState::Discovered) {
+                    PluginState::Discovered => rshell_api::types::PluginState::Discovered,
                     PluginState::Loaded => rshell_api::types::PluginState::Loaded,
                     PluginState::Active => rshell_api::types::PluginState::Active,
                     PluginState::Disabled => rshell_api::types::PluginState::Disabled,
                     _ => rshell_api::types::PluginState::Error,
                 };
                 rshell_api::types::PluginInfo {
-                    id: p.manifest.name.clone(),
-                    name: p.manifest.name.clone(),
-                    version: p.manifest.version.clone(),
-                    author: p.manifest.author.clone(),
-                    description: p.manifest.description.clone(),
-                    plugin_type: rshell_api::types::PluginType::Builtin,
+                    id: manifest.name.clone(),
+                    name: manifest.name.clone(),
+                    version: manifest.version.clone(),
+                    author: manifest.author.clone(),
+                    description: manifest.description.clone(),
+                    plugin_type: match manifest.plugin_type {
+                        PluginType::Builtin => rshell_api::types::PluginType::Builtin,
+                        PluginType::Wasm => rshell_api::types::PluginType::Wasm,
+                        PluginType::DynamicLib => rshell_api::types::PluginType::DynamicLib,
+                    },
                     state,
                     extensions,
                     permissions,
                 }
             })
-            .collect()
+            .collect();
+        plugins.sort_by(|a, b| a.id.cmp(&b.id));
+        plugins
     }
 }
 
@@ -228,5 +225,61 @@ impl Clone for LoadedPlugin {
             state: self.state.clone(),
             path: self.path.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wasm_plugin_is_discovered_compiled_and_unloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("example");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("plugin.toml"), r#"
+name = "example"
+version = "1.0.0"
+author = "test"
+description = "test plugin"
+plugin_type = "Wasm"
+extensions = []
+permissions = []
+min_rshell_version = "0.1.0"
+"#).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), wat::parse_str("(module (func (export \"run\")))").unwrap()).unwrap();
+
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        assert_eq!(loader.scan_plugins().await.unwrap().len(), 1);
+        let plugins = loader.list_plugins().await;
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].state, rshell_api::types::PluginState::Discovered);
+        assert_eq!(plugins[0].plugin_type, rshell_api::types::PluginType::Wasm);
+        loader.load_plugin("example").await.unwrap();
+        assert_eq!(loader.list_plugins().await[0].state, rshell_api::types::PluginState::Loaded);
+        loader.unload_plugin("example").await.unwrap();
+        assert_eq!(loader.list_plugins().await[0].state, rshell_api::types::PluginState::Discovered);
+    }
+
+    #[tokio::test]
+    async fn invalid_wasm_cannot_report_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("bad");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("plugin.toml"), r#"
+name = "bad"
+version = "1.0.0"
+author = "test"
+description = "bad plugin"
+plugin_type = "Wasm"
+extensions = []
+permissions = []
+min_rshell_version = "0.1.0"
+"#).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"not wasm").unwrap();
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader.scan_plugins().await.unwrap();
+        assert!(loader.load_plugin("bad").await.is_err());
+        assert_eq!(loader.list_plugins().await[0].state, rshell_api::types::PluginState::Discovered);
     }
 }

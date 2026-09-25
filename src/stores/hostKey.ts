@@ -7,7 +7,7 @@
  */
 import { defineStore } from "pinia";
 import { ref } from "vue";
-import { listen } from "@tauri-apps/api/event";
+import { subscribeAppEvents } from "../ipc/events";
 import { decideHostKey } from "../ipc/client";
 
 export interface HostKeyRequest {
@@ -23,15 +23,20 @@ export interface HostKeyRequest {
 export const useHostKeyStore = defineStore("hostKey", () => {
   const current = ref<HostKeyRequest | null>(null);
   const history = ref<HostKeyRequest[]>([]); // 已处理但留作审计
+  let unlisten: (() => void) | null = null;
+  let subscriptionGeneration = 0;
 
   async function subscribeEvents() {
-    await listen<HostKeyRequest>("rshell://event", (msg) => {
-      const payload = msg.payload;
-      if (payload && "decision_id" in payload && "received" in payload) {
-        current.value = payload;
-      }
+    if (unlisten) return;
+    const generation = ++subscriptionGeneration;
+    const stop = await subscribeAppEvents((event) => {
+      if (typeof event !== "string" && "HostKeyMismatch" in event) current.value = event.HostKeyMismatch;
     });
+    if (generation === subscriptionGeneration) unlisten = stop;
+    else stop();
   }
+
+  function disposeEvents() { subscriptionGeneration++; unlisten?.(); unlisten = null; }
 
   async function trustOnce() {
     if (!current.value) return;
@@ -61,5 +66,5 @@ export const useHostKeyStore = defineStore("hostKey", () => {
     current.value = null;
   }
 
-  return { current, history, subscribeEvents, trustOnce, trustPermanent, reject, dismiss };
+  return { current, history, subscribeEvents, disposeEvents, trustOnce, trustPermanent, reject, dismiss };
 });

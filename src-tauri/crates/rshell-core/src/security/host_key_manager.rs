@@ -10,12 +10,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 use rshell_api::events::AppEvent;
 use rshell_api::types::{HostKeyEntry, TrustLevel};
-use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -101,31 +100,18 @@ impl HostKeyManager {
             }
         }
 
-        // 在初始化阶段同步写入
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let entries_arc = Arc::new(self.entries.clone());
-            let entries_clone = entries;
-            let _ = std::thread::spawn(move || {
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async {
-                    *entries_arc.write().await = entries_clone;
-                });
-            })
-            .join();
-        } else {
-            *self.entries.blocking_write() = entries;
-        }
+        *self.entries.write().expect("host key lock poisoned") = entries;
 
         info!(
             "Loaded {} entries from known_hosts",
-            self.entries.blocking_read().len()
+            self.entries.read().expect("host key lock poisoned").len()
         );
         Ok(())
     }
 
     /// 保存 known_hosts 文件（OpenSSH 标准格式）
     fn save_known_hosts(&self) -> Result<(), CoreError> {
-        let entries = self.entries.blocking_read();
+        let entries = self.entries.read().expect("host key lock poisoned");
         let mut content = String::new();
 
         for entry in entries.values() {
@@ -177,7 +163,7 @@ impl HostKeyManager {
         key_blob: &str,
     ) -> Result<Option<bool>, CoreError> {
         let key = format!("{}:{}", host, port);
-        let entries = self.entries.read().await;
+        let entries = self.entries.read().expect("host key lock poisoned");
 
         if let Some(entry) = entries.get(&key) {
             if entry.fingerprint == key_blob {
@@ -241,7 +227,7 @@ impl HostKeyManager {
             last_seen: now,
         };
 
-        self.entries.write().await.insert(key, entry);
+        self.entries.write().expect("host key lock poisoned").insert(key, entry);
         self.save_known_hosts()?;
 
         info!("Host key trusted: {}:{}", host, port);
@@ -251,7 +237,7 @@ impl HostKeyManager {
     /// 删除主机密钥
     pub async fn delete_host_key(&self, host: &str, port: u16) -> Result<(), CoreError> {
         let key = format!("{}:{}", host, port);
-        self.entries.write().await.remove(&key);
+        self.entries.write().expect("host key lock poisoned").remove(&key);
         self.save_known_hosts()?;
         info!("Host key deleted: {}:{}", host, port);
         Ok(())
@@ -259,13 +245,13 @@ impl HostKeyManager {
 
     /// 列出所有已知主机
     pub async fn list_hosts(&self) -> Vec<HostKeyEntry> {
-        self.entries.read().await.values().cloned().collect()
+        self.entries.read().expect("host key lock poisoned").values().cloned().collect()
     }
 
     /// 更新最后访问时间
     pub async fn update_last_seen(&self, host: &str, port: u16) {
         let key = format!("{}:{}", host, port);
-        let mut entries = self.entries.write().await;
+        let mut entries = self.entries.write().expect("host key lock poisoned");
         if let Some(entry) = entries.get_mut(&key) {
             entry.last_seen = Utc::now().to_rfc3339();
         }
@@ -297,4 +283,21 @@ fn parse_host_port(pattern: &str, default_port: u16) -> (String, u16) {
 fn _fingerprint_helper(key_blob: &str) -> String {
     let _ = key_blob;
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn permanent_trust_persists_across_manager_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let bus = Arc::new(EventBus::new());
+        let manager = HostKeyManager::new(path.clone(), bus.clone());
+        manager.trust_host_key("example.test", 2222, "ssh-ed25519", "AAAAkey").await.unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("[example.test]:2222 ssh-ed25519 AAAAkey"));
+        let restored = HostKeyManager::new(path, bus);
+        assert_eq!(restored.check_host_key("example.test", 2222, "ssh-ed25519", "AAAAkey").await.unwrap(), Some(true));
+    }
 }

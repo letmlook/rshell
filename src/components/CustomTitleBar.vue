@@ -23,7 +23,6 @@ const emit = defineEmits<{
   (e: "open-quick-commands"): void;
   (e: "open-triggers"): void;
   (e: "open-tunnels"): void;
-  (e: "about"): void;
 }>();
 
 const store = useSessionsStore();
@@ -73,14 +72,20 @@ async function onDragDoubleClick() {
 }
 
 let unlistenResize: (() => void) | null = null;
+let mounted = false;
 
 onMounted(async () => {
+  mounted = true;
   await refreshMaximize();
+  if (!mounted) return;
   const w = getCurrentWindow();
-  unlistenResize = await w.onResized(() => refreshMaximize());
+  const stop = await w.onResized(() => refreshMaximize());
+  if (mounted) unlistenResize = stop;
+  else stop();
 });
 
 onBeforeUnmount(() => {
+  mounted = false;
   unlistenResize?.();
   unlistenResize = null;
 });
@@ -156,18 +161,6 @@ defineExpose({
           </template>
         </el-dropdown>
 
-        <!-- 帮助菜单 -->
-        <el-dropdown trigger="click">
-          <span class="menu-item">帮助</span>
-          <template #dropdown>
-            <el-dropdown-menu>
-              <el-dropdown-item disabled>RShell v0.1.0</el-dropdown-item>
-              <el-dropdown-item @click="emit('about')">
-                <span class="mi-icon">ⓘ</span>关于
-              </el-dropdown-item>
-            </el-dropdown-menu>
-          </template>
-        </el-dropdown>
       </nav>
     </div>
 

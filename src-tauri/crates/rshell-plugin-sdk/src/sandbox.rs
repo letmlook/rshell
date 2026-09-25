@@ -224,6 +224,12 @@ impl WasmSandbox {
             .collect()
     }
 
+    /// Remove a compiled module when its plugin is unloaded.
+    pub fn unload(&self, name: &str) {
+        self.modules.lock().expect("modules mutex poisoned")
+            .retain(|(module_name, _)| module_name != name);
+    }
+
     /// 调用已加载模块的导出函数
     ///
     /// 同步执行（fuel 机制会保证不会无限循环），在 `async` 上下文外调用。

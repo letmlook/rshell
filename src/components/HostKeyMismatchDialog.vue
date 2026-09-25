@@ -15,7 +15,7 @@ const visible = computed(() => store.current !== null);
 <template>
   <el-dialog
     :model-value="visible"
-    title="主机密钥不匹配"
+    :title="store.current?.expected ? '警告：主机密钥已改变' : '确认新主机密钥'"
     width="520px"
     :show-close="false"
     :close-on-click-modal="false"
@@ -24,13 +24,17 @@ const visible = computed(() => store.current !== null);
     <template v-if="store.current">
       <p>
         <strong>{{ store.current.host }}:{{ store.current.port }}</strong>
-        的 SSH 服务器密钥不在已知主机列表中。
+        的 SSH 服务器{{ store.current.expected ? '密钥与已保存记录不一致' : '密钥尚未保存' }}。
       </p>
       <dl class="key-info">
         <dt>算法</dt>
         <dd>{{ store.current.key_type }}</dd>
         <dt>收到的指纹 (SHA256)</dt>
         <dd class="mono">{{ store.current.received }}</dd>
+        <template v-if="store.current.expected">
+          <dt>原有指纹 (SHA256)</dt>
+          <dd class="mono">{{ store.current.expected }}</dd>
+        </template>
         <dt>公钥 blob</dt>
         <dd class="mono small">{{ store.current.public_key_blob }}</dd>
       </dl>

@@ -60,6 +60,7 @@ export type EventDispatcher = {
 
 export function makeDispatcher(dispatcher: EventDispatcher): EventHandler {
   return (event) => {
+    if (typeof event === "string") return;
     const key = Object.keys(event)[0] as keyof AppEvent;
     switch (key) {
       case "ConnectionStateChanged": {

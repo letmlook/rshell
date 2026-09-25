@@ -90,6 +90,8 @@ mod tests {
         assert_eq!(CommandOutcome::Themes(crate::types::ThemeInfo {
             current_theme: String::new(),
             current_scheme: String::new(),
+            current_colors: crate::types::ThemeColors { background: 0, foreground: 0, accent: 0, border: 0, sidebar_bg: 0, toolbar_bg: 0, statusbar_bg: 0, selection_bg: 0, hover_bg: 0 },
+            current_palette: crate::types::TerminalColorScheme { name: String::new(), ansi_colors: [0; 16], default_fg: 0, default_bg: 0, cursor_fg: 0, cursor_bg: 0, selection_fg: 0, selection_bg: 0 },
             available_themes: vec![],
             available_schemes: vec![],
         }).kind(), "themes");
@@ -117,6 +119,8 @@ mod tests {
             CommandOutcome::Themes(crate::types::ThemeInfo {
                 current_theme: String::new(),
                 current_scheme: String::new(),
+                current_colors: crate::types::ThemeColors { background: 0, foreground: 0, accent: 0, border: 0, sidebar_bg: 0, toolbar_bg: 0, statusbar_bg: 0, selection_bg: 0, hover_bg: 0 },
+                current_palette: crate::types::TerminalColorScheme { name: String::new(), ansi_colors: [0; 16], default_fg: 0, default_bg: 0, cursor_fg: 0, cursor_bg: 0, selection_fg: 0, selection_bg: 0 },
                 available_themes: vec![],
                 available_schemes: vec![],
             }),

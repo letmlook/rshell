@@ -20,6 +20,7 @@ const emit = defineEmits<{
   (e: "select", id: Uuid): void;
   (e: "open-sftp", id: Uuid): void;
   (e: "open-terminal", id: Uuid, path: string): void;
+  (e: "new-session"): void;
 }>();
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
@@ -125,7 +126,7 @@ function ctxDelete() {
       <h3>会话 ({{ store.items.length }})</h3>
       <div class="header-actions">
         <el-tooltip content="新建会话" placement="top">
-          <button class="mini-btn" aria-label="新建会话">
+          <button class="mini-btn" aria-label="新建会话" @click="emit('new-session')">
             <svg width="12" height="12" viewBox="0 0 16 16"><path d="M8 3 V13 M3 8 H13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
           </button>
         </el-tooltip>
@@ -190,7 +191,7 @@ function ctxDelete() {
       <button class="ctx-item" @click="ctxDisconnect">断开</button>
       <div class="ctx-sep" />
       <button class="ctx-item" @click="ctxOpenSftp">打开 SFTP</button>
-      <button class="ctx-item" @click="ctxOpenTerminal">在此打开终端</button>
+      <button class="ctx-item" @click="ctxOpenTerminal">打开终端</button>
       <div class="ctx-sep" />
       <button class="ctx-item ctx-danger" @click="ctxDelete">删除</button>
     </div>

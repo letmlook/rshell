@@ -6,10 +6,21 @@
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
 use rshell_api::types::ScriptResult;
-use rhai::{Engine, Scope, AST};
+use rhai::{Engine, EvalAltResult, Scope, AST};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Host actions are injected by core; the Rhai engine never depends on Tauri.
+pub trait ScriptHost: Send + Sync {
+    fn send_text(&self, session_id: Uuid, text: &str) -> Result<(), CoreError>;
+    fn list_sessions(&self) -> Result<Vec<Uuid>, CoreError>;
+    fn execute_quick_command(&self, command_id: Uuid, session_id: Uuid) -> Result<(), CoreError>;
+}
+
+fn rhai_error(message: impl ToString) -> Box<EvalAltResult> {
+    message.to_string().into()
+}
 
 /// 脚本引擎
 pub struct ScriptEngine {
@@ -29,7 +40,16 @@ pub struct ScriptContext {
 impl ScriptEngine {
     /// 创建新的脚本引擎
     pub fn new(event_bus: Arc<EventBus>) -> Self {
+        Self::build(event_bus, None)
+    }
+
+    pub fn with_host(event_bus: Arc<EventBus>, host: Arc<dyn ScriptHost>) -> Self {
+        Self::build(event_bus, Some(host))
+    }
+
+    fn build(event_bus: Arc<EventBus>, host: Option<Arc<dyn ScriptHost>>) -> Self {
         let mut engine = Engine::new();
+        engine.set_max_operations(100_000);
 
         // 注册 rshell API 函数 (host API)
         // 命名约定: rshell_<verb>, 全部无副作用或仅 log, 不引入 host state
@@ -50,8 +70,25 @@ impl ScriptEngine {
         });
 
         engine.register_fn("rshell_sleep", |ms: i64| {
-            std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+            std::thread::sleep(std::time::Duration::from_millis(ms.clamp(0, 10_000) as u64));
         });
+
+        if let Some(host) = host {
+            let send_host = host.clone();
+            engine.register_fn("rshell_send", move |session: String, text: String| -> Result<(), Box<EvalAltResult>> {
+                let id = Uuid::parse_str(&session).map_err(rhai_error)?;
+                send_host.send_text(id, &text).map_err(rhai_error)
+            });
+            let list_host = host.clone();
+            engine.register_fn("rshell_list_sessions", move || -> Result<rhai::Array, Box<EvalAltResult>> {
+                Ok(list_host.list_sessions().map_err(rhai_error)?.into_iter().map(|id| id.to_string().into()).collect())
+            });
+            engine.register_fn("rshell_execute_quick_command", move |command: String, session: String| -> Result<(), Box<EvalAltResult>> {
+                let command_id = Uuid::parse_str(&command).map_err(rhai_error)?;
+                let session_id = Uuid::parse_str(&session).map_err(rhai_error)?;
+                host.execute_quick_command(command_id, session_id).map_err(rhai_error)
+            });
+        }
 
         // 当前 Unix epoch 毫秒
         engine.register_fn("rshell_now_ms", || -> i64 {
@@ -176,6 +213,48 @@ impl ScriptEngine {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct FakeHost {
+        sent: Mutex<Vec<(Uuid, String)>>,
+        quick: Mutex<Vec<(Uuid, Uuid)>>,
+    }
+
+    impl ScriptHost for FakeHost {
+        fn send_text(&self, session_id: Uuid, text: &str) -> Result<(), CoreError> {
+            self.sent.lock().unwrap().push((session_id, text.to_owned()));
+            Ok(())
+        }
+        fn list_sessions(&self) -> Result<Vec<Uuid>, CoreError> { Ok(vec![Uuid::nil()]) }
+        fn execute_quick_command(&self, command_id: Uuid, session_id: Uuid) -> Result<(), CoreError> {
+            self.quick.lock().unwrap().push((command_id, session_id));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn host_api_sends_exact_text_and_lists_sessions() {
+        let host = Arc::new(FakeHost::default());
+        let engine = ScriptEngine::with_host(Arc::new(EventBus::new()), host.clone());
+        let result = engine.execute_string("rshell_send(session_id, \"clear\\n\"); rshell_list_sessions().len", &empty_ctx()).unwrap();
+        assert!(result.success, "{result:?}");
+        assert_eq!(host.sent.lock().unwrap().as_slice(), &[(Uuid::nil(), "clear\n".into())]);
+        assert_eq!(result.output, "1");
+    }
+
+    #[test]
+    fn host_api_quick_command_and_invalid_id_error() {
+        let host = Arc::new(FakeHost::default());
+        let engine = ScriptEngine::with_host(Arc::new(EventBus::new()), host.clone());
+        let id = Uuid::new_v4();
+        let code = format!("rshell_execute_quick_command(\"{id}\", session_id)");
+        assert!(engine.execute_string(&code, &empty_ctx()).unwrap().success);
+        assert_eq!(host.quick.lock().unwrap().as_slice(), &[(id, Uuid::nil())]);
+        let failure = engine.execute_string("rshell_send(\"bad-id\", \"x\")", &empty_ctx()).unwrap();
+        assert!(!failure.success);
+        assert!(failure.error.unwrap().contains("invalid"));
+    }
 
     fn make_engine() -> ScriptEngine {
         ScriptEngine::new(Arc::new(EventBus::new()))

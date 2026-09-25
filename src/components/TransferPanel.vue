@@ -24,6 +24,7 @@ export interface TransferItem {
   local: string;
   remote: string;
   speed: number; // bytes/sec
+  error?: string | null;
 }
 
 const props = defineProps<{
@@ -129,6 +130,11 @@ function phaseClass(p: TransferPhase): string {
     <div v-if="expanded && tab === 'transfer'" class="panel-body">
       <el-table :data="merged" size="small" empty-text="暂无传输任务" class="xfer-table">
         <el-table-column prop="name" label="名称" min-width="180" />
+        <el-table-column label="错误详情" min-width="220">
+          <template #default="{ row }">
+            <span v-if="row.phase === 'failed'" role="alert">{{ row.error || '传输失败，请检查连接和文件权限后重试。' }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
             <span class="phase">

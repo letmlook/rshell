@@ -68,7 +68,18 @@ pub fn run() {
             let known_hosts_path = data_root.join("known_hosts");
 
             let terminal_service = Arc::new(TerminalService::new(event_bus.clone()));
-            let trigger_engine = Arc::new(TriggerEngine::new(event_bus.clone()));
+            let terminal_channels = Arc::new(TerminalChannels::new());
+            let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
+            terminal_service.set_output_sender(output_tx);
+            let channels_for_output = terminal_channels.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some((session_id, data)) = output_rx.recv().await {
+                    channels_for_output.push(session_id, &data).await;
+                }
+            });
+            let trigger_engine = Arc::new(TriggerEngine::with_path(
+                event_bus.clone(), data_root.join("triggers.json"),
+            ));
             let host_key_registry = Arc::new(HostKeyDecisionRegistry::new(event_bus.clone()));
 
             let session_repository = Arc::new(SessionRepository::with_default_path());
@@ -93,12 +104,7 @@ pub fn run() {
             ));
             let theme_manager = Arc::new(ThemeManager::new(event_bus.clone()));
 
-            // ── 3. 切片 1.1：load_from_disk 不在 setup 阻塞,改为 spawn ──
-            // 设计 §4.5：磁盘加载失败不阻断启动,用户首次启动本来就空。
-            let ss_for_load = session_service.clone();
-            tokio::spawn(async move {
-                ss_for_load.load_from_disk().await;
-            });
+            // SessionService restores saved sessions during construction.
 
             // ── 4. CommandDispatcher ────────────────────────────────────
             let dispatcher = Arc::new(CommandDispatcher::new(
@@ -116,13 +122,12 @@ pub fn run() {
                     host_key_registry: host_key_registry.clone(),
                 },
             ));
-            tauri::async_runtime::block_on(dispatcher.initialize());
+            dispatcher.initialize();
 
             // ── 5. EventBus → Tauri emit 桥 ─────────────────────────────
             events::subscribe_bridge(event_bus.clone(), app.handle().clone());
 
             // ── 6. AppState ─────────────────────────────────────────────
-            let terminal_channels = Arc::new(TerminalChannels::new());
             app.manage(AppState {
                 dispatcher,
                 terminal_channels,
@@ -148,7 +153,7 @@ pub fn run() {
             commands::list_keys,
             commands::list_themes,
             commands::verify_master_password,
-            commands::set_theme,
+            commands::set_app_theme,
             commands::set_terminal_color_scheme,
             commands::enqueue_upload,
             commands::enqueue_download,
@@ -168,6 +173,8 @@ pub fn run() {
             commands::change_master_password,
             commands::trust_host_key,
             commands::execute_quick_command,
+            commands::list_quick_commands,
+            commands::list_triggers,
             commands::create_quick_command,
             commands::delete_quick_command,
             commands::create_trigger,
@@ -180,10 +187,14 @@ pub fn run() {
             commands::suspend_tunnel,
             commands::resume_tunnel,
             commands::scan_plugins,
+            commands::list_plugins,
+            commands::send_compose_text,
+            commands::toggle_sync_input,
+            commands::export_public_key,
+            commands::delete_host_key,
+            commands::import_color_scheme,
             commands::load_plugin,
             commands::unload_plugin,
-            commands::enable_plugin,
-            commands::disable_plugin,
             commands::push_one_mb,
         ])
         .run(tauri::generate_context!())

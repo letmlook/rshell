@@ -20,6 +20,9 @@ import { Channel } from "@tauri-apps/api/core";
 import { invoke } from "@tauri-apps/api/core";
 import { sendInput, resizeTerminal } from "../ipc/client";
 import type { Uuid } from "../ipc/types";
+import { useThemeStore } from "../stores/theme";
+
+const themeStore = useThemeStore();
 
 const props = defineProps<{
   sessionId?: Uuid;
@@ -33,6 +36,10 @@ let fit: FitAddon | null = null;
 let search: SearchAddon | null = null;
 let channel: Channel<number[]> | null = null;
 let detachSizeObserver: (() => void) | null = null;
+
+function onTerminalTheme(event: Event) {
+  if (term) term.options.theme = (event as CustomEvent<ITheme>).detail;
+}
 
 function findNext() {
   if (search && searchTerm.value) {
@@ -96,6 +103,13 @@ function onWindowKeydown(e: KeyboardEvent) {
   }
 }
 
+function onTerminalAction(event: Event) {
+  const detail = (event as CustomEvent<{ sessionId: Uuid; action: "find" | "clear" }>).detail;
+  if (detail.sessionId !== props.sessionId) return;
+  if (detail.action === "find") searchBarVisible.value = true;
+  if (detail.action === "clear") term?.clear();
+}
+
 onMounted(async () => {
   if (!containerRef.value) return;
 
@@ -104,7 +118,7 @@ onMounted(async () => {
     fontSize: 13,
     cursorBlink: true,
     scrollback: 10000,
-    theme: readXtermThemeFromCssVars(),
+    theme: themeStore.terminalTheme ?? readXtermThemeFromCssVars(),
   });
 
   fit = new FitAddon();
@@ -128,6 +142,7 @@ onMounted(async () => {
 
   term.open(containerRef.value);
   fit.fit();
+  window.addEventListener("rshell:terminal-theme", onTerminalTheme);
 
   // 后端 → 前端字节流通道（设计 §4.1）
   channel = new Channel<number[]>();
@@ -159,6 +174,7 @@ onMounted(async () => {
   // 切片 2.4:Ctrl+F 切换搜索栏（前端拦截 keydown,不让 xterm 接走）
   // 简化实现:监听 window keydown,xterm 不会消费 Ctrl 组合键。
   window.addEventListener("keydown", onWindowKeydown);
+  window.addEventListener("rshell:terminal-action", onTerminalAction);
 
   // 尺寸变化:前端权威 resize_terminal（设计 §4.2 表格"终端尺寸"行）
   const ro = new ResizeObserver(() => {
@@ -184,6 +200,8 @@ onBeforeUnmount(() => {
   detachSizeObserver?.();
   detachSizeObserver = null;
   window.removeEventListener("keydown", onWindowKeydown);
+  window.removeEventListener("rshell:terminal-theme", onTerminalTheme);
+  window.removeEventListener("rshell:terminal-action", onTerminalAction);
   term?.dispose();
   term = null;
   channel = null;
@@ -216,7 +234,7 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   position: relative;
-  background: #1e1e1e;
+  background: var(--rs-bg);
   overflow: hidden;
 }
 .terminal-pane {

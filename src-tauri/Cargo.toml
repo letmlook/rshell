@@ -1,7 +1,7 @@
 # RShell - Tauri 2.0 workspace manifest
 #
 # 仓库根不再有 Cargo.toml;Rust workspace 在 src-tauri/ 内。
-# 前端代码在仓库根 src/ (Vite + React + TS)。
+# 前端代码在仓库根 src/ (Vite + Vue + TS)。
 
 [workspace]
 members = [

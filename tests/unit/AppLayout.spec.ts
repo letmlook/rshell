@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { mount } from "@vue/test-utils";
+import { flushPromises, mount } from "@vue/test-utils";
 import App from "../../src/App.vue";
+import { subscribeAppEvents } from "../../src/ipc/events";
+import { listTransfers } from "../../src/ipc/client";
+import TransferPanel from "../../src/components/TransferPanel.vue";
+import ElementPlus from "element-plus";
+
+vi.mock("../../src/components/TerminalPane.vue", () => ({ default: { name: "TerminalPane", template: "<div />" } }));
 
 vi.mock("../../src/stores/sessions", () => ({
   useSessionsStore: () => ({
@@ -10,11 +16,15 @@ vi.mock("../../src/stores/sessions", () => ({
     connectionState: new Map(),
     refresh: vi.fn().mockResolvedValue(undefined),
     subscribeEvents: vi.fn().mockResolvedValue(undefined),
+    disposeEvents: vi.fn(),
     connect: vi.fn().mockResolvedValue(undefined),
   }),
 }));
 vi.mock("../../src/stores/hostKey", () => ({
-  useHostKeyStore: () => ({ subscribeEvents: vi.fn().mockResolvedValue(undefined) }),
+  useHostKeyStore: () => ({ subscribeEvents: vi.fn().mockResolvedValue(undefined), disposeEvents: vi.fn() }),
+}));
+vi.mock("../../src/stores/theme", () => ({
+  useThemeStore: () => ({ refresh: vi.fn().mockResolvedValue(undefined), subscribeEvents: vi.fn().mockResolvedValue(undefined), disposeEvents: vi.fn() }),
 }));
 vi.mock("../../src/ipc/client", () => ({ listTransfers: vi.fn().mockResolvedValue([]) }));
 vi.mock("../../src/ipc/events", () => ({ subscribeAppEvents: vi.fn().mockResolvedValue(vi.fn()) }));
@@ -56,6 +66,18 @@ describe("App layout", () => {
     expect(wrapper.findComponent({ name: "SidePanel" }).props("expanded")).toBe(false);
   });
 
+  it("shows the backend failure reason in the transfer queue", async () => {
+    vi.mocked(listTransfers).mockResolvedValueOnce([{
+      id: "transfer-1", session_id: "session-1", direction: "Upload", state: "Failed",
+      local_path: "/tmp/file", remote_path: "/remote/file", total_bytes: 10,
+      bytes_transferred: 0, error_message: "Permission denied: /remote/file",
+    }]);
+    const wrapper = mount(App, { global: { plugins: [ElementPlus], stubs: { ...childStubs, TransferPanel: false } } });
+    await flushPromises();
+    expect(wrapper.findComponent(TransferPanel).text()).toContain("Permission denied: /remote/file");
+    wrapper.unmount();
+  });
+
   it("renders one sidebar and no ActivityBar", () => {
     const wrapper = mount(App, { global: { stubs: childStubs } });
     expect(wrapper.find('[data-testid="side-panel"]').exists()).toBe(true);
@@ -70,5 +92,19 @@ describe("App layout", () => {
     await toolbarVm.$emit("toggle-sidebar", false);
     await toolbarVm.$emit("select-panel", "keys");
     expect(wrapper.findComponent({ name: "SidePanel" }).props("active")).toBe("keys");
+  });
+
+  it("unsubscribes the App event listener on each unmount", async () => {
+    const firstStop = vi.fn();
+    const secondStop = vi.fn();
+    vi.mocked(subscribeAppEvents).mockResolvedValueOnce(firstStop).mockResolvedValueOnce(secondStop);
+    const first = mount(App, { global: { stubs: childStubs } });
+    await flushPromises();
+    first.unmount();
+    expect(firstStop).toHaveBeenCalledOnce();
+    const second = mount(App, { global: { stubs: childStubs } });
+    await flushPromises();
+    second.unmount();
+    expect(secondStop).toHaveBeenCalledOnce();
   });
 });

@@ -9,7 +9,7 @@
  * tools / settings 内部由嵌套 subview-tabs 切换子视图;
  * 内嵌时给子组件传 embedded=true 抑制它们的外层 header。
  */
-import { onBeforeUnmount, ref } from "vue";
+import { onBeforeUnmount, ref, watch } from "vue";
 import {
   DEFAULT_SIDEBAR_WIDTH,
   MAX_SIDEBAR_WIDTH,
@@ -36,6 +36,10 @@ const props = withDefaults(
     expanded?: boolean;
     activeSessionId?: string | null;
     activeSessionConnected?: boolean;
+    toolSubview?: ToolSubview;
+    settingsSubview?: SettingsSubview;
+    toolSubviewRequest?: number;
+    settingsSubviewRequest?: number;
   }>(),
   {
     width: DEFAULT_SIDEBAR_WIDTH,
@@ -49,6 +53,7 @@ const emit = defineEmits<{
   (e: "select-session", id: string): void;
   (e: "open-sftp", id: string): void;
   (e: "open-terminal", id: string, path: string): void;
+  (e: "new-session"): void;
 }>();
 
 const titles: Record<string, string> = {
@@ -61,6 +66,8 @@ const titles: Record<string, string> = {
 
 const activeToolSubview = ref<ToolSubview>("quick-commands");
 const activeSettingsSubview = ref<SettingsSubview>("theme");
+watch(() => [props.toolSubview, props.toolSubviewRequest] as const, ([value]) => { if (value) activeToolSubview.value = value; });
+watch(() => [props.settingsSubview, props.settingsSubviewRequest] as const, ([value]) => { if (value) activeSettingsSubview.value = value; });
 const dragging = ref(false);
 let stopResize: (() => void) | null = null;
 
@@ -108,7 +115,7 @@ function resetWidth() {
   >
     <header class="side-panel-header">
       <h3>{{ titles[active] || active }}</h3>
-      <button class="panel-reset" title="恢复侧栏宽度" aria-label="恢复侧栏宽度" @dblclick="resetWidth">↺</button>
+      <button class="panel-reset" title="恢复侧栏宽度" aria-label="恢复侧栏宽度" @click="resetWidth">↺</button>
     </header>
 
     <nav v-if="active === 'tools'" class="subview-tabs" aria-label="工具面板">
@@ -125,6 +132,7 @@ function resetWidth() {
       <SessionList
         v-if="active === 'sessions'"
         embedded
+        @new-session="emit('new-session')"
         @select="(id) => emit('select-session', id)"
         @open-sftp="(id) => emit('open-sftp', id)"
         @open-terminal="(id, p) => emit('open-terminal', id, p)"

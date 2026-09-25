@@ -29,6 +29,7 @@ export interface SessionConfig {
   port: number;
   protocol: Protocol;
   auth_method: AuthMethod;
+  serial_config?: SerialConfig | null;
 }
 
 export type Protocol = "SSH" | "Telnet" | "Serial";
@@ -263,7 +264,7 @@ export interface ThemeColors {
 
 export interface TerminalColorScheme {
   name: string;
-  ansi_colors: number[]; // 长度 16
+  ansi_colors: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number];
   default_fg: number;
   default_bg: number;
   cursor_fg: number;
@@ -384,14 +385,10 @@ export type AppCommand =
   | { SetTerminalColorScheme: { scheme_name: string } }
   | { ImportColorScheme: { scheme: TerminalColorScheme } }
   // 多协议
-  | { ConnectTelnet: { config: TelnetConfig } }
-  | { ConnectSerial: { config: SerialConfig } }
   // 插件
   | { ScanPlugins: null }
   | { LoadPlugin: { plugin_id: string } }
   | { UnloadPlugin: { plugin_id: string } }
-  | { EnablePlugin: { plugin_id: string } }
-  | { DisablePlugin: { plugin_id: string } }
   // List / snapshot
   | { ListSessions: null }
   | { ListTunnels: null }
@@ -467,23 +464,24 @@ export type AppEvent =
         action_summary: string;
       };
     }
+  | { TriggerActionFailed: { trigger_id: Uuid; session_id: Uuid; error: string } }
   | { ScriptFinished: { session_id: Uuid; result: ScriptResult } }
   | { SyncInputSessionsChanged: { session_ids: Uuid[] } }
   // 密钥
-  | { SshKeyListChanged: null }
+  | "SshKeyListChanged"
   | { SshKeyGenerated: { key: SshKeyInfo } }
   | { PublicKeyExported: { key_id: Uuid; public_key: string } }
   | { MasterPasswordChanged: { is_set: boolean } }
   | { MasterPasswordVerified: { success: boolean } }
   // 隧道
-  | { ActiveTunnelsChanged: null }
+  | "ActiveTunnelsChanged"
   | { TunnelUpdated: { tunnel: ActiveTunnelInfo } }
   // 主题
   | { ThemeChanged: { theme: AppTheme } }
   | { ColorSchemeChanged: { scheme: TerminalColorScheme } }
-  | { ColorSchemeListChanged: null }
+  | "ColorSchemeListChanged"
   // 插件
-  | { PluginListUpdated: null }
+  | "PluginListUpdated"
   | { PluginStateChanged: { plugin_id: string; state: PluginState } }
   | { PluginLoadFailed: { plugin_id: string; error: string } };
   // 切片 2.2 删除（设计 §3.3 / §5 / §2.2）：

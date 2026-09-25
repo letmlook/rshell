@@ -2,11 +2,11 @@
 /**
  * TriggerEditor —— 切片 7.3
  *
- * 触发器列表 + 正则/动作编辑。SendText 触发器的远端真发已在切片 7.1 标为
- * 已知缺口（!Send 障碍），本切片 UI 仅展示 + 配置元数据。
+ * 触发器列表和动作编辑；远端输出匹配后由后端执行动作。
  */
-import { onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import { listTriggers, createTrigger, deleteTrigger, toggleTrigger } from "../ipc/client";
+import { subscribeAppEvents } from "../ipc/events";
 import type { Trigger, Uuid } from "../ipc/types";
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
@@ -22,41 +22,49 @@ const items = ref<Trigger[]>([]);
 const newPattern = ref("");
 const newText = ref("");
 const loading = ref(false);
+const error = ref<string | null>(null);
+let unlisten: (() => void) | null = null;
+let active = false;
 
 async function refresh() {
   loading.value = true;
   try {
-    items.value = (await listTriggers()) as unknown as Trigger[];
+    items.value = await listTriggers();
+    error.value = null;
+  } catch (e) {
+    error.value = String(e);
   } finally {
     loading.value = false;
   }
 }
 
 async function add() {
-  if (!newPattern.value) return;
-  await createTrigger({
+  if (!newPattern.value || !newText.value) { error.value = "正则和发送文本均不能为空"; return; }
+  try { await createTrigger({
     id: crypto.randomUUID() as Uuid,
     name: newPattern.value,
     enabled: true,
     condition: { RegexAppear: newPattern.value },
     action: { SendText: newText.value },
-  } as unknown as Trigger);
+  });
+  } catch (e) { error.value = String(e); return; }
   newPattern.value = "";
   newText.value = "";
   await refresh();
 }
 
 async function toggle(t: Trigger) {
-  await toggleTrigger(t.id);
+  try { await toggleTrigger(t.id); } catch (e) { error.value = String(e); return; }
   await refresh();
 }
 
 async function remove(t: Trigger) {
-  await deleteTrigger(t.id);
+  try { await deleteTrigger(t.id); } catch (e) { error.value = String(e); return; }
   await refresh();
 }
 
 function actionLabel(t: Trigger): string {
+  if (t.action === "Disconnect") return "disconnect";
   const a = t.action as {
     SendText?: string;
     ShowNotification?: string;
@@ -65,12 +73,19 @@ function actionLabel(t: Trigger): string {
   };
   if (a.SendText !== undefined) return `send_text(${a.SendText.length} chars)`;
   if (a.ShowNotification !== undefined) return `notify: ${a.ShowNotification}`;
-  if (a.Disconnect) return "disconnect";
   if (a.LogToFile) return `log_to_file: ${a.LogToFile}`;
   return "(none)";
 }
 
-onMounted(refresh);
+onMounted(async () => {
+  active = true;
+  await refresh();
+  if (!active) return;
+  const stop = await subscribeAppEvents((event) => { if (event === "TriggerListChanged") void refresh(); });
+  if (active) unlisten = stop;
+  else stop();
+});
+onBeforeUnmount(() => { active = false; unlisten?.(); unlisten = null; });
 </script>
 
 <template>
@@ -79,6 +94,7 @@ onMounted(refresh);
       <h3>触发器 ({{ items.length }})</h3>
       <el-button size="small" :loading="loading" @click="refresh">刷新</el-button>
     </header>
+    <p v-if="error" class="error">{{ error }}</p>
     <el-form inline size="small" class="add-form" @submit.prevent="add">
       <el-form-item label="正则">
         <el-input v-model="newPattern" placeholder="^\\$" style="width: 120px" />

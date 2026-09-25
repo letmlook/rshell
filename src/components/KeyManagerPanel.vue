@@ -84,6 +84,8 @@ async function generate() {
 }
 
 async function remove(id: Uuid) {
+  const name = keys.value.find(key => key.id === id)?.name ?? id;
+  if (!window.confirm(`删除 SSH 密钥“${name}”？此操作无法撤销。`)) return;
   try {
     await deleteSshKey(id);
     await refresh();
@@ -97,8 +99,8 @@ onMounted(refresh);
 
 <template>
   <section class="key-manager">
-    <header v-if="!props.embedded">
-      <h3>SSH 密钥 ({{ keys.length }})</h3>
+    <header>
+      <h3 v-if="!props.embedded">SSH 密钥 ({{ keys.length }})</h3>
       <el-button-group size="small">
         <el-button @click="refresh" :loading="loading">刷新</el-button>
         <el-button @click="importKey">导入</el-button>

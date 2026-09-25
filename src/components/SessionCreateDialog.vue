@@ -1,16 +1,7 @@
 <script setup lang="ts">
-/**
- * SessionCreateDialog —— 切片 1.3
- *
- * Element Plus 表单收集最小 SSH 会话配置,提交调 invoke('create_session')
- * （设计 §1.3 边界铁律 2:前端只通过 invoke 接触后端）。
- *
- * 字段仅做切片 1 最小可用:host / port / username / password;
- * 切片 3 增 SSH 密钥选择、文件夹、超时等。
- */
 import { ref } from "vue";
 import { useSessionsStore } from "../stores/sessions";
-import type { SessionConfig, Uuid } from "../ipc/types";
+import type { Protocol, SerialFlowControl, SerialParity, SessionConfig, Uuid } from "../ipc/types";
 
 const props = defineProps<{ visible: boolean }>();
 const emit = defineEmits<{ (e: "close"): void; (e: "created", id: Uuid): void }>();
@@ -19,10 +10,17 @@ const store = useSessionsStore();
 
 const form = ref({
   name: "",
+  protocol: "SSH" as Protocol,
   host: "",
   port: 22,
   username: "",
   password: "",
+  serialPort: "",
+  baudRate: 115200,
+  dataBits: 8,
+  stopBits: 1,
+  parity: "None" as SerialParity,
+  flowControl: "None" as SerialFlowControl,
 });
 
 const submitting = ref(false);
@@ -32,19 +30,34 @@ async function submit() {
   submitting.value = true;
   error.value = null;
   try {
+    const isSerial = form.value.protocol === "Serial";
+    if (isSerial ? !form.value.serialPort.trim() : !form.value.host.trim()) {
+      throw new Error(isSerial ? "请输入串口设备路径" : "请输入主机地址");
+    }
+    if (form.value.protocol === "SSH" && !form.value.username.trim()) {
+      throw new Error("请输入 SSH 用户名");
+    }
     const cfg: SessionConfig = {
       id: crypto.randomUUID() as Uuid,
-      name: form.value.name || `${form.value.username}@${form.value.host}`,
+      name: form.value.name || (isSerial ? form.value.serialPort : form.value.protocol === "SSH" ? `${form.value.username}@${form.value.host}` : `${form.value.host}:${form.value.port}`),
       folder_id: null,
-      host: form.value.host,
-      port: form.value.port,
-      protocol: "SSH",
+      host: isSerial ? form.value.serialPort : form.value.host,
+      port: isSerial ? 0 : form.value.port,
+      protocol: form.value.protocol,
       auth_method: {
         Password: {
-          username: form.value.username,
-          password: form.value.password,
+          username: form.value.protocol === "SSH" ? form.value.username : "",
+          password: form.value.protocol === "SSH" ? form.value.password : "",
         },
       },
+      serial_config: isSerial ? {
+        port: form.value.serialPort,
+        baud_rate: form.value.baudRate,
+        data_bits: form.value.dataBits,
+        stop_bits: form.value.stopBits,
+        parity: form.value.parity,
+        flow_control: form.value.flowControl,
+      } : null,
     };
     const id = await store.create(cfg);
     emit("created", id);
@@ -64,27 +77,67 @@ function onUpdateVisible(v: boolean) {
 <template>
   <el-dialog
     :model-value="props.visible"
-    title="新建 SSH 会话"
+    title="新建会话"
     width="480px"
     @update:model-value="onUpdateVisible"
     @close="emit('close')"
   >
     <el-form label-width="80px" @submit.prevent="submit">
+      <el-form-item label="协议">
+        <el-select v-model="form.protocol">
+          <el-option label="SSH" value="SSH" />
+          <el-option label="Telnet" value="Telnet" />
+          <el-option label="串口" value="Serial" />
+        </el-select>
+      </el-form-item>
       <el-form-item label="名称">
         <el-input v-model="form.name" placeholder="可留空,用 host 自动命名" />
       </el-form-item>
-      <el-form-item label="主机" required>
+      <el-form-item v-if="form.protocol !== 'Serial'" label="主机" required>
         <el-input v-model="form.host" placeholder="host or ip" />
       </el-form-item>
-      <el-form-item label="端口">
+      <el-form-item v-if="form.protocol !== 'Serial'" label="端口">
         <el-input-number v-model="form.port" :min="1" :max="65535" />
       </el-form-item>
-      <el-form-item label="用户名" required>
+      <el-form-item v-if="form.protocol === 'SSH'" label="用户名" required>
         <el-input v-model="form.username" />
       </el-form-item>
-      <el-form-item label="密码">
+      <el-form-item v-if="form.protocol === 'SSH'" label="密码">
         <el-input v-model="form.password" type="password" show-password />
       </el-form-item>
+      <template v-if="form.protocol === 'Serial'">
+        <el-form-item label="设备" required>
+          <el-input v-model="form.serialPort" placeholder="/dev/cu.usbserial-..." />
+        </el-form-item>
+        <el-form-item label="波特率">
+          <el-input-number v-model="form.baudRate" :min="1" :max="4000000" />
+        </el-form-item>
+        <el-form-item label="数据位">
+          <el-select v-model="form.dataBits">
+            <el-option v-for="bits in [5, 6, 7, 8]" :key="bits" :label="String(bits)" :value="bits" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="停止位">
+          <el-select v-model="form.stopBits">
+            <el-option :value="1" label="1" />
+            <el-option :value="2" label="2" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="校验">
+          <el-select v-model="form.parity">
+            <el-option label="无" value="None" />
+            <el-option label="偶" value="Even" />
+            <el-option label="奇" value="Odd" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="流控">
+          <el-select v-model="form.flowControl">
+            <el-option label="无" value="None" />
+            <el-option label="软件" value="Software" />
+            <el-option label="硬件" value="Hardware" />
+          </el-select>
+        </el-form-item>
+      </template>
       <p v-if="error" style="color: var(--el-color-danger)">{{ error }}</p>
     </el-form>
     <template #footer>

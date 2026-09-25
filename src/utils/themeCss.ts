@@ -1,8 +1,7 @@
 /**
  * 主题颜色 → CSS 变量映射（设计 §5 / §4.2 "主题颜色 → CSS 变量"行）
  *
- * 后端只持久化当前主题名 + 配色方案名（不传整套颜色 JSON）;
- * 颜色值由前端根据 scheme 计算,写入 :root 的 CSS 变量供整个 UI 使用。
+ * 后端主题使用 0xRRGGBB;这里映射到组件实际消费的 --rs-* token。
  *
  * 纯函数 —— 切片 3 起有 Vitest 单测覆盖。
  */
@@ -12,7 +11,7 @@ import type { ITheme } from "@xterm/xterm";
 /** CSS 变量定义,key 是变量名,value 是 hex/rgb 字符串 */
 export type ThemeCssVars = Record<string, string>;
 
-/** 主题颜色 RGBA u32（与 rshell_api::types::ThemeColors 对齐） */
+/** 主题颜色 0xRRGGBB（与 rshell_api::types::ThemeColors 对齐） */
 export interface ThemeColorSet {
   background: number;
   foreground: number;
@@ -36,15 +35,15 @@ export interface TerminalPalette {
   selection_bg: number;
 }
 
-/** u32 RGBA → "#rrggbb" 字符串（忽略 alpha,前端主题色用 RGB 表达） */
+/** Rust 0xRRGGBB → "#rrggbb" 字符串。 */
 export function rgbaToCss(c: number): string {
-  const r = (c >> 24) & 0xff;
-  const g = (c >> 16) & 0xff;
-  const b = (c >> 8) & 0xff;
+  const r = (c >> 16) & 0xff;
+  const g = (c >> 8) & 0xff;
+  const b = c & 0xff;
   return `#${[r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
 }
 
-/** u32 RGBA → xterm ITheme 期望的 "#rrggbb" 字符串 */
+/** 0xRRGGBB → xterm ITheme 期望的 "#rrggbb" 字符串 */
 function paletteToXterm(c: number): string {
   return rgbaToCss(c);
 }
@@ -52,15 +51,15 @@ function paletteToXterm(c: number): string {
 /** 把 ThemeColorSet 摊平到 CSS 变量字典 */
 export function themeColorSetToCssVars(set: ThemeColorSet): ThemeCssVars {
   return {
-    "--rshell-bg": rgbaToCss(set.background),
-    "--rshell-fg": rgbaToCss(set.foreground),
-    "--rshell-accent": rgbaToCss(set.accent),
-    "--rshell-border": rgbaToCss(set.border),
-    "--rshell-sidebar-bg": rgbaToCss(set.sidebar_bg),
-    "--rshell-toolbar-bg": rgbaToCss(set.toolbar_bg),
-    "--rshell-statusbar-bg": rgbaToCss(set.statusbar_bg),
-    "--rshell-selection-bg": rgbaToCss(set.selection_bg),
-    "--rshell-hover-bg": rgbaToCss(set.hover_bg),
+    "--rs-bg": rgbaToCss(set.background),
+    "--rs-fg": rgbaToCss(set.foreground),
+    "--rs-accent": rgbaToCss(set.accent),
+    "--rs-border": rgbaToCss(set.border),
+    "--rs-bg-panel": rgbaToCss(set.sidebar_bg),
+    "--rs-bg-surface": rgbaToCss(set.toolbar_bg),
+    "--rs-statusbar-bg": rgbaToCss(set.statusbar_bg),
+    "--rs-row-selected": rgbaToCss(set.selection_bg),
+    "--rs-bg-surface-hover": rgbaToCss(set.hover_bg),
   };
 }
 

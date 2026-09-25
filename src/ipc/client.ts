@@ -9,6 +9,7 @@ import type {
   ConnectionState,
   PathBuf,
   PortForwardRule,
+  PluginInfo,
   ActiveTunnelInfo,
   PendingTunnelInfo,
   RemoteFileEntry,
@@ -16,11 +17,10 @@ import type {
   Protocol,
   ProtocolType,
   QuickCommand,
-  SerialConfig,
   SessionConfig,
   SshKeyType,
-  TelnetConfig,
   TerminalColorScheme,
+  ThemeColors,
   Trigger,
   TrustHostKeyDecision,
   Uuid,
@@ -88,6 +88,8 @@ export const resizeTerminal = (session_id: Uuid, cols: number, rows: number) =>
 export interface ThemeInfo {
   current_theme: string;
   current_scheme: string;
+  current_colors: ThemeColors;
+  current_palette: TerminalColorScheme;
   available_themes: string[];
   available_schemes: string[];
 }
@@ -132,14 +134,14 @@ export const createQuickCommand = (command: QuickCommand) =>
   call({ CreateQuickCommand: { command } });
 export const deleteQuickCommand = (command_id: Uuid) =>
   call({ DeleteQuickCommand: { command_id } });
-export const listQuickCommands = () => call({ ListQuickCommands: null });
+export const listQuickCommands = () => call<QuickCommand[]>({ ListQuickCommands: null });
 
 // ===== 触发器 =====
 
 export const createTrigger = (trigger: Trigger) => call({ CreateTrigger: { trigger } });
 export const deleteTrigger = (trigger_id: Uuid) => call({ DeleteTrigger: { trigger_id } });
 export const toggleTrigger = (trigger_id: Uuid) => call({ ToggleTrigger: { trigger_id } });
-export const listTriggers = () => call({ ListTriggers: null });
+export const listTriggers = () => call<Trigger[]>({ ListTriggers: null });
 
 // ===== 撰写窗格 =====
 
@@ -202,30 +204,16 @@ export const setTerminalColorScheme = (scheme_name: string) =>
 export const importColorScheme = (scheme: TerminalColorScheme) =>
   call({ ImportColorScheme: { scheme } });
 export const listThemes = () =>
-  call<{
-    current_theme: string;
-    current_scheme: string;
-    available_themes: string[];
-    available_schemes: string[];
-  }>({ ListThemes: null });
+  call<ThemeInfo>({ ListThemes: null });
 
 // 切片 4：decideHostKey —— 已在下方"主机密钥"分区声明（line 196）
-
-// ===== 多协议 =====
-
-export const connectTelnet = (config: TelnetConfig) =>
-  call({ ConnectTelnet: { config } });
-export const connectSerial = (config: SerialConfig) =>
-  call({ ConnectSerial: { config } });
 
 // ===== 插件 =====
 
 export const scanPlugins = () => call({ ScanPlugins: null });
 export const loadPlugin = (plugin_id: string) => call({ LoadPlugin: { plugin_id } });
 export const unloadPlugin = (plugin_id: string) => call({ UnloadPlugin: { plugin_id } });
-export const enablePlugin = (plugin_id: string) => call({ EnablePlugin: { plugin_id } });
-export const disablePlugin = (plugin_id: string) => call({ DisablePlugin: { plugin_id } });
-export const listPlugins = () => call<{ plugins: unknown[] }>({ ListPlugins: null });
+export const listPlugins = () => call<PluginInfo[]>({ ListPlugins: null });
 
 // 重新导出类型方便使用方
 export type { ConnectionState, Protocol, ProtocolType };

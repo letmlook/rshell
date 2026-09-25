@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::{ComposeTarget, PortForwardRule, QuickCommand, SerialConfig, SessionConfig, SshKeyType, TelnetConfig, TerminalColorScheme, TrustHostKeyDecision, Trigger};
+use crate::types::{ComposeTarget, PortForwardRule, QuickCommand, SessionConfig, SshKeyType, TerminalColorScheme, TrustHostKeyDecision, Trigger};
 
 /// 前端发送的所有命令
 // 切片 2.3 注释：ts-rs 全量 derive 等 types.rs 同步 derive 后再开。
@@ -158,12 +158,6 @@ pub enum AppCommand {
     /// 导入自定义配色方案
     ImportColorScheme { scheme: TerminalColorScheme },
 
-    // ===== 多协议 =====
-    /// 连接 Telnet 会话
-    ConnectTelnet { config: TelnetConfig },
-    /// 连接串口会话
-    ConnectSerial { config: SerialConfig },
-
     // ===== 插件管理 =====
     /// 扫描插件目录
     ScanPlugins,
@@ -171,10 +165,6 @@ pub enum AppCommand {
     LoadPlugin { plugin_id: String },
     /// 卸载插件
     UnloadPlugin { plugin_id: String },
-    /// 启用插件
-    EnablePlugin { plugin_id: String },
-    /// 禁用插件
-    DisablePlugin { plugin_id: String },
 
     // ===== List / snapshot 拉取 =====
     // 这些命令让 UI 主动拉数据, 触发后端 publish 对应 XSnapshot 事件。

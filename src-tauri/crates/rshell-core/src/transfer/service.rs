@@ -114,7 +114,7 @@ pub struct TransferService {
     /// 事件总线
     event_bus: Arc<EventBus>,
     /// 获取 SSH 客户端的函数（由外部注入）
-    ssh_client_provider: Arc<RwLock<Option<SshClientProvider>>>,
+    ssh_client_provider: Arc<std::sync::RwLock<Option<SshClientProvider>>>,
 }
 
 impl TransferService {
@@ -123,13 +123,13 @@ impl TransferService {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             event_bus,
-            ssh_client_provider: Arc::new(RwLock::new(None)),
+            ssh_client_provider: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
     /// 设置 SSH 客户端提供函数
-    pub async fn set_ssh_client_provider(&self, provider: SshClientProvider) {
-        let mut p = self.ssh_client_provider.write().await;
+    pub fn set_ssh_client_provider(&self, provider: SshClientProvider) {
+        let mut p = self.ssh_client_provider.write().expect("SSH provider lock poisoned");
         *p = Some(provider);
     }
 
@@ -244,9 +244,9 @@ impl TransferService {
         }
 
         // 获取 SSH 客户端
-        let provider = self.ssh_client_provider.read().await;
-        let ssh_client_provider = match provider.as_ref() {
-            Some(p) => p.clone(),
+        let provider = self.ssh_client_provider.read().expect("SSH provider lock poisoned").clone();
+        let ssh_client_provider = match provider {
+            Some(p) => p,
             None => {
                 let err = "SSH client provider not set".to_string();
                 self.mark_failed(task_id, err.clone()).await?;

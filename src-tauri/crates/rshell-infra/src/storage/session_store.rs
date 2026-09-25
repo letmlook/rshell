@@ -138,6 +138,7 @@ mod tests {
                 username: "root".to_string(),
                 password: "password123".to_string(),
             },
+            serial_config: None,
         }
     }
 
