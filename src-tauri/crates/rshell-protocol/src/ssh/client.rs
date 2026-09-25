@@ -14,7 +14,9 @@ struct ShellOutput {
 impl ShellOutput {
     fn data(&self, channel: u32, data: &[u8]) {
         if self.channel == Some(channel) {
-            if let Some(sender) = &self.sender { let _ = sender.send(data.to_vec()); }
+            if let Some(sender) = &self.sender {
+                let _ = sender.send(data.to_vec());
+            }
         }
     }
 
@@ -137,7 +139,12 @@ impl SshHandler {
     }
 
     /// 扫描 known_hosts 内容，匹配 host 模式 + 密钥指纹
-    fn scan_known_hosts(&self, content: &str, server_key: &ssh_key::PublicKey, expected_fp: &str) -> (bool, Option<String>) {
+    fn scan_known_hosts(
+        &self,
+        content: &str,
+        server_key: &ssh_key::PublicKey,
+        expected_fp: &str,
+    ) -> (bool, Option<String>) {
         let mut changed = None;
         for line in content.lines() {
             let line = line.trim();
@@ -164,9 +171,9 @@ impl SshHandler {
             }
 
             // 检查 host 模式是否匹配（逗号分隔多个 host）
-            let host_matches = host_field.split(',').any(|pattern| {
-                self.pattern_matches(pattern)
-            });
+            let host_matches = host_field
+                .split(',')
+                .any(|pattern| self.pattern_matches(pattern));
             if !host_matches {
                 continue;
             }
@@ -276,7 +283,9 @@ impl russh::client::Handler for SshHandler {
             );
             return Err(anyhow::anyhow!(
                 "Host key for {}:{} not found in known_hosts (fingerprint {})",
-                self.host, self.port, fp
+                self.host,
+                self.port,
+                fp
             ));
         };
 
@@ -284,7 +293,8 @@ impl russh::client::Handler for SshHandler {
         let (decision_id, rx) = sink.register_decision();
 
         // 2. 通知 UI 端"请决策"
-        let key_blob = server_public_key.to_openssh()
+        let key_blob = server_public_key
+            .to_openssh()
             .map_err(|e| anyhow::anyhow!("Cannot encode server public key: {e}"))?;
         sink.publish_request(HostKeyDecisionRequest {
             decision_id,
@@ -318,7 +328,11 @@ impl russh::client::Handler for SshHandler {
                     fingerprint = %fp,
                     "User rejected host key"
                 );
-                Err(anyhow::anyhow!("User rejected host key for {}:{}", self.host, self.port))
+                Err(anyhow::anyhow!(
+                    "User rejected host key for {}:{}",
+                    self.host,
+                    self.port
+                ))
             }
             Ok(Err(_)) | Err(_) => {
                 sink.cancel_decision(decision_id);
@@ -330,7 +344,8 @@ impl russh::client::Handler for SshHandler {
                 );
                 Err(anyhow::anyhow!(
                     "Host key decision channel closed for {}:{}",
-                    self.host, self.port
+                    self.host,
+                    self.port
                 ))
             }
         }
@@ -356,13 +371,27 @@ impl russh::client::Handler for SshHandler {
         Ok(())
     }
 
-    async fn channel_eof(&mut self, channel: russh::ChannelId, _session: &mut russh::client::Session) -> Result<(), Self::Error> {
-        self.shell_output.lock().unwrap().close(Some(channel.into()));
+    async fn channel_eof(
+        &mut self,
+        channel: russh::ChannelId,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        self.shell_output
+            .lock()
+            .unwrap()
+            .close(Some(channel.into()));
         Ok(())
     }
 
-    async fn channel_close(&mut self, channel: russh::ChannelId, _session: &mut russh::client::Session) -> Result<(), Self::Error> {
-        self.shell_output.lock().unwrap().close(Some(channel.into()));
+    async fn channel_close(
+        &mut self,
+        channel: russh::ChannelId,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        self.shell_output
+            .lock()
+            .unwrap()
+            .close(Some(channel.into()));
         Ok(())
     }
 }
@@ -405,7 +434,10 @@ impl SshClient {
 
         // 创建数据通道
         let (data_tx, data_rx) = mpsc::unbounded_channel();
-        self.shell_output = Arc::new(Mutex::new(ShellOutput { channel: None, sender: Some(data_tx) }));
+        self.shell_output = Arc::new(Mutex::new(ShellOutput {
+            channel: None,
+            sender: Some(data_tx),
+        }));
 
         // 创建 SSH 配置
         let ssh_config = Arc::new(russh::client::Config {
@@ -483,12 +515,13 @@ impl SshClient {
                 }
             }
             AuthMethod::PublicKey {
-                key_path, passphrase, ..
+                key_path,
+                passphrase,
+                ..
             } => {
                 // 加载私钥
-                let key = russh_keys::load_secret_key(key_path, passphrase.as_deref()).map_err(
-                    |e| ProtocolError::AuthFailed(format!("Failed to load key: {}", e)),
-                )?;
+                let key = russh_keys::load_secret_key(key_path, passphrase.as_deref())
+                    .map_err(|e| ProtocolError::AuthFailed(format!("Failed to load key: {}", e)))?;
 
                 let key = Arc::new(key);
                 let success = handle
@@ -512,12 +545,12 @@ impl SshClient {
                 match response {
                     russh::client::KeyboardInteractiveAuthResponse::Success => {}
                     russh::client::KeyboardInteractiveAuthResponse::InfoRequest {
-                        prompts,
-                        ..
+                        prompts, ..
                     } => {
                         // 使用配置中的密码（如果有），否则用空字符串
                         let pwd = password.as_deref().unwrap_or("");
-                        let responses: Vec<String> = prompts.iter().map(|_| pwd.to_string()).collect();
+                        let responses: Vec<String> =
+                            prompts.iter().map(|_| pwd.to_string()).collect();
 
                         let response = handle
                             .authenticate_keyboard_interactive_respond(responses)
@@ -623,7 +656,9 @@ impl SshClient {
     pub async fn disconnect_ssh(&mut self) -> Result<(), ProtocolError> {
         if let Some(channel) = self.channel.take() {
             let (reply, received) = oneshot::channel();
-            if channel.send(ShellRequest::Close(reply)).await.is_ok() { let _ = received.await; }
+            if channel.send(ShellRequest::Close(reply)).await.is_ok() {
+                let _ = received.await;
+            }
         }
 
         if let Some(handle) = self.handle.take() {
@@ -647,8 +682,13 @@ impl SshClient {
             .ok_or(ProtocolError::ConnectionClosed)?;
 
         let (reply, received) = oneshot::channel();
-        channel.send(ShellRequest::Send(data.to_vec(), reply)).await.map_err(|_| ProtocolError::ConnectionClosed)?;
-        received.await.map_err(|_| ProtocolError::ConnectionClosed)?
+        channel
+            .send(ShellRequest::Send(data.to_vec(), reply))
+            .await
+            .map_err(|_| ProtocolError::ConnectionClosed)?;
+        received
+            .await
+            .map_err(|_| ProtocolError::ConnectionClosed)?
     }
 
     /// 接收数据（从通道读取）
@@ -679,8 +719,13 @@ impl SshClient {
             .ok_or(ProtocolError::ConnectionClosed)?;
 
         let (reply, received) = oneshot::channel();
-        channel.send(ShellRequest::Resize(cols, rows, reply)).await.map_err(|_| ProtocolError::ConnectionClosed)?;
-        received.await.map_err(|_| ProtocolError::ConnectionClosed)?
+        channel
+            .send(ShellRequest::Resize(cols, rows, reply))
+            .await
+            .map_err(|_| ProtocolError::ConnectionClosed)?;
+        received
+            .await
+            .map_err(|_| ProtocolError::ConnectionClosed)?
     }
 
     /// 获取 SSH 连接句柄（用于打开 SFTP 通道等）
@@ -698,16 +743,17 @@ impl SshClient {
             .as_ref()
             .ok_or(ProtocolError::ConnectionClosed)?;
 
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| ProtocolError::ConnectionFailed(format!("SFTP channel open failed: {}", e)))?;
+        let channel = handle.channel_open_session().await.map_err(|e| {
+            ProtocolError::ConnectionFailed(format!("SFTP channel open failed: {}", e))
+        })?;
 
         // 请求 sftp 子系统
         channel
             .request_subsystem(false, "sftp")
             .await
-            .map_err(|e| ProtocolError::ProtocolError(format!("SFTP subsystem request failed: {}", e)))?;
+            .map_err(|e| {
+                ProtocolError::ProtocolError(format!("SFTP subsystem request failed: {}", e))
+            })?;
 
         Ok(channel)
     }
@@ -733,7 +779,9 @@ impl SshClient {
         handle
             .channel_open_direct_tcpip(host, port, "127.0.0.1", 0)
             .await
-            .map_err(|e| ProtocolError::ConnectionFailed(format!("direct-tcpip open failed: {}", e)))
+            .map_err(|e| {
+                ProtocolError::ConnectionFailed(format!("direct-tcpip open failed: {}", e))
+            })
     }
 }
 
@@ -778,7 +826,13 @@ mod tests {
     impl HostKeyDecisionSink for AcceptTestHost {
         fn register_decision(&self) -> (Uuid, oneshot::Receiver<HostKeyDecision>) {
             let (tx, rx) = oneshot::channel();
-            tx.send(HostKeyDecision { fingerprint: String::new(), key_blob: String::new(), accept: true, permanent: false }).unwrap();
+            tx.send(HostKeyDecision {
+                fingerprint: String::new(),
+                key_blob: String::new(),
+                accept: true,
+                permanent: false,
+            })
+            .unwrap();
             (Uuid::new_v4(), rx)
         }
         fn publish_request(&self, _: HostKeyDecisionRequest) {}
@@ -786,28 +840,57 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct OutputTestServer { shell: Option<russh::ChannelId> }
+    struct OutputTestServer {
+        shell: Option<russh::ChannelId>,
+    }
 
     #[async_trait::async_trait]
     impl russh::server::Handler for OutputTestServer {
         type Error = russh::Error;
-        async fn auth_password(&mut self, _: &str, _: &str) -> Result<russh::server::Auth, Self::Error> {
+        async fn auth_password(
+            &mut self,
+            _: &str,
+            _: &str,
+        ) -> Result<russh::server::Auth, Self::Error> {
             Ok(russh::server::Auth::Accept)
         }
-        async fn channel_open_session(&mut self, _: russh::Channel<russh::server::Msg>, _: &mut russh::server::Session) -> Result<bool, Self::Error> { Ok(true) }
-        async fn shell_request(&mut self, channel: russh::ChannelId, session: &mut russh::server::Session) -> Result<(), Self::Error> {
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            _: &mut russh::server::Session,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn shell_request(
+            &mut self,
+            channel: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
             self.shell = Some(channel);
             session.data(channel, russh::CryptoVec::from_slice(b"shell output"))?;
             Ok(())
         }
-        async fn subsystem_request(&mut self, channel: russh::ChannelId, _: &str, session: &mut russh::server::Session) -> Result<(), Self::Error> {
-            session.data(channel, russh::CryptoVec::from_slice(b"binary sftp payload"))?;
+        async fn subsystem_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.data(
+                channel,
+                russh::CryptoVec::from_slice(b"binary sftp payload"),
+            )?;
             session.eof(channel)?;
             session.close(channel)?;
             session.eof(self.shell.unwrap())?;
             Ok(())
         }
-        async fn data(&mut self, channel: russh::ChannelId, data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+        async fn data(
+            &mut self,
+            channel: russh::ChannelId,
+            data: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
             session.data(channel, russh::CryptoVec::from_slice(data))?;
             Ok(())
         }
@@ -817,20 +900,41 @@ mod tests {
     async fn ssh_loopback_isolates_subsystem_payload_and_closes_shell_receiver() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let key = ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let config = russh::server::Config { keys: vec![key], ..Default::default() };
-            let running = russh::server::run_stream(Arc::new(config), stream, OutputTestServer::default()).await.unwrap();
+            let config = russh::server::Config {
+                keys: vec![key],
+                ..Default::default()
+            };
+            let running =
+                russh::server::run_stream(Arc::new(config), stream, OutputTestServer::default())
+                    .await
+                    .unwrap();
             let _ = running.await;
         });
         let mut client = SshClient::new(SessionConfig {
-            id: Uuid::new_v4(), name: "loopback".into(), folder_id: None,
-            host: "127.0.0.1".into(), port, protocol: rshell_api::types::Protocol::SSH,
-            auth_method: AuthMethod::Password { username: "test".into(), password: "test".into() }, serial_config: None,
+            id: Uuid::new_v4(),
+            name: "loopback".into(),
+            folder_id: None,
+            host: "127.0.0.1".into(),
+            port,
+            protocol: rshell_api::types::Protocol::SSH,
+            auth_method: AuthMethod::Password {
+                username: "test".into(),
+                password: "test".into(),
+            },
+            serial_config: None,
         });
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            client.connect_ssh(Some(Arc::new(AcceptTestHost))).await.unwrap();
+            client
+                .connect_ssh(Some(Arc::new(AcceptTestHost)))
+                .await
+                .unwrap();
             let mut output = client.take_data_receiver().unwrap();
             assert_eq!(output.recv().await.unwrap(), b"shell output");
             client.send_data(b"input echo").await.unwrap();
@@ -839,14 +943,19 @@ mod tests {
             let _subsystem = client.open_sftp_channel().await.unwrap();
             assert_eq!(output.recv().await, None);
             client.disconnect_ssh().await.unwrap();
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         server.await.unwrap();
     }
 
     #[tokio::test]
     async fn shell_output_excludes_other_channels_and_ends_on_shell_eof() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut output = ShellOutput { channel: Some(7), sender: Some(tx) };
+        let mut output = ShellOutput {
+            channel: Some(7),
+            sender: Some(tx),
+        };
         output.data(9, b"sftp payload");
         output.data(7, b"shell");
         output.close(Some(9));
@@ -861,7 +970,10 @@ mod tests {
     #[tokio::test]
     async fn transport_disconnect_ends_shell_output() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut output = ShellOutput { channel: Some(7), sender: Some(tx) };
+        let mut output = ShellOutput {
+            channel: Some(7),
+            sender: Some(tx),
+        };
         output.close(None);
         assert_eq!(rx.recv().await, None);
     }
@@ -873,11 +985,21 @@ mod tests {
         let changed_key = ssh_key::PublicKey::new(KeyData::Ed25519(Ed25519PublicKey([2; 32])), "");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("known_hosts");
-        std::fs::write(&path, format!("[example.test]:2222 {}\n", key.to_openssh().unwrap())).unwrap();
+        std::fs::write(
+            &path,
+            format!("[example.test]:2222 {}\n", key.to_openssh().unwrap()),
+        )
+        .unwrap();
         let (data_tx, _) = mpsc::unbounded_channel();
         let handler = SshHandler {
-            shell_output: Arc::new(Mutex::new(ShellOutput { channel: None, sender: Some(data_tx) })), host: "example.test".into(), port: 2222,
-            known_hosts_paths: vec![path], host_key_sink: None,
+            shell_output: Arc::new(Mutex::new(ShellOutput {
+                channel: None,
+                sender: Some(data_tx),
+            })),
+            host: "example.test".into(),
+            port: 2222,
+            known_hosts_paths: vec![path],
+            host_key_sink: None,
         };
         assert_eq!(handler.verify_known_hosts(&key), (true, None));
         let (matched, previous) = handler.verify_known_hosts(&changed_key);

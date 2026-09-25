@@ -5,9 +5,9 @@
 
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
+use regex::Regex;
 use rshell_api::types::{Trigger, TriggerAction, TriggerCondition};
 use rshell_api::AppEvent;
-use regex::Regex;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -44,7 +44,10 @@ impl TriggerEngine {
     pub fn with_path(event_bus: Arc<EventBus>, path: PathBuf) -> Self {
         let (triggers, writable) = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<Vec<Trigger>>(&bytes) {
-                Ok(items) => (items.into_iter().map(|item| (item.id, item)).collect(), true),
+                Ok(items) => (
+                    items.into_iter().map(|item| (item.id, item)).collect(),
+                    true,
+                ),
                 Err(error) => {
                     warn!(path = %path.display(), %error, "Trigger file is invalid; leaving it untouched");
                     (HashMap::new(), false)
@@ -56,16 +59,26 @@ impl TriggerEngine {
                 (HashMap::new(), false)
             }
         };
-        Self { triggers: Arc::new(RwLock::new(triggers)), event_bus, path: Some(path), read_only: !writable }
+        Self {
+            triggers: Arc::new(RwLock::new(triggers)),
+            event_bus,
+            path: Some(path),
+            read_only: !writable,
+        }
     }
 
     fn persist(&self, triggers: &HashMap<Uuid, Trigger>) -> Result<(), CoreError> {
         if self.read_only {
-            return Err(CoreError::StorageError("Trigger file could not be read; preserving it without changes".into()));
+            return Err(CoreError::StorageError(
+                "Trigger file could not be read; preserving it without changes".into(),
+            ));
         }
-        let Some(path) = &self.path else { return Ok(()); };
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         let items: Vec<_> = triggers.values().cloned().collect();
-        let bytes = serde_json::to_vec_pretty(&items).map_err(|e| CoreError::StorageError(e.to_string()))?;
+        let bytes = serde_json::to_vec_pretty(&items)
+            .map_err(|e| CoreError::StorageError(e.to_string()))?;
         crate::script::quick_command::persist_json(path, &bytes)
     }
 
@@ -73,27 +86,43 @@ impl TriggerEngine {
     pub fn create_trigger(&self, trigger: Trigger) -> Result<Uuid, CoreError> {
         match &trigger.condition {
             TriggerCondition::RegexAppear(pattern) => {
-                if pattern.is_empty() { return Err(CoreError::InvalidState("Trigger regex cannot be empty".into())); }
-                Regex::new(pattern).map_err(|e| CoreError::InvalidState(format!("Invalid trigger regex: {e}")))?;
+                if pattern.is_empty() {
+                    return Err(CoreError::InvalidState(
+                        "Trigger regex cannot be empty".into(),
+                    ));
+                }
+                Regex::new(pattern)
+                    .map_err(|e| CoreError::InvalidState(format!("Invalid trigger regex: {e}")))?;
             }
             TriggerCondition::ExactMatch(text) if text.is_empty() => {
-                return Err(CoreError::InvalidState("Trigger match text cannot be empty".into()));
+                return Err(CoreError::InvalidState(
+                    "Trigger match text cannot be empty".into(),
+                ));
             }
             _ => {}
         }
         match &trigger.action {
-            TriggerAction::SendText(text) | TriggerAction::ShowNotification(text) if text.is_empty() => {
-                return Err(CoreError::InvalidState("Trigger action text cannot be empty".into()));
+            TriggerAction::SendText(text) | TriggerAction::ShowNotification(text)
+                if text.is_empty() =>
+            {
+                return Err(CoreError::InvalidState(
+                    "Trigger action text cannot be empty".into(),
+                ));
             }
             TriggerAction::LogToFile(path) if !path.is_absolute() || path.file_name().is_none() => {
-                return Err(CoreError::InvalidState("Trigger log path must be an absolute file".into()));
+                return Err(CoreError::InvalidState(
+                    "Trigger log path must be an absolute file".into(),
+                ));
             }
             _ => {}
         }
         let id = trigger.id;
         info!(trigger_id = %id, name = %trigger.name, "Creating trigger");
 
-        let mut triggers = self.triggers.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut triggers = self
+            .triggers
+            .write()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         let mut updated = triggers.clone();
         updated.insert(id, trigger);
         self.persist(&updated)?;
@@ -109,10 +138,16 @@ impl TriggerEngine {
     pub fn delete_trigger(&self, trigger_id: Uuid) -> Result<(), CoreError> {
         info!(trigger_id = %trigger_id, "Deleting trigger");
 
-        let mut triggers = self.triggers.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut triggers = self
+            .triggers
+            .write()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         if !triggers.contains_key(&trigger_id) {
             warn!(trigger_id = %trigger_id, "Trigger not found");
-            return Err(CoreError::NotFound(format!("Trigger {} not found", trigger_id)));
+            return Err(CoreError::NotFound(format!(
+                "Trigger {} not found",
+                trigger_id
+            )));
         }
         let mut updated = triggers.clone();
         updated.remove(&trigger_id);
@@ -127,7 +162,10 @@ impl TriggerEngine {
 
     /// 切换触发器启用/禁用
     pub fn toggle_trigger(&self, trigger_id: Uuid) -> Result<(), CoreError> {
-        let mut triggers = self.triggers.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut triggers = self
+            .triggers
+            .write()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         if triggers.contains_key(&trigger_id) {
             let mut updated = triggers.clone();
             let trigger = updated.get_mut(&trigger_id).expect("checked trigger");
@@ -140,21 +178,34 @@ impl TriggerEngine {
             self.event_bus.publish(AppEvent::TriggerListChanged);
             Ok(())
         } else {
-            Err(CoreError::NotFound(format!("Trigger {} not found", trigger_id)))
+            Err(CoreError::NotFound(format!(
+                "Trigger {} not found",
+                trigger_id
+            )))
         }
     }
 
     /// 获取所有触发器
     pub fn list_triggers(&self) -> Result<Vec<Trigger>, CoreError> {
-        let triggers = self.triggers.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let triggers = self
+            .triggers
+            .read()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         Ok(triggers.values().cloned().collect())
     }
 
     /// 检查终端输出是否匹配任何触发器
     ///
     /// 返回所有匹配的触发器动作列表。
-    pub fn check_output(&self, output: &str, _session_id: Uuid) -> Result<Vec<TriggerMatch>, CoreError> {
-        let triggers = self.triggers.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+    pub fn check_output(
+        &self,
+        output: &str,
+        _session_id: Uuid,
+    ) -> Result<Vec<TriggerMatch>, CoreError> {
+        let triggers = self
+            .triggers
+            .read()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         let mut matches = Vec::new();
 
         for trigger in triggers.values() {
@@ -163,15 +214,13 @@ impl TriggerEngine {
             }
 
             let matched = match &trigger.condition {
-                TriggerCondition::RegexAppear(pattern) => {
-                    match Regex::new(pattern) {
-                        Ok(re) => re.is_match(output),
-                        Err(e) => {
-                            warn!(trigger_id = %trigger.id, error = %e, "Invalid regex pattern");
-                            false
-                        }
+                TriggerCondition::RegexAppear(pattern) => match Regex::new(pattern) {
+                    Ok(re) => re.is_match(output),
+                    Err(e) => {
+                        warn!(trigger_id = %trigger.id, error = %e, "Invalid regex pattern");
+                        false
                     }
-                }
+                },
                 TriggerCondition::ExactMatch(text) => output.contains(text),
             };
 
@@ -223,10 +272,13 @@ mod tests {
         let path = dir.path().join("triggers.json");
         let bus = Arc::new(EventBus::new());
         let first = TriggerEngine::with_path(bus.clone(), path.clone());
-        let id = first.create_trigger(make_trigger(
-            "notify", TriggerCondition::ExactMatch("hello".into()),
-            TriggerAction::ShowNotification("hello".into()),
-        )).unwrap();
+        let id = first
+            .create_trigger(make_trigger(
+                "notify",
+                TriggerCondition::ExactMatch("hello".into()),
+                TriggerAction::ShowNotification("hello".into()),
+            ))
+            .unwrap();
         first.toggle_trigger(id).unwrap();
         let restarted = TriggerEngine::with_path(bus, path);
         let triggers = restarted.list_triggers().unwrap();
@@ -271,7 +323,9 @@ mod tests {
             TriggerAction::ShowNotification("error code".to_string()),
         );
         eng.create_trigger(t.clone()).unwrap();
-        let matches = eng.check_output("Got error 42 from server", Uuid::new_v4()).unwrap();
+        let matches = eng
+            .check_output("Got error 42 from server", Uuid::new_v4())
+            .unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].trigger_id, t.id);
     }
@@ -279,12 +333,14 @@ mod tests {
     #[test]
     fn test_invalid_regex_is_rejected_before_activation() {
         let eng = make_engine();
-        assert!(eng.create_trigger(make_trigger(
-            "bad",
-            // 未闭合的括号,Regex::new 必失败
-            TriggerCondition::RegexAppear("(unclosed".to_string()),
-            TriggerAction::Disconnect,
-        )).is_err());
+        assert!(eng
+            .create_trigger(make_trigger(
+                "bad",
+                // 未闭合的括号,Regex::new 必失败
+                TriggerCondition::RegexAppear("(unclosed".to_string()),
+                TriggerAction::Disconnect,
+            ))
+            .is_err());
         let matches = eng.check_output("anything", Uuid::new_v4()).unwrap();
         assert!(matches.is_empty());
     }

@@ -37,7 +37,10 @@ impl QuickCommandService {
     pub fn with_path(event_bus: Arc<EventBus>, path: PathBuf) -> Self {
         let (commands, writable) = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<Vec<QuickCommand>>(&bytes) {
-                Ok(items) => (items.into_iter().map(|item| (item.id, item)).collect(), true),
+                Ok(items) => (
+                    items.into_iter().map(|item| (item.id, item)).collect(),
+                    true,
+                ),
                 Err(error) => {
                     warn!(path = %path.display(), %error, "Quick command file is invalid; leaving it untouched");
                     (HashMap::new(), false)
@@ -49,28 +52,43 @@ impl QuickCommandService {
                 (HashMap::new(), false)
             }
         };
-        Self { commands: Arc::new(RwLock::new(commands)), event_bus, path: Some(path), read_only: !writable }
+        Self {
+            commands: Arc::new(RwLock::new(commands)),
+            event_bus,
+            path: Some(path),
+            read_only: !writable,
+        }
     }
 
     fn persist(&self, commands: &HashMap<Uuid, QuickCommand>) -> Result<(), CoreError> {
         if self.read_only {
-            return Err(CoreError::StorageError("Quick command file could not be read; preserving it without changes".into()));
+            return Err(CoreError::StorageError(
+                "Quick command file could not be read; preserving it without changes".into(),
+            ));
         }
-        let Some(path) = &self.path else { return Ok(()); };
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         let items: Vec<_> = commands.values().cloned().collect();
-        let bytes = serde_json::to_vec_pretty(&items).map_err(|e| CoreError::StorageError(e.to_string()))?;
+        let bytes = serde_json::to_vec_pretty(&items)
+            .map_err(|e| CoreError::StorageError(e.to_string()))?;
         persist_json(path, &bytes)
     }
 
     /// 创建快速命令
     pub fn create_command(&self, command: QuickCommand) -> Result<Uuid, CoreError> {
         if command.name.trim().is_empty() || command.command.trim().is_empty() {
-            return Err(CoreError::InvalidState("Quick command name and text are required".into()));
+            return Err(CoreError::InvalidState(
+                "Quick command name and text are required".into(),
+            ));
         }
         let id = command.id;
         info!(command_id = %id, name = %command.name, "Creating quick command");
 
-        let mut commands = self.commands.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut commands = self
+            .commands
+            .write()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         let mut updated = commands.clone();
         updated.insert(id, command);
         self.persist(&updated)?;
@@ -86,10 +104,16 @@ impl QuickCommandService {
     pub fn delete_command(&self, command_id: Uuid) -> Result<(), CoreError> {
         info!(command_id = %command_id, "Deleting quick command");
 
-        let mut commands = self.commands.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut commands = self
+            .commands
+            .write()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         if !commands.contains_key(&command_id) {
             warn!(command_id = %command_id, "Quick command not found");
-            return Err(CoreError::NotFound(format!("Quick command {} not found", command_id)));
+            return Err(CoreError::NotFound(format!(
+                "Quick command {} not found",
+                command_id
+            )));
         }
         let mut updated = commands.clone();
         updated.remove(&command_id);
@@ -104,22 +128,31 @@ impl QuickCommandService {
 
     /// 获取所有快速命令
     pub fn list_commands(&self) -> Result<Vec<QuickCommand>, CoreError> {
-        let commands = self.commands.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let commands = self
+            .commands
+            .read()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         Ok(commands.values().cloned().collect())
     }
 
     /// 获取指定快速命令
     pub fn get_command(&self, command_id: Uuid) -> Result<Option<QuickCommand>, CoreError> {
-        let commands = self.commands.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let commands = self
+            .commands
+            .read()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         Ok(commands.get(&command_id).cloned())
     }
 
     /// 获取快速命令的文本内容（含可选回车）
     pub fn get_command_text(&self, command_id: Uuid) -> Result<Vec<u8>, CoreError> {
-        let commands = self.commands.read().map_err(|e| CoreError::Internal(e.to_string()))?;
-        let cmd = commands
-            .get(&command_id)
-            .ok_or_else(|| CoreError::NotFound(format!("Quick command {} not found", command_id)))?;
+        let commands = self
+            .commands
+            .read()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let cmd = commands.get(&command_id).ok_or_else(|| {
+            CoreError::NotFound(format!("Quick command {} not found", command_id))
+        })?;
 
         let mut text = cmd.command.clone();
         if cmd.send_enter {
@@ -136,10 +169,13 @@ impl QuickCommandService {
         active_session: Option<Uuid>,
         all_sessions: &[Uuid],
     ) -> Result<Vec<Uuid>, CoreError> {
-        let commands = self.commands.read().map_err(|e| CoreError::Internal(e.to_string()))?;
-        let cmd = commands
-            .get(&command_id)
-            .ok_or_else(|| CoreError::NotFound(format!("Quick command {} not found", command_id)))?;
+        let commands = self
+            .commands
+            .read()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let cmd = commands.get(&command_id).ok_or_else(|| {
+            CoreError::NotFound(format!("Quick command {} not found", command_id))
+        })?;
 
         let targets = match &cmd.scope {
             QuickCommandScope::CurrentSession => {
@@ -195,7 +231,9 @@ mod tests {
         let path = dir.path().join("quick-commands.json");
         let bus = Arc::new(EventBus::new());
         let first = QuickCommandService::with_path(bus.clone(), path.clone());
-        let id = first.create_command(make_cmd("list", "ls", QuickCommandScope::CurrentSession)).unwrap();
+        let id = first
+            .create_command(make_cmd("list", "ls", QuickCommandScope::CurrentSession))
+            .unwrap();
         let restarted = QuickCommandService::with_path(bus, path);
         assert_eq!(restarted.get_command(id).unwrap().unwrap().command, "ls");
         restarted.delete_command(id).unwrap();

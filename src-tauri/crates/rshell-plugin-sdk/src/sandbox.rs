@@ -226,7 +226,9 @@ impl WasmSandbox {
 
     /// Remove a compiled module when its plugin is unloaded.
     pub fn unload(&self, name: &str) {
-        self.modules.lock().expect("modules mutex poisoned")
+        self.modules
+            .lock()
+            .expect("modules mutex poisoned")
             .retain(|(module_name, _)| module_name != name);
     }
 
@@ -252,13 +254,10 @@ impl WasmSandbox {
         // 每个调用独立 Store 以隔离状态
         let mut store = Store::new(&self.engine, ());
         // 初始 fuel：约 1ms → 1000 fuel 的比例
-        let initial_fuel = self
-            .config
-            .max_execution_time_ms
-            .saturating_mul(1_000);
-        store.set_fuel(initial_fuel).map_err(|e| {
-            SandboxError::ExecutionError(format!("set_fuel failed: {}", e))
-        })?;
+        let initial_fuel = self.config.max_execution_time_ms.saturating_mul(1_000);
+        store
+            .set_fuel(initial_fuel)
+            .map_err(|e| SandboxError::ExecutionError(format!("set_fuel failed: {}", e)))?;
 
         let instance = Instance::new(&mut store, &module, &[])
             .map_err(|e| SandboxError::ExecutionError(format!("instantiate: {}", e)))?;
@@ -384,19 +383,24 @@ mod tests {
 
     #[test]
     fn test_string_marshal_roundtrip() {
-        use wat::parse_str;
         use wasmtime::{Instance, Memory, Store};
+        use wat::parse_str;
 
         let bytes = parse_str(ECHO_WAT).expect("valid wat");
         let sandbox = WasmSandbox::default();
-        let module = WasmModule { name: "echo".to_string(), bytes };
+        let module = WasmModule {
+            name: "echo".to_string(),
+            bytes,
+        };
         sandbox.load(&module).unwrap();
 
         // 自己 instance 一个, 拿 Memory, 调 marshal / unmarshal
         let mut store = Store::new(&sandbox.engine, ());
         let instance = Instance::new(&mut store, &sandbox_module(&sandbox, "echo").unwrap(), &[])
             .expect("instantiate");
-        let memory: Memory = instance.get_memory(&mut store, "memory").expect("memory export");
+        let memory: Memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("memory export");
 
         let input = "hello, rshell plugin";
         let (ptr, len) = marshal_string_input(&memory, &mut store, input).expect("marshal");
@@ -410,17 +414,28 @@ mod tests {
 
     #[test]
     fn test_string_marshal_rejects_oversize() {
-        use wat::parse_str;
         use wasmtime::{Instance, Memory, Store};
+        use wat::parse_str;
 
         let bytes = parse_str(ECHO_WAT).expect("valid wat");
         let sandbox = WasmSandbox::default();
-        sandbox.load(&WasmModule { name: "echo_big".to_string(), bytes }).unwrap();
+        sandbox
+            .load(&WasmModule {
+                name: "echo_big".to_string(),
+                bytes,
+            })
+            .unwrap();
 
         let mut store = Store::new(&sandbox.engine, ());
-        let instance = Instance::new(&mut store, &sandbox_module(&sandbox, "echo_big").unwrap(), &[])
-            .expect("instantiate");
-        let memory: Memory = instance.get_memory(&mut store, "memory").expect("memory export");
+        let instance = Instance::new(
+            &mut store,
+            &sandbox_module(&sandbox, "echo_big").unwrap(),
+            &[],
+        )
+        .expect("instantiate");
+        let memory: Memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("memory export");
 
         // 1 page = 64 KiB; 超过会被拒
         let big = "x".repeat(64 * 1024 + 1);
@@ -431,6 +446,9 @@ mod tests {
     /// 内部 helper: 拿已加载模块的克隆 (用 load 缓存的, 走 sandbox.modules)
     fn sandbox_module(sandbox: &WasmSandbox, name: &str) -> Option<wasmtime::Module> {
         let modules = sandbox.modules.lock().unwrap();
-        modules.iter().find(|(n, _)| n == name).map(|(_, m)| m.clone())
+        modules
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, m)| m.clone())
     }
 }

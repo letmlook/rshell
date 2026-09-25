@@ -2,7 +2,9 @@
 //!
 //! 使用 ring 库实现 AES-256-GCM 对称加密。
 
-use ring::aead::{self, Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, NONCE_LEN};
+use ring::aead::{
+    self, Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, NONCE_LEN,
+};
 use ring::error::Unspecified;
 use ring::rand::{SecureRandom, SystemRandom};
 
@@ -38,8 +40,8 @@ impl NonceSequence for SimpleNonceSequence {
 /// `key` 必须是 32 字节。
 /// 返回格式：nonce (12 bytes) + ciphertext + tag (16 bytes)
 pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    let unbound_key = UnboundKey::new(&aead::AES_256_GCM, key)
-        .map_err(|_| "Invalid key".to_string())?;
+    let unbound_key =
+        UnboundKey::new(&aead::AES_256_GCM, key).map_err(|_| "Invalid key".to_string())?;
 
     let mut sealing_key = SealingKey::new(unbound_key, SimpleNonceSequence::new());
 
@@ -58,9 +60,11 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     };
 
     // 重新加密使用确定的 nonce
-    let unbound_key2 = UnboundKey::new(&aead::AES_256_GCM, key)
-        .map_err(|_| "Invalid key".to_string())?;
-    let nonce_seq = FixedNonceSequence { nonce: nonce_for_storage };
+    let unbound_key2 =
+        UnboundKey::new(&aead::AES_256_GCM, key).map_err(|_| "Invalid key".to_string())?;
+    let nonce_seq = FixedNonceSequence {
+        nonce: nonce_for_storage,
+    };
     let mut sealing_key2 = SealingKey::new(unbound_key2, nonce_seq);
     let mut in_out2 = plaintext.to_vec();
     sealing_key2
@@ -84,11 +88,13 @@ pub fn decrypt(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
 
     let (nonce_bytes, encrypted) = ciphertext.split_at(NONCE_LEN);
 
-    let unbound_key = UnboundKey::new(&aead::AES_256_GCM, key)
-        .map_err(|_| "Invalid key".to_string())?;
+    let unbound_key =
+        UnboundKey::new(&aead::AES_256_GCM, key).map_err(|_| "Invalid key".to_string())?;
 
     let nonce_seq = FixedNonceSequence {
-        nonce: nonce_bytes.try_into().map_err(|_| "Invalid nonce".to_string())?,
+        nonce: nonce_bytes
+            .try_into()
+            .map_err(|_| "Invalid nonce".to_string())?,
     };
 
     let mut opening_key = OpeningKey::new(unbound_key, nonce_seq);

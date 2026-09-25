@@ -55,7 +55,9 @@ impl MasterPassword {
     pub async fn setup(&self, password: &str) -> Result<(), CoreError> {
         let current_state = self.state.read().await.clone();
         if current_state != MasterPasswordState::NotSet {
-            return Err(CoreError::InvalidState("Master password already set".into()));
+            return Err(CoreError::InvalidState(
+                "Master password already set".into(),
+            ));
         }
 
         info!("Setting up master password");
@@ -77,7 +79,8 @@ impl MasterPassword {
         *self.derived_key.write().await = Some(derived);
         *self.state.write().await = MasterPasswordState::Unlocked;
 
-        self.event_bus.publish(AppEvent::MasterPasswordChanged { is_set: true });
+        self.event_bus
+            .publish(AppEvent::MasterPasswordChanged { is_set: true });
 
         info!("Master password set successfully");
         Ok(())
@@ -94,7 +97,9 @@ impl MasterPassword {
         let encrypted_token = self.encrypted_token.read().await;
 
         let (Some(salt), Some(encrypted_token)) = (salt.as_ref(), encrypted_token.as_ref()) else {
-            return Err(CoreError::InvalidState("Master password data missing".into()));
+            return Err(CoreError::InvalidState(
+                "Master password data missing".into(),
+            ));
         };
 
         // 派生密钥
@@ -107,27 +112,36 @@ impl MasterPassword {
                     *self.derived_key.write().await = Some(derived);
                     *self.state.write().await = MasterPasswordState::Unlocked;
                     info!("Master password verified successfully");
-                    self.event_bus.publish(AppEvent::MasterPasswordVerified { success: true });
+                    self.event_bus
+                        .publish(AppEvent::MasterPasswordVerified { success: true });
                     Ok(true)
                 } else {
                     warn!("Master password verification failed: wrong token");
-                    self.event_bus.publish(AppEvent::MasterPasswordVerified { success: false });
+                    self.event_bus
+                        .publish(AppEvent::MasterPasswordVerified { success: false });
                     Ok(false)
                 }
             }
             Err(_) => {
                 warn!("Master password verification failed: decryption error");
-                self.event_bus.publish(AppEvent::MasterPasswordVerified { success: false });
+                self.event_bus
+                    .publish(AppEvent::MasterPasswordVerified { success: false });
                 Ok(false)
             }
         }
     }
 
     /// 修改主密码
-    pub async fn change_password(&self, old_password: &str, new_password: &str) -> Result<(), CoreError> {
+    pub async fn change_password(
+        &self,
+        old_password: &str,
+        new_password: &str,
+    ) -> Result<(), CoreError> {
         // 先验证旧密码
         if !self.verify(old_password).await? {
-            return Err(CoreError::AuthenticationFailed("Old password incorrect".into()));
+            return Err(CoreError::AuthenticationFailed(
+                "Old password incorrect".into(),
+            ));
         }
 
         info!("Changing master password");
@@ -171,11 +185,15 @@ impl MasterPassword {
     /// 加密数据（需要已解锁）
     pub async fn encrypt_data(&self, plaintext: &[u8]) -> Result<Vec<u8>, CoreError> {
         if !self.is_unlocked().await {
-            return Err(CoreError::AuthenticationFailed("Master password not unlocked".into()));
+            return Err(CoreError::AuthenticationFailed(
+                "Master password not unlocked".into(),
+            ));
         }
 
         let key = self.derived_key.read().await;
-        let key = key.as_ref().ok_or_else(|| CoreError::Internal("No derived key".into()))?;
+        let key = key
+            .as_ref()
+            .ok_or_else(|| CoreError::Internal("No derived key".into()))?;
 
         aes::encrypt(key, plaintext)
             .map_err(|e| CoreError::Internal(format!("Encryption failed: {}", e)))
@@ -184,11 +202,15 @@ impl MasterPassword {
     /// 解密数据（需要已解锁）
     pub async fn decrypt_data(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CoreError> {
         if !self.is_unlocked().await {
-            return Err(CoreError::AuthenticationFailed("Master password not unlocked".into()));
+            return Err(CoreError::AuthenticationFailed(
+                "Master password not unlocked".into(),
+            ));
         }
 
         let key = self.derived_key.read().await;
-        let key = key.as_ref().ok_or_else(|| CoreError::Internal("No derived key".into()))?;
+        let key = key
+            .as_ref()
+            .ok_or_else(|| CoreError::Internal("No derived key".into()))?;
 
         aes::decrypt(key, ciphertext)
             .map_err(|e| CoreError::Internal(format!("Decryption failed: {}", e)))

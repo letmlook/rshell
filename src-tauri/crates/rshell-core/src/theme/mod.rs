@@ -40,7 +40,10 @@ impl ThemeManager {
         // 初始化内置配色方案
         color_schemes.insert("Monokai".to_string(), Self::monokai_scheme());
         color_schemes.insert("Solarized Dark".to_string(), Self::solarized_dark_scheme());
-        color_schemes.insert("Solarized Light".to_string(), Self::solarized_light_scheme());
+        color_schemes.insert(
+            "Solarized Light".to_string(),
+            Self::solarized_light_scheme(),
+        );
         color_schemes.insert("Dracula".to_string(), Self::dracula_scheme());
         color_schemes.insert("Nord".to_string(), Self::nord_scheme());
         color_schemes.insert("Default Dark".to_string(), Self::default_dark_scheme());
@@ -60,7 +63,8 @@ impl ThemeManager {
     /// 设置应用主题
     pub async fn set_theme(&self, theme_name: &str) -> Result<(), CoreError> {
         let themes = self.themes.read().await;
-        let theme = themes.get(theme_name)
+        let theme = themes
+            .get(theme_name)
             .ok_or_else(|| CoreError::InvalidState(format!("Theme '{}' not found", theme_name)))?
             .clone();
         drop(themes);
@@ -77,8 +81,11 @@ impl ThemeManager {
     /// 设置终端配色方案
     pub async fn set_color_scheme(&self, scheme_name: &str) -> Result<(), CoreError> {
         let schemes = self.color_schemes.read().await;
-        let scheme = schemes.get(scheme_name)
-            .ok_or_else(|| CoreError::InvalidState(format!("Color scheme '{}' not found", scheme_name)))?
+        let scheme = schemes
+            .get(scheme_name)
+            .ok_or_else(|| {
+                CoreError::InvalidState(format!("Color scheme '{}' not found", scheme_name))
+            })?
             .clone();
         drop(schemes);
 
@@ -87,7 +94,8 @@ impl ThemeManager {
         drop(current);
 
         info!("Color scheme changed to: {}", scheme_name);
-        self.event_bus.publish(AppEvent::ColorSchemeChanged { scheme });
+        self.event_bus
+            .publish(AppEvent::ColorSchemeChanged { scheme });
         Ok(())
     }
 
@@ -167,10 +175,8 @@ impl ThemeManager {
         TerminalColorScheme {
             name: "Default Dark".to_string(),
             ansi_colors: [
-                0x000000, 0xcd0000, 0x00cd00, 0xcdcd00,
-                0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5,
-                0x7f7f7f, 0xff0000, 0x00ff00, 0xffff00,
-                0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff,
+                0x000000, 0xcd0000, 0x00cd00, 0xcdcd00, 0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5,
+                0x7f7f7f, 0xff0000, 0x00ff00, 0xffff00, 0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff,
             ],
             default_fg: 0xcdd6f4,
             default_bg: 0x1e1e2e,
@@ -185,10 +191,8 @@ impl ThemeManager {
         TerminalColorScheme {
             name: "Monokai".to_string(),
             ansi_colors: [
-                0x272822, 0xf92672, 0xa6e22e, 0xf4bf75,
-                0x66d9ef, 0xae81ff, 0xa1efe4, 0xf8f8f2,
-                0x75715e, 0xf92672, 0xa6e22e, 0xf4bf75,
-                0x66d9ef, 0xae81ff, 0xa1efe4, 0xf9f8f5,
+                0x272822, 0xf92672, 0xa6e22e, 0xf4bf75, 0x66d9ef, 0xae81ff, 0xa1efe4, 0xf8f8f2,
+                0x75715e, 0xf92672, 0xa6e22e, 0xf4bf75, 0x66d9ef, 0xae81ff, 0xa1efe4, 0xf9f8f5,
             ],
             default_fg: 0xf8f8f2,
             default_bg: 0x272822,
@@ -203,10 +207,8 @@ impl ThemeManager {
         TerminalColorScheme {
             name: "Solarized Dark".to_string(),
             ansi_colors: [
-                0x073642, 0xdc322f, 0x859900, 0xb58900,
-                0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
-                0x002b36, 0xcb4b16, 0x586e75, 0x657b83,
-                0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
+                0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
+                0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
             ],
             default_fg: 0x839496,
             default_bg: 0x002b36,
@@ -221,10 +223,8 @@ impl ThemeManager {
         TerminalColorScheme {
             name: "Solarized Light".to_string(),
             ansi_colors: [
-                0x073642, 0xdc322f, 0x859900, 0xb58900,
-                0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
-                0x002b36, 0xcb4b16, 0x586e75, 0x657b83,
-                0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
+                0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
+                0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
             ],
             default_fg: 0x657b83,
             default_bg: 0xfdf6e3,
@@ -239,10 +239,8 @@ impl ThemeManager {
         TerminalColorScheme {
             name: "Dracula".to_string(),
             ansi_colors: [
-                0x21222c, 0xff5555, 0x50fa7b, 0xf1fa8c,
-                0xbd93f9, 0xff79c6, 0x8be9fd, 0xf8f8f2,
-                0x6272a4, 0xff6e6e, 0x69ff94, 0xffffa5,
-                0xd6acff, 0xff92df, 0xa4ffff, 0xffffff,
+                0x21222c, 0xff5555, 0x50fa7b, 0xf1fa8c, 0xbd93f9, 0xff79c6, 0x8be9fd, 0xf8f8f2,
+                0x6272a4, 0xff6e6e, 0x69ff94, 0xffffa5, 0xd6acff, 0xff92df, 0xa4ffff, 0xffffff,
             ],
             default_fg: 0xf8f8f2,
             default_bg: 0x282a36,
@@ -257,10 +255,8 @@ impl ThemeManager {
         TerminalColorScheme {
             name: "Nord".to_string(),
             ansi_colors: [
-                0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b,
-                0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0,
-                0x4c566a, 0xbf616a, 0xa3be8c, 0xebcb8b,
-                0x81a1c1, 0xb48ead, 0x8fbcbb, 0xeceff4,
+                0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0,
+                0x4c566a, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x8fbcbb, 0xeceff4,
             ],
             default_fg: 0xd8dee9,
             default_bg: 0x2e3440,

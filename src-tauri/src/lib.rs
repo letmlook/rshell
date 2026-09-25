@@ -78,7 +78,8 @@ pub fn run() {
                 }
             });
             let trigger_engine = Arc::new(TriggerEngine::with_path(
-                event_bus.clone(), data_root.join("triggers.json"),
+                event_bus.clone(),
+                data_root.join("triggers.json"),
             ));
             let host_key_registry = Arc::new(HostKeyDecisionRegistry::new(event_bus.clone()));
 
@@ -98,10 +99,8 @@ pub fn run() {
                 TunnelManager::new(event_bus.clone())
                     .with_persistence(data_root.join("tunnels.toml")),
             );
-            let host_key_manager = Arc::new(HostKeyManager::new(
-                known_hosts_path,
-                event_bus.clone(),
-            ));
+            let host_key_manager =
+                Arc::new(HostKeyManager::new(known_hosts_path, event_bus.clone()));
             let theme_manager = Arc::new(ThemeManager::new(event_bus.clone()));
 
             // SessionService restores saved sessions during construction.

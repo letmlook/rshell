@@ -2,16 +2,16 @@
 //!
 //! 管理 SSH 密钥对的生成、导入、导出和删除。
 
+use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use uuid::Uuid;
-use chrono::Utc;
 use tracing::{info, warn};
+use uuid::Uuid;
 
-use rshell_api::types::{SshKeyInfo, SshKeyType};
 use rshell_api::events::AppEvent;
+use rshell_api::types::{SshKeyInfo, SshKeyType};
 use rshell_infra::crypto::hash::sha256_fingerprint;
 
 use crate::error::CoreError;
@@ -62,42 +62,58 @@ impl KeyManager {
 
         // 使用 ssh-key crate 生成密钥
         let private_key = match key_type {
-            SshKeyType::ED25519 => {
-                ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-                    .map_err(|e| CoreError::Internal(format!("Failed to generate ED25519 key: {}", e)))?
-            }
-            SshKeyType::RSA2048 | SshKeyType::RSA4096 => {
-                ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Rsa { hash: Some(ssh_key::HashAlg::Sha256) })
-                    .map_err(|e| CoreError::Internal(format!("Failed to generate RSA key: {}", e)))?
-            }
-            SshKeyType::ECDSA256 => {
-                ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ecdsa { curve: ssh_key::EcdsaCurve::NistP256 })
-                    .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {}", e)))?
-            }
-            SshKeyType::ECDSA384 => {
-                ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ecdsa { curve: ssh_key::EcdsaCurve::NistP384 })
-                    .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {}", e)))?
-            }
-            SshKeyType::ECDSA521 => {
-                ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ecdsa { curve: ssh_key::EcdsaCurve::NistP521 })
-                    .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {}", e)))?
-            }
+            SshKeyType::ED25519 => ssh_key::PrivateKey::random(
+                &mut ssh_key::rand_core::OsRng,
+                ssh_key::Algorithm::Ed25519,
+            )
+            .map_err(|e| CoreError::Internal(format!("Failed to generate ED25519 key: {}", e)))?,
+            SshKeyType::RSA2048 | SshKeyType::RSA4096 => ssh_key::PrivateKey::random(
+                &mut ssh_key::rand_core::OsRng,
+                ssh_key::Algorithm::Rsa {
+                    hash: Some(ssh_key::HashAlg::Sha256),
+                },
+            )
+            .map_err(|e| CoreError::Internal(format!("Failed to generate RSA key: {}", e)))?,
+            SshKeyType::ECDSA256 => ssh_key::PrivateKey::random(
+                &mut ssh_key::rand_core::OsRng,
+                ssh_key::Algorithm::Ecdsa {
+                    curve: ssh_key::EcdsaCurve::NistP256,
+                },
+            )
+            .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {}", e)))?,
+            SshKeyType::ECDSA384 => ssh_key::PrivateKey::random(
+                &mut ssh_key::rand_core::OsRng,
+                ssh_key::Algorithm::Ecdsa {
+                    curve: ssh_key::EcdsaCurve::NistP384,
+                },
+            )
+            .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {}", e)))?,
+            SshKeyType::ECDSA521 => ssh_key::PrivateKey::random(
+                &mut ssh_key::rand_core::OsRng,
+                ssh_key::Algorithm::Ecdsa {
+                    curve: ssh_key::EcdsaCurve::NistP521,
+                },
+            )
+            .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {}", e)))?,
         };
 
         // 获取公钥
         let public_key = private_key.public_key();
-        let public_key_blob = public_key.to_bytes()
+        let public_key_blob = public_key
+            .to_bytes()
             .map_err(|e| CoreError::Internal(format!("Failed to encode public key: {}", e)))?;
 
         // 计算指纹
         let fingerprint = sha256_fingerprint(&public_key_blob);
 
         // 编码公钥为 OpenSSH 格式
-        let public_key_str = public_key.to_openssh()
+        let public_key_str = public_key
+            .to_openssh()
             .map_err(|e| CoreError::Internal(format!("Failed to encode public key: {}", e)))?;
 
         // 编码私钥 - to_openssh 返回 Zeroizing<String>，需要转换为 bytes
-        let private_key_string = private_key.to_openssh(ssh_key::LineEnding::LF)
+        let private_key_string = private_key
+            .to_openssh(ssh_key::LineEnding::LF)
             .map_err(|e| CoreError::Internal(format!("Failed to encode private key: {}", e)))?;
         let private_key_data = private_key_string.to_string().into_bytes();
 
@@ -137,10 +153,15 @@ impl KeyManager {
         };
 
         // 发布事件（同步调用）
-        self.event_bus.publish(AppEvent::SshKeyGenerated { key: key_info.clone() });
+        self.event_bus.publish(AppEvent::SshKeyGenerated {
+            key: key_info.clone(),
+        });
         self.event_bus.publish(AppEvent::SshKeyListChanged);
 
-        info!("SSH key generated: id={}, fingerprint={}", id, key_info.fingerprint);
+        info!(
+            "SSH key generated: id={}, fingerprint={}",
+            id, key_info.fingerprint
+        );
         Ok(key_info)
     }
 
@@ -162,7 +183,8 @@ impl KeyManager {
 
         // 获取公钥信息
         let public_key = private_key.public_key();
-        let public_key_blob = public_key.to_bytes()
+        let public_key_blob = public_key
+            .to_bytes()
             .map_err(|e| CoreError::Internal(format!("Failed to encode public key: {}", e)))?;
         let fingerprint = sha256_fingerprint(&public_key_blob);
 
@@ -177,7 +199,8 @@ impl KeyManager {
             _ => SshKeyType::ED25519,
         };
 
-        let public_key_str = public_key.to_openssh()
+        let public_key_str = public_key
+            .to_openssh()
             .map_err(|e| CoreError::Internal(format!("Failed to encode public key: {}", e)))?;
 
         let id = Uuid::new_v4();
@@ -219,10 +242,15 @@ impl KeyManager {
             created_at: now,
         };
 
-        self.event_bus.publish(AppEvent::SshKeyGenerated { key: key_info.clone() });
+        self.event_bus.publish(AppEvent::SshKeyGenerated {
+            key: key_info.clone(),
+        });
         self.event_bus.publish(AppEvent::SshKeyListChanged);
 
-        info!("SSH key imported: id={}, fingerprint={}", id, key_info.fingerprint);
+        info!(
+            "SSH key imported: id={}, fingerprint={}",
+            id, key_info.fingerprint
+        );
         Ok(key_info)
     }
 

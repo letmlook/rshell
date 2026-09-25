@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 /// Unix PTY
 pub struct UnixPty {
@@ -35,16 +35,19 @@ impl UnixPty {
                     debug!("Unix PTY created via /dev/ptmx");
                     Ok(pty)
                 }
-                Err(e) => {
-                    Err(PtyError::CreationFailed(format!("Failed to create PTY: {}", e)))
-                }
+                Err(e) => Err(PtyError::CreationFailed(format!(
+                    "Failed to create PTY: {}",
+                    e
+                ))),
             }
         }
 
         #[cfg(not(unix))]
         {
             let _ = (rows, cols);
-            Err(PtyError::CreationFailed("Unix PTY not supported on this platform".to_string()))
+            Err(PtyError::CreationFailed(
+                "Unix PTY not supported on this platform".to_string(),
+            ))
         }
     }
 
@@ -99,9 +102,7 @@ impl UnixPty {
                 ws_ypixel: 0,
             };
 
-            let ret = unsafe {
-                libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws)
-            };
+            let ret = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
 
             if ret != 0 {
                 return Err(io::Error::last_os_error());

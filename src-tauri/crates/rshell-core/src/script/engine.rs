@@ -5,8 +5,8 @@
 
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
-use rshell_api::types::ScriptResult;
 use rhai::{Engine, EvalAltResult, Scope, AST};
+use rshell_api::types::ScriptResult;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -75,19 +75,34 @@ impl ScriptEngine {
 
         if let Some(host) = host {
             let send_host = host.clone();
-            engine.register_fn("rshell_send", move |session: String, text: String| -> Result<(), Box<EvalAltResult>> {
-                let id = Uuid::parse_str(&session).map_err(rhai_error)?;
-                send_host.send_text(id, &text).map_err(rhai_error)
-            });
+            engine.register_fn(
+                "rshell_send",
+                move |session: String, text: String| -> Result<(), Box<EvalAltResult>> {
+                    let id = Uuid::parse_str(&session).map_err(rhai_error)?;
+                    send_host.send_text(id, &text).map_err(rhai_error)
+                },
+            );
             let list_host = host.clone();
-            engine.register_fn("rshell_list_sessions", move || -> Result<rhai::Array, Box<EvalAltResult>> {
-                Ok(list_host.list_sessions().map_err(rhai_error)?.into_iter().map(|id| id.to_string().into()).collect())
-            });
-            engine.register_fn("rshell_execute_quick_command", move |command: String, session: String| -> Result<(), Box<EvalAltResult>> {
-                let command_id = Uuid::parse_str(&command).map_err(rhai_error)?;
-                let session_id = Uuid::parse_str(&session).map_err(rhai_error)?;
-                host.execute_quick_command(command_id, session_id).map_err(rhai_error)
-            });
+            engine.register_fn(
+                "rshell_list_sessions",
+                move || -> Result<rhai::Array, Box<EvalAltResult>> {
+                    Ok(list_host
+                        .list_sessions()
+                        .map_err(rhai_error)?
+                        .into_iter()
+                        .map(|id| id.to_string().into())
+                        .collect())
+                },
+            );
+            engine.register_fn(
+                "rshell_execute_quick_command",
+                move |command: String, session: String| -> Result<(), Box<EvalAltResult>> {
+                    let command_id = Uuid::parse_str(&command).map_err(rhai_error)?;
+                    let session_id = Uuid::parse_str(&session).map_err(rhai_error)?;
+                    host.execute_quick_command(command_id, session_id)
+                        .map_err(rhai_error)
+                },
+            );
         }
 
         // 当前 Unix epoch 毫秒
@@ -106,15 +121,16 @@ impl ScriptEngine {
 
         // 把字符串解析为 UUID, 失败返回空串
         engine.register_fn("rshell_parse_uuid", |s: &str| -> String {
-            Uuid::parse_str(s).map(|u| u.to_string()).unwrap_or_default()
+            Uuid::parse_str(s)
+                .map(|u| u.to_string())
+                .unwrap_or_default()
         });
 
         // 比较两个版本字符串 (semver-ish: "1.2.3" vs "1.2.4")
         // 返回 -1 / 0 / 1 (统一 i64 便于 rhai 直接 == 比较)
         engine.register_fn("rshell_version_compare", |a: &str, b: &str| -> i64 {
-            let parse = |s: &str| -> Vec<u64> {
-                s.split('.').filter_map(|p| p.parse().ok()).collect()
-            };
+            let parse =
+                |s: &str| -> Vec<u64> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
             let av = parse(a);
             let bv = parse(b);
             for i in 0..av.len().max(bv.len()) {
@@ -130,26 +146,38 @@ impl ScriptEngine {
             0
         });
 
-        Self {
-            engine,
-            event_bus,
-        }
+        Self { engine, event_bus }
     }
 
     /// 执行脚本字符串
-    pub fn execute_string(&self, code: &str, context: &ScriptContext) -> Result<ScriptResult, CoreError> {
+    pub fn execute_string(
+        &self,
+        code: &str,
+        context: &ScriptContext,
+    ) -> Result<ScriptResult, CoreError> {
         info!(session_id = %context.session_id, "Executing script");
 
         let mut scope = Scope::new();
         scope.push("session_id", context.session_id.to_string());
-        scope.push("target_sessions", context.target_sessions.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","));
+        scope.push(
+            "target_sessions",
+            context
+                .target_sessions
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
 
         // 注入变量
         for (key, value) in &context.variables {
             scope.push(key.as_str(), value.clone());
         }
 
-        match self.engine.eval_with_scope::<rhai::Dynamic>(&mut scope, code) {
+        match self
+            .engine
+            .eval_with_scope::<rhai::Dynamic>(&mut scope, code)
+        {
             Ok(result) => {
                 let output = format!("{:?}", result);
                 debug!(output = %output, "Script executed successfully");
@@ -178,7 +206,11 @@ impl ScriptEngine {
     }
 
     /// 执行已编译的 AST
-    pub fn execute_ast(&self, ast: &AST, context: &ScriptContext) -> Result<ScriptResult, CoreError> {
+    pub fn execute_ast(
+        &self,
+        ast: &AST,
+        context: &ScriptContext,
+    ) -> Result<ScriptResult, CoreError> {
         let mut scope = Scope::new();
         scope.push("session_id", context.session_id.to_string());
 
@@ -186,7 +218,10 @@ impl ScriptEngine {
             scope.push(key.as_str(), value.clone());
         }
 
-        match self.engine.eval_ast_with_scope::<rhai::Dynamic>(&mut scope, ast) {
+        match self
+            .engine
+            .eval_ast_with_scope::<rhai::Dynamic>(&mut scope, ast)
+        {
             Ok(result) => {
                 let output = format!("{:?}", result);
                 Ok(ScriptResult {
@@ -223,11 +258,20 @@ mod tests {
 
     impl ScriptHost for FakeHost {
         fn send_text(&self, session_id: Uuid, text: &str) -> Result<(), CoreError> {
-            self.sent.lock().unwrap().push((session_id, text.to_owned()));
+            self.sent
+                .lock()
+                .unwrap()
+                .push((session_id, text.to_owned()));
             Ok(())
         }
-        fn list_sessions(&self) -> Result<Vec<Uuid>, CoreError> { Ok(vec![Uuid::nil()]) }
-        fn execute_quick_command(&self, command_id: Uuid, session_id: Uuid) -> Result<(), CoreError> {
+        fn list_sessions(&self) -> Result<Vec<Uuid>, CoreError> {
+            Ok(vec![Uuid::nil()])
+        }
+        fn execute_quick_command(
+            &self,
+            command_id: Uuid,
+            session_id: Uuid,
+        ) -> Result<(), CoreError> {
             self.quick.lock().unwrap().push((command_id, session_id));
             Ok(())
         }
@@ -237,9 +281,17 @@ mod tests {
     fn host_api_sends_exact_text_and_lists_sessions() {
         let host = Arc::new(FakeHost::default());
         let engine = ScriptEngine::with_host(Arc::new(EventBus::new()), host.clone());
-        let result = engine.execute_string("rshell_send(session_id, \"clear\\n\"); rshell_list_sessions().len", &empty_ctx()).unwrap();
+        let result = engine
+            .execute_string(
+                "rshell_send(session_id, \"clear\\n\"); rshell_list_sessions().len",
+                &empty_ctx(),
+            )
+            .unwrap();
         assert!(result.success, "{result:?}");
-        assert_eq!(host.sent.lock().unwrap().as_slice(), &[(Uuid::nil(), "clear\n".into())]);
+        assert_eq!(
+            host.sent.lock().unwrap().as_slice(),
+            &[(Uuid::nil(), "clear\n".into())]
+        );
         assert_eq!(result.output, "1");
     }
 
@@ -251,7 +303,9 @@ mod tests {
         let code = format!("rshell_execute_quick_command(\"{id}\", session_id)");
         assert!(engine.execute_string(&code, &empty_ctx()).unwrap().success);
         assert_eq!(host.quick.lock().unwrap().as_slice(), &[(id, Uuid::nil())]);
-        let failure = engine.execute_string("rshell_send(\"bad-id\", \"x\")", &empty_ctx()).unwrap();
+        let failure = engine
+            .execute_string("rshell_send(\"bad-id\", \"x\")", &empty_ctx())
+            .unwrap();
         assert!(!failure.success);
         assert!(failure.error.unwrap().contains("invalid"));
     }
@@ -271,7 +325,9 @@ mod tests {
     #[test]
     fn test_rshell_log_does_not_error() {
         let eng = make_engine();
-        let r = eng.execute_string("rshell_log(\"hi\");", &empty_ctx()).unwrap();
+        let r = eng
+            .execute_string("rshell_log(\"hi\");", &empty_ctx())
+            .unwrap();
         assert!(r.success);
     }
 

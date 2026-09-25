@@ -6,7 +6,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::{ActiveTunnelInfo, AppTheme, ConnectionInfo, ConnectionState, ScriptResult, SshKeyInfo, TerminalColorScheme, TunnelState};
+use crate::types::{
+    ActiveTunnelInfo, AppTheme, ConnectionInfo, ConnectionState, ScriptResult, SshKeyInfo,
+    TerminalColorScheme, TunnelState,
+};
 
 /// 后端发布的所有事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +50,11 @@ pub enum AppEvent {
     /// 传输队列改变
     TransferQueueChanged,
     /// 传输任务已添加
-    TransferTaskAdded { task_id: Uuid, filename: String, direction: crate::types::TransferDirection },
+    TransferTaskAdded {
+        task_id: Uuid,
+        filename: String,
+        direction: crate::types::TransferDirection,
+    },
     /// 传输任务已完成
     TransferTaskCompleted { task_id: Uuid },
     /// 传输任务已失败
@@ -89,7 +96,11 @@ pub enum AppEvent {
         session_id: Uuid,
         action_summary: String,
     },
-    TriggerActionFailed { trigger_id: Uuid, session_id: Uuid, error: String },
+    TriggerActionFailed {
+        trigger_id: Uuid,
+        session_id: Uuid,
+        error: String,
+    },
     /// 待重建隧道列表变化 (从磁盘恢复但未在本次进程启动)
     PendingTunnelsSnapshot {
         rules: Vec<(Uuid, crate::types::PortForwardRule)>,
@@ -130,10 +141,12 @@ pub enum AppEvent {
     /// 插件列表已更新
     PluginListUpdated,
     /// 插件状态已变化
-    PluginStateChanged { plugin_id: String, state: crate::types::PluginState },
+    PluginStateChanged {
+        plugin_id: String,
+        state: crate::types::PluginState,
+    },
     /// 插件加载失败
     PluginLoadFailed { plugin_id: String, error: String },
-
     // 切片 2.2 删除：7 个 *Snapshot 事件 + ClipboardCopy + RemoteDirListed —— 设计 §3.3
     //   "ListX" 读命令统一改为返回 CommandOutcome 变体（不通过事件总线带数据）。
     //   剪贴板上移前端 xterm 自持选区(设计 §5)。

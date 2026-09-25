@@ -227,7 +227,10 @@ impl HostKeyManager {
             last_seen: now,
         };
 
-        self.entries.write().expect("host key lock poisoned").insert(key, entry);
+        self.entries
+            .write()
+            .expect("host key lock poisoned")
+            .insert(key, entry);
         self.save_known_hosts()?;
 
         info!("Host key trusted: {}:{}", host, port);
@@ -237,7 +240,10 @@ impl HostKeyManager {
     /// 删除主机密钥
     pub async fn delete_host_key(&self, host: &str, port: u16) -> Result<(), CoreError> {
         let key = format!("{}:{}", host, port);
-        self.entries.write().expect("host key lock poisoned").remove(&key);
+        self.entries
+            .write()
+            .expect("host key lock poisoned")
+            .remove(&key);
         self.save_known_hosts()?;
         info!("Host key deleted: {}:{}", host, port);
         Ok(())
@@ -245,7 +251,12 @@ impl HostKeyManager {
 
     /// 列出所有已知主机
     pub async fn list_hosts(&self) -> Vec<HostKeyEntry> {
-        self.entries.read().expect("host key lock poisoned").values().cloned().collect()
+        self.entries
+            .read()
+            .expect("host key lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// 更新最后访问时间
@@ -295,9 +306,20 @@ mod tests {
         let path = dir.path().join("known_hosts");
         let bus = Arc::new(EventBus::new());
         let manager = HostKeyManager::new(path.clone(), bus.clone());
-        manager.trust_host_key("example.test", 2222, "ssh-ed25519", "AAAAkey").await.unwrap();
-        assert!(std::fs::read_to_string(&path).unwrap().contains("[example.test]:2222 ssh-ed25519 AAAAkey"));
+        manager
+            .trust_host_key("example.test", 2222, "ssh-ed25519", "AAAAkey")
+            .await
+            .unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("[example.test]:2222 ssh-ed25519 AAAAkey"));
         let restored = HostKeyManager::new(path, bus);
-        assert_eq!(restored.check_host_key("example.test", 2222, "ssh-ed25519", "AAAAkey").await.unwrap(), Some(true));
+        assert_eq!(
+            restored
+                .check_host_key("example.test", 2222, "ssh-ed25519", "AAAAkey")
+                .await
+                .unwrap(),
+            Some(true)
+        );
     }
 }

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::{
-    ActiveTunnelInfo, PendingTunnelInfo, PluginInfo, QuickCommand, RemoteFileEntry,
-    SessionConfig, SshKeyInfo, ThemeInfo, TransferTaskInfo, Trigger,
+    ActiveTunnelInfo, PendingTunnelInfo, PluginInfo, QuickCommand, RemoteFileEntry, SessionConfig,
+    SshKeyInfo, ThemeInfo, TransferTaskInfo, Trigger,
 };
 
 /// 读命令返回结构化数据;写命令返回 `None`。
@@ -85,20 +85,50 @@ mod tests {
         assert_eq!(CommandOutcome::None.kind(), "none");
         assert_eq!(CommandOutcome::SessionId(Uuid::nil()).kind(), "session_id");
         assert_eq!(CommandOutcome::Triggers(Vec::new()).kind(), "triggers");
-        assert_eq!(CommandOutcome::QuickCommands(Vec::new()).kind(), "quick_commands");
+        assert_eq!(
+            CommandOutcome::QuickCommands(Vec::new()).kind(),
+            "quick_commands"
+        );
         assert_eq!(CommandOutcome::Verified(true).kind(), "verified");
-        assert_eq!(CommandOutcome::Themes(crate::types::ThemeInfo {
-            current_theme: String::new(),
-            current_scheme: String::new(),
-            current_colors: crate::types::ThemeColors { background: 0, foreground: 0, accent: 0, border: 0, sidebar_bg: 0, toolbar_bg: 0, statusbar_bg: 0, selection_bg: 0, hover_bg: 0 },
-            current_palette: crate::types::TerminalColorScheme { name: String::new(), ansi_colors: [0; 16], default_fg: 0, default_bg: 0, cursor_fg: 0, cursor_bg: 0, selection_fg: 0, selection_bg: 0 },
-            available_themes: vec![],
-            available_schemes: vec![],
-        }).kind(), "themes");
-        assert_eq!(CommandOutcome::RemoteDir {
-            path: String::new(),
-            entries: vec![],
-        }.kind(), "remote_dir");
+        assert_eq!(
+            CommandOutcome::Themes(crate::types::ThemeInfo {
+                current_theme: String::new(),
+                current_scheme: String::new(),
+                current_colors: crate::types::ThemeColors {
+                    background: 0,
+                    foreground: 0,
+                    accent: 0,
+                    border: 0,
+                    sidebar_bg: 0,
+                    toolbar_bg: 0,
+                    statusbar_bg: 0,
+                    selection_bg: 0,
+                    hover_bg: 0
+                },
+                current_palette: crate::types::TerminalColorScheme {
+                    name: String::new(),
+                    ansi_colors: [0; 16],
+                    default_fg: 0,
+                    default_bg: 0,
+                    cursor_fg: 0,
+                    cursor_bg: 0,
+                    selection_fg: 0,
+                    selection_bg: 0
+                },
+                available_themes: vec![],
+                available_schemes: vec![],
+            })
+            .kind(),
+            "themes"
+        );
+        assert_eq!(
+            CommandOutcome::RemoteDir {
+                path: String::new(),
+                entries: vec![],
+            }
+            .kind(),
+            "remote_dir"
+        );
     }
 
     /// 切片 3.3：每个 CommandOutcome 变体的契约测试 —— 序列化标签稳定
@@ -119,12 +149,34 @@ mod tests {
             CommandOutcome::Themes(crate::types::ThemeInfo {
                 current_theme: String::new(),
                 current_scheme: String::new(),
-                current_colors: crate::types::ThemeColors { background: 0, foreground: 0, accent: 0, border: 0, sidebar_bg: 0, toolbar_bg: 0, statusbar_bg: 0, selection_bg: 0, hover_bg: 0 },
-                current_palette: crate::types::TerminalColorScheme { name: String::new(), ansi_colors: [0; 16], default_fg: 0, default_bg: 0, cursor_fg: 0, cursor_bg: 0, selection_fg: 0, selection_bg: 0 },
+                current_colors: crate::types::ThemeColors {
+                    background: 0,
+                    foreground: 0,
+                    accent: 0,
+                    border: 0,
+                    sidebar_bg: 0,
+                    toolbar_bg: 0,
+                    statusbar_bg: 0,
+                    selection_bg: 0,
+                    hover_bg: 0,
+                },
+                current_palette: crate::types::TerminalColorScheme {
+                    name: String::new(),
+                    ansi_colors: [0; 16],
+                    default_fg: 0,
+                    default_bg: 0,
+                    cursor_fg: 0,
+                    cursor_bg: 0,
+                    selection_fg: 0,
+                    selection_bg: 0,
+                },
                 available_themes: vec![],
                 available_schemes: vec![],
             }),
-            CommandOutcome::PendingTunnels(PendingTunnelInfo { rules: vec![], unsupported: vec![] }),
+            CommandOutcome::PendingTunnels(PendingTunnelInfo {
+                rules: vec![],
+                unsupported: vec![],
+            }),
             CommandOutcome::RemoteDir {
                 path: String::new(),
                 entries: vec![],

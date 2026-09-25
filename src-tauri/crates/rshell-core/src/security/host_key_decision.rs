@@ -59,7 +59,10 @@ impl HostKeyDecisionRegistry {
     /// 找不到 decision_id（UI 端超时/竞态/双重决策）时返回 false,调用方
     /// 应当视为 reject。
     pub fn resolve(&self, decision_id: Uuid, decision: HostKeyDecision) -> bool {
-        self.requests.lock().expect("HostKeyDecisionRegistry mutex poisoned").remove(&decision_id);
+        self.requests
+            .lock()
+            .expect("HostKeyDecisionRegistry mutex poisoned")
+            .remove(&decision_id);
         let mut map = self
             .inner
             .lock()
@@ -74,13 +77,22 @@ impl HostKeyDecisionRegistry {
     }
 
     pub fn request_info(&self, decision_id: Uuid) -> Option<HostKeyDecisionRequest> {
-        self.requests.lock().expect("HostKeyDecisionRegistry mutex poisoned")
-            .get(&decision_id).cloned()
+        self.requests
+            .lock()
+            .expect("HostKeyDecisionRegistry mutex poisoned")
+            .get(&decision_id)
+            .cloned()
     }
 
     pub fn cancel(&self, decision_id: Uuid) {
-        self.inner.lock().expect("HostKeyDecisionRegistry mutex poisoned").remove(&decision_id);
-        self.requests.lock().expect("HostKeyDecisionRegistry mutex poisoned").remove(&decision_id);
+        self.inner
+            .lock()
+            .expect("HostKeyDecisionRegistry mutex poisoned")
+            .remove(&decision_id);
+        self.requests
+            .lock()
+            .expect("HostKeyDecisionRegistry mutex poisoned")
+            .remove(&decision_id);
     }
 }
 
@@ -90,7 +102,9 @@ impl HostKeyDecisionSink for HostKeyDecisionRegistry {
     }
 
     fn publish_request(&self, info: HostKeyDecisionRequest) {
-        self.requests.lock().expect("HostKeyDecisionRegistry mutex poisoned")
+        self.requests
+            .lock()
+            .expect("HostKeyDecisionRegistry mutex poisoned")
             .insert(info.decision_id, info.clone());
         self.event_bus.publish(AppEvent::HostKeyMismatch {
             decision_id: info.decision_id,
@@ -196,7 +210,10 @@ mod tests {
             expected: String::new(),
             public_key_blob: "ssh-ed25519 AAAA...".to_string(),
         });
-        assert_eq!(reg.request_info(id).unwrap().public_key_blob, "ssh-ed25519 AAAA...");
+        assert_eq!(
+            reg.request_info(id).unwrap().public_key_blob,
+            "ssh-ed25519 AAAA..."
+        );
         let evt = got.lock().unwrap().clone().unwrap();
         if let AppEvent::HostKeyMismatch {
             decision_id,

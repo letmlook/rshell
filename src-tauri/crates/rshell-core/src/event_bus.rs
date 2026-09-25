@@ -47,7 +47,9 @@ impl EventBus {
     where
         F: Fn(&AppEvent) + Send + Sync + 'static,
     {
-        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut subscribers = self.subscribers.write().unwrap();
         subscribers.push((id, Box::new(handler)));
         debug!(subscription_id = id, "New subscription");

@@ -6,11 +6,14 @@ use crate::script::trigger_engine::TriggerEngine;
 use crate::security::host_key_decision::HostKeyDecisionRegistry;
 use crate::session::repository::SessionRepository;
 use crate::terminal::service::TerminalService;
-use rshell_api::types::{ConnectionInfo, ConnectionState, FileType, Protocol, RemoteFileEntry, SessionConfig, TriggerAction};
-use rshell_protocol::ssh::SshClient;
+use rshell_api::types::{
+    ConnectionInfo, ConnectionState, FileType, Protocol, RemoteFileEntry, SessionConfig,
+    TriggerAction,
+};
+use rshell_protocol::serial::{SerialConfig as ProtocolSerialConfig, SerialConnection};
 use rshell_protocol::ssh::sftp::SftpClient;
+use rshell_protocol::ssh::SshClient;
 use rshell_protocol::telnet::TelnetConnection;
-use rshell_protocol::serial::{SerialConnection, SerialConfig as ProtocolSerialConfig};
 use rshell_protocol::Connection;
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,16 +30,24 @@ fn validate_session_config(config: &SessionConfig) -> Result<(), CoreError> {
     match config.protocol {
         Protocol::SSH | Protocol::Telnet => {
             if config.host.trim().is_empty() || config.port == 0 {
-                return Err(CoreError::InvalidState("Host and TCP port are required".into()));
+                return Err(CoreError::InvalidState(
+                    "Host and TCP port are required".into(),
+                ));
             }
         }
         Protocol::Serial => {
-            let serial = config.serial_config.as_ref()
+            let serial = config
+                .serial_config
+                .as_ref()
                 .ok_or_else(|| CoreError::InvalidState("Serial settings are required".into()))?;
-            if !serial.port.starts_with("/dev/") || serial.baud_rate == 0
-                || !(5..=8).contains(&serial.data_bits) || !(1..=2).contains(&serial.stop_bits)
+            if !serial.port.starts_with("/dev/")
+                || serial.baud_rate == 0
+                || !(5..=8).contains(&serial.data_bits)
+                || !(1..=2).contains(&serial.stop_bits)
             {
-                return Err(CoreError::InvalidState("Invalid macOS serial configuration".into()));
+                return Err(CoreError::InvalidState(
+                    "Invalid macOS serial configuration".into(),
+                ));
             }
         }
     }
@@ -45,24 +56,43 @@ fn validate_session_config(config: &SessionConfig) -> Result<(), CoreError> {
 
 /// Destructive SFTP operations accept only an absolute, unambiguous non-root path.
 pub(crate) fn validate_remote_mutation_path(path: &str) -> Result<(), CoreError> {
-    if !path.starts_with('/') || path == "/" || path.ends_with('/')
-        || path.split('/').skip(1).any(|part| part.is_empty() || part == "." || part == "..")
+    if !path.starts_with('/')
+        || path == "/"
+        || path.ends_with('/')
+        || path
+            .split('/')
+            .skip(1)
+            .any(|part| part.is_empty() || part == "." || part == "..")
         || path.chars().any(|c| c == '\0' || c == '\\')
     {
-        return Err(CoreError::InvalidState(format!("Unsafe remote file path: {path}")));
+        return Err(CoreError::InvalidState(format!(
+            "Unsafe remote file path: {path}"
+        )));
     }
     Ok(())
 }
 
 async fn append_trigger_log(path: &Path, output: &str) -> Result<(), CoreError> {
     if !path.is_absolute() || path.file_name().is_none() || path.is_dir() {
-        return Err(CoreError::InvalidState("Trigger log path must be an absolute file".into()));
+        return Err(CoreError::InvalidState(
+            "Trigger log path must be an absolute file".into(),
+        ));
     }
-    let mut file = tokio::fs::OpenOptions::new().create(true).append(true).open(path).await
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
         .map_err(|e| CoreError::StorageError(e.to_string()))?;
-    file.write_all(output.as_bytes()).await.map_err(|e| CoreError::StorageError(e.to_string()))?;
-    file.write_all(b"\n").await.map_err(|e| CoreError::StorageError(e.to_string()))?;
-    file.flush().await.map_err(|e| CoreError::StorageError(e.to_string()))
+    file.write_all(output.as_bytes())
+        .await
+        .map_err(|e| CoreError::StorageError(e.to_string()))?;
+    file.write_all(b"\n")
+        .await
+        .map_err(|e| CoreError::StorageError(e.to_string()))?;
+    file.flush()
+        .await
+        .map_err(|e| CoreError::StorageError(e.to_string()))
 }
 
 fn trigger_action_summary(action: &TriggerAction) -> String {
@@ -84,7 +114,11 @@ async fn execute_trigger_action(
         TriggerAction::SendText(text) => {
             let client = client
                 .ok_or_else(|| CoreError::NotFound(format!("Connection {session_id} not found")))?;
-            let result = client.read().await.send_data(text.as_bytes()).await
+            let result = client
+                .read()
+                .await
+                .send_data(text.as_bytes())
+                .await
                 .map_err(|e| CoreError::ConnectionError(e.to_string()));
             result
         }
@@ -93,7 +127,11 @@ async fn execute_trigger_action(
         TriggerAction::Disconnect => {
             let client = client
                 .ok_or_else(|| CoreError::NotFound(format!("Connection {session_id} not found")))?;
-            let result = client.write().await.disconnect_ssh().await
+            let result = client
+                .write()
+                .await
+                .disconnect_ssh()
+                .await
                 .map_err(|e| CoreError::ConnectionError(e.to_string()));
             result
         }
@@ -153,7 +191,13 @@ impl SessionService {
         trigger_engine: Arc<TriggerEngine>,
         host_key_registry: Arc<HostKeyDecisionRegistry>,
     ) -> Self {
-        Self::with_repository(event_bus, terminal_service, trigger_engine, host_key_registry, None)
+        Self::with_repository(
+            event_bus,
+            terminal_service,
+            trigger_engine,
+            host_key_registry,
+            None,
+        )
     }
 
     /// 带持久化仓库构造。
@@ -170,10 +214,16 @@ impl SessionService {
             match repo.list_all() {
                 Ok(configs) => {
                     for config in configs {
-                        restored.insert(config.id, SessionState {
-                            config, connection_state: ConnectionState::Disconnected, connection_info: None,
-                            attempt: None, cancel_connect: None,
-                        });
+                        restored.insert(
+                            config.id,
+                            SessionState {
+                                config,
+                                connection_state: ConnectionState::Disconnected,
+                                connection_info: None,
+                                attempt: None,
+                                cancel_connect: None,
+                            },
+                        );
                     }
                 }
                 Err(e) => warn!(error = %e, "Could not restore saved sessions"),
@@ -216,7 +266,8 @@ impl SessionService {
                     config: cfg,
                     connection_state: ConnectionState::Disconnected,
                     connection_info: None,
-                    attempt: None, cancel_connect: None,
+                    attempt: None,
+                    cancel_connect: None,
                 },
             );
             debug!(session_id = %id, "load_from_disk: restored");
@@ -234,17 +285,26 @@ impl SessionService {
         let config = {
             let _lifecycle = self.lifecycle.lock().await;
             let mut sessions = self.sessions.write().await;
-            let state = sessions.get_mut(&session_id)
+            let state = sessions
+                .get_mut(&session_id)
                 .ok_or_else(|| CoreError::NotFound(format!("Session {} not found", session_id)))?;
-            if matches!(state.connection_state, ConnectionState::Connecting | ConnectionState::Connected) {
-                return Err(CoreError::InvalidState(format!("Session {session_id} is already connecting or connected")));
+            if matches!(
+                state.connection_state,
+                ConnectionState::Connecting | ConnectionState::Connected
+            ) {
+                return Err(CoreError::InvalidState(format!(
+                    "Session {session_id} is already connecting or connected"
+                )));
             }
             state.connection_state = ConnectionState::Connecting;
             state.attempt = Some(attempt);
             state.cancel_connect = Some(cancel_tx);
-            self.event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-                session_id, state: ConnectionState::Connecting, info: None,
-            });
+            self.event_bus
+                .publish(rshell_api::AppEvent::ConnectionStateChanged {
+                    session_id,
+                    state: ConnectionState::Connecting,
+                    info: None,
+                });
             state.config.clone()
         };
         let result = tokio::select! {
@@ -254,20 +314,31 @@ impl SessionService {
         if result.is_err() {
             let _lifecycle = self.lifecycle.lock().await;
             let mut sessions = self.sessions.write().await;
-            if let Some(state) = sessions.get_mut(&session_id).filter(|state| state.attempt == Some(attempt)) {
+            if let Some(state) = sessions
+                .get_mut(&session_id)
+                .filter(|state| state.attempt == Some(attempt))
+            {
                 state.attempt = None;
                 state.cancel_connect = None;
                 state.connection_state = ConnectionState::Disconnected;
                 state.connection_info = None;
-                self.event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-                    session_id, state: ConnectionState::Disconnected, info: None,
-                });
+                self.event_bus
+                    .publish(rshell_api::AppEvent::ConnectionStateChanged {
+                        session_id,
+                        state: ConnectionState::Disconnected,
+                        info: None,
+                    });
             }
         }
         result
     }
 
-    async fn connect_attempt(&self, session_id: Uuid, config: SessionConfig, attempt: Uuid) -> Result<(), CoreError> {
+    async fn connect_attempt(
+        &self,
+        session_id: Uuid,
+        config: SessionConfig,
+        attempt: Uuid,
+    ) -> Result<(), CoreError> {
         if config.protocol != Protocol::SSH {
             return self.connect_protocol(session_id, config, attempt).await;
         }
@@ -277,7 +348,8 @@ impl SessionService {
         // HostKeyMismatch { decision_id, ... } 然后同步 block_on 等 UI 端的
         // AppCommand::DecideHostKey。
         let mut client = SshClient::new(config.clone());
-        let sink: Arc<dyn rshell_protocol::ssh::HostKeyDecisionSink> = self.host_key_registry.clone();
+        let sink: Arc<dyn rshell_protocol::ssh::HostKeyDecisionSink> =
+            self.host_key_registry.clone();
 
         match client.connect_ssh(Some(sink)).await {
             Ok(()) => {
@@ -288,7 +360,8 @@ impl SessionService {
                     }
                 }
 
-                let mut output_rx = client.take_data_receiver()
+                let mut output_rx = client
+                    .take_data_receiver()
                     .ok_or_else(|| CoreError::InvalidState("SSH output channel missing".into()))?;
                 // 创建取消通道
                 let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
@@ -297,17 +370,28 @@ impl SessionService {
                 let client = Arc::new(tokio::sync::RwLock::new(client));
 
                 let publication = self.lifecycle.lock().await;
-                if !self.sessions.read().await.get(&session_id).is_some_and(|state| state.attempt == Some(attempt)) {
-                    return Err(CoreError::InvalidState("Connection attempt cancelled".into()));
+                if !self
+                    .sessions
+                    .read()
+                    .await
+                    .get(&session_id)
+                    .is_some_and(|state| state.attempt == Some(attempt))
+                {
+                    return Err(CoreError::InvalidState(
+                        "Connection attempt cancelled".into(),
+                    ));
                 }
 
                 // 保存活动连接
                 {
                     let mut connections = self.connections.write().await;
-                    connections.insert(session_id, ActiveConnection {
-                        client: client.clone(),
-                        _cancel_tx: cancel_tx,
-                    });
+                    connections.insert(
+                        session_id,
+                        ActiveConnection {
+                            client: client.clone(),
+                            _cancel_tx: cancel_tx,
+                        },
+                    );
                 }
 
                 // 更新状态为 Connected
@@ -329,19 +413,20 @@ impl SessionService {
                 }
 
                 // 发布连接成功事件
-                self.event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-                    session_id,
-                    state: ConnectionState::Connected,
-                    info: Some(ConnectionInfo {
-                        protocol: config.protocol,
-                        host: config.host.clone(),
-                        port: config.port,
+                self.event_bus
+                    .publish(rshell_api::AppEvent::ConnectionStateChanged {
+                        session_id,
                         state: ConnectionState::Connected,
-                        bytes_sent: 0,
-                        bytes_received: 0,
-                        latency_ms: None,
-                    }),
-                });
+                        info: Some(ConnectionInfo {
+                            protocol: config.protocol,
+                            host: config.host.clone(),
+                            port: config.port,
+                            state: ConnectionState::Connected,
+                            bytes_sent: 0,
+                            bytes_received: 0,
+                            latency_ms: None,
+                        }),
+                    });
                 drop(publication);
 
                 // 输出接收器独立于 SSH 客户端锁，读等待不阻塞发送/SFTP。
@@ -405,13 +490,18 @@ impl SessionService {
                     let _ = client.write().await.disconnect_ssh().await;
                     let _lifecycle = lifecycle.lock().await;
                     let mut states = sessions.write().await;
-                    if let Some(state) = states.get_mut(&session_id).filter(|state| state.attempt == Some(attempt)) {
+                    if let Some(state) = states
+                        .get_mut(&session_id)
+                        .filter(|state| state.attempt == Some(attempt))
+                    {
                         connections.write().await.remove(&session_id);
                         state.attempt = None;
                         state.connection_state = ConnectionState::Disconnected;
                         state.connection_info = None;
                         event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-                            session_id, state: ConnectionState::Disconnected, info: None,
+                            session_id,
+                            state: ConnectionState::Disconnected,
+                            info: None,
                         });
                     }
                 });
@@ -431,52 +521,97 @@ impl SessionService {
         }
     }
 
-    async fn connect_protocol(&self, session_id: Uuid, config: SessionConfig, attempt: Uuid) -> Result<(), CoreError> {
+    async fn connect_protocol(
+        &self,
+        session_id: Uuid,
+        config: SessionConfig,
+        attempt: Uuid,
+    ) -> Result<(), CoreError> {
         let connection: Result<Box<dyn Connection>, CoreError> = match config.protocol {
             Protocol::Telnet => Ok(Box::new(TelnetConnection::new(&config.host, config.port))),
-            Protocol::Serial => {
-                config.serial_config.as_ref().map(|serial| Box::new(SerialConnection::new(ProtocolSerialConfig {
-                    port: serial.port.clone(), baud_rate: serial.baud_rate,
-                    data_bits: serial.data_bits, stop_bits: serial.stop_bits,
-                    parity: match serial.parity {
-                        rshell_api::types::SerialParity::None => rshell_protocol::serial::SerialParity::None,
-                        rshell_api::types::SerialParity::Even => rshell_protocol::serial::SerialParity::Even,
-                        rshell_api::types::SerialParity::Odd => rshell_protocol::serial::SerialParity::Odd,
-                    },
-                    flow_control: match serial.flow_control {
-                        rshell_api::types::SerialFlowControl::None => rshell_protocol::serial::SerialFlowControl::None,
-                        rshell_api::types::SerialFlowControl::Software => rshell_protocol::serial::SerialFlowControl::Software,
-                        rshell_api::types::SerialFlowControl::Hardware => rshell_protocol::serial::SerialFlowControl::Hardware,
-                    },
-                })) as Box<dyn Connection>).ok_or_else(|| CoreError::InvalidState("Serial settings are missing".into()))
-            }
+            Protocol::Serial => config
+                .serial_config
+                .as_ref()
+                .map(|serial| {
+                    Box::new(SerialConnection::new(ProtocolSerialConfig {
+                        port: serial.port.clone(),
+                        baud_rate: serial.baud_rate,
+                        data_bits: serial.data_bits,
+                        stop_bits: serial.stop_bits,
+                        parity: match serial.parity {
+                            rshell_api::types::SerialParity::None => {
+                                rshell_protocol::serial::SerialParity::None
+                            }
+                            rshell_api::types::SerialParity::Even => {
+                                rshell_protocol::serial::SerialParity::Even
+                            }
+                            rshell_api::types::SerialParity::Odd => {
+                                rshell_protocol::serial::SerialParity::Odd
+                            }
+                        },
+                        flow_control: match serial.flow_control {
+                            rshell_api::types::SerialFlowControl::None => {
+                                rshell_protocol::serial::SerialFlowControl::None
+                            }
+                            rshell_api::types::SerialFlowControl::Software => {
+                                rshell_protocol::serial::SerialFlowControl::Software
+                            }
+                            rshell_api::types::SerialFlowControl::Hardware => {
+                                rshell_protocol::serial::SerialFlowControl::Hardware
+                            }
+                        },
+                    })) as Box<dyn Connection>
+                })
+                .ok_or_else(|| CoreError::InvalidState("Serial settings are missing".into())),
             Protocol::SSH => unreachable!(),
         };
         let mut connection = connection?;
-        connection.connect().await.map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+        connection
+            .connect()
+            .await
+            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
         if let Some((cols, rows)) = self.terminal_service.size(session_id) {
             if let Err(e) = connection.resize(cols, rows).await {
                 warn!(session_id = %session_id, error = %e, "initial terminal resize failed");
             }
         }
         let info = ConnectionInfo {
-            protocol: config.protocol, host: config.host.clone(), port: config.port,
-            state: ConnectionState::Connected, bytes_sent: 0, bytes_received: 0, latency_ms: None,
+            protocol: config.protocol,
+            host: config.host.clone(),
+            port: config.port,
+            state: ConnectionState::Connected,
+            bytes_sent: 0,
+            bytes_received: 0,
+            latency_ms: None,
         };
         let (tx, mut rx) = mpsc::channel::<ProtocolRequest>(32);
         let publication = self.lifecycle.lock().await;
-        if !self.sessions.read().await.get(&session_id).is_some_and(|state| state.attempt == Some(attempt)) {
-            return Err(CoreError::InvalidState("Connection attempt cancelled".into()));
+        if !self
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .is_some_and(|state| state.attempt == Some(attempt))
+        {
+            return Err(CoreError::InvalidState(
+                "Connection attempt cancelled".into(),
+            ));
         }
-        self.protocol_connections.write().await.insert(session_id, tx);
+        self.protocol_connections
+            .write()
+            .await
+            .insert(session_id, tx);
         if let Some(state) = self.sessions.write().await.get_mut(&session_id) {
             state.connection_state = ConnectionState::Connected;
             state.cancel_connect = None;
             state.connection_info = Some(info.clone());
         }
-        self.event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-            session_id, state: ConnectionState::Connected, info: Some(info),
-        });
+        self.event_bus
+            .publish(rshell_api::AppEvent::ConnectionStateChanged {
+                session_id,
+                state: ConnectionState::Connected,
+                info: Some(info),
+            });
         drop(publication);
         let sessions = self.sessions.clone();
         let connections = self.protocol_connections.clone();
@@ -541,13 +676,18 @@ impl SessionService {
             drop(rx);
             let _lifecycle = lifecycle.lock().await;
             let mut sessions = sessions.write().await;
-            if let Some(state) = sessions.get_mut(&session_id).filter(|state| state.attempt == Some(attempt)) {
+            if let Some(state) = sessions
+                .get_mut(&session_id)
+                .filter(|state| state.attempt == Some(attempt))
+            {
                 connections.write().await.remove(&session_id);
                 state.attempt = None;
                 state.connection_state = ConnectionState::Disconnected;
                 state.connection_info = None;
                 event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-                    session_id, state: ConnectionState::Disconnected, info: None,
+                    session_id,
+                    state: ConnectionState::Disconnected,
+                    info: None,
                 });
             }
         });
@@ -565,25 +705,37 @@ impl SessionService {
         let (sender, active) = {
             let _lifecycle = self.lifecycle.lock().await;
             let mut sessions = self.sessions.write().await;
-            let state = sessions.get_mut(&session_id)
+            let state = sessions
+                .get_mut(&session_id)
                 .ok_or_else(|| CoreError::NotFound(format!("Session {session_id} not found")))?;
             state.attempt = None;
-            if let Some(cancel) = state.cancel_connect.take() { let _ = cancel.send(()); }
+            if let Some(cancel) = state.cancel_connect.take() {
+                let _ = cancel.send(());
+            }
             state.connection_state = ConnectionState::Disconnected;
             state.connection_info = None;
             let sender = self.protocol_connections.write().await.remove(&session_id);
             let active = self.connections.write().await.remove(&session_id);
-            if delete { sessions.remove(&session_id); }
-            self.event_bus.publish(rshell_api::AppEvent::ConnectionStateChanged {
-                session_id, state: ConnectionState::Disconnected, info: None,
-            });
+            if delete {
+                sessions.remove(&session_id);
+            }
+            self.event_bus
+                .publish(rshell_api::AppEvent::ConnectionStateChanged {
+                    session_id,
+                    state: ConnectionState::Disconnected,
+                    info: None,
+                });
             (sender, active)
         };
         if let Some(sender) = sender {
             let (reply_tx, reply_rx) = oneshot::channel();
-            sender.send(ProtocolRequest::Disconnect(reply_tx)).await
+            sender
+                .send(ProtocolRequest::Disconnect(reply_tx))
+                .await
                 .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
-            reply_rx.await.map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))??;
+            reply_rx
+                .await
+                .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))??;
             return Ok(());
         }
 
@@ -603,12 +755,22 @@ impl SessionService {
 
     /// 发送数据到会话
     pub async fn send_data(&self, session_id: Uuid, data: &[u8]) -> Result<(), CoreError> {
-        let sender = { self.protocol_connections.read().await.get(&session_id).cloned() };
+        let sender = {
+            self.protocol_connections
+                .read()
+                .await
+                .get(&session_id)
+                .cloned()
+        };
         if let Some(sender) = sender {
             let (reply_tx, reply_rx) = oneshot::channel();
-            sender.send(ProtocolRequest::Send(data.to_vec(), reply_tx)).await
+            sender
+                .send(ProtocolRequest::Send(data.to_vec(), reply_tx))
+                .await
                 .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
-            return reply_rx.await.map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
+            return reply_rx
+                .await
+                .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
         }
         // 先在锁内克隆出 client 句柄，立刻释放 connections guard，避免跨 await 持锁
         let client = {
@@ -616,7 +778,9 @@ impl SessionService {
             connections
                 .get(&session_id)
                 .map(|c| c.client.clone())
-                .ok_or_else(|| CoreError::NotFound(format!("Connection {} not found", session_id)))?
+                .ok_or_else(|| {
+                    CoreError::NotFound(format!("Connection {} not found", session_id))
+                })?
         };
         let client = client.read().await;
         client
@@ -627,20 +791,37 @@ impl SessionService {
     }
 
     /// 调整终端大小
-    pub async fn resize_terminal(&self, session_id: Uuid, cols: u32, rows: u32) -> Result<(), CoreError> {
-        let sender = { self.protocol_connections.read().await.get(&session_id).cloned() };
+    pub async fn resize_terminal(
+        &self,
+        session_id: Uuid,
+        cols: u32,
+        rows: u32,
+    ) -> Result<(), CoreError> {
+        let sender = {
+            self.protocol_connections
+                .read()
+                .await
+                .get(&session_id)
+                .cloned()
+        };
         if let Some(sender) = sender {
             let (reply_tx, reply_rx) = oneshot::channel();
-            sender.send(ProtocolRequest::Resize(cols as u16, rows as u16, reply_tx)).await
+            sender
+                .send(ProtocolRequest::Resize(cols as u16, rows as u16, reply_tx))
+                .await
                 .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
-            return reply_rx.await.map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
+            return reply_rx
+                .await
+                .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
         }
         let client = {
             let connections = self.connections.read().await;
             connections
                 .get(&session_id)
                 .map(|c| c.client.clone())
-                .ok_or_else(|| CoreError::NotFound(format!("Connection {} not found", session_id)))?
+                .ok_or_else(|| {
+                    CoreError::NotFound(format!("Connection {} not found", session_id))
+                })?
         };
         let client = client.read().await;
         client
@@ -669,13 +850,15 @@ impl SessionService {
             config,
             connection_state: ConnectionState::Disconnected,
             connection_info: None,
-            attempt: None, cancel_connect: None,
+            attempt: None,
+            cancel_connect: None,
         };
 
         let mut sessions = self.sessions.write().await;
         sessions.insert(id, state);
 
-        self.event_bus.publish(rshell_api::AppEvent::SessionListChanged);
+        self.event_bus
+            .publish(rshell_api::AppEvent::SessionListChanged);
 
         debug!(session_id = %id, "Session created");
         Ok(id)
@@ -686,7 +869,9 @@ impl SessionService {
     pub async fn update_session(&self, id: Uuid, config: SessionConfig) -> Result<(), CoreError> {
         validate_session_config(&config)?;
         if id != config.id {
-            return Err(CoreError::InvalidState("Session ID cannot be changed".into()));
+            return Err(CoreError::InvalidState(
+                "Session ID cannot be changed".into(),
+            ));
         }
         info!(session_id = %id, "Updating session");
 
@@ -703,7 +888,8 @@ impl SessionService {
             return Err(CoreError::NotFound(format!("Session {} not found", id)));
         }
 
-        self.event_bus.publish(rshell_api::AppEvent::SessionUpdated { session_id: id });
+        self.event_bus
+            .publish(rshell_api::AppEvent::SessionUpdated { session_id: id });
 
         debug!(session_id = %id, "Session updated");
         Ok(())
@@ -724,7 +910,8 @@ impl SessionService {
         // between disconnect and deletion and publish into a deleted session.
         let _ = self.detach_session(id, true).await;
 
-        self.event_bus.publish(rshell_api::AppEvent::SessionListChanged);
+        self.event_bus
+            .publish(rshell_api::AppEvent::SessionListChanged);
 
         debug!(session_id = %id, "Session deleted");
         Ok(())
@@ -740,9 +927,14 @@ impl SessionService {
     }
 
     /// 获取连接信息
-    pub async fn get_connection_info(&self, session_id: Uuid) -> Result<Option<ConnectionInfo>, CoreError> {
+    pub async fn get_connection_info(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<ConnectionInfo>, CoreError> {
         let sessions = self.sessions.read().await;
-        Ok(sessions.get(&session_id).and_then(|s| s.connection_info.clone()))
+        Ok(sessions
+            .get(&session_id)
+            .and_then(|s| s.connection_info.clone()))
     }
 
     /// 获取活动连接的 SSH 客户端引用（用于 SFTP 操作等）
@@ -782,30 +974,49 @@ impl SessionService {
         Ok(entries)
     }
 
-    pub async fn create_remote_directory(&self, session_id: Uuid, path: &str) -> Result<(), CoreError> {
+    pub async fn create_remote_directory(
+        &self,
+        session_id: Uuid,
+        path: &str,
+    ) -> Result<(), CoreError> {
         validate_remote_mutation_path(path)?;
         let client = self.get_ssh_client(session_id).await?;
         let ssh = client.read().await;
-        let channel = ssh.open_sftp_channel().await
+        let channel = ssh
+            .open_sftp_channel()
+            .await
             .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        let sftp = SftpClient::new(channel).await
+        let sftp = SftpClient::new(channel)
+            .await
             .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        sftp.create_dir(path).await.map_err(|e| CoreError::ServiceError(e.to_string()))
+        sftp.create_dir(path)
+            .await
+            .map_err(|e| CoreError::ServiceError(e.to_string()))
     }
 
     pub async fn delete_remote_entry(&self, session_id: Uuid, path: &str) -> Result<(), CoreError> {
         validate_remote_mutation_path(path)?;
         let client = self.get_ssh_client(session_id).await?;
         let ssh = client.read().await;
-        let channel = ssh.open_sftp_channel().await
+        let channel = ssh
+            .open_sftp_channel()
+            .await
             .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        let sftp = SftpClient::new(channel).await
+        let sftp = SftpClient::new(channel)
+            .await
             .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        let entry = sftp.metadata(path).await.map_err(|e| CoreError::ServiceError(e.to_string()))?;
+        let entry = sftp
+            .metadata(path)
+            .await
+            .map_err(|e| CoreError::ServiceError(e.to_string()))?;
         if entry.file_type != FileType::File {
-            return Err(CoreError::InvalidState("Only regular remote files can be deleted".into()));
+            return Err(CoreError::InvalidState(
+                "Only regular remote files can be deleted".into(),
+            ));
         }
-        sftp.remove_file(path).await.map_err(|e| CoreError::ServiceError(e.to_string()))
+        sftp.remove_file(path)
+            .await
+            .map_err(|e| CoreError::ServiceError(e.to_string()))
     }
 
     /// 列出所有会话
@@ -865,15 +1076,36 @@ mod tests {
         let mut cfg = make_config("pending", "127.0.0.1");
         cfg.port = listener.local_addr().unwrap().port();
         let id = svc.create_session(cfg).await.unwrap();
-        let first = { let svc = svc.clone(); tokio::spawn(async move { svc.connect(id).await }) };
+        let first = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.connect(id).await })
+        };
         let (_socket, _) = listener.accept().await.unwrap();
         svc.disconnect(id).await.unwrap();
-        let second = { let svc = svc.clone(); tokio::spawn(async move { svc.connect(id).await }) };
+        let second = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.connect(id).await })
+        };
         let (_second_socket, _) = listener.accept().await.unwrap();
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), first).await.expect("cancel must end pending handshake").unwrap().is_err());
-        assert_eq!(svc.get_state(id).await.unwrap(), ConnectionState::Connecting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), first)
+                .await
+                .expect("cancel must end pending handshake")
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(
+            svc.get_state(id).await.unwrap(),
+            ConnectionState::Connecting
+        );
         svc.delete_session(id).await.unwrap();
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), second).await.expect("delete must cancel handshake").unwrap().is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), second)
+                .await
+                .expect("delete must cancel handshake")
+                .unwrap()
+                .is_err()
+        );
         assert!(svc.get_state(id).await.is_err());
         assert!(!svc.connections.read().await.contains_key(&id));
     }
@@ -882,16 +1114,22 @@ mod tests {
     async fn protocol_requests_release_lookup_lock_before_waiting_for_reply() {
         for operation in 0..3 {
             let svc = Arc::new(make_service());
-            let id = svc.create_session(make_config("race", "host")).await.unwrap();
+            let id = svc
+                .create_session(make_config("race", "host"))
+                .await
+                .unwrap();
             let (tx, mut rx) = mpsc::channel(1);
             svc.protocol_connections.write().await.insert(id, tx);
-            let caller = { let svc = svc.clone(); tokio::spawn(async move {
-                match operation {
-                    0 => svc.send_data(id, b"x").await,
-                    1 => svc.resize_terminal(id, 90, 30).await,
-                    _ => svc.disconnect(id).await,
-                }
-            }) };
+            let caller = {
+                let svc = svc.clone();
+                tokio::spawn(async move {
+                    match operation {
+                        0 => svc.send_data(id, b"x").await,
+                        1 => svc.resize_terminal(id, 90, 30).await,
+                        _ => svc.disconnect(id).await,
+                    }
+                })
+            };
             let request = rx.recv().await.unwrap();
             // EOF cleanup needs this write lock before the request's reply is dropped.
             let cleanup = async {
@@ -900,7 +1138,9 @@ mod tests {
                 drop(rx);
                 assert!(caller.await.unwrap().is_err());
             };
-            tokio::time::timeout(std::time::Duration::from_millis(300), cleanup).await.expect("EOF/request race deadlocked");
+            tokio::time::timeout(std::time::Duration::from_millis(300), cleanup)
+                .await
+                .expect("EOF/request race deadlocked");
         }
     }
 
@@ -932,10 +1172,16 @@ mod tests {
         let id = svc.create_session(cfg).await.unwrap();
         svc.connect(id).await.unwrap();
         assert_eq!(svc.get_state(id).await.unwrap(), ConnectionState::Connected);
-        let (_, ready) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+        let (_, ready) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(ready, b"ready\n");
         svc.send_data(id, b"ping").await.unwrap();
-        let (_, pong) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+        let (_, pong) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(pong, b"pong\n");
         server.await.unwrap();
     }
@@ -944,13 +1190,19 @@ mod tests {
     async fn telnet_notification_includes_message_and_eof_clears_state() {
         use tokio::io::AsyncWriteExt;
         let svc = make_service();
-        svc.trigger_engine.create_trigger(rshell_api::types::Trigger {
-            id: Uuid::new_v4(), name: "notify".into(), enabled: true,
-            condition: rshell_api::types::TriggerCondition::ExactMatch("ready".into()),
-            action: TriggerAction::ShowNotification("Server is ready".into()),
-        }).unwrap();
+        svc.trigger_engine
+            .create_trigger(rshell_api::types::Trigger {
+                id: Uuid::new_v4(),
+                name: "notify".into(),
+                enabled: true,
+                condition: rshell_api::types::TriggerCondition::ExactMatch("ready".into()),
+                action: TriggerAction::ShowNotification("Server is ready".into()),
+            })
+            .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        svc.event_bus.subscribe(move |event| { let _ = tx.send(event.clone()); });
+        svc.event_bus.subscribe(move |event| {
+            let _ = tx.send(event.clone());
+        });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut cfg = make_config("telnet", "127.0.0.1");
         cfg.protocol = Protocol::Telnet;
@@ -968,14 +1220,22 @@ mod tests {
                         assert_eq!(action_summary, "notify: Server is ready");
                         notified = true;
                     }
-                    AppEvent::ConnectionStateChanged { state: ConnectionState::Disconnected, .. } => break,
-                    _ => {},
+                    AppEvent::ConnectionStateChanged {
+                        state: ConnectionState::Disconnected,
+                        ..
+                    } => break,
+                    _ => {}
                 }
             }
             assert!(notified);
-            assert_eq!(svc.get_state(id).await.unwrap(), ConnectionState::Disconnected);
+            assert_eq!(
+                svc.get_state(id).await.unwrap(),
+                ConnectionState::Disconnected
+            );
             assert!(!svc.protocol_connections.read().await.contains_key(&id));
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -986,30 +1246,62 @@ mod tests {
         let bus = svc.event_bus.clone();
         let dir = tempfile::tempdir().unwrap();
         let dispatcher = CommandDispatcher::new(Services {
-            session_service: svc.clone(), terminal_service: svc.terminal_service.clone(),
+            session_service: svc.clone(),
+            terminal_service: svc.terminal_service.clone(),
             transfer_service: Arc::new(crate::transfer::service::TransferService::new(bus.clone())),
             trigger_engine: svc.trigger_engine.clone(),
-            key_manager: Arc::new(crate::security::key_manager::KeyManager::new(dir.path().join("keys"), bus.clone())),
-            master_password: Arc::new(crate::security::master_password::MasterPassword::new(bus.clone())),
-            tunnel_manager: Arc::new(crate::security::tunnel_manager::TunnelManager::new(bus.clone())),
-            host_key_manager: Arc::new(crate::security::host_key_manager::HostKeyManager::new(dir.path().join("known_hosts"), bus.clone())),
+            key_manager: Arc::new(crate::security::key_manager::KeyManager::new(
+                dir.path().join("keys"),
+                bus.clone(),
+            )),
+            master_password: Arc::new(crate::security::master_password::MasterPassword::new(
+                bus.clone(),
+            )),
+            tunnel_manager: Arc::new(crate::security::tunnel_manager::TunnelManager::new(
+                bus.clone(),
+            )),
+            host_key_manager: Arc::new(crate::security::host_key_manager::HostKeyManager::new(
+                dir.path().join("known_hosts"),
+                bus.clone(),
+            )),
             theme_manager: Arc::new(crate::theme::ThemeManager::new(bus.clone())),
-            event_bus: bus, host_key_registry: svc.host_key_registry.clone(),
+            event_bus: bus,
+            host_key_registry: svc.host_key_registry.clone(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut cfg = make_config("resize", "127.0.0.1");
         cfg.protocol = Protocol::Telnet;
         cfg.port = listener.local_addr().unwrap().port();
         let id = svc.create_session(cfg).await.unwrap();
-        dispatcher.dispatch(rshell_api::AppCommand::ResizeTerminal { session_id: id, cols: 90, rows: 30 }).await.unwrap();
+        dispatcher
+            .dispatch(rshell_api::AppCommand::ResizeTerminal {
+                session_id: id,
+                cols: 90,
+                rows: 30,
+            })
+            .await
+            .unwrap();
         svc.connect(id).await.unwrap();
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut initial = [0; 15];
         socket.read_exact(&mut initial).await.unwrap();
         assert_eq!(&initial[6..], &[255, 250, 31, 0, 90, 0, 30, 255, 240]);
-        dispatcher.dispatch(rshell_api::AppCommand::ResizeTerminal { session_id: id, cols: 100, rows: 40 }).await.unwrap();
+        dispatcher
+            .dispatch(rshell_api::AppCommand::ResizeTerminal {
+                session_id: id,
+                cols: 100,
+                rows: 40,
+            })
+            .await
+            .unwrap();
         let mut resized = [0; 9];
-        tokio::time::timeout(std::time::Duration::from_millis(300), socket.read_exact(&mut resized)).await.expect("live resize was not routed").unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            socket.read_exact(&mut resized),
+        )
+        .await
+        .expect("live resize was not routed")
+        .unwrap();
         assert_eq!(resized, [255, 250, 31, 0, 100, 0, 40, 255, 240]);
         svc.disconnect(id).await.unwrap();
     }
@@ -1025,21 +1317,39 @@ mod tests {
         svc.connect(id).await.unwrap();
         let (_socket, _) = listener.accept().await.unwrap();
         let lifecycle = svc.lifecycle.lock().await;
-        let sender = svc.protocol_connections.read().await.get(&id).unwrap().clone();
+        let sender = svc
+            .protocol_connections
+            .read()
+            .await
+            .get(&id)
+            .unwrap()
+            .clone();
         let (reply, received) = oneshot::channel();
-        sender.send(ProtocolRequest::Disconnect(reply)).await.unwrap();
+        sender
+            .send(ProtocolRequest::Disconnect(reply))
+            .await
+            .unwrap();
         received.await.unwrap().unwrap();
         // The old actor is now queued for cleanup. Publish a replacement before
         // letting it acquire the lifecycle lock, exactly the reconnect race.
         let attempt = Uuid::new_v4();
         svc.sessions.write().await.get_mut(&id).unwrap().attempt = Some(attempt);
         let (replacement, _rx) = mpsc::channel(1);
-        svc.protocol_connections.write().await.insert(id, replacement.clone());
+        svc.protocol_connections
+            .write()
+            .await
+            .insert(id, replacement.clone());
         tokio::task::yield_now().await;
         drop(lifecycle);
         let _finished = svc.lifecycle.lock().await;
         assert_eq!(svc.get_state(id).await.unwrap(), ConnectionState::Connected);
-        assert!(svc.protocol_connections.read().await.get(&id).unwrap().same_channel(&replacement));
+        assert!(svc
+            .protocol_connections
+            .read()
+            .await
+            .get(&id)
+            .unwrap()
+            .same_channel(&replacement));
     }
 
     #[tokio::test]
@@ -1049,8 +1359,11 @@ mod tests {
         cfg.protocol = Protocol::Serial;
         assert!(svc.create_session(cfg.clone()).await.is_err());
         cfg.serial_config = Some(rshell_api::types::SerialConfig {
-            port: "/dev/cu.test".into(), baud_rate: 115200, data_bits: 8,
-            stop_bits: 1, parity: rshell_api::types::SerialParity::None,
+            port: "/dev/cu.test".into(),
+            baud_rate: 115200,
+            data_bits: 8,
+            stop_bits: 1,
+            parity: rshell_api::types::SerialParity::None,
             flow_control: rshell_api::types::SerialFlowControl::None,
         });
         assert!(svc.create_session(cfg).await.is_ok());
@@ -1111,20 +1424,33 @@ mod tests {
     #[tokio::test]
     async fn test_resize_terminal_unknown_returns_not_found() {
         let svc = make_service();
-        let err = svc.resize_terminal(Uuid::new_v4(), 80, 24).await.unwrap_err();
+        let err = svc
+            .resize_terminal(Uuid::new_v4(), 80, 24)
+            .await
+            .unwrap_err();
         assert!(format!("{err}").contains("not found"));
     }
 
     #[tokio::test]
     async fn test_browse_remote_dir_unknown_returns_not_found() {
         let svc = make_service();
-        let err = svc.browse_remote_dir(Uuid::new_v4(), "/").await.unwrap_err();
+        let err = svc
+            .browse_remote_dir(Uuid::new_v4(), "/")
+            .await
+            .unwrap_err();
         assert!(format!("{err}").contains("not found"));
     }
 
     #[tokio::test]
     async fn trigger_send_after_disconnect_is_an_error() {
-        let err = execute_trigger_action(&TriggerAction::SendText("clear\n".into()), "", Uuid::new_v4(), None).await.unwrap_err();
+        let err = execute_trigger_action(
+            &TriggerAction::SendText("clear\n".into()),
+            "",
+            Uuid::new_v4(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, CoreError::NotFound(_)));
     }
 
@@ -1134,7 +1460,9 @@ mod tests {
         let path = dir.path().join("trigger.log");
         append_trigger_log(&path, "match: hello").await.unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "match: hello\n");
-        assert!(append_trigger_log(Path::new("relative.log"), "x").await.is_err());
+        assert!(append_trigger_log(Path::new("relative.log"), "x")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

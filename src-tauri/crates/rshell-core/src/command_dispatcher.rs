@@ -10,17 +10,17 @@ use crate::script::engine::{ScriptContext, ScriptEngine, ScriptHost};
 use crate::script::quick_command::QuickCommandService;
 use crate::script::sync_input::SyncInputService;
 use crate::script::trigger_engine::TriggerEngine;
+use crate::security::host_key_manager::HostKeyManager;
 use crate::security::key_manager::KeyManager;
 use crate::security::master_password::MasterPassword;
 use crate::security::tunnel_manager::TunnelManager;
-use crate::security::host_key_manager::HostKeyManager;
 use crate::session::service::SessionService;
 use crate::terminal::service::TerminalService;
 use crate::theme::ThemeManager;
 use crate::transfer::service::TransferService;
 use rshell_api::{AppCommand, CommandOutcome};
-use rshell_protocol::ssh::HostKeyDecision;
 use rshell_plugin_sdk::loader::PluginLoader;
+use rshell_protocol::ssh::HostKeyDecision;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
@@ -55,11 +55,16 @@ struct CoreScriptHost {
 
 impl ScriptHost for CoreScriptHost {
     fn send_text(&self, session_id: Uuid, text: &str) -> Result<(), CoreError> {
-        tokio::runtime::Handle::current().block_on(self.sessions.send_data(session_id, text.as_bytes()))
+        tokio::runtime::Handle::current()
+            .block_on(self.sessions.send_data(session_id, text.as_bytes()))
     }
 
     fn list_sessions(&self) -> Result<Vec<Uuid>, CoreError> {
-        Ok(tokio::runtime::Handle::current().block_on(self.sessions.list_sessions())?.into_iter().map(|s| s.id).collect())
+        Ok(tokio::runtime::Handle::current()
+            .block_on(self.sessions.list_sessions())?
+            .into_iter()
+            .map(|s| s.id)
+            .collect())
     }
 
     fn execute_quick_command(&self, command_id: Uuid, session_id: Uuid) -> Result<(), CoreError> {
@@ -110,16 +115,23 @@ impl CommandDispatcher {
             host_key_registry,
         } = services;
 
-        let data_dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("rshell");
+        let data_dir = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("rshell");
         let quick_command_service = Arc::new(QuickCommandService::with_path(
-            event_bus.clone(), data_dir.join("quick-commands.json"),
+            event_bus.clone(),
+            data_dir.join("quick-commands.json"),
         ));
         let compose_service = Arc::new(ComposeService::new(event_bus.clone()));
         // rhai::Engine 启用 sync feature 后 Arc<Dynamic> 内部走 Arc，可 Send+Sync；
         // 该 crate 在 Tauri 模式下由 app.manage() 直接持有（见设计 §1.2）。
-        let script_engine = Arc::new(ScriptEngine::with_host(event_bus.clone(), Arc::new(CoreScriptHost {
-            sessions: session_service.clone(), quick_commands: quick_command_service.clone(),
-        })));
+        let script_engine = Arc::new(ScriptEngine::with_host(
+            event_bus.clone(),
+            Arc::new(CoreScriptHost {
+                sessions: session_service.clone(),
+                quick_commands: quick_command_service.clone(),
+            }),
+        ));
         let sync_input_service = Arc::new(SyncInputService::new(event_bus.clone()));
 
         // 插件目录：用户数据目录/plugins
@@ -151,8 +163,11 @@ impl CommandDispatcher {
         let session_service = self.session_service.clone();
         let provider = Arc::new(
             move |session_id: Uuid| -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<crate::session::service::SshClientHandle, CoreError>>
-                    + Send>,
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::session::service::SshClientHandle, CoreError>,
+                        > + Send,
+                >,
             > {
                 let svc = session_service.clone();
                 Box::pin(async move { svc.get_ssh_client(session_id).await })
@@ -205,21 +220,42 @@ impl CommandDispatcher {
                 }
                 Ok(CommandOutcome::None)
             }
-            AppCommand::ResizeTerminal { session_id, cols, rows } => {
+            AppCommand::ResizeTerminal {
+                session_id,
+                cols,
+                rows,
+            } => {
                 self.terminal_service.resize(session_id, cols, rows)?;
-                if matches!(self.session_service.get_state(session_id).await, Ok(rshell_api::types::ConnectionState::Connected)) {
-                    self.session_service.resize_terminal(session_id, cols as u32, rows as u32).await?;
+                if matches!(
+                    self.session_service.get_state(session_id).await,
+                    Ok(rshell_api::types::ConnectionState::Connected)
+                ) {
+                    self.session_service
+                        .resize_terminal(session_id, cols as u32, rows as u32)
+                        .await?;
                 }
                 Ok(CommandOutcome::None)
             }
 
             // ===== 文件传输命令 =====
-            AppCommand::EnqueueUpload { local, remote, session_id } => {
-                self.transfer_service.enqueue_upload(local, remote, session_id).await?;
+            AppCommand::EnqueueUpload {
+                local,
+                remote,
+                session_id,
+            } => {
+                self.transfer_service
+                    .enqueue_upload(local, remote, session_id)
+                    .await?;
                 Ok(CommandOutcome::None)
             }
-            AppCommand::EnqueueDownload { remote, local, session_id } => {
-                self.transfer_service.enqueue_download(remote, local, session_id).await?;
+            AppCommand::EnqueueDownload {
+                remote,
+                local,
+                session_id,
+            } => {
+                self.transfer_service
+                    .enqueue_download(remote, local, session_id)
+                    .await?;
                 Ok(CommandOutcome::None)
             }
             AppCommand::PauseTransfer { task_id } => {
@@ -235,26 +271,41 @@ impl CommandDispatcher {
                 Ok(CommandOutcome::None)
             }
             AppCommand::BrowseRemoteDir { session_id, path } => {
-                let entries = self.session_service.browse_remote_dir(session_id, &path).await?;
+                let entries = self
+                    .session_service
+                    .browse_remote_dir(session_id, &path)
+                    .await?;
                 Ok(CommandOutcome::RemoteDir { path, entries })
             }
             AppCommand::CreateRemoteDirectory { session_id, path } => {
-                self.session_service.create_remote_directory(session_id, &path).await?;
+                self.session_service
+                    .create_remote_directory(session_id, &path)
+                    .await?;
                 Ok(CommandOutcome::None)
             }
             AppCommand::DeleteRemoteEntry { session_id, path } => {
-                self.session_service.delete_remote_entry(session_id, &path).await?;
+                self.session_service
+                    .delete_remote_entry(session_id, &path)
+                    .await?;
                 Ok(CommandOutcome::None)
             }
             AppCommand::ListTransfers => {
-                let tasks = self.transfer_service.list_tasks().await.into_iter().map(Into::into).collect();
+                let tasks = self
+                    .transfer_service
+                    .list_tasks()
+                    .await
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
                 Ok(CommandOutcome::Transfers(tasks))
             }
 
             // ===== 隧道命令 =====
             AppCommand::CreateTunnel { session_id, rule } => {
                 let ssh_client = self.session_service.get_ssh_client(session_id).await?;
-                self.tunnel_manager.create_tunnel(session_id, rule, Some(ssh_client)).await?;
+                self.tunnel_manager
+                    .create_tunnel(session_id, rule, Some(ssh_client))
+                    .await?;
                 Ok(CommandOutcome::None)
             }
             AppCommand::CloseTunnel { tunnel_id } => {
@@ -263,12 +314,18 @@ impl CommandDispatcher {
             }
             AppCommand::ListPendingTunnels => {
                 let pending = self.tunnel_manager.restore_pending_rules_info().await;
-                info!(count = pending.rules.len(), unsupported = pending.unsupported.len(), "UI requested pending tunnels");
+                info!(
+                    count = pending.rules.len(),
+                    unsupported = pending.unsupported.len(),
+                    "UI requested pending tunnels"
+                );
                 Ok(CommandOutcome::PendingTunnels(pending))
             }
             AppCommand::RestoreTunnel { session_id, rule } => {
                 let ssh_client = self.session_service.get_ssh_client(session_id).await?;
-                self.tunnel_manager.create_tunnel(session_id, rule, Some(ssh_client)).await?;
+                self.tunnel_manager
+                    .create_tunnel(session_id, rule, Some(ssh_client))
+                    .await?;
                 Ok(CommandOutcome::None)
             }
             AppCommand::SuspendTunnel { tunnel_id } => {
@@ -281,8 +338,12 @@ impl CommandDispatcher {
             }
 
             // ===== 快速命令 =====
-            AppCommand::ExecuteQuickCommand { command_id, target_sessions } => {
-                self.execute_quick_command(command_id, &target_sessions).await?;
+            AppCommand::ExecuteQuickCommand {
+                command_id,
+                target_sessions,
+            } => {
+                self.execute_quick_command(command_id, &target_sessions)
+                    .await?;
                 Ok(CommandOutcome::None)
             }
             AppCommand::CreateQuickCommand { command } => {
@@ -329,12 +390,20 @@ impl CommandDispatcher {
             }
 
             // ===== 安全：密钥管理 =====
-            AppCommand::GenerateSshKey { name, key_type, passphrase } => {
-                self.key_manager.generate_key(&name, key_type, passphrase.as_deref()).await?;
+            AppCommand::GenerateSshKey {
+                name,
+                key_type,
+                passphrase,
+            } => {
+                self.key_manager
+                    .generate_key(&name, key_type, passphrase.as_deref())
+                    .await?;
                 Ok(CommandOutcome::None)
             }
             AppCommand::ImportPrivateKey { path, passphrase } => {
-                self.key_manager.import_private_key(&path, passphrase.as_deref()).await?;
+                self.key_manager
+                    .import_private_key(&path, passphrase.as_deref())
+                    .await?;
                 Ok(CommandOutcome::None)
             }
             AppCommand::DeleteSshKey { key_id } => {
@@ -343,7 +412,8 @@ impl CommandDispatcher {
             }
             AppCommand::ExportPublicKey { key_id } => {
                 let public_key = self.key_manager.export_public_key(key_id).await?;
-                self.event_bus.publish(rshell_api::AppEvent::PublicKeyExported { key_id, public_key });
+                self.event_bus
+                    .publish(rshell_api::AppEvent::PublicKeyExported { key_id, public_key });
                 Ok(CommandOutcome::None)
             }
 
@@ -356,30 +426,64 @@ impl CommandDispatcher {
                 self.master_password.verify(&password).await?;
                 Ok(CommandOutcome::None)
             }
-            AppCommand::ChangeMasterPassword { old_password, new_password } => {
-                self.master_password.change_password(&old_password, &new_password).await?;
+            AppCommand::ChangeMasterPassword {
+                old_password,
+                new_password,
+            } => {
+                self.master_password
+                    .change_password(&old_password, &new_password)
+                    .await?;
                 Ok(CommandOutcome::None)
             }
 
             // ===== 安全：主机密钥 =====
-            AppCommand::TrustHostKey { host, port, key_type, public_key_blob, .. } => {
-                self.host_key_manager.trust_host_key(&host, port, &key_type, &public_key_blob).await?;
+            AppCommand::TrustHostKey {
+                host,
+                port,
+                key_type,
+                public_key_blob,
+                ..
+            } => {
+                self.host_key_manager
+                    .trust_host_key(&host, port, &key_type, &public_key_blob)
+                    .await?;
                 Ok(CommandOutcome::None)
             }
-            AppCommand::DecideHostKey { decision_id, accept, permanent } => {
-                let request = self.host_key_registry.request_info(decision_id)
-                    .ok_or_else(|| CoreError::NotFound(format!("Host key decision {decision_id} is no longer pending")))?;
+            AppCommand::DecideHostKey {
+                decision_id,
+                accept,
+                permanent,
+            } => {
+                let request = self
+                    .host_key_registry
+                    .request_info(decision_id)
+                    .ok_or_else(|| {
+                        CoreError::NotFound(format!(
+                            "Host key decision {decision_id} is no longer pending"
+                        ))
+                    })?;
                 if accept && permanent {
                     let mut parts = request.public_key_blob.split_whitespace();
-                    let key_type = parts.next().ok_or_else(|| CoreError::InvalidState("Host key type is missing".into()))?;
-                    let key_blob = parts.next().ok_or_else(|| CoreError::InvalidState("Host key blob is missing".into()))?;
-                    if let Err(error) = self.host_key_manager.trust_host_key(
-                        &request.host, request.port, key_type, key_blob,
-                    ).await {
-                        self.host_key_registry.resolve(decision_id, HostKeyDecision {
-                            fingerprint: request.fingerprint.clone(), key_blob: request.public_key_blob.clone(),
-                            accept: false, permanent: false,
-                        });
+                    let key_type = parts.next().ok_or_else(|| {
+                        CoreError::InvalidState("Host key type is missing".into())
+                    })?;
+                    let key_blob = parts.next().ok_or_else(|| {
+                        CoreError::InvalidState("Host key blob is missing".into())
+                    })?;
+                    if let Err(error) = self
+                        .host_key_manager
+                        .trust_host_key(&request.host, request.port, key_type, key_blob)
+                        .await
+                    {
+                        self.host_key_registry.resolve(
+                            decision_id,
+                            HostKeyDecision {
+                                fingerprint: request.fingerprint.clone(),
+                                key_blob: request.public_key_blob.clone(),
+                                accept: false,
+                                permanent: false,
+                            },
+                        );
                         return Err(error);
                     }
                 }
@@ -390,7 +494,9 @@ impl CommandDispatcher {
                     permanent,
                 };
                 if !self.host_key_registry.resolve(decision_id, decision) {
-                    return Err(CoreError::NotFound(format!("Host key decision {decision_id} is no longer pending")));
+                    return Err(CoreError::NotFound(format!(
+                        "Host key decision {decision_id} is no longer pending"
+                    )));
                 }
                 Ok(CommandOutcome::None)
             }
@@ -498,20 +604,23 @@ impl CommandDispatcher {
         let engine = self.script_engine.clone();
         let code = code.to_owned();
         let result = tokio::task::spawn_blocking(move || engine.execute_string(&code, &context))
-            .await.map_err(|e| CoreError::Internal(e.to_string()))??;
+            .await
+            .map_err(|e| CoreError::Internal(e.to_string()))??;
 
-        self.event_bus.publish(rshell_api::AppEvent::ScriptFinished {
-            session_id,
-            result: result.clone(),
-        });
+        self.event_bus
+            .publish(rshell_api::AppEvent::ScriptFinished {
+                session_id,
+                result: result.clone(),
+            });
 
         if !result.success {
-            return Err(CoreError::InvalidState(result.error.unwrap_or_else(|| "Script failed".into())));
+            return Err(CoreError::InvalidState(
+                result.error.unwrap_or_else(|| "Script failed".into()),
+            ));
         }
 
         Ok(())
     }
-
 
     /// 扫描插件
     async fn scan_plugins(&self) -> Result<(), CoreError> {
@@ -520,7 +629,8 @@ impl CommandDispatcher {
         match self.plugin_loader.scan_plugins().await {
             Ok(manifests) => {
                 info!("Found {} plugins", manifests.len());
-                self.event_bus.publish(rshell_api::AppEvent::PluginListUpdated);
+                self.event_bus
+                    .publish(rshell_api::AppEvent::PluginListUpdated);
             }
             Err(e) => {
                 warn!("Plugin scan failed: {}", e);
@@ -537,16 +647,18 @@ impl CommandDispatcher {
 
         match self.plugin_loader.load_plugin(plugin_id).await {
             Ok(()) => {
-                self.event_bus.publish(rshell_api::AppEvent::PluginStateChanged {
-                    plugin_id: plugin_id.to_string(),
-                    state: rshell_api::types::PluginState::Loaded,
-                });
+                self.event_bus
+                    .publish(rshell_api::AppEvent::PluginStateChanged {
+                        plugin_id: plugin_id.to_string(),
+                        state: rshell_api::types::PluginState::Loaded,
+                    });
             }
             Err(e) => {
-                self.event_bus.publish(rshell_api::AppEvent::PluginLoadFailed {
-                    plugin_id: plugin_id.to_string(),
-                    error: e.to_string(),
-                });
+                self.event_bus
+                    .publish(rshell_api::AppEvent::PluginLoadFailed {
+                        plugin_id: plugin_id.to_string(),
+                        error: e.to_string(),
+                    });
                 return Err(CoreError::Internal(format!("Plugin load failed: {}", e)));
             }
         }
@@ -560,10 +672,11 @@ impl CommandDispatcher {
 
         match self.plugin_loader.unload_plugin(plugin_id).await {
             Ok(()) => {
-                self.event_bus.publish(rshell_api::AppEvent::PluginStateChanged {
-                    plugin_id: plugin_id.to_string(),
-                    state: rshell_api::types::PluginState::Disabled,
-                });
+                self.event_bus
+                    .publish(rshell_api::AppEvent::PluginStateChanged {
+                        plugin_id: plugin_id.to_string(),
+                        state: rshell_api::types::PluginState::Disabled,
+                    });
             }
             Err(e) => {
                 warn!("Plugin unload failed: {}", e);

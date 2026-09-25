@@ -33,19 +33,32 @@ impl TerminalService {
     }
 
     pub fn set_output_sender(&self, sender: OutputSender) {
-        *self.output_sender.write().expect("output sender lock poisoned") = Some(sender);
+        *self
+            .output_sender
+            .write()
+            .expect("output sender lock poisoned") = Some(sender);
     }
 
     pub fn push_output(&self, session_id: Uuid, data: Vec<u8>) -> Result<(), CoreError> {
-        let sink = self.output_sender.read().map_err(|e| CoreError::Internal(e.to_string()))?;
-        let sender = sink.as_ref().ok_or_else(|| CoreError::InvalidState("Terminal output sink is not configured".into()))?;
-        sender.send((session_id, data)).map_err(|_| CoreError::InvalidState("Terminal output sink is closed".into()))
+        let sink = self
+            .output_sender
+            .read()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let sender = sink.as_ref().ok_or_else(|| {
+            CoreError::InvalidState("Terminal output sink is not configured".into())
+        })?;
+        sender
+            .send((session_id, data))
+            .map_err(|_| CoreError::InvalidState("Terminal output sink is closed".into()))
     }
 
     /// 登记会话终端;启动时由 setup 或首条 recv 字节触发。
     #[instrument(skip(self))]
     pub fn create_terminal(&self, id: Uuid, cols: u16, rows: u16) -> Result<(), CoreError> {
-        let mut sizes = self.sizes.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut sizes = self
+            .sizes
+            .write()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         sizes.insert(id, (cols, rows));
         debug!(terminal_id = %id, cols, rows, "Terminal registered");
         Ok(())
@@ -54,7 +67,10 @@ impl TerminalService {
     /// 会话关闭时清理。
     #[instrument(skip(self))]
     pub fn destroy_terminal(&self, id: Uuid) -> Result<(), CoreError> {
-        let mut sizes = self.sizes.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut sizes = self
+            .sizes
+            .write()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         sizes.remove(&id);
         debug!(terminal_id = %id, "Terminal removed");
         Ok(())
@@ -63,7 +79,10 @@ impl TerminalService {
     /// 前端权威 resize（设计 §4.2 "终端尺寸"行）。
     #[instrument(skip(self))]
     pub fn resize(&self, terminal_id: Uuid, cols: u16, rows: u16) -> Result<(), CoreError> {
-        let mut sizes = self.sizes.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut sizes = self
+            .sizes
+            .write()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         sizes.insert(terminal_id, (cols, rows));
         debug!(terminal_id = %terminal_id, cols, rows, "Terminal resized");
         Ok(())
@@ -107,7 +126,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         service.set_output_sender(tx);
         let session_id = Uuid::new_v4();
-        service.push_output(session_id, vec![0, 0xff, b'\n']).unwrap();
+        service
+            .push_output(session_id, vec![0, 0xff, b'\n'])
+            .unwrap();
         assert_eq!(rx.try_recv().unwrap(), (session_id, vec![0, 0xff, b'\n']));
     }
 }

@@ -34,9 +34,19 @@ pub enum Protocol {
 /// 认证方式
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthMethod {
-    Password { username: String, password: String },
-    PublicKey { username: String, key_path: PathBuf, passphrase: Option<String> },
-    KeyboardInteractive { username: String, password: Option<String> },
+    Password {
+        username: String,
+        password: String,
+    },
+    PublicKey {
+        username: String,
+        key_path: PathBuf,
+        passphrase: Option<String>,
+    },
+    KeyboardInteractive {
+        username: String,
+        password: Option<String>,
+    },
 }
 
 /// 连接状态
@@ -98,7 +108,14 @@ pub struct TransferTaskInfo {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum TransferTaskState { Pending, Transferring, Paused, Completed, Failed, Cancelled }
+pub enum TransferTaskState {
+    Pending,
+    Transferring,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+}
 
 /// 文件权限
 #[derive(Debug, Clone, Serialize, Deserialize)]

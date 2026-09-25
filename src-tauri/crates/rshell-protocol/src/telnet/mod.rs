@@ -4,9 +4,9 @@
 
 #![allow(dead_code)]
 
-use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, debug};
+use tokio::net::TcpStream;
+use tracing::{debug, info};
 
 use crate::{Connection, ProtocolError};
 
@@ -14,33 +14,33 @@ use crate::{Connection, ProtocolError};
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelnetCommand {
-    SE = 240,    // 子协商结束
-    NOP = 241,   // 无操作
-    DM = 242,    // 数据标记
-    BRK = 243,   // 中断
-    IP = 244,    // 中断进程
-    AO = 245,    // 中止输出
-    AYT = 246,   // 你在那里
-    EC = 247,    // 擦除字符
-    EL = 248,    // 擦除行
-    GA = 249,    // 继续
-    SB = 250,    // 子协商开始
-    WILL = 251,  // 愿意
-    WONT = 252,  // 不愿意
-    DO = 253,    // 要求对方
-    DONT = 254,  // 拒绝对方
-    IAC = 255,   // 解释为命令
+    SE = 240,   // 子协商结束
+    NOP = 241,  // 无操作
+    DM = 242,   // 数据标记
+    BRK = 243,  // 中断
+    IP = 244,   // 中断进程
+    AO = 245,   // 中止输出
+    AYT = 246,  // 你在那里
+    EC = 247,   // 擦除字符
+    EL = 248,   // 擦除行
+    GA = 249,   // 继续
+    SB = 250,   // 子协商开始
+    WILL = 251, // 愿意
+    WONT = 252, // 不愿意
+    DO = 253,   // 要求对方
+    DONT = 254, // 拒绝对方
+    IAC = 255,  // 解释为命令
 }
 
 /// Telnet 选项
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelnetOption {
-    Echo = 1,              // RFC 857
-    SuppressGoAhead = 3,   // RFC 858
-    TerminalType = 24,     // RFC 1091
-    WindowSize = 31,       // RFC 1073
-    LineMode = 34,         // RFC 1184
+    Echo = 1,            // RFC 857
+    SuppressGoAhead = 3, // RFC 858
+    TerminalType = 24,   // RFC 1091
+    WindowSize = 31,     // RFC 1073
+    LineMode = 34,       // RFC 1184
 }
 
 /// Telnet 连接状态
@@ -87,8 +87,14 @@ impl TelnetConnection {
     }
 
     /// 发送 Telnet 命令
-    async fn send_command(&mut self, cmd: TelnetCommand, option: Option<TelnetOption>) -> Result<(), ProtocolError> {
-        let stream = self.stream.as_mut()
+    async fn send_command(
+        &mut self,
+        cmd: TelnetCommand,
+        option: Option<TelnetOption>,
+    ) -> Result<(), ProtocolError> {
+        let stream = self
+            .stream
+            .as_mut()
             .ok_or_else(|| ProtocolError::ConnectionFailed("Not connected".to_string()))?;
 
         let mut buf = vec![TelnetCommand::IAC as u8, cmd as u8];
@@ -96,14 +102,20 @@ impl TelnetConnection {
             buf.push(opt as u8);
         }
 
-        stream.write_all(&buf).await
+        stream
+            .write_all(&buf)
+            .await
             .map_err(|e| ProtocolError::ProtocolError(format!("Failed to send command: {}", e)))?;
 
         Ok(())
     }
 
     /// 处理接收到的 Telnet 命令
-    async fn handle_command(&mut self, cmd: TelnetCommand, option: u8) -> Result<Vec<u8>, ProtocolError> {
+    async fn handle_command(
+        &mut self,
+        cmd: TelnetCommand,
+        option: u8,
+    ) -> Result<Vec<u8>, ProtocolError> {
         let mut response = Vec::new();
 
         match cmd {
@@ -137,35 +149,33 @@ impl TelnetConnection {
                     }
                 }
             }
-            TelnetCommand::WILL => {
-                match option {
-                    x if x == TelnetOption::Echo as u8 => {
-                        self.server_echo = true;
-                        response.extend_from_slice(&[
-                            TelnetCommand::IAC as u8,
-                            TelnetCommand::DO as u8,
-                            TelnetOption::Echo as u8,
-                        ]);
-                        debug!("Telnet: Accepted server echo");
-                    }
-                    x if x == TelnetOption::SuppressGoAhead as u8 => {
-                        self.suppress_go_ahead = true;
-                        response.extend_from_slice(&[
-                            TelnetCommand::IAC as u8,
-                            TelnetCommand::DO as u8,
-                            TelnetOption::SuppressGoAhead as u8,
-                        ]);
-                        debug!("Telnet: Accepted server Suppress Go Ahead");
-                    }
-                    _ => {
-                        response.extend_from_slice(&[
-                            TelnetCommand::IAC as u8,
-                            TelnetCommand::DONT as u8,
-                            option,
-                        ]);
-                    }
+            TelnetCommand::WILL => match option {
+                x if x == TelnetOption::Echo as u8 => {
+                    self.server_echo = true;
+                    response.extend_from_slice(&[
+                        TelnetCommand::IAC as u8,
+                        TelnetCommand::DO as u8,
+                        TelnetOption::Echo as u8,
+                    ]);
+                    debug!("Telnet: Accepted server echo");
                 }
-            }
+                x if x == TelnetOption::SuppressGoAhead as u8 => {
+                    self.suppress_go_ahead = true;
+                    response.extend_from_slice(&[
+                        TelnetCommand::IAC as u8,
+                        TelnetCommand::DO as u8,
+                        TelnetOption::SuppressGoAhead as u8,
+                    ]);
+                    debug!("Telnet: Accepted server Suppress Go Ahead");
+                }
+                _ => {
+                    response.extend_from_slice(&[
+                        TelnetCommand::IAC as u8,
+                        TelnetCommand::DONT as u8,
+                        option,
+                    ]);
+                }
+            },
             TelnetCommand::SB => {
                 // 子协商 - 简化处理
                 debug!("Telnet: Subnegotiation for option {}", option);
@@ -243,7 +253,10 @@ impl TelnetConnection {
                         // 跳过子协商直到 SE
                         let mut completed = false;
                         while i < data.len() {
-                            if data[i] == TelnetCommand::IAC as u8 && i + 1 < data.len() && data[i + 1] == TelnetCommand::SE as u8 {
+                            if data[i] == TelnetCommand::IAC as u8
+                                && i + 1 < data.len()
+                                && data[i + 1] == TelnetCommand::SE as u8
+                            {
                                 i += 2;
                                 completed = true;
                                 break;
@@ -271,8 +284,9 @@ impl TelnetConnection {
         // 发送响应命令
         if !response.is_empty() {
             if let Some(stream) = self.stream.as_mut() {
-                stream.write_all(&response).await
-                    .map_err(|e| ProtocolError::ProtocolError(format!("Failed to negotiate Telnet options: {e}")))?;
+                stream.write_all(&response).await.map_err(|e| {
+                    ProtocolError::ProtocolError(format!("Failed to negotiate Telnet options: {e}"))
+                })?;
             }
         }
 
@@ -294,10 +308,15 @@ impl Connection for TelnetConnection {
         self.state = TelnetState::Connected;
 
         // 主动请求 Suppress Go Ahead 与 Window Size (NAWS, RFC 1073)
-        self.send_command(TelnetCommand::DO, Some(TelnetOption::SuppressGoAhead)).await?;
-        self.send_command(TelnetCommand::DO, Some(TelnetOption::WindowSize)).await?;
+        self.send_command(TelnetCommand::DO, Some(TelnetOption::SuppressGoAhead))
+            .await?;
+        self.send_command(TelnetCommand::DO, Some(TelnetOption::WindowSize))
+            .await?;
 
-        info!("Telnet connection established to {}:{}", self.host, self.port);
+        info!(
+            "Telnet connection established to {}:{}",
+            self.host, self.port
+        );
         Ok(())
     }
 
@@ -311,7 +330,9 @@ impl Connection for TelnetConnection {
     }
 
     async fn send(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
-        let stream = self.stream.as_mut()
+        let stream = self
+            .stream
+            .as_mut()
             .ok_or_else(|| ProtocolError::ConnectionFailed("Not connected".to_string()))?;
 
         // 转义 IAC 字节
@@ -323,21 +344,29 @@ impl Connection for TelnetConnection {
             }
         }
 
-        stream.write_all(&escaped).await
+        stream
+            .write_all(&escaped)
+            .await
             .map_err(|e| ProtocolError::ProtocolError(format!("Failed to send: {}", e)))?;
 
         Ok(())
     }
 
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, ProtocolError> {
-        let stream = self.stream.as_mut()
+        let stream = self
+            .stream
+            .as_mut()
             .ok_or_else(|| ProtocolError::ConnectionFailed("Not connected".to_string()))?;
 
         // Command filtering never expands plain output beyond the raw input.
         // Limit reads to the caller's capacity so no decoded bytes are discarded.
-        if buf.is_empty() { return Ok(0); }
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut raw_buf = vec![0u8; buf.len()];
-        let n = stream.read(&mut raw_buf).await
+        let n = stream
+            .read(&mut raw_buf)
+            .await
             .map_err(|e| ProtocolError::ProtocolError(format!("Failed to recv: {}", e)))?;
 
         if n == 0 {
@@ -364,12 +393,16 @@ impl Connection for TelnetConnection {
             TelnetCommand::IAC as u8,
             TelnetCommand::SB as u8,
             TelnetOption::WindowSize as u8,
-            (cols >> 8) as u8, cols as u8,
-            (rows >> 8) as u8, rows as u8,
+            (cols >> 8) as u8,
+            cols as u8,
+            (rows >> 8) as u8,
+            rows as u8,
             TelnetCommand::IAC as u8,
             TelnetCommand::SE as u8,
         ];
-        stream.write_all(&payload).await
+        stream
+            .write_all(&payload)
+            .await
             .map_err(|e| ProtocolError::ProtocolError(format!("Failed to send NAWS: {}", e)))?;
         debug!("Telnet: NAWS sent ({}x{})", cols, rows);
         Ok(())
@@ -383,14 +416,17 @@ mod tests {
     #[tokio::test]
     async fn recv_preserves_output_larger_than_callers_buffer() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut connection = TelnetConnection::new("127.0.0.1", listener.local_addr().unwrap().port());
+        let mut connection =
+            TelnetConnection::new("127.0.0.1", listener.local_addr().unwrap().port());
         connection.connect().await.unwrap();
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(b"abcdefgh").await.unwrap();
         socket.shutdown().await.unwrap();
         let mut all = Vec::new();
         let mut buf = [0; 4];
-        while let Ok(n) = connection.recv(&mut buf).await { all.extend_from_slice(&buf[..n]); }
+        while let Ok(n) = connection.recv(&mut buf).await {
+            all.extend_from_slice(&buf[..n]);
+        }
         assert_eq!(all, b"abcdefgh");
     }
 
@@ -416,7 +452,9 @@ mod tests {
     async fn test_send_command_requires_connected() {
         let mut c = TelnetConnection::new("h", 23);
         // 未连接时调 send_command 应返回错误
-        let r = c.send_command(TelnetCommand::DO, Some(TelnetOption::SuppressGoAhead)).await;
+        let r = c
+            .send_command(TelnetCommand::DO, Some(TelnetOption::SuppressGoAhead))
+            .await;
         assert!(r.is_err());
         assert!(format!("{}", r.unwrap_err()).contains("Not connected"));
     }
@@ -426,7 +464,10 @@ mod tests {
         let mut connection = TelnetConnection::new("example", 23);
         assert!(connection.process_data(&[255]).await.unwrap().is_empty());
         assert_eq!(connection.pending_bytes, vec![255]);
-        assert_eq!(connection.process_data(&[253, 3, b'A']).await.unwrap(), b"A");
+        assert_eq!(
+            connection.process_data(&[253, 3, b'A']).await.unwrap(),
+            b"A"
+        );
         assert!(connection.pending_bytes.is_empty());
     }
 
@@ -456,9 +497,9 @@ mod tests {
         // 该测试保护 #4 实现不被后续 refactor 破坏
         let payload = [
             255u8, 250, 31, // IAC SB NAWS
-            0, 80,        // cols = 80
-            0, 24,        // rows = 24
-            255, 240,     // IAC SE
+            0, 80, // cols = 80
+            0, 24, // rows = 24
+            255, 240, // IAC SE
         ];
         assert_eq!(payload.len(), 9);
         assert_eq!(payload[0], TelnetCommand::IAC as u8);

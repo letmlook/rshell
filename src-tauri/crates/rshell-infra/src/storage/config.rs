@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,8 +30,7 @@ impl Default for AppConfig {
 
 /// 获取配置文件路径
 fn config_path() -> PathBuf {
-    let mut path = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."));
+    let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("rshell");
     path.push("config.toml");
     path

@@ -166,7 +166,10 @@ mod tests {
         let tc = TerminalChannels::new();
         let id = Uuid::new_v4();
         // 灌入 2 × 上限
-        let big: Vec<u8> = (0..(BUFFER_CAP_BYTES * 2) as u8).cycle().take(BUFFER_CAP_BYTES * 2).collect();
+        let big: Vec<u8> = (0..(BUFFER_CAP_BYTES * 2) as u8)
+            .cycle()
+            .take(BUFFER_CAP_BYTES * 2)
+            .collect();
         tc.push(id, &big).await;
         // 内层状态应是 Buffering 且长度为 cap
         let summary = tc.debug_summary().await;

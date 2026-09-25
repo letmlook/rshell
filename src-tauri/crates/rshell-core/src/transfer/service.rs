@@ -5,10 +5,13 @@
 
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
-use crate::session::service::SshClientHandle;
 use crate::session::service::validate_remote_mutation_path;
+use crate::session::service::SshClientHandle;
+use rshell_api::types::{
+    TransferDirection as ApiTransferDirection, TransferTaskInfo,
+    TransferTaskState as ApiTransferTaskState,
+};
 use rshell_api::AppEvent;
-use rshell_api::types::{TransferDirection as ApiTransferDirection, TransferTaskInfo, TransferTaskState as ApiTransferTaskState};
 use rshell_protocol::ssh::sftp::SftpClient;
 use std::collections::HashMap;
 use std::future::Future;
@@ -89,7 +92,10 @@ impl From<TransferTask> for TransferTaskInfo {
         Self {
             id: task.id,
             session_id: task.session_id,
-            direction: match task.direction { TransferDirection::Upload => ApiTransferDirection::Upload, TransferDirection::Download => ApiTransferDirection::Download },
+            direction: match task.direction {
+                TransferDirection::Upload => ApiTransferDirection::Upload,
+                TransferDirection::Download => ApiTransferDirection::Download,
+            },
             local_path: task.local_path.to_string_lossy().into_owned(),
             remote_path: task.remote_path,
             state: match task.state {
@@ -129,7 +135,10 @@ impl TransferService {
 
     /// 设置 SSH 客户端提供函数
     pub fn set_ssh_client_provider(&self, provider: SshClientProvider) {
-        let mut p = self.ssh_client_provider.write().expect("SSH provider lock poisoned");
+        let mut p = self
+            .ssh_client_provider
+            .write()
+            .expect("SSH provider lock poisoned");
         *p = Some(provider);
     }
 
@@ -141,8 +150,15 @@ impl TransferService {
         session_id: Uuid,
     ) -> Result<Uuid, CoreError> {
         validate_remote_mutation_path(&remote)?;
-        if !local.is_absolute() || !tokio::fs::metadata(&local).await.map(|m| m.is_file()).unwrap_or(false) {
-            return Err(CoreError::InvalidState("Upload source must be an existing regular local file".into()));
+        if !local.is_absolute()
+            || !tokio::fs::metadata(&local)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+        {
+            return Err(CoreError::InvalidState(
+                "Upload source must be an existing regular local file".into(),
+            ));
         }
         let task_id = Uuid::new_v4();
 
@@ -184,10 +200,14 @@ impl TransferService {
     ) -> Result<Uuid, CoreError> {
         validate_remote_mutation_path(&remote)?;
         if !local.is_absolute() || local.file_name().is_none() || local.exists() {
-            return Err(CoreError::InvalidState("Download target must be a new absolute local file".into()));
+            return Err(CoreError::InvalidState(
+                "Download target must be a new absolute local file".into(),
+            ));
         }
         if !local.parent().is_some_and(|p| p.is_dir()) {
-            return Err(CoreError::InvalidState("Download target directory does not exist".into()));
+            return Err(CoreError::InvalidState(
+                "Download target directory does not exist".into(),
+            ));
         }
         let task_id = Uuid::new_v4();
 
@@ -244,7 +264,11 @@ impl TransferService {
         }
 
         // 获取 SSH 客户端
-        let provider = self.ssh_client_provider.read().expect("SSH provider lock poisoned").clone();
+        let provider = self
+            .ssh_client_provider
+            .read()
+            .expect("SSH provider lock poisoned")
+            .clone();
         let ssh_client_provider = match provider {
             Some(p) => p,
             None => {
@@ -455,7 +479,8 @@ impl TransferService {
         if let Some(task) = tasks.get_mut(&task_id) {
             task.state = TransferTaskState::Completed;
             info!(task_id = %task_id, "Transfer completed");
-            self.event_bus.publish(AppEvent::TransferCompleted { task_id });
+            self.event_bus
+                .publish(AppEvent::TransferCompleted { task_id });
             self.event_bus.publish(AppEvent::TransferQueueChanged);
         }
 
@@ -470,7 +495,8 @@ impl TransferService {
             task.state = TransferTaskState::Failed;
             task.error_message = Some(error.clone());
             warn!(task_id = %task_id, error = %error, "Transfer failed");
-            self.event_bus.publish(AppEvent::TransferFailed { task_id, error });
+            self.event_bus
+                .publish(AppEvent::TransferFailed { task_id, error });
             self.event_bus.publish(AppEvent::TransferQueueChanged);
         }
 
@@ -501,7 +527,14 @@ mod tests {
     #[tokio::test]
     async fn enqueue_upload_rejects_missing_file_before_queueing() {
         let service = make_service();
-        let err = service.enqueue_upload(PathBuf::from("/definitely/missing/rshell-file"), "/remote/file".into(), Uuid::new_v4()).await.unwrap_err();
+        let err = service
+            .enqueue_upload(
+                PathBuf::from("/definitely/missing/rshell-file"),
+                "/remote/file".into(),
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, CoreError::InvalidState(_)));
         assert!(service.list_tasks().await.is_empty());
     }
@@ -511,9 +544,19 @@ mod tests {
         let service = make_service();
         let folder = tempfile::tempdir().unwrap();
         let target = folder.path().join("file");
-        assert!(matches!(service.enqueue_download("/".into(), target.clone(), Uuid::new_v4()).await, Err(CoreError::InvalidState(_))));
+        assert!(matches!(
+            service
+                .enqueue_download("/".into(), target.clone(), Uuid::new_v4())
+                .await,
+            Err(CoreError::InvalidState(_))
+        ));
         std::fs::write(&target, b"keep").unwrap();
-        assert!(matches!(service.enqueue_download("/remote/file".into(), target.clone(), Uuid::new_v4()).await, Err(CoreError::InvalidState(_))));
+        assert!(matches!(
+            service
+                .enqueue_download("/remote/file".into(), target.clone(), Uuid::new_v4())
+                .await,
+            Err(CoreError::InvalidState(_))
+        ));
         assert_eq!(std::fs::read(target).unwrap(), b"keep");
         assert!(service.list_tasks().await.is_empty());
     }
@@ -651,7 +694,9 @@ mod tests {
             tasks.insert(id, make_task(id, TransferTaskState::Transferring));
         }
 
-        svc.mark_failed(id, "connection reset".to_string()).await.unwrap();
+        svc.mark_failed(id, "connection reset".to_string())
+            .await
+            .unwrap();
         let t = svc.get_task(id).await.unwrap();
         assert_eq!(t.state, TransferTaskState::Failed);
         assert_eq!(t.error_message.as_deref(), Some("connection reset"));
@@ -671,7 +716,9 @@ mod tests {
 
         let all = svc.list_tasks().await;
         assert_eq!(all.len(), 2);
-        assert!(all.iter().any(|t| t.state == TransferTaskState::Transferring));
+        assert!(all
+            .iter()
+            .any(|t| t.state == TransferTaskState::Transferring));
         assert!(all.iter().any(|t| t.state == TransferTaskState::Paused));
     }
 

@@ -23,9 +23,7 @@ impl SftpClient {
     ///
     /// `channel` 必须已经请求了 sftp 子系统。
     /// 调用 `channel.into_stream()` 将其转换为 AsyncRead + AsyncWrite 流。
-    pub async fn new(
-        channel: russh::Channel<russh::client::Msg>,
-    ) -> Result<Self, ProtocolError> {
+    pub async fn new(channel: russh::Channel<russh::client::Msg>) -> Result<Self, ProtocolError> {
         let stream = channel.into_stream();
         let session = russh_sftp::client::SftpSession::new(stream)
             .await
@@ -95,21 +93,19 @@ impl SftpClient {
     pub async fn upload(&self, local: &PathBuf, remote: &str) -> Result<u64, ProtocolError> {
         info!(local = %local.display(), remote = %remote, "Uploading file");
 
-        let data = tokio::fs::read(local)
-            .await
-            .map_err(|e| ProtocolError::ProtocolError(format!("Failed to read local file: {}", e)))?;
+        let data = tokio::fs::read(local).await.map_err(|e| {
+            ProtocolError::ProtocolError(format!("Failed to read local file: {}", e))
+        })?;
 
         let total = data.len() as u64;
 
-        let mut file = self
-            .session
-            .create(remote)
-            .await
-            .map_err(|e| ProtocolError::ProtocolError(format!("Failed to create remote file: {}", e)))?;
+        let mut file = self.session.create(remote).await.map_err(|e| {
+            ProtocolError::ProtocolError(format!("Failed to create remote file: {}", e))
+        })?;
 
-        file.write_all(&data)
-            .await
-            .map_err(|e| ProtocolError::ProtocolError(format!("Failed to write remote file: {}", e)))?;
+        file.write_all(&data).await.map_err(|e| {
+            ProtocolError::ProtocolError(format!("Failed to write remote file: {}", e))
+        })?;
 
         // 关闭文件（通过 drop）
         drop(file);
@@ -122,29 +118,27 @@ impl SftpClient {
     pub async fn download(&self, remote: &str, local: &PathBuf) -> Result<u64, ProtocolError> {
         info!(remote = %remote, local = %local.display(), "Downloading file");
 
-        let mut file = self
-            .session
-            .open(remote)
-            .await
-            .map_err(|e| ProtocolError::ProtocolError(format!("Failed to open remote file: {}", e)))?;
+        let mut file = self.session.open(remote).await.map_err(|e| {
+            ProtocolError::ProtocolError(format!("Failed to open remote file: {}", e))
+        })?;
 
         let mut data = Vec::new();
-        file.read_to_end(&mut data)
-            .await
-            .map_err(|e| ProtocolError::ProtocolError(format!("Failed to read remote file: {}", e)))?;
+        file.read_to_end(&mut data).await.map_err(|e| {
+            ProtocolError::ProtocolError(format!("Failed to read remote file: {}", e))
+        })?;
 
         let total = data.len() as u64;
 
         // 确保本地目录存在
         if let Some(parent) = local.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ProtocolError::ProtocolError(format!("Failed to create local dir: {}", e)))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ProtocolError::ProtocolError(format!("Failed to create local dir: {}", e))
+            })?;
         }
 
-        tokio::fs::write(local, &data)
-            .await
-            .map_err(|e| ProtocolError::ProtocolError(format!("Failed to write local file: {}", e)))?;
+        tokio::fs::write(local, &data).await.map_err(|e| {
+            ProtocolError::ProtocolError(format!("Failed to write local file: {}", e))
+        })?;
 
         info!(remote = %remote, bytes = total, "Download completed");
         Ok(total)

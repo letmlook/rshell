@@ -11,9 +11,8 @@ pub mod sandbox;
 
 // Re-export 主要类型
 pub use api::{
-    ExtensionPoint, PluginContext, PluginError, PluginLogger,
-    PluginManifest, PluginPermission, PluginState, PluginType,
-    RShellPlugin, PluginConfigStore,
+    ExtensionPoint, PluginConfigStore, PluginContext, PluginError, PluginLogger, PluginManifest,
+    PluginPermission, PluginState, PluginType, RShellPlugin,
 };
 pub use loader::{LoadError, LoadedPlugin, PluginLoader};
 pub use sandbox::{SandboxConfig, SandboxError, WasmModule, WasmSandbox, WasmValue};

@@ -12,11 +12,14 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
+use tracing::{error, info, warn};
 use uuid::Uuid;
-use tracing::{info, warn, error};
 
-use rshell_api::types::{ActiveTunnelInfo, ForwardDirection, PendingTunnelInfo, PortForwardRule, TunnelState, UnsupportedTunnelRule};
 use rshell_api::events::AppEvent;
+use rshell_api::types::{
+    ActiveTunnelInfo, ForwardDirection, PendingTunnelInfo, PortForwardRule, TunnelState,
+    UnsupportedTunnelRule,
+};
 
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
@@ -127,12 +130,18 @@ impl TunnelManager {
     /// 同时返回可恢复规则及被安全跳过的旧规则诊断。
     pub async fn restore_pending_rules_info(&self) -> PendingTunnelInfo {
         let Some(path) = self.persist_path.as_ref() else {
-            return PendingTunnelInfo { rules: Vec::new(), unsupported: Vec::new() };
+            return PendingTunnelInfo {
+                rules: Vec::new(),
+                unsupported: Vec::new(),
+            };
         };
         match std::fs::read_to_string(path) {
             Ok(content) => match toml::from_str::<PersistedTunnels>(&content) {
                 Ok(p) => {
-                    let mut info = PendingTunnelInfo { rules: Vec::new(), unsupported: Vec::new() };
+                    let mut info = PendingTunnelInfo {
+                        rules: Vec::new(),
+                        unsupported: Vec::new(),
+                    };
                     for (sid, rules) in p.rules {
                         for rule in rules {
                             if rule.direction == PersistedDirection::Remote {
@@ -150,13 +159,22 @@ impl TunnelManager {
                 }
                 Err(e) => {
                     warn!("Failed to parse {}: {}", path.display(), e);
-                    PendingTunnelInfo { rules: Vec::new(), unsupported: Vec::new() }
+                    PendingTunnelInfo {
+                        rules: Vec::new(),
+                        unsupported: Vec::new(),
+                    }
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PendingTunnelInfo { rules: Vec::new(), unsupported: Vec::new() },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PendingTunnelInfo {
+                rules: Vec::new(),
+                unsupported: Vec::new(),
+            },
             Err(e) => {
                 warn!("Failed to read {}: {}", path.display(), e);
-                PendingTunnelInfo { rules: Vec::new(), unsupported: Vec::new() }
+                PendingTunnelInfo {
+                    rules: Vec::new(),
+                    unsupported: Vec::new(),
+                }
             }
         }
     }
@@ -175,7 +193,9 @@ impl TunnelManager {
                 Ok(previous) => {
                     for (sid, rules) in previous.rules {
                         grouped.entry(sid).or_default().extend(
-                            rules.into_iter().filter(|rule| rule.direction == PersistedDirection::Remote),
+                            rules
+                                .into_iter()
+                                .filter(|rule| rule.direction == PersistedDirection::Remote),
                         );
                     }
                 }
@@ -234,7 +254,8 @@ impl TunnelManager {
             .await
             .map_err(|e| CoreError::Internal(format!("Failed to bind {}: {}", bind_addr, e)))?;
 
-        let local_addr = listener.local_addr()
+        let local_addr = listener
+            .local_addr()
             .map_err(|e| CoreError::Internal(format!("Failed to get local addr: {}", e)))?;
 
         info!("Tunnel listening on: {}", local_addr);
@@ -251,7 +272,10 @@ impl TunnelManager {
             loop {
                 match listener.accept().await {
                     Ok((inbound, peer_addr)) => {
-                        info!("Tunnel {}: new connection from {}", tunnel_id_for_task, peer_addr);
+                        info!(
+                            "Tunnel {}: new connection from {}",
+                            tunnel_id_for_task, peer_addr
+                        );
 
                         // 更新连接计数
                         {
@@ -272,7 +296,14 @@ impl TunnelManager {
                         tokio::spawn(async move {
                             let res = match direction {
                                 ForwardDirection::Local => {
-                                    forward_local(ssh_client_for_task, inbound, &remote_host, remote_port, tid).await
+                                    forward_local(
+                                        ssh_client_for_task,
+                                        inbound,
+                                        &remote_host,
+                                        remote_port,
+                                        tid,
+                                    )
+                                    .await
                                 }
                                 ForwardDirection::Dynamic => {
                                     // SOCKS5 DynamicForward: 解析客户端握手得到目标 host:port,
@@ -351,7 +382,10 @@ impl TunnelManager {
             info!("Tunnel closed: {}", tunnel_id);
             Ok(())
         } else {
-            Err(CoreError::NotFound(format!("Tunnel not found: {}", tunnel_id)))
+            Err(CoreError::NotFound(format!(
+                "Tunnel not found: {}",
+                tunnel_id
+            )))
         }
     }
 
@@ -369,7 +403,10 @@ impl TunnelManager {
             info!("Tunnel suspended: {}", tunnel_id);
             Ok(())
         } else {
-            Err(CoreError::NotFound(format!("Tunnel not found: {}", tunnel_id)))
+            Err(CoreError::NotFound(format!(
+                "Tunnel not found: {}",
+                tunnel_id
+            )))
         }
     }
 
@@ -387,7 +424,10 @@ impl TunnelManager {
             info!("Tunnel resumed: {}", tunnel_id);
             Ok(())
         } else {
-            Err(CoreError::NotFound(format!("Tunnel not found: {}", tunnel_id)))
+            Err(CoreError::NotFound(format!(
+                "Tunnel not found: {}",
+                tunnel_id
+            )))
         }
     }
 
@@ -494,7 +534,10 @@ async fn socks5_handshake(inbound: &mut TcpStream) -> Result<(String, u16), Stri
     }
     let nmethods = buf[1] as usize;
     if n < 2 + nmethods {
-        return Err(format!("socks5 greeting truncated: n={} nmethods={}", n, nmethods));
+        return Err(format!(
+            "socks5 greeting truncated: n={} nmethods={}",
+            n, nmethods
+        ));
     }
     // 强制 no-auth (即便客户端没列, RFC 允许 server 选)
     inbound
@@ -596,14 +639,21 @@ mod tests {
         let pending = mgr.restore_pending_rules().await;
 
         assert_eq!(pending.len(), 2);
-        assert!(pending.iter().any(|(_, r)| r.direction == ForwardDirection::Local));
-        assert!(pending.iter().any(|(_, r)| r.direction == ForwardDirection::Dynamic));
+        assert!(pending
+            .iter()
+            .any(|(_, r)| r.direction == ForwardDirection::Local));
+        assert!(pending
+            .iter()
+            .any(|(_, r)| r.direction == ForwardDirection::Dynamic));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
 
         let info = mgr.restore_pending_rules_info().await;
         assert_eq!(info.unsupported.len(), 1);
         assert_eq!(info.unsupported[0].session_id, sid);
-        assert_eq!(info.unsupported[0].reason, "Remote forwarding is not supported");
+        assert_eq!(
+            info.unsupported[0].reason,
+            "Remote forwarding is not supported"
+        );
 
         mgr.save_to_disk().await;
         let after_save = std::fs::read_to_string(&path).unwrap();
@@ -614,7 +664,9 @@ mod tests {
     #[tokio::test]
     async fn tunnel_needs_an_ssh_connection() {
         let mgr = TunnelManager::new(Arc::new(EventBus::new()));
-        let result = mgr.create_tunnel(Uuid::new_v4(), make_rule("example.com", 0), None).await;
+        let result = mgr
+            .create_tunnel(Uuid::new_v4(), make_rule("example.com", 0), None)
+            .await;
         assert!(result.is_err());
     }
 
@@ -630,10 +682,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_persistence_roundtrip() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rshell-tunnels-{}.toml",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("rshell-tunnels-{}.toml", uuid::Uuid::new_v4()));
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let mgr = TunnelManager::new(bus).with_persistence(tmp.clone());
 
@@ -644,15 +694,18 @@ mod tests {
         // 持久化测试只注入规则，不需要建立真实 SSH 连接或监听器。
         let sid = Uuid::new_v4();
         let tid = Uuid::new_v4();
-        mgr.tunnels.write().await.insert(tid, ActiveTunnel {
-            id: tid,
-            session_id: sid,
-            rule: make_rule("example.com", 0),
-            state: TunnelState::Active,
-            bytes_transferred: 0,
-            connections_count: 0,
-            listener_handle: None,
-        });
+        mgr.tunnels.write().await.insert(
+            tid,
+            ActiveTunnel {
+                id: tid,
+                session_id: sid,
+                rule: make_rule("example.com", 0),
+                state: TunnelState::Active,
+                bytes_transferred: 0,
+                connections_count: 0,
+                listener_handle: None,
+            },
+        );
         mgr.save_to_disk().await;
         let saved = std::fs::read_to_string(&tmp).unwrap();
         assert!(saved.contains(&sid.to_string()));
@@ -670,12 +723,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_restore_handles_missing_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rshell-missing-{}.toml",
-            uuid::Uuid::new_v4()
-        ));
-        let mgr = TunnelManager::new(Arc::new(crate::event_bus::EventBus::new()))
-            .with_persistence(tmp);
+        let tmp =
+            std::env::temp_dir().join(format!("rshell-missing-{}.toml", uuid::Uuid::new_v4()));
+        let mgr =
+            TunnelManager::new(Arc::new(crate::event_bus::EventBus::new())).with_persistence(tmp);
         let pending = mgr.restore_pending_rules().await;
         assert!(pending.is_empty());
     }

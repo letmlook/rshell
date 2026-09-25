@@ -5,7 +5,7 @@
 
 use super::{Pty, PtyError};
 use std::io::{self, Read, Write};
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 /// Windows PTY
 pub struct WindowsPty {
@@ -29,9 +29,13 @@ impl WindowsPty {
             .spawn()
             .map_err(|e| PtyError::CreationFailed(format!("Failed to spawn cmd.exe: {}", e)))?;
 
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| PtyError::CreationFailed("Failed to take stdout".to_string()))?;
-        let stdin = child.stdin.take()
+        let stdin = child
+            .stdin
+            .take()
             .ok_or_else(|| PtyError::CreationFailed("Failed to take stdin".to_string()))?;
 
         let reader: Box<dyn Read + Send + Sync> = Box::new(stdout);

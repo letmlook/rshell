@@ -32,23 +32,33 @@ impl SyncInputService {
     ///
     /// 设置需要同步输入的会话列表。空列表表示关闭同步输入。
     pub fn toggle_sync_input(&self, session_ids: Vec<Uuid>) -> Result<(), CoreError> {
-        let mut sync = self.sync_sessions.write().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut sync = self
+            .sync_sessions
+            .write()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         *sync = session_ids.clone();
 
         info!(count = session_ids.len(), "Sync input sessions updated");
-        self.event_bus.publish(AppEvent::SyncInputSessionsChanged { session_ids });
+        self.event_bus
+            .publish(AppEvent::SyncInputSessionsChanged { session_ids });
         Ok(())
     }
 
     /// 获取当前同步输入会话列表
     pub fn get_sync_sessions(&self) -> Result<Vec<Uuid>, CoreError> {
-        let sync = self.sync_sessions.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let sync = self
+            .sync_sessions
+            .read()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         Ok(sync.clone())
     }
 
     /// 是否处于同步输入模式
     pub fn is_sync_active(&self) -> Result<bool, CoreError> {
-        let sync = self.sync_sessions.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+        let sync = self
+            .sync_sessions
+            .read()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
         Ok(!sync.is_empty())
     }
 
@@ -59,7 +69,10 @@ impl SyncInputService {
         session_service: &SessionService,
     ) -> Result<(), CoreError> {
         let sessions = {
-            let sync = self.sync_sessions.read().map_err(|e| CoreError::Internal(e.to_string()))?;
+            let sync = self
+                .sync_sessions
+                .read()
+                .map_err(|e| CoreError::Internal(e.to_string()))?;
             sync.clone()
         };
 

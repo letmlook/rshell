@@ -12,7 +12,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::{ComposeTarget, PortForwardRule, QuickCommand, SessionConfig, SshKeyType, TerminalColorScheme, TrustHostKeyDecision, Trigger};
+use crate::types::{
+    ComposeTarget, PortForwardRule, QuickCommand, SessionConfig, SshKeyType, TerminalColorScheme,
+    Trigger, TrustHostKeyDecision,
+};
 
 /// 前端发送的所有命令
 // 切片 2.3 注释：ts-rs 全量 derive 等 types.rs 同步 derive 后再开。
@@ -22,21 +25,39 @@ use crate::types::{ComposeTarget, PortForwardRule, QuickCommand, SessionConfig, 
 pub enum AppCommand {
     // ===== 会话命令 =====
     /// 连接到指定会话
-    ConnectSession { session_id: Uuid },
+    ConnectSession {
+        session_id: Uuid,
+    },
     /// 断开指定会话
-    DisconnectSession { session_id: Uuid },
+    DisconnectSession {
+        session_id: Uuid,
+    },
     /// 创建新会话
-    CreateSession { config: SessionConfig },
+    CreateSession {
+        config: SessionConfig,
+    },
     /// 更新会话配置
-    UpdateSession { id: Uuid, config: SessionConfig },
+    UpdateSession {
+        id: Uuid,
+        config: SessionConfig,
+    },
     /// 删除会话
-    DeleteSession { id: Uuid },
+    DeleteSession {
+        id: Uuid,
+    },
 
     // ===== 终端命令 =====
     /// 发送输入到终端
-    SendInput { session_id: Uuid, data: Vec<u8> },
+    SendInput {
+        session_id: Uuid,
+        data: Vec<u8>,
+    },
     /// 调整终端大小
-    ResizeTerminal { session_id: Uuid, cols: u16, rows: u16 },
+    ResizeTerminal {
+        session_id: Uuid,
+        cols: u16,
+        rows: u16,
+    },
 
     // ===== 文件传输命令 =====
     /// 添加上传任务
@@ -52,73 +73,135 @@ pub enum AppCommand {
         session_id: Uuid,
     },
     /// 暂停传输
-    PauseTransfer { task_id: Uuid },
+    PauseTransfer {
+        task_id: Uuid,
+    },
     /// 恢复传输
-    ResumeTransfer { task_id: Uuid },
+    ResumeTransfer {
+        task_id: Uuid,
+    },
     /// 取消传输
-    CancelTransfer { task_id: Uuid },
+    CancelTransfer {
+        task_id: Uuid,
+    },
     /// 浏览远程目录
-    BrowseRemoteDir { session_id: Uuid, path: String },
-    CreateRemoteDirectory { session_id: Uuid, path: String },
-    DeleteRemoteEntry { session_id: Uuid, path: String },
+    BrowseRemoteDir {
+        session_id: Uuid,
+        path: String,
+    },
+    CreateRemoteDirectory {
+        session_id: Uuid,
+        path: String,
+    },
+    DeleteRemoteEntry {
+        session_id: Uuid,
+        path: String,
+    },
     ListTransfers,
 
     // ===== 隧道命令 =====
     /// 创建端口转发隧道
-    CreateTunnel { session_id: Uuid, rule: PortForwardRule },
+    CreateTunnel {
+        session_id: Uuid,
+        rule: PortForwardRule,
+    },
     /// 关闭隧道
-    CloseTunnel { tunnel_id: Uuid },
+    CloseTunnel {
+        tunnel_id: Uuid,
+    },
 
     /// 列出待重建隧道 (从磁盘恢复, 本次进程未启动 listener)
     ListPendingTunnels,
     /// 把一条 pending 规则升级为活动隧道 (UI 端"启动"按钮)
-    RestoreTunnel { session_id: Uuid, rule: PortForwardRule },
+    RestoreTunnel {
+        session_id: Uuid,
+        rule: PortForwardRule,
+    },
 
     // ===== 快速命令 =====
     /// 执行快速命令
-    ExecuteQuickCommand { command_id: Uuid, target_sessions: Vec<Uuid> },
+    ExecuteQuickCommand {
+        command_id: Uuid,
+        target_sessions: Vec<Uuid>,
+    },
     /// 创建快速命令
-    CreateQuickCommand { command: QuickCommand },
+    CreateQuickCommand {
+        command: QuickCommand,
+    },
     /// 删除快速命令
-    DeleteQuickCommand { command_id: Uuid },
+    DeleteQuickCommand {
+        command_id: Uuid,
+    },
 
     // ===== 触发器 =====
     /// 创建触发器
-    CreateTrigger { trigger: Trigger },
+    CreateTrigger {
+        trigger: Trigger,
+    },
     /// 删除触发器
-    DeleteTrigger { trigger_id: Uuid },
+    DeleteTrigger {
+        trigger_id: Uuid,
+    },
     /// 切换触发器启用/禁用
-    ToggleTrigger { trigger_id: Uuid },
+    ToggleTrigger {
+        trigger_id: Uuid,
+    },
 
     // ===== 撰写窗格 =====
     /// 发送撰写窗格文本
-    SendComposeText { content: String, target: ComposeTarget },
+    SendComposeText {
+        content: String,
+        target: ComposeTarget,
+    },
 
     // ===== 脚本 =====
     /// 执行脚本
-    ExecuteScript { code: String, session_id: Uuid },
+    ExecuteScript {
+        code: String,
+        session_id: Uuid,
+    },
 
     // ===== 同步输入 =====
     /// 切换同步输入模式
-    ToggleSyncInput { session_ids: Vec<Uuid> },
+    ToggleSyncInput {
+        session_ids: Vec<Uuid>,
+    },
 
     // ===== 安全：密钥管理 =====
     /// 生成 SSH 密钥对
-    GenerateSshKey { name: String, key_type: SshKeyType, passphrase: Option<String> },
+    GenerateSshKey {
+        name: String,
+        key_type: SshKeyType,
+        passphrase: Option<String>,
+    },
     /// 导入私钥
-    ImportPrivateKey { path: std::path::PathBuf, passphrase: Option<String> },
+    ImportPrivateKey {
+        path: std::path::PathBuf,
+        passphrase: Option<String>,
+    },
     /// 删除密钥
-    DeleteSshKey { key_id: Uuid },
+    DeleteSshKey {
+        key_id: Uuid,
+    },
     /// 导出公钥
-    ExportPublicKey { key_id: Uuid },
+    ExportPublicKey {
+        key_id: Uuid,
+    },
 
     // ===== 安全：主密码 =====
     /// 设置主密码
-    SetupMasterPassword { password: String },
+    SetupMasterPassword {
+        password: String,
+    },
     /// 验证主密码
-    VerifyMasterPassword { password: String },
+    VerifyMasterPassword {
+        password: String,
+    },
     /// 修改主密码
-    ChangeMasterPassword { old_password: String, new_password: String },
+    ChangeMasterPassword {
+        old_password: String,
+        new_password: String,
+    },
 
     // ===== 安全：主机密钥 =====
     /// 信任主机密钥（在 HostKeyMismatch 后用户选择接受）
@@ -142,29 +225,46 @@ pub enum AppCommand {
     },
 
     /// 删除主机密钥
-    DeleteHostKey { host: String, port: u16 },
+    DeleteHostKey {
+        host: String,
+        port: u16,
+    },
 
     // ===== 安全：隧道管理 =====
     /// 暂停隧道
-    SuspendTunnel { tunnel_id: Uuid },
+    SuspendTunnel {
+        tunnel_id: Uuid,
+    },
     /// 恢复隧道
-    ResumeTunnel { tunnel_id: Uuid },
+    ResumeTunnel {
+        tunnel_id: Uuid,
+    },
 
     // ===== 主题/配色方案 =====
     /// 设置应用主题
-    SetAppTheme { theme_name: String },
+    SetAppTheme {
+        theme_name: String,
+    },
     /// 设置终端配色方案
-    SetTerminalColorScheme { scheme_name: String },
+    SetTerminalColorScheme {
+        scheme_name: String,
+    },
     /// 导入自定义配色方案
-    ImportColorScheme { scheme: TerminalColorScheme },
+    ImportColorScheme {
+        scheme: TerminalColorScheme,
+    },
 
     // ===== 插件管理 =====
     /// 扫描插件目录
     ScanPlugins,
     /// 加载插件
-    LoadPlugin { plugin_id: String },
+    LoadPlugin {
+        plugin_id: String,
+    },
     /// 卸载插件
-    UnloadPlugin { plugin_id: String },
+    UnloadPlugin {
+        plugin_id: String,
+    },
 
     // ===== List / snapshot 拉取 =====
     // 这些命令让 UI 主动拉数据, 触发后端 publish 对应 XSnapshot 事件。

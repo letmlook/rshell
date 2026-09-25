@@ -69,7 +69,10 @@ impl IpcError {
     pub fn outcome_mismatch(expected: &str, actual: &str) -> Self {
         Self::new(
             IpcErrorKind::OutcomeMismatch,
-            format!("dispatcher returned {:?} where {:?} expected", actual, expected),
+            format!(
+                "dispatcher returned {:?} where {:?} expected",
+                actual, expected
+            ),
         )
     }
 }
@@ -110,7 +113,10 @@ impl std::error::Error for IpcError {}
 impl From<IpcError> for String {
     fn from(err: IpcError) -> Self {
         serde_json::to_string(&err).unwrap_or_else(|e| {
-            format!(r#"{{"kind":"internal","message":"IpcError serialize failed: {}"}}"#, e)
+            format!(
+                r#"{{"kind":"internal","message":"IpcError serialize failed: {}"}}"#,
+                e
+            )
         })
     }
 }
@@ -155,9 +161,15 @@ mod tests {
         // host_key_decision 单独 publish,不走 CoreError 路径)
         for k in &kinds {
             assert!(
-                ["not_found", "auth_failed", "connection", "storage", "internal"]
-                    .iter()
-                    .any(|allowed| allowed == &k.as_str()),
+                [
+                    "not_found",
+                    "auth_failed",
+                    "connection",
+                    "storage",
+                    "internal"
+                ]
+                .iter()
+                .any(|allowed| allowed == &k.as_str()),
                 "unexpected kind: {}",
                 k
             );

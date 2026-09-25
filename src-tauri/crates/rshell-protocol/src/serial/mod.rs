@@ -6,8 +6,8 @@
 //! depending on platform），因此所有 I/O 都包在 `tokio::task::spawn_blocking` 中，
 //! 以避免阻塞后端 runtime 的事件循环。
 
-use std::io::{Read, Write};
 use std::collections::VecDeque;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -141,7 +141,10 @@ impl SerialConnection {
             let ports = serialport::available_ports().map_err(|e| {
                 ProtocolError::ConnectionFailed(format!("available_ports failed: {}", e))
             })?;
-            Ok(ports.into_iter().map(|p: SerialPortInfo| p.port_name).collect())
+            Ok(ports
+                .into_iter()
+                .map(|p: SerialPortInfo| p.port_name)
+                .collect())
         })
         .await
         .map_err(|e| ProtocolError::ConnectionFailed(format!("join error: {}", e)))?
@@ -174,8 +177,7 @@ impl Connection for SerialConnection {
             }
         })
         .await
-        .map_err(|e| ProtocolError::ConnectionFailed(format!("join error: {}", e)))?
-        ?;
+        .map_err(|e| ProtocolError::ConnectionFailed(format!("join error: {}", e)))??;
 
         self.port = Some(Arc::new(Mutex::new(port)));
         self.state = SerialState::Connected;
@@ -231,14 +233,22 @@ impl Connection for SerialConnection {
             ));
         }
 
-        if buf.is_empty() { return Ok(0); }
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if !self.pending_bytes.is_empty() {
             let count = buf.len().min(self.pending_bytes.len());
-            for byte in &mut buf[..count] { *byte = self.pending_bytes.pop_front().unwrap(); }
+            for byte in &mut buf[..count] {
+                *byte = self.pending_bytes.pop_front().unwrap();
+            }
             return Ok(count);
         }
         if self.read_task.is_none() {
-            let port = self.port.as_ref().ok_or(ProtocolError::ConnectionClosed)?.clone();
+            let port = self
+                .port
+                .as_ref()
+                .ok_or(ProtocolError::ConnectionClosed)?
+                .clone();
             let capacity = buf.len();
             self.read_task = Some(task::spawn_blocking(move || {
                 let mut bytes = vec![0u8; capacity];
@@ -248,16 +258,21 @@ impl Connection for SerialConnection {
         }
         // Await by reference: cancelling recv leaves the task owned by this
         // connection, and the next recv consumes the same result exactly once.
-        let completed = self.read_task.as_mut().expect("read task initialized").await;
+        let completed = self
+            .read_task
+            .as_mut()
+            .expect("read task initialized")
+            .await;
         self.read_task = None;
-        let (result, bytes) = completed.map_err(|e| ProtocolError::ProtocolError(format!("join error: {e}")))?;
+        let (result, bytes) =
+            completed.map_err(|e| ProtocolError::ProtocolError(format!("join error: {e}")))?;
         match result {
             Ok(n) => {
                 let count = n.min(buf.len());
                 buf[..count].copy_from_slice(&bytes[..count]);
                 self.pending_bytes.extend(&bytes[count..n]);
                 Ok(count)
-            },
+            }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(0),
             Err(e) => Err(ProtocolError::ProtocolError(format!("read failed: {}", e))),
         }
@@ -290,7 +305,11 @@ mod tests {
             (Ok(3), b"abc".to_vec())
         }));
         let mut buffer = [0u8; 2];
-        assert!(tokio::time::timeout(Duration::from_millis(5), connection.recv(&mut buffer)).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), connection.recv(&mut buffer))
+                .await
+                .is_err()
+        );
         ready.send(()).unwrap();
         assert_eq!(connection.recv(&mut buffer).await.unwrap(), 2);
         assert_eq!(&buffer, b"ab");
@@ -311,36 +330,84 @@ mod tests {
 
     #[test]
     fn test_to_serialport_data_bits() {
-        assert!(matches!(to_serialport_data_bits(5), serialport::DataBits::Five));
-        assert!(matches!(to_serialport_data_bits(6), serialport::DataBits::Six));
-        assert!(matches!(to_serialport_data_bits(7), serialport::DataBits::Seven));
+        assert!(matches!(
+            to_serialport_data_bits(5),
+            serialport::DataBits::Five
+        ));
+        assert!(matches!(
+            to_serialport_data_bits(6),
+            serialport::DataBits::Six
+        ));
+        assert!(matches!(
+            to_serialport_data_bits(7),
+            serialport::DataBits::Seven
+        ));
         // 任何其他值 (含 0、8、9) 都 fallback 到 8
-        assert!(matches!(to_serialport_data_bits(0), serialport::DataBits::Eight));
-        assert!(matches!(to_serialport_data_bits(8), serialport::DataBits::Eight));
-        assert!(matches!(to_serialport_data_bits(99), serialport::DataBits::Eight));
+        assert!(matches!(
+            to_serialport_data_bits(0),
+            serialport::DataBits::Eight
+        ));
+        assert!(matches!(
+            to_serialport_data_bits(8),
+            serialport::DataBits::Eight
+        ));
+        assert!(matches!(
+            to_serialport_data_bits(99),
+            serialport::DataBits::Eight
+        ));
     }
 
     #[test]
     fn test_to_serialport_stop_bits() {
-        assert!(matches!(to_serialport_stop_bits(1), serialport::StopBits::One));
-        assert!(matches!(to_serialport_stop_bits(2), serialport::StopBits::Two));
+        assert!(matches!(
+            to_serialport_stop_bits(1),
+            serialport::StopBits::One
+        ));
+        assert!(matches!(
+            to_serialport_stop_bits(2),
+            serialport::StopBits::Two
+        ));
         // 其他值 fallback 到 1
-        assert!(matches!(to_serialport_stop_bits(0), serialport::StopBits::One));
-        assert!(matches!(to_serialport_stop_bits(3), serialport::StopBits::One));
+        assert!(matches!(
+            to_serialport_stop_bits(0),
+            serialport::StopBits::One
+        ));
+        assert!(matches!(
+            to_serialport_stop_bits(3),
+            serialport::StopBits::One
+        ));
     }
 
     #[test]
     fn test_to_serialport_parity() {
-        assert!(matches!(to_serialport_parity(SerialParity::None), serialport::Parity::None));
-        assert!(matches!(to_serialport_parity(SerialParity::Even), serialport::Parity::Even));
-        assert!(matches!(to_serialport_parity(SerialParity::Odd), serialport::Parity::Odd));
+        assert!(matches!(
+            to_serialport_parity(SerialParity::None),
+            serialport::Parity::None
+        ));
+        assert!(matches!(
+            to_serialport_parity(SerialParity::Even),
+            serialport::Parity::Even
+        ));
+        assert!(matches!(
+            to_serialport_parity(SerialParity::Odd),
+            serialport::Parity::Odd
+        ));
     }
 
     #[test]
     fn test_to_serialport_flow() {
-        assert!(matches!(to_serialport_flow(SerialFlowControl::None), serialport::FlowControl::None));
-        assert!(matches!(to_serialport_flow(SerialFlowControl::Software), serialport::FlowControl::Software));
-        assert!(matches!(to_serialport_flow(SerialFlowControl::Hardware), serialport::FlowControl::Hardware));
+        assert!(matches!(
+            to_serialport_flow(SerialFlowControl::None),
+            serialport::FlowControl::None
+        ));
+        assert!(matches!(
+            to_serialport_flow(SerialFlowControl::Software),
+            serialport::FlowControl::Software
+        ));
+        assert!(matches!(
+            to_serialport_flow(SerialFlowControl::Hardware),
+            serialport::FlowControl::Hardware
+        ));
     }
 
     #[test]

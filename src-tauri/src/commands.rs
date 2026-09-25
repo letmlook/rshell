@@ -8,7 +8,10 @@
 //! - `update_session` / `delete_session`
 //! - `send_input` / `resize_terminal` / `attach_terminal`
 
-use rshell_api::types::{ComposeTarget, PluginInfo, RemoteFileEntry, SessionConfig, TerminalColorScheme, TransferTaskInfo};
+use rshell_api::types::{
+    ComposeTarget, PluginInfo, RemoteFileEntry, SessionConfig, TerminalColorScheme,
+    TransferTaskInfo,
+};
 use rshell_api::{AppCommand, CommandOutcome};
 use tauri::ipc::Channel;
 use tauri::State;
@@ -72,14 +75,23 @@ macro_rules! cmd {
 // 用宏不易表达"返回 ()",改写为直接函数体。
 #[tauri::command]
 pub async fn connect_session(session_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::ConnectSession { session_id }).await
+    state
+        .dispatcher
+        .dispatch(AppCommand::ConnectSession { session_id })
+        .await
         .map_err(IpcError::from)?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn disconnect_session(session_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::DisconnectSession { session_id }).await
+pub async fn disconnect_session(
+    session_id: Uuid,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::DisconnectSession { session_id })
+        .await
         .map_err(IpcError::from)?;
     Ok(())
 }
@@ -90,14 +102,20 @@ pub async fn update_session(
     config: SessionConfig,
     state: State<'_, AppState>,
 ) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::UpdateSession { id, config }).await
+    state
+        .dispatcher
+        .dispatch(AppCommand::UpdateSession { id, config })
+        .await
         .map_err(IpcError::from)?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn delete_session(id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::DeleteSession { id }).await
+    state
+        .dispatcher
+        .dispatch(AppCommand::DeleteSession { id })
+        .await
         .map_err(IpcError::from)?;
     Ok(())
 }
@@ -108,7 +126,10 @@ pub async fn send_input(
     data: Vec<u8>,
     state: State<'_, AppState>,
 ) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::SendInput { session_id, data }).await
+    state
+        .dispatcher
+        .dispatch(AppCommand::SendInput { session_id, data })
+        .await
         .map_err(IpcError::from)?;
     Ok(())
 }
@@ -120,7 +141,14 @@ pub async fn resize_terminal(
     rows: u16,
     state: State<'_, AppState>,
 ) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::ResizeTerminal { session_id, cols, rows }).await
+    state
+        .dispatcher
+        .dispatch(AppCommand::ResizeTerminal {
+            session_id,
+            cols,
+            rows,
+        })
+        .await
         .map_err(IpcError::from)?;
     Ok(())
 }
@@ -131,7 +159,10 @@ pub async fn create_session(
     config: SessionConfig,
     state: State<'_, AppState>,
 ) -> Result<Uuid, IpcError> {
-    let outcome = state.dispatcher.dispatch(AppCommand::CreateSession { config }).await
+    let outcome = state
+        .dispatcher
+        .dispatch(AppCommand::CreateSession { config })
+        .await
         .map_err(IpcError::from)?;
     match outcome {
         CommandOutcome::SessionId(id) => Ok(id),
@@ -262,14 +293,30 @@ pub struct RemoteDirectoryResult {
 }
 
 #[tauri::command]
-pub async fn create_remote_directory(session_id: Uuid, path: String, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::CreateRemoteDirectory { session_id, path }).await.map_err(IpcError::from)?;
+pub async fn create_remote_directory(
+    session_id: Uuid,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::CreateRemoteDirectory { session_id, path })
+        .await
+        .map_err(IpcError::from)?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn delete_remote_entry(session_id: Uuid, path: String, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::DeleteRemoteEntry { session_id, path }).await.map_err(IpcError::from)?;
+pub async fn delete_remote_entry(
+    session_id: Uuid,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::DeleteRemoteEntry { session_id, path })
+        .await
+        .map_err(IpcError::from)?;
     Ok(())
 }
 
@@ -288,7 +335,11 @@ pub async fn generate_ssh_key(
 ) -> Result<(), IpcError> {
     state
         .dispatcher
-        .dispatch(AppCommand::GenerateSshKey { name, key_type, passphrase })
+        .dispatch(AppCommand::GenerateSshKey {
+            name,
+            key_type,
+            passphrase,
+        })
         .await
         .map_err(IpcError::from)?;
     Ok(())
@@ -343,7 +394,10 @@ pub async fn change_master_password(
 ) -> Result<(), IpcError> {
     state
         .dispatcher
-        .dispatch(AppCommand::ChangeMasterPassword { old_password, new_password })
+        .dispatch(AppCommand::ChangeMasterPassword {
+            old_password,
+            new_password,
+        })
         .await
         .map_err(IpcError::from)?;
     Ok(())
@@ -534,32 +588,66 @@ pub async fn resume_tunnel(tunnel_id: Uuid, state: State<'_, AppState>) -> Resul
 cmd!(list_plugins() -> Plugins(Vec<PluginInfo>) = AppCommand::ListPlugins);
 
 #[tauri::command]
-pub async fn send_compose_text(content: String, target: ComposeTarget, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::SendComposeText { content, target }).await.map_err(IpcError::from)?;
+pub async fn send_compose_text(
+    content: String,
+    target: ComposeTarget,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::SendComposeText { content, target })
+        .await
+        .map_err(IpcError::from)?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn toggle_sync_input(session_ids: Vec<Uuid>, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::ToggleSyncInput { session_ids }).await.map_err(IpcError::from)?;
+pub async fn toggle_sync_input(
+    session_ids: Vec<Uuid>,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::ToggleSyncInput { session_ids })
+        .await
+        .map_err(IpcError::from)?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn export_public_key(key_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::ExportPublicKey { key_id }).await.map_err(IpcError::from)?;
+    state
+        .dispatcher
+        .dispatch(AppCommand::ExportPublicKey { key_id })
+        .await
+        .map_err(IpcError::from)?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn delete_host_key(host: String, port: u16, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::DeleteHostKey { host, port }).await.map_err(IpcError::from)?;
+pub async fn delete_host_key(
+    host: String,
+    port: u16,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::DeleteHostKey { host, port })
+        .await
+        .map_err(IpcError::from)?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn import_color_scheme(scheme: TerminalColorScheme, state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.dispatcher.dispatch(AppCommand::ImportColorScheme { scheme }).await.map_err(IpcError::from)?;
+pub async fn import_color_scheme(
+    scheme: TerminalColorScheme,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::ImportColorScheme { scheme })
+        .await
+        .map_err(IpcError::from)?;
     Ok(())
 }
 #[tauri::command]
