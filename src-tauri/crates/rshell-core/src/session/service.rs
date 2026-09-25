@@ -6,7 +6,7 @@ use crate::script::trigger_engine::TriggerEngine;
 use crate::security::host_key_decision::HostKeyDecisionRegistry;
 use crate::session::repository::SessionRepository;
 use crate::terminal::service::TerminalService;
-use rshell_api::types::{ConnectionInfo, ConnectionState, RemoteFileEntry, SessionConfig, TriggerAction};
+use rshell_api::types::{ConnectionInfo, ConnectionState, FileType, RemoteFileEntry, SessionConfig, TriggerAction};
 use rshell_protocol::ssh::SshClient;
 use rshell_protocol::ssh::sftp::SftpClient;
 use std::collections::HashMap;
@@ -17,6 +17,17 @@ use uuid::Uuid;
 
 /// 活动连接的 SSH 客户端句柄别名（与 SshClient 内部使用了同样的 tokio RwLock）
 pub type SshClientHandle = Arc<tokio::sync::RwLock<SshClient>>;
+
+/// Destructive SFTP operations accept only an absolute, unambiguous non-root path.
+pub(crate) fn validate_remote_mutation_path(path: &str) -> Result<(), CoreError> {
+    if !path.starts_with('/') || path == "/" || path.ends_with('/')
+        || path.split('/').skip(1).any(|part| part.is_empty() || part == "." || part == "..")
+        || path.chars().any(|c| c == '\0' || c == '\\')
+    {
+        return Err(CoreError::InvalidState(format!("Unsafe remote file path: {path}")));
+    }
+    Ok(())
+}
 
 /// 会话运行时状态
 struct SessionState {
@@ -535,6 +546,32 @@ impl SessionService {
         Ok(entries)
     }
 
+    pub async fn create_remote_directory(&self, session_id: Uuid, path: &str) -> Result<(), CoreError> {
+        validate_remote_mutation_path(path)?;
+        let client = self.get_ssh_client(session_id).await?;
+        let ssh = client.read().await;
+        let channel = ssh.open_sftp_channel().await
+            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+        let sftp = SftpClient::new(channel).await
+            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+        sftp.create_dir(path).await.map_err(|e| CoreError::ServiceError(e.to_string()))
+    }
+
+    pub async fn delete_remote_entry(&self, session_id: Uuid, path: &str) -> Result<(), CoreError> {
+        validate_remote_mutation_path(path)?;
+        let client = self.get_ssh_client(session_id).await?;
+        let ssh = client.read().await;
+        let channel = ssh.open_sftp_channel().await
+            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+        let sftp = SftpClient::new(channel).await
+            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+        let entry = sftp.metadata(path).await.map_err(|e| CoreError::ServiceError(e.to_string()))?;
+        if entry.file_type != FileType::File {
+            return Err(CoreError::InvalidState("Only regular remote files can be deleted".into()));
+        }
+        sftp.remove_file(path).await.map_err(|e| CoreError::ServiceError(e.to_string()))
+    }
+
     /// 列出所有会话
     pub async fn list_sessions(&self) -> Result<Vec<SessionConfig>, CoreError> {
         let sessions = self.sessions.read().await;
@@ -552,6 +589,14 @@ mod tests {
     use rshell_api::AppEvent;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn remote_mutation_path_rejects_root_empty_and_traversal() {
+        for path in ["", "/", "//", "/a/../b", "/a/./b", "relative/file", "/a/"] {
+            assert!(validate_remote_mutation_path(path).is_err(), "{path}");
+        }
+        assert!(validate_remote_mutation_path("/home/user/file.txt").is_ok());
+    }
 
     fn make_service() -> SessionService {
         let bus = Arc::new(EventBus::new());

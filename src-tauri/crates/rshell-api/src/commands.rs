@@ -59,6 +59,9 @@ pub enum AppCommand {
     CancelTransfer { task_id: Uuid },
     /// 浏览远程目录
     BrowseRemoteDir { session_id: Uuid, path: String },
+    CreateRemoteDirectory { session_id: Uuid, path: String },
+    DeleteRemoteEntry { session_id: Uuid, path: String },
+    ListTransfers,
 
     // ===== 隧道命令 =====
     /// 创建端口转发隧道

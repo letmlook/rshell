@@ -34,6 +34,8 @@ const props = withDefaults(
     width?: number;
     maxWidth?: number;
     expanded?: boolean;
+    activeSessionId?: string | null;
+    activeSessionConnected?: boolean;
   }>(),
   {
     width: DEFAULT_SIDEBAR_WIDTH,
@@ -128,8 +130,9 @@ function resetWidth() {
         @open-terminal="(id, p) => emit('open-terminal', id, p)"
       />
       <div v-else-if="active === 'files'" class="placeholder">
-        <p>文件浏览（切片 5.2）</p>
-        <p class="hint">本地 / 远端双面板 · 待 Tauri-plugin-fs + SFTP 接入</p>
+        <p>文件浏览位于传输工作区</p>
+        <p class="hint">{{ activeSessionConnected ? '使用当前 SSH 会话浏览远程目录。' : '先连接 SSH 会话，再打开传输工作区。' }}</p>
+        <el-button :disabled="!activeSessionConnected || !activeSessionId" @click="emit('open-sftp', activeSessionId!)">打开传输工作区</el-button>
       </div>
       <KeyManagerPanel v-else-if="active === 'keys'" embedded />
       <QuickCommandPanel

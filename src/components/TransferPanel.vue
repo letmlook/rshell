@@ -9,11 +9,11 @@
  * 进度条颜色映射到 --rs-progress-*
  * 状态点复用签名元素
  *
- * 数据:本地 mock(可由 WorkspaceToolbar 触发入队;本次不做真后端对接)
+ * 数据来自后端真实传输队列快照。
  */
 import { computed, ref } from "vue";
 
-export type TransferPhase = "queued" | "active" | "paused" | "failed" | "done";
+export type TransferPhase = "queued" | "active" | "paused" | "failed" | "done" | "cancelled";
 
 export interface TransferItem {
   id: string;
@@ -28,64 +28,18 @@ export interface TransferItem {
 
 const props = defineProps<{
   expanded: boolean;
-  items?: TransferItem[];
+  items: TransferItem[];
   /** 队列高度,折叠后不占空间 */
   height?: number;
 }>();
 
 const emit = defineEmits<{
   (e: "toggle"): void;
-  (e: "pause", id: string): void;
-  (e: "resume", id: string): void;
-  (e: "cancel", id: string): void;
 }>();
 
 const tab = ref<"transfer" | "log">("transfer");
 
-const internalItems = ref<TransferItem[]>([
-  {
-    id: "t-1",
-    name: "machine_m01986.json",
-    phase: "done",
-    progress: 1,
-    size: 117 * 1024,
-    local: "C:\\code\\pmi\\datasave\\machines\\machine_m01986.json",
-    remote: "/root/pmi/datasave/machines/machine_m01986.json",
-    speed: 0,
-  },
-  {
-    id: "t-2",
-    name: "machine_m01986.json.bak",
-    phase: "active",
-    progress: 0.42,
-    size: 134 * 1024,
-    local: "C:\\code\\pmi\\datasave\\machines\\machine_m01986.json.bak",
-    remote: "/root/pmi/datasave/machines/machine_m01986.json.bak",
-    speed: 580 * 1024,
-  },
-  {
-    id: "t-3",
-    name: "machine_m01986.json.bak.1",
-    phase: "paused",
-    progress: 0.18,
-    size: 186 * 1024,
-    local: "C:\\code\\pmi\\datasave\\machines\\machine_m01986.json.bak.1",
-    remote: "/root/pmi/datasave/machines/machine_m01986.json.bak.1",
-    speed: 0,
-  },
-  {
-    id: "t-4",
-    name: "build-output-2026-07-12.tar.gz",
-    phase: "failed",
-    progress: 0.66,
-    size: 2_400_000,
-    local: "C:\\code\\pmi\\builds\\build-output-2026-07-12.tar.gz",
-    remote: "/root/pmi/datasave/machines/build-output-2026-07-12.tar.gz",
-    speed: 0,
-  },
-]);
-
-const merged = computed<TransferItem[]>(() => props.items ?? internalItems.value);
+const merged = computed<TransferItem[]>(() => props.items);
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -103,6 +57,7 @@ function fmtRemaining(item: TransferItem): string {
   if (item.phase === "done") return "已完成";
   if (item.phase === "paused") return "已暂停";
   if (item.phase === "failed") return "失败";
+  if (item.phase === "cancelled") return "已取消";
   if (item.phase === "queued") return "排队中";
   if (item.speed <= 0) return "—";
   const left = (item.size * (1 - item.progress)) / item.speed;
@@ -113,7 +68,7 @@ function fmtRemaining(item: TransferItem): string {
 }
 
 function phaseLabel(p: TransferPhase): string {
-  return { queued: "排队", active: "传输中", paused: "已暂停", failed: "失败", done: "完成" }[p];
+  return { queued: "排队", active: "传输中", paused: "已暂停", failed: "失败", done: "完成", cancelled: "已取消" }[p];
 }
 
 function phaseClass(p: TransferPhase): string {
@@ -123,6 +78,7 @@ function phaseClass(p: TransferPhase): string {
     paused: "rs-status-dot--connecting",
     failed: "rs-status-dot--failed",
     done: "rs-status-dot--connected",
+    cancelled: "rs-status-dot--disconnected",
   }[p];
 }
 </script>
@@ -215,35 +171,10 @@ function phaseClass(p: TransferPhase): string {
         <el-table-column label="估计剩余" width="100">
           <template #default="{ row }">{{ fmtRemaining(row) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="140" fixed="right">
-          <template #default="{ row }">
-            <el-button
-              v-if="row.phase === 'active'"
-              size="small"
-              link
-              @click="emit('pause', row.id)"
-            >暂停</el-button>
-            <el-button
-              v-else-if="row.phase === 'paused' || row.phase === 'queued'"
-              size="small"
-              link
-              type="primary"
-              @click="emit('resume', row.id)"
-            >继续</el-button>
-            <el-button
-              size="small"
-              link
-              type="danger"
-              @click="emit('cancel', row.id)"
-            >取消</el-button>
-          </template>
-        </el-table-column>
       </el-table>
     </div>
     <div v-else-if="expanded && tab === 'log'" class="panel-body log">
-      <p class="log-line"><span class="log-time">15:17:02</span> 已开始传输 <code>machine_m01986.json</code></p>
-      <p class="log-line"><span class="log-time">15:17:03</span> 上传 117 KB 到 <code>/root/pmi/datasave/machines/</code></p>
-      <p class="log-line"><span class="log-time">15:18:11</span> 任务完成,共耗时 1 分 9 秒</p>
+      <p class="log-line">传输错误会显示在任务状态中。</p>
     </div>
   </section>
 </template>

@@ -8,7 +8,7 @@
 //! - `update_session` / `delete_session`
 //! - `send_input` / `resize_terminal` / `attach_terminal`
 
-use rshell_api::types::SessionConfig;
+use rshell_api::types::{RemoteFileEntry, SessionConfig, TransferTaskInfo};
 use rshell_api::{AppCommand, CommandOutcome};
 use tauri::ipc::Channel;
 use tauri::State;
@@ -238,21 +238,42 @@ pub async fn cancel_transfer(task_id: Uuid, state: State<'_, AppState>) -> Resul
     Ok(())
 }
 
-// browse_remote_dir —— dispatcher 当前返回 None(切片 3 迁移,CommandOutcome::RemoteDir
-// 完整接通留到切片 5+)。本切片先注册占位薄壳保证 IPC 路由可用。
 #[tauri::command]
 pub async fn browse_remote_dir(
     session_id: Uuid,
     path: String,
     state: State<'_, AppState>,
-) -> Result<(), IpcError> {
-    state
+) -> Result<RemoteDirectoryResult, IpcError> {
+    let outcome = state
         .dispatcher
         .dispatch(AppCommand::BrowseRemoteDir { session_id, path })
         .await
         .map_err(IpcError::from)?;
+    match outcome {
+        CommandOutcome::RemoteDir { path, entries } => Ok(RemoteDirectoryResult { path, entries }),
+        other => Err(IpcError::outcome_mismatch("remote_dir", other.kind())),
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct RemoteDirectoryResult {
+    path: String,
+    entries: Vec<RemoteFileEntry>,
+}
+
+#[tauri::command]
+pub async fn create_remote_directory(session_id: Uuid, path: String, state: State<'_, AppState>) -> Result<(), IpcError> {
+    state.dispatcher.dispatch(AppCommand::CreateRemoteDirectory { session_id, path }).await.map_err(IpcError::from)?;
     Ok(())
 }
+
+#[tauri::command]
+pub async fn delete_remote_entry(session_id: Uuid, path: String, state: State<'_, AppState>) -> Result<(), IpcError> {
+    state.dispatcher.dispatch(AppCommand::DeleteRemoteEntry { session_id, path }).await.map_err(IpcError::from)?;
+    Ok(())
+}
+
+cmd!(list_transfers() -> Transfers(Vec<TransferTaskInfo>) = AppCommand::ListTransfers);
 
 // ===== 切片 6: 密钥管理 + 主密码薄壳 =====
 use rshell_api::types::SshKeyType;

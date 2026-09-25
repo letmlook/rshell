@@ -6,7 +6,9 @@
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
 use crate::session::service::SshClientHandle;
+use crate::session::service::validate_remote_mutation_path;
 use rshell_api::AppEvent;
+use rshell_api::types::{TransferDirection as ApiTransferDirection, TransferTaskInfo, TransferTaskState as ApiTransferTaskState};
 use rshell_protocol::ssh::sftp::SftpClient;
 use std::collections::HashMap;
 use std::future::Future;
@@ -82,6 +84,29 @@ impl TransferTask {
     }
 }
 
+impl From<TransferTask> for TransferTaskInfo {
+    fn from(task: TransferTask) -> Self {
+        Self {
+            id: task.id,
+            session_id: task.session_id,
+            direction: match task.direction { TransferDirection::Upload => ApiTransferDirection::Upload, TransferDirection::Download => ApiTransferDirection::Download },
+            local_path: task.local_path.to_string_lossy().into_owned(),
+            remote_path: task.remote_path,
+            state: match task.state {
+                TransferTaskState::Pending => ApiTransferTaskState::Pending,
+                TransferTaskState::Transferring => ApiTransferTaskState::Transferring,
+                TransferTaskState::Paused => ApiTransferTaskState::Paused,
+                TransferTaskState::Completed => ApiTransferTaskState::Completed,
+                TransferTaskState::Failed => ApiTransferTaskState::Failed,
+                TransferTaskState::Cancelled => ApiTransferTaskState::Cancelled,
+            },
+            bytes_transferred: task.bytes_transferred,
+            total_bytes: task.total_bytes,
+            error_message: task.error_message,
+        }
+    }
+}
+
 /// 文件传输服务
 pub struct TransferService {
     /// 传输任务队列
@@ -115,6 +140,10 @@ impl TransferService {
         remote: String,
         session_id: Uuid,
     ) -> Result<Uuid, CoreError> {
+        validate_remote_mutation_path(&remote)?;
+        if !local.is_absolute() || !tokio::fs::metadata(&local).await.map(|m| m.is_file()).unwrap_or(false) {
+            return Err(CoreError::InvalidState("Upload source must be an existing regular local file".into()));
+        }
         let task_id = Uuid::new_v4();
 
         let task = TransferTask {
@@ -153,6 +182,13 @@ impl TransferService {
         local: PathBuf,
         session_id: Uuid,
     ) -> Result<Uuid, CoreError> {
+        validate_remote_mutation_path(&remote)?;
+        if !local.is_absolute() || local.file_name().is_none() || local.exists() {
+            return Err(CoreError::InvalidState("Download target must be a new absolute local file".into()));
+        }
+        if !local.parent().is_some_and(|p| p.is_dir()) {
+            return Err(CoreError::InvalidState("Download target directory does not exist".into()));
+        }
         let task_id = Uuid::new_v4();
 
         let task = TransferTask {
@@ -460,6 +496,26 @@ mod tests {
 
     fn make_service() -> TransferService {
         TransferService::new(Arc::new(crate::event_bus::EventBus::new()))
+    }
+
+    #[tokio::test]
+    async fn enqueue_upload_rejects_missing_file_before_queueing() {
+        let service = make_service();
+        let err = service.enqueue_upload(PathBuf::from("/definitely/missing/rshell-file"), "/remote/file".into(), Uuid::new_v4()).await.unwrap_err();
+        assert!(matches!(err, CoreError::InvalidState(_)));
+        assert!(service.list_tasks().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enqueue_download_rejects_root_and_existing_target() {
+        let service = make_service();
+        let folder = tempfile::tempdir().unwrap();
+        let target = folder.path().join("file");
+        assert!(matches!(service.enqueue_download("/".into(), target.clone(), Uuid::new_v4()).await, Err(CoreError::InvalidState(_))));
+        std::fs::write(&target, b"keep").unwrap();
+        assert!(matches!(service.enqueue_download("/remote/file".into(), target.clone(), Uuid::new_v4()).await, Err(CoreError::InvalidState(_))));
+        assert_eq!(std::fs::read(target).unwrap(), b"keep");
+        assert!(service.list_tasks().await.is_empty());
     }
 
     fn make_task(id: Uuid, state: TransferTaskState) -> TransferTask {

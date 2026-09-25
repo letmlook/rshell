@@ -39,6 +39,12 @@ const props = defineProps<{
   onToggleTransferPanel?: () => void;
   syncEnabled?: boolean;
   transferPanelExpanded?: boolean;
+  canUpload?: boolean;
+  canDownload?: boolean;
+  canCreateFolder?: boolean;
+  canDelete?: boolean;
+  canRefreshFiles?: boolean;
+  canSyncFiles?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -199,18 +205,19 @@ function pickWorkspace(w: WorkspaceKind) {
           :title="syncEnabled ? '同步浏览(已开启)' : '同步浏览(关闭)'"
           aria-label="同步浏览"
           :aria-pressed="syncEnabled"
+          :disabled="!canSyncFiles"
           @click="onSyncToggle"
         >
           <svg width="14" height="14" viewBox="0 0 16 16">
             <path d="M3 8 H13 M9 4 L13 8 L9 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </button>
-        <button class="tb-btn" title="上传" aria-label="上传" @click="onUpload">
+        <button class="tb-btn" title="上传" aria-label="上传" :disabled="!canUpload" @click="onUpload">
           <svg width="14" height="14" viewBox="0 0 16 16">
             <path d="M8 12 V3 M4 7 L8 3 L12 7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </button>
-        <button class="tb-btn" title="下载" aria-label="下载" @click="onDownload">
+        <button class="tb-btn" title="下载" aria-label="下载" :disabled="!canDownload" @click="onDownload">
           <svg width="14" height="14" viewBox="0 0 16 16">
             <path d="M8 3 V12 M4 8 L8 12 L12 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
@@ -218,19 +225,19 @@ function pickWorkspace(w: WorkspaceKind) {
       </div>
       <div class="sep" aria-hidden="true" />
       <div class="cluster">
-        <button class="tb-btn" title="新建文件夹" aria-label="新建文件夹" @click="onNewFolder">
+        <button class="tb-btn" title="新建文件夹" aria-label="新建文件夹" :disabled="!canCreateFolder" @click="onNewFolder">
           <svg width="14" height="14" viewBox="0 0 16 16">
             <path d="M2 4.5 V12.5 H14 V6 H8 L6.5 4.5 Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
             <path d="M8 8.5 V11.5 M7 10 H9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
           </svg>
         </button>
-        <button class="tb-btn danger" title="删除" aria-label="删除" @click="onDelete">
+        <button class="tb-btn danger" title="删除" aria-label="删除" :disabled="!canDelete" @click="onDelete">
           <svg width="14" height="14" viewBox="0 0 16 16">
             <rect x="3" y="4.5" width="10" height="9" rx="0.5" fill="none" stroke="currentColor" stroke-width="1.2" />
             <path d="M5 4.5 V3.5 H11 V4.5 M2 4.5 H14" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
           </svg>
         </button>
-        <button class="tb-btn" title="刷新" aria-label="刷新" @click="onRefresh">
+        <button class="tb-btn" title="刷新" aria-label="刷新" :disabled="!canRefreshFiles" @click="onRefresh">
           <svg width="14" height="14" viewBox="0 0 16 16">
             <path d="M13 8 A5 5 0 1 1 11.5 4.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
             <path d="M11.5 2.5 V5 H9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />

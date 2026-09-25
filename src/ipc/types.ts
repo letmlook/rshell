@@ -88,6 +88,18 @@ export interface FilePermissions {
 }
 
 export type TransferDirection = "Upload" | "Download";
+export type TransferTaskState = "Pending" | "Transferring" | "Paused" | "Completed" | "Failed" | "Cancelled";
+export interface TransferTaskInfo {
+  id: Uuid;
+  session_id: Uuid;
+  direction: TransferDirection;
+  local_path: string;
+  remote_path: string;
+  state: TransferTaskState;
+  bytes_transferred: number;
+  total_bytes: number;
+  error_message: string | null;
+}
 
 // ===== 隧道相关 =====
 
@@ -321,6 +333,9 @@ export type AppCommand =
   | { ResumeTransfer: { task_id: Uuid } }
   | { CancelTransfer: { task_id: Uuid } }
   | { BrowseRemoteDir: { session_id: Uuid; path: string } }
+  | { CreateRemoteDirectory: { session_id: Uuid; path: string } }
+  | { DeleteRemoteEntry: { session_id: Uuid; path: string } }
+  | { ListTransfers: null }
   // 隧道
   | { CreateTunnel: { session_id: Uuid; rule: PortForwardRule } }
   | { CloseTunnel: { tunnel_id: Uuid } }
@@ -404,7 +419,7 @@ export type AppEvent =
   // 切片 2.2 删除：TerminalOutput / TerminalBufferUpdated —— 设计 §2.2
   // 原始字节经 Channel<Vec<u8>> 直推 xterm.js,事件总线不再承担高频路径
   // 会话
-  | { SessionListChanged: null }
+  | "SessionListChanged"
   | { SessionUpdated: { session_id: Uuid } }
   // 传输
   | {
@@ -417,7 +432,7 @@ export type AppEvent =
     }
   | { TransferCompleted: { task_id: Uuid } }
   | { TransferFailed: { task_id: Uuid; error: string } }
-  | { TransferQueueChanged: null }
+  | "TransferQueueChanged"
   | {
       TransferTaskAdded: {
         task_id: Uuid;
@@ -441,10 +456,10 @@ export type AppEvent =
         public_key_blob: string;
       };
     }
-  | { MasterPasswordRequired: null }
+  | "MasterPasswordRequired"
   // 效率工具
-  | { QuickCommandListChanged: null }
-  | { TriggerListChanged: null }
+  | "QuickCommandListChanged"
+  | "TriggerListChanged"
   | {
       TriggerFired: {
         trigger_id: Uuid;

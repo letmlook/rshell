@@ -82,6 +82,22 @@ pub enum FileType {
     Other,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferTaskInfo {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub direction: TransferDirection,
+    pub local_path: String,
+    pub remote_path: String,
+    pub state: TransferTaskState,
+    pub bytes_transferred: u64,
+    pub total_bytes: u64,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum TransferTaskState { Pending, Transferring, Paused, Completed, Failed, Cancelled }
+
 /// 文件权限
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilePermissions {

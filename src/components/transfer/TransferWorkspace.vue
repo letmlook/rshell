@@ -8,21 +8,24 @@
  *   │ (本地路径)  │ (远程路径)  │
  *   └─────────────┴─────────────┘
  *
- * 同步浏览:开启后,左窗格 navigate 也会驱动右窗格 navigate(单向);
- *         反向亦然(用 externallyNavigated 标志避免循环)。
- * 拖拽:左→右 = 上传;右→左 = 下载(emit,TransferPanel 处理实际入队)。
+ * 选择文件只更新状态;传输与删除必须由显式操作触发。
  * 分隔条可拖动改变窗格比例。
  */
 import { computed, ref, watch } from "vue";
+import { open, confirm } from "@tauri-apps/plugin-dialog";
+import { ElMessage, ElMessageBox } from "element-plus";
 import FileBrowserPane, { type FsEntry } from "./FileBrowserPane.vue";
 import type { Uuid } from "../../ipc/types";
 import {
   enqueueUpload,
   enqueueDownload,
+  createRemoteDirectory,
+  deleteRemoteEntry,
 } from "../../ipc/client";
 
 const props = defineProps<{
   sessionId?: Uuid;
+  connected?: boolean;
   remotePath?: string;
   localPath?: string;
   syncEnabled?: boolean;
@@ -33,108 +36,125 @@ const emit = defineEmits<{
   (e: "download-queued", count: number): void;
   (e: "remote-path", path: string): void;
   (e: "local-path", path: string): void;
+  (e: "capabilities", state: { upload: boolean; download: boolean; createFolder: boolean; delete: boolean; refresh: boolean; sync: boolean }): void;
 }>();
 
-const internalLocalPath = ref(props.localPath || "C:\\code\\pmi\\datasave\\machines");
-const internalRemotePath = ref(props.remotePath || "/root/pmi/datasave/machines");
+const localRoot = ref(props.localPath || "");
+const internalLocalPath = ref(props.localPath || "");
+const internalRemotePath = ref(props.remotePath || "/");
+const selectedLocal = ref<FsEntry[]>([]);
+const selectedRemote = ref<FsEntry[]>([]);
+const localPane = ref<InstanceType<typeof FileBrowserPane> | null>(null);
+const remotePane = ref<InstanceType<typeof FileBrowserPane> | null>(null);
 const splitPct = ref(50);
 const leftSyncFlag = ref(false);
 const rightSyncFlag = ref(false);
 const splitDragging = ref(false);
 
-watch(() => props.localPath, (v) => { if (v && v !== internalLocalPath.value) internalLocalPath.value = v; });
+watch(() => props.localPath, (v) => { if (v && v !== internalLocalPath.value) { localRoot.value = v; internalLocalPath.value = v; } });
 watch(() => props.remotePath, (v) => { if (v && v !== internalRemotePath.value) internalRemotePath.value = v; });
 
-const localMock = ref<FsEntry[]>([
-  { name: "..", size: 0, is_dir: true, modified: "2026-08-01T15:17:00" },
-  { name: "machine_m01986.json", size: 118 * 1024, is_dir: false, modified: "2026-08-01T15:17:00" },
-]);
-const remoteMock = ref<FsEntry[]>([
-  { name: "..", size: 0, is_dir: true, modified: "2026-08-01T15:15:00" },
-  { name: "machine_m01986.json.bak", size: 134 * 1024, is_dir: false, modified: "2026-07-21T11:03:00", mode: "-rw-r--r--", owner: "root" },
-  { name: "machine_m01986.json", size: 117 * 1024, is_dir: false, modified: "2026-08-01T15:15:00", mode: "-rw-r--r--", owner: "root" },
-  { name: "machine_m01986.json.bak.1", size: 186 * 1024, is_dir: false, modified: "2026-07-21T15:08:00", mode: "-rw-r--r--", owner: "root" },
-]);
+const validFile = (entries: FsEntry[]) => entries.length === 1 && !entries[0].is_dir && safeName(entries[0].name);
+const capabilities = computed(() => ({
+  upload: !!props.sessionId && !!props.connected && !!localRoot.value && validFile(selectedLocal.value),
+  download: !!props.sessionId && !!props.connected && !!localRoot.value && validFile(selectedRemote.value),
+  createFolder: !!props.sessionId && !!props.connected && !!internalRemotePath.value,
+  delete: !!props.sessionId && !!props.connected && validFile(selectedRemote.value),
+  refresh: !!props.connected || !!localRoot.value,
+  sync: !!props.connected && !!localRoot.value,
+}));
+watch(capabilities, (state) => emit("capabilities", state), { immediate: true });
+
+function safeName(name: string) { return !!name && name !== "." && name !== ".." && !/[\\/\0]/.test(name); }
+function joinPath(base: string, name: string) { return `${base.replace(/\/$/, "")}/${name}`; }
+
+async function chooseLocalRoot() {
+  const result = await open({ directory: true, multiple: false, recursive: true, title: "选择本地文件夹" });
+  if (typeof result !== "string") return;
+  localRoot.value = result;
+  internalLocalPath.value = result;
+  emit("local-path", result);
+}
 
 function onLocalNavigate(path: string) {
   internalLocalPath.value = path;
   emit("local-path", path);
-  if (props.syncEnabled && !leftSyncFlag.value) {
+  if (props.syncEnabled && localRoot.value && !leftSyncFlag.value) {
     leftSyncFlag.value = true;
-    internalRemotePath.value = path;
-    emit("remote-path", path);
+    internalRemotePath.value = "/" + path.slice(localRoot.value.length).replace(/^\/+/, "");
+    emit("remote-path", internalRemotePath.value);
     setTimeout(() => (leftSyncFlag.value = false), 0);
   }
 }
 function onRemoteNavigate(path: string) {
   internalRemotePath.value = path;
   emit("remote-path", path);
-  if (props.syncEnabled && !rightSyncFlag.value) {
+  if (props.syncEnabled && localRoot.value && !rightSyncFlag.value) {
     rightSyncFlag.value = true;
-    internalLocalPath.value = path;
-    emit("local-path", path);
+    internalLocalPath.value = joinPath(localRoot.value, path.replace(/^\/+/, ""));
+    emit("local-path", internalLocalPath.value);
     setTimeout(() => (rightSyncFlag.value = false), 0);
   }
 }
 
 function onLocalSyncRequest(path: string) {
-  if (props.syncEnabled && !rightSyncFlag.value) {
+  if (props.syncEnabled && localRoot.value && !rightSyncFlag.value) {
     rightSyncFlag.value = true;
-    internalRemotePath.value = path;
-    emit("remote-path", path);
+    internalRemotePath.value = "/" + path.slice(localRoot.value.length).replace(/^\/+/, "");
+    emit("remote-path", internalRemotePath.value);
     setTimeout(() => (rightSyncFlag.value = false), 0);
   }
 }
 function onRemoteSyncRequest(path: string) {
-  if (props.syncEnabled && !leftSyncFlag.value) {
+  if (props.syncEnabled && localRoot.value && !leftSyncFlag.value) {
     leftSyncFlag.value = true;
-    internalLocalPath.value = path;
-    emit("local-path", path);
+    internalLocalPath.value = joinPath(localRoot.value, path.replace(/^\/+/, ""));
+    emit("local-path", internalLocalPath.value);
     setTimeout(() => (leftSyncFlag.value = false), 0);
   }
 }
 
-async function uploadSelected(entries: FsEntry[]) {
-  if (!props.sessionId) return;
-  let count = 0;
-  for (const e of entries) {
-    if (e.name === ".." || e.is_dir) continue;
-    try {
-      const local = internalLocalPath.value.endsWith("\\")
-        ? `${internalLocalPath.value}${e.name}`
-        : `${internalLocalPath.value}/${e.name}`;
-      const remote = internalRemotePath.value.endsWith("/")
-        ? `${internalRemotePath.value}${e.name}`
-        : `${internalRemotePath.value}/${e.name}`;
-      await enqueueUpload(local, remote, props.sessionId);
-      count++;
-    } catch (err) {
-      console.warn("upload failed", err);
-    }
-  }
-  emit("upload-queued", count);
+async function upload() {
+  if (!capabilities.value.upload || !props.sessionId) return;
+  const file = selectedLocal.value[0];
+  try {
+    await enqueueUpload(joinPath(internalLocalPath.value, file.name), joinPath(internalRemotePath.value, file.name), props.sessionId);
+    emit("upload-queued", 1);
+  } catch (error) { ElMessage.error(`上传失败：${String(error)}`); }
 }
 
-async function downloadSelected(entries: FsEntry[]) {
-  if (!props.sessionId) return;
-  let count = 0;
-  for (const e of entries) {
-    if (e.name === ".." || e.is_dir) continue;
-    try {
-      const remote = internalRemotePath.value.endsWith("/")
-        ? `${internalRemotePath.value}${e.name}`
-        : `${internalRemotePath.value}/${e.name}`;
-      const local = internalLocalPath.value.endsWith("\\")
-        ? `${internalLocalPath.value}${e.name}`
-        : `${internalLocalPath.value}/${e.name}`;
-      await enqueueDownload(remote, local, props.sessionId);
-      count++;
-    } catch (err) {
-      console.warn("download failed", err);
-    }
-  }
-  emit("download-queued", count);
+async function download() {
+  if (!capabilities.value.download || !props.sessionId) return;
+  const file = selectedRemote.value[0];
+  try {
+    await enqueueDownload(joinPath(internalRemotePath.value, file.name), joinPath(internalLocalPath.value, file.name), props.sessionId);
+    emit("download-queued", 1);
+  } catch (error) { ElMessage.error(`下载失败：${String(error)}`); }
 }
+
+async function createFolder() {
+  if (!capabilities.value.createFolder || !props.sessionId) return;
+  try {
+    const { value } = await ElMessageBox.prompt("文件夹名称", "新建远程文件夹");
+    if (!safeName(value)) { ElMessage.error("无效的文件夹名称"); return; }
+    await createRemoteDirectory(props.sessionId, joinPath(internalRemotePath.value, value));
+    await remotePane.value?.refresh();
+  } catch (error) { if (error !== "cancel" && error !== "close") ElMessage.error(`创建失败：${String(error)}`); }
+}
+
+async function deleteSelected() {
+  if (!capabilities.value.delete || !props.sessionId) return;
+  const file = selectedRemote.value[0];
+  if (!await confirm(`确定删除远程文件「${file.name}」吗？`, { title: "删除文件", kind: "warning" })) return;
+  try {
+    await deleteRemoteEntry(props.sessionId, joinPath(internalRemotePath.value, file.name));
+    selectedRemote.value = [];
+    await remotePane.value?.refresh();
+  } catch (error) { ElMessage.error(`删除失败：${String(error)}`); }
+}
+
+async function refresh() { await Promise.all([localPane.value?.refresh(), remotePane.value?.refresh()]); }
+defineExpose({ upload, download, createFolder, deleteSelected, refresh, chooseLocalRoot });
 
 function startSplitDrag(e: MouseEvent) {
   splitDragging.value = true;
@@ -163,13 +183,16 @@ const rightWidth = computed(() => `${100 - splitPct.value}%`);
     @mouseleave="endSplitDrag"
   >
     <div class="pane-slot" :style="{ width: leftWidth }">
+      <button v-if="!localRoot" class="choose-root" @click="chooseLocalRoot">选择本地文件夹</button>
+      <button v-else class="choose-root" @click="chooseLocalRoot">本地：{{ localRoot }} · 更换</button>
       <FileBrowserPane
+        ref="localPane"
         mode="local"
         :path="internalLocalPath"
-        :mock-entries="localMock"
+        :root-path="localRoot"
         @navigate="onLocalNavigate"
         @request-sync="onLocalSyncRequest"
-        @selection-change="(s) => uploadSelected(s)"
+        @selection-change="(s) => selectedLocal = s"
       />
     </div>
     <div
@@ -180,14 +203,14 @@ const rightWidth = computed(() => `${100 - splitPct.value}%`);
     />
     <div class="pane-slot" :style="{ width: rightWidth }">
       <FileBrowserPane
+        ref="remotePane"
         mode="remote"
-        :session-id="sessionId"
+        :session-id="connected ? sessionId : undefined"
         :path="internalRemotePath"
-        :mock-entries="remoteMock"
         :externally-navigated="rightSyncFlag"
         @navigate="onRemoteNavigate"
         @request-sync="onRemoteSyncRequest"
-        @selection-change="(s) => downloadSelected(s)"
+        @selection-change="(s) => selectedRemote = s"
       />
     </div>
   </div>
@@ -211,6 +234,7 @@ const rightWidth = computed(() => `${100 - splitPct.value}%`);
   height: 100%;
   min-width: 200px;
 }
+.choose-root { display: block; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--rs-accent); }
 
 .split {
   width: 5px;

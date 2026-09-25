@@ -216,6 +216,18 @@ impl CommandDispatcher {
                 let entries = self.session_service.browse_remote_dir(session_id, &path).await?;
                 Ok(CommandOutcome::RemoteDir { path, entries })
             }
+            AppCommand::CreateRemoteDirectory { session_id, path } => {
+                self.session_service.create_remote_directory(session_id, &path).await?;
+                Ok(CommandOutcome::None)
+            }
+            AppCommand::DeleteRemoteEntry { session_id, path } => {
+                self.session_service.delete_remote_entry(session_id, &path).await?;
+                Ok(CommandOutcome::None)
+            }
+            AppCommand::ListTransfers => {
+                let tasks = self.transfer_service.list_tasks().await.into_iter().map(Into::into).collect();
+                Ok(CommandOutcome::Transfers(tasks))
+            }
 
             // ===== 隧道命令 =====
             AppCommand::CreateTunnel { session_id, rule } => {

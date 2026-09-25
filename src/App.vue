@@ -33,7 +33,10 @@ import WorkspaceToolbar, {
   type WorkspaceKind,
   type PanelKind,
 } from "./components/WorkspaceToolbar.vue";
-import TransferPanel from "./components/TransferPanel.vue";
+import TransferPanel, { type TransferItem, type TransferPhase } from "./components/TransferPanel.vue";
+import { listTransfers } from "./ipc/client";
+import { subscribeAppEvents } from "./ipc/events";
+import type { TransferTaskInfo } from "./ipc/types";
 import {
   DEFAULT_SIDEBAR_WIDTH,
   clampSidebarWidth,
@@ -54,6 +57,32 @@ const workspace = ref<WorkspaceKind>("terminal");
 const syncEnabled = ref(false);
 const transferPanelExpanded = ref(true);
 const activeTransferSession = ref<Uuid | null>(null);
+const transferWorkspace = ref<InstanceType<typeof TransferWorkspace> | null>(null);
+const transferCapabilities = ref({ upload: false, download: false, createFolder: false, delete: false, refresh: false, sync: false });
+const transferItems = ref<TransferItem[]>([]);
+let unlistenTransfers: (() => void) | null = null;
+
+function toTransferItem(task: TransferTaskInfo): TransferItem {
+  const phase: Record<TransferTaskInfo["state"], TransferPhase> = {
+    Pending: "queued", Transferring: "active", Paused: "paused",
+    Completed: "done", Failed: "failed", Cancelled: "cancelled",
+  };
+  return {
+    id: task.id,
+    name: task.remote_path.split("/").pop() || task.remote_path,
+    phase: phase[task.state],
+    progress: task.total_bytes ? task.bytes_transferred / task.total_bytes : 0,
+    size: task.total_bytes,
+    local: task.local_path,
+    remote: task.remote_path,
+    speed: 0,
+  };
+}
+
+async function refreshTransfers() {
+  try { transferItems.value = (await listTransfers()).map(toTransferItem); }
+  catch (error) { console.error("无法读取传输队列", error); }
+}
 
 const sidebarWidth = ref(DEFAULT_SIDEBAR_WIDTH);
 const viewportWidth = ref(
@@ -133,10 +162,19 @@ onMounted(async () => {
   await store.refresh();
   await store.subscribeEvents();
   await hostKeyStore.subscribeEvents();
+  await refreshTransfers();
+  try {
+    unlistenTransfers = await subscribeAppEvents((event) => {
+      if (event === "TransferQueueChanged" || (typeof event === "object" && event !== null && (
+        "TransferCompleted" in event || "TransferFailed" in event || "TransferProgress" in event
+      ))) void refreshTransfers();
+    });
+  } catch (error) { console.error("无法订阅传输队列", error); }
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("resize", onViewportResize);
+  unlistenTransfers?.();
 });
 </script>
 
@@ -162,22 +200,30 @@ onBeforeUnmount(() => {
       :sidebar-expanded="panelExpanded"
       :sync-enabled="syncEnabled"
       :transfer-panel-expanded="transferPanelExpanded"
+      :can-upload="transferCapabilities.upload"
+      :can-download="transferCapabilities.download"
+      :can-create-folder="transferCapabilities.createFolder"
+      :can-delete="transferCapabilities.delete"
+      :can-refresh-files="transferCapabilities.refresh"
+      :can-sync-files="transferCapabilities.sync"
       :on-new-session="openNewSession"
       @change-workspace="pickWorkspace"
       @select-panel="selectPanel"
       @toggle-sidebar="toggleSidebar"
       @sync-toggle="syncEnabled = !syncEnabled"
-      @upload="() => {}"
-      @download="() => {}"
-      @new-folder="() => {}"
-      @delete="() => {}"
-      @refresh="store.refresh()"
+      @upload="transferWorkspace?.upload()"
+      @download="transferWorkspace?.download()"
+      @new-folder="transferWorkspace?.createFolder()"
+      @delete="transferWorkspace?.deleteSelected()"
+      @refresh="transferWorkspace?.refresh()"
       @toggle-transfer-panel="transferPanelExpanded = !transferPanelExpanded"
     />
 
     <div class="body">
       <SidePanel
         :active="activePanel"
+        :active-session-id="store.currentId"
+        :active-session-connected="!!store.currentId && store.connectionState.get(store.currentId) === 'connected'"
         :width="sidebarWidth"
         :max-width="sidebarMaxWidth"
         :expanded="panelExpanded"
@@ -214,8 +260,13 @@ onBeforeUnmount(() => {
           <div class="transfer-area">
             <TransferWorkspace
               v-if="activeTransferSession"
+              ref="transferWorkspace"
               :session-id="activeTransferSession"
+              :connected="store.connectionState.get(activeTransferSession) === 'connected'"
               :sync-enabled="syncEnabled"
+              @capabilities="transferCapabilities = $event"
+              @upload-queued="refreshTransfers"
+              @download-queued="refreshTransfers"
               style="flex: 1; min-height: 0"
             />
             <div v-else class="empty">
@@ -230,6 +281,7 @@ onBeforeUnmount(() => {
             </div>
             <TransferPanel
               :expanded="transferPanelExpanded"
+              :items="transferItems"
               @toggle="transferPanelExpanded = !transferPanelExpanded"
             />
           </div>

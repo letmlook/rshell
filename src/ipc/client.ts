@@ -11,6 +11,8 @@ import type {
   PortForwardRule,
   ActiveTunnelInfo,
   PendingTunnelInfo,
+  RemoteFileEntry,
+  TransferTaskInfo,
   Protocol,
   ProtocolType,
   QuickCommand,
@@ -103,7 +105,12 @@ export const resumeTransfer = (task_id: Uuid) => call({ ResumeTransfer: { task_i
 export const cancelTransfer = (task_id: Uuid) => call({ CancelTransfer: { task_id } });
 
 export const browseRemoteDir = (session_id: Uuid, path: string) =>
-  call<{ entries: unknown[] }>({ BrowseRemoteDir: { session_id, path } });
+  call<{ path: string; entries: RemoteFileEntry[] }>({ BrowseRemoteDir: { session_id, path } });
+export const createRemoteDirectory = (session_id: Uuid, path: string) =>
+  call<void>({ CreateRemoteDirectory: { session_id, path } });
+export const deleteRemoteEntry = (session_id: Uuid, path: string) =>
+  call<void>({ DeleteRemoteEntry: { session_id, path } });
+export const listTransfers = () => call<TransferTaskInfo[]>({ ListTransfers: null });
 
 // ===== 隧道 =====
 

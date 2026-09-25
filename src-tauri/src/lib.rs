@@ -116,6 +116,7 @@ pub fn run() {
                     host_key_registry: host_key_registry.clone(),
                 },
             ));
+            tauri::async_runtime::block_on(dispatcher.initialize());
 
             // ── 5. EventBus → Tauri emit 桥 ─────────────────────────────
             events::subscribe_bridge(event_bus.clone(), app.handle().clone());
@@ -155,6 +156,9 @@ pub fn run() {
             commands::resume_transfer,
             commands::cancel_transfer,
             commands::browse_remote_dir,
+            commands::create_remote_directory,
+            commands::delete_remote_entry,
+            commands::list_transfers,
             commands::list_tunnels,
             commands::list_pending_tunnels,
             commands::generate_ssh_key,

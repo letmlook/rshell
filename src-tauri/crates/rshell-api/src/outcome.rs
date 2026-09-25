@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::types::{
     ActiveTunnelInfo, PendingTunnelInfo, PluginInfo, QuickCommand, RemoteFileEntry,
-    SessionConfig, SshKeyInfo, ThemeInfo, Trigger,
+    SessionConfig, SshKeyInfo, ThemeInfo, TransferTaskInfo, Trigger,
 };
 
 /// 读命令返回结构化数据;写命令返回 `None`。
@@ -46,6 +46,7 @@ pub enum CommandOutcome {
         path: String,
         entries: Vec<RemoteFileEntry>,
     },
+    Transfers(Vec<TransferTaskInfo>),
     /// 响应 `ExportPublicKey`
     PublicKey(String),
     /// 响应 `VerifyMasterPassword`
@@ -68,6 +69,7 @@ impl CommandOutcome {
             Self::Themes(_) => "themes",
             Self::PendingTunnels(_) => "pending_tunnels",
             Self::RemoteDir { .. } => "remote_dir",
+            Self::Transfers(_) => "transfers",
             Self::PublicKey(_) => "public_key",
             Self::Verified(_) => "verified",
         }
@@ -123,6 +125,7 @@ mod tests {
                 path: String::new(),
                 entries: vec![],
             },
+            CommandOutcome::Transfers(vec![]),
             CommandOutcome::PublicKey(String::new()),
             CommandOutcome::Verified(false),
         ];
@@ -130,7 +133,7 @@ mod tests {
         assert_eq!(
             kinds.len(),
             variants.len(),
-            "all 13 variants must have distinct kind labels"
+            "all variants must have distinct kind labels"
         );
     }
 

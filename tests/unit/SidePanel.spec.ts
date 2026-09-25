@@ -10,6 +10,7 @@ const stubs = {
   TunnelPanel: { template: "<div data-testid='tunnel-child' />" },
   ThemePanel: { template: "<div data-testid='theme-child' />" },
   PluginPanel: { template: "<div data-testid='plugin-child' />" },
+  "el-button": { props: ["disabled"], template: "<button :disabled='disabled'><slot /></button>" },
 };
 
 describe("SidePanel", () => {
@@ -38,5 +39,14 @@ describe("SidePanel", () => {
     expect(separator.attributes("aria-valuenow")).toBe("280");
     await separator.trigger("keydown", { key: "ArrowRight" });
     expect(wrapper.emitted("update:width")).toEqual([[288]]);
+  });
+
+  it("offers the transfer workspace only for a connected SSH session", async () => {
+    const wrapper = mount(SidePanel, { props: { active: "files", activeSessionId: "s", activeSessionConnected: false }, global: { stubs } });
+    const button = wrapper.get(".placeholder button");
+    expect(button.attributes("disabled")).toBeDefined();
+    await wrapper.setProps({ activeSessionConnected: true });
+    await button.trigger("click");
+    expect(wrapper.emitted("open-sftp")).toEqual([["s"]]);
   });
 });

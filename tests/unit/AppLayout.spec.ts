@@ -16,6 +16,8 @@ vi.mock("../../src/stores/sessions", () => ({
 vi.mock("../../src/stores/hostKey", () => ({
   useHostKeyStore: () => ({ subscribeEvents: vi.fn().mockResolvedValue(undefined) }),
 }));
+vi.mock("../../src/ipc/client", () => ({ listTransfers: vi.fn().mockResolvedValue([]) }));
+vi.mock("../../src/ipc/events", () => ({ subscribeAppEvents: vi.fn().mockResolvedValue(vi.fn()) }));
 
 describe("App layout", () => {
   const childStubs = {

@@ -8,11 +8,10 @@
  *   - 双击目录 = 进入;双击文件 = 触发 'open-file'
  *   - 多选 / 拖拽上传下载
  *
- * 数据:本次重设计用前端 mock(本地:用 Tauri fs plugin 列目录;
- * 远程:用 browseRemoteDir IPC),失败时 fallback 到 mock 数据,
- * 保证 UI 完整可演示。
+ * 本地目录由已授权的 Tauri fs 读取;远程目录由 SFTP IPC 读取。
  */
 import { computed, ref, watch } from "vue";
+import { readDir, stat } from "@tauri-apps/plugin-fs";
 import { browseRemoteDir } from "../../ipc/client";
 import type { Uuid } from "../../ipc/types";
 
@@ -31,8 +30,7 @@ const props = defineProps<{
   /** 远程必填;本地时忽略 */
   sessionId?: Uuid;
   path: string;
-  /** 后端挂掉时的 mock 数据,保证 UI 不空 */
-  mockEntries?: FsEntry[];
+  rootPath?: string;
   /** 是否参与同步浏览(被反向 navigate) */
   externallyNavigated?: boolean;
 }>();
@@ -54,6 +52,7 @@ const selected = ref<Set<string>>(new Set());
 
 const canBack = computed(() => historyIndex.value > 0);
 const canForward = computed(() => historyIndex.value < history.value.length - 1);
+const visibleEntries = computed(() => entries.value.filter((entry) => entry.name.toLowerCase().includes(search.value.toLowerCase())));
 
 const breadcrumb = computed(() => {
   const parts = props.path.split(/[\\/]/).filter(Boolean);
@@ -81,13 +80,33 @@ async function load(path: string, pushHistory = true) {
   loading.value = true;
   errorText.value = null;
   selected.value = new Set();
+  emit("selection-change", []);
   try {
     if (props.mode === "remote" && props.sessionId) {
       const r = await browseRemoteDir(props.sessionId, path);
-      entries.value = (r.entries as FsEntry[]) ?? [];
-    } else if (props.mockEntries) {
-      // mock 模式:仅在 path 完全等于 props.path 时返回数据
-      entries.value = props.mockEntries;
+      entries.value = r.entries.map((entry) => ({
+        name: entry.name,
+        size: entry.size,
+        is_dir: entry.file_type === "Directory",
+        modified: entry.modified && /^\d+$/.test(entry.modified)
+          ? new Date(Number(entry.modified) * 1000).toISOString() : entry.modified,
+        owner: entry.owner,
+        mode: entry.file_type,
+      }));
+    } else if (props.mode === "remote") {
+      throw new Error("请先连接 SSH 会话");
+    } else if (props.mode === "local" && path) {
+      const items = await readDir(path);
+      entries.value = await Promise.all(items.map(async (item) => {
+        const fullPath = joinPath(path, item.name);
+        const details = await stat(fullPath).catch(() => null);
+        return {
+          name: item.name,
+          size: details?.size ?? 0,
+          is_dir: item.isDirectory,
+          modified: details?.mtime?.toISOString() ?? "",
+        };
+      }));
     } else {
       entries.value = [];
     }
@@ -99,13 +118,21 @@ async function load(path: string, pushHistory = true) {
     }
   } catch (e) {
     errorText.value = String(e);
-    entries.value = props.mockEntries ?? [];
+    entries.value = [];
   } finally {
     loading.value = false;
   }
 }
 
+function joinPath(base: string, name: string): string {
+  return `${base.replace(/\/$/, "")}/${name}`;
+}
+
+function refresh() { return load(props.path, false); }
+defineExpose({ refresh });
+
 function navigateTo(path: string, pushHistory = true) {
+  if (props.mode === "local" && props.rootPath && path !== props.rootPath && !path.startsWith(`${props.rootPath}/`)) return;
   emit("navigate", path);
   if (pushHistory) emit("request-sync", path);
   void load(path, pushHistory);
@@ -128,21 +155,17 @@ function goForward() {
 }
 
 function goUp() {
-  const sep = props.path.includes("\\") ? "\\" : "/";
-  const parts = props.path.split(/[\\/]/).filter(Boolean);
+  if (props.mode === "local" && props.rootPath && props.path === props.rootPath) return;
+  const parts = props.path.split("/").filter(Boolean);
   parts.pop();
-  const parent = parts.length === 0
-    ? (sep === "\\" ? "C:\\" : "/")
-    : (sep === "\\" ? parts.join("\\") + "\\" : "/" + parts.join("/"));
+  const parent = "/" + parts.join("/");
+  if (props.mode === "local" && props.rootPath && parent !== props.rootPath && !parent.startsWith(`${props.rootPath}/`)) return;
   navigateTo(parent);
 }
 
 function onRowDblClick(entry: FsEntry) {
   if (entry.is_dir) {
-    const sep = props.path.includes("\\") ? "\\" : "/";
-    const next = props.path.endsWith(sep)
-      ? `${props.path}${entry.name}${sep}`
-      : `${props.path}${sep}${entry.name}${sep}`;
+    const next = joinPath(props.path, entry.name);
     navigateTo(next);
   } else {
     emit("open-file", entry);
@@ -175,9 +198,9 @@ function onRowClick(entry: FsEntry) {
 }
 
 watch(
-  () => props.path,
-  (p, old) => {
-    if (p !== old && !props.externallyNavigated) void load(p);
+  () => [props.path, props.sessionId] as const,
+  ([p, session], old) => {
+    if ((!old || p !== old[0] || session !== old[1]) && !props.externallyNavigated) void load(p);
   },
   { immediate: true },
 );
@@ -208,7 +231,7 @@ watch(
           v-for="(seg, i) in breadcrumb"
           :key="i"
           class="seg"
-          @click="navigateTo(breadcrumb.slice(0, i + 1).join('/'))"
+          @click="navigateTo('/' + breadcrumb.slice(0, i + 1).join('/'))"
         >
           {{ seg }}
         </span>
@@ -229,11 +252,11 @@ watch(
     <div class="list-wrap">
       <p v-if="errorText" class="err">{{ errorText }}</p>
       <el-table
-        :data="entries"
+        :data="visibleEntries"
         :loading="loading"
         :show-header="true"
         size="small"
-        empty-text="空目录"
+        :empty-text="mode === 'local' && !path ? '先选择本地文件夹' : '空目录'"
         class="fs-table"
         @row-dblclick="onRowDblClick"
         @row-click="(row: FsEntry) => onRowClick(row)"
