@@ -2,10 +2,10 @@ import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 
 // Vite config tailored for Tauri:
-// - server.port 1420 must match tauri.conf.json devUrl
+// - server.port 51820 must match tauri.conf.json devUrl
 // - clearScreen false so Rust build output stays visible
 // - envPrefix includes TAURI_ so @tauri-apps/api can read TAURI_* at runtime
-// - server.strictPort: fail fast if 1420 is taken (Tauri dev won't find it)
+// - server.strictPort: fail fast if 51820 is taken (Tauri dev won't find it)
 export default defineConfig({
   plugins: [vue()],
   clearScreen: false,
