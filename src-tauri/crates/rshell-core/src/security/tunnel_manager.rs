@@ -1,6 +1,6 @@
 //! SSH 隧道管理器
 //!
-//! 管理本地/远程/动态端口转发隧道。
+//! 管理本地和动态端口转发隧道。
 //!
 //! 持久化:隧道规则写入 `data_local_dir/rshell/tunnels.toml`,
 //! 启动时自动恢复。运行时只持久化**规则**,不恢复 listener（避免与
@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 use tracing::{info, warn, error};
 
-use rshell_api::types::{ActiveTunnelInfo, ForwardDirection, PortForwardRule, TunnelState};
+use rshell_api::types::{ActiveTunnelInfo, ForwardDirection, PendingTunnelInfo, PortForwardRule, TunnelState, UnsupportedTunnelRule};
 use rshell_api::events::AppEvent;
 
 use crate::error::CoreError;
@@ -48,7 +48,55 @@ pub struct TunnelManager {
 struct PersistedTunnels {
     /// 按 session_id 分组,每个 session 下挂若干条规则
     #[serde(default)]
-    rules: HashMap<Uuid, Vec<PortForwardRule>>,
+    rules: HashMap<Uuid, Vec<PersistedRule>>,
+}
+
+/// 仅用于读取旧配置；Remote 不会进入公开 API 或运行中的隧道。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedRule {
+    bind_address: String,
+    bind_port: u16,
+    remote_host: String,
+    remote_port: u16,
+    direction: PersistedDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedDirection {
+    Local,
+    Remote,
+    Dynamic,
+}
+
+impl PersistedRule {
+    fn from_supported(rule: PortForwardRule) -> Self {
+        let direction = match rule.direction {
+            ForwardDirection::Local => PersistedDirection::Local,
+            ForwardDirection::Dynamic => PersistedDirection::Dynamic,
+        };
+        Self {
+            bind_address: rule.bind_address,
+            bind_port: rule.bind_port,
+            remote_host: rule.remote_host,
+            remote_port: rule.remote_port,
+            direction,
+        }
+    }
+
+    fn into_supported(self) -> Option<PortForwardRule> {
+        let direction = match self.direction {
+            PersistedDirection::Local => ForwardDirection::Local,
+            PersistedDirection::Dynamic => ForwardDirection::Dynamic,
+            PersistedDirection::Remote => return None,
+        };
+        Some(PortForwardRule {
+            bind_address: self.bind_address,
+            bind_port: self.bind_port,
+            remote_host: self.remote_host,
+            remote_port: self.remote_port,
+            direction,
+        })
+    }
 }
 
 impl TunnelManager {
@@ -73,27 +121,42 @@ impl TunnelManager {
 
     /// 从磁盘读所有 (session_id, rule) 对,供调用方决定是否重建
     pub async fn restore_pending_rules(&self) -> Vec<(Uuid, PortForwardRule)> {
+        self.restore_pending_rules_info().await.rules
+    }
+
+    /// 同时返回可恢复规则及被安全跳过的旧规则诊断。
+    pub async fn restore_pending_rules_info(&self) -> PendingTunnelInfo {
         let Some(path) = self.persist_path.as_ref() else {
-            return Vec::new();
+            return PendingTunnelInfo { rules: Vec::new(), unsupported: Vec::new() };
         };
         match std::fs::read_to_string(path) {
             Ok(content) => match toml::from_str::<PersistedTunnels>(&content) {
-                Ok(p) => p
-                    .rules
-                    .into_iter()
-                    .flat_map(|(sid, rules)| {
-                        rules.into_iter().map(move |r| (sid, r))
-                    })
-                    .collect(),
+                Ok(p) => {
+                    let mut info = PendingTunnelInfo { rules: Vec::new(), unsupported: Vec::new() };
+                    for (sid, rules) in p.rules {
+                        for rule in rules {
+                            if rule.direction == PersistedDirection::Remote {
+                                warn!(session_id = %sid, "Skipping unsupported legacy Remote forwarding rule");
+                                info.unsupported.push(UnsupportedTunnelRule {
+                                    session_id: sid,
+                                    reason: "Remote forwarding is not supported".into(),
+                                });
+                            } else if let Some(rule) = rule.into_supported() {
+                                info.rules.push((sid, rule));
+                            }
+                        }
+                    }
+                    info
+                }
                 Err(e) => {
                     warn!("Failed to parse {}: {}", path.display(), e);
-                    Vec::new()
+                    PendingTunnelInfo { rules: Vec::new(), unsupported: Vec::new() }
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PendingTunnelInfo { rules: Vec::new(), unsupported: Vec::new() },
             Err(e) => {
                 warn!("Failed to read {}: {}", path.display(), e);
-                Vec::new()
+                PendingTunnelInfo { rules: Vec::new(), unsupported: Vec::new() }
             }
         }
     }
@@ -105,12 +168,33 @@ impl TunnelManager {
         };
         let tunnels = self.tunnels.read().await;
         // 把 ActiveTunnel 简化成 PersistedTunnels (只存规则)
-        let mut grouped: HashMap<Uuid, Vec<PortForwardRule>> = HashMap::new();
+        let mut grouped: HashMap<Uuid, Vec<PersistedRule>> = HashMap::new();
+        // 旧 Remote 规则保持在用户文件中，但永远不恢复或启动。
+        match std::fs::read_to_string(path) {
+            Ok(content) => match toml::from_str::<PersistedTunnels>(&content) {
+                Ok(previous) => {
+                    for (sid, rules) in previous.rules {
+                        grouped.entry(sid).or_default().extend(
+                            rules.into_iter().filter(|rule| rule.direction == PersistedDirection::Remote),
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "Skipping tunnel save to preserve unreadable existing config");
+                    return;
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(%error, "Skipping tunnel save to preserve unreadable existing config");
+                return;
+            }
+        }
         for t in tunnels.values() {
             grouped
                 .entry(t.session_id)
                 .or_default()
-                .push(t.rule.clone());
+                .push(PersistedRule::from_supported(t.rule.clone()));
         }
         let persisted = PersistedTunnels { rules: grouped };
         match toml::to_string_pretty(&persisted) {
@@ -128,19 +212,20 @@ impl TunnelManager {
 
     /// 创建端口转发隧道
     ///
-    /// `ssh_client`: 与该隧道关联的 SSH 连接句柄。若为 `None`（如 Telnet/Serial），
-    /// 隧道退化为"仅 TCP 监听器"，不执行 SSH 通道转发。
+    /// `ssh_client`: 与该隧道关联的 SSH 连接句柄；缺失时拒绝创建。
     ///
     /// LocalForward: 监听 `bind_address:bind_port`，每条接入连接通过 SSH direct-tcpip
     /// 通道转发到 `remote_host:remote_port`。
-    /// RemoteForward: 需要 SSH `tcpip-forward` 请求（russh 支持），本实现先做 LocalForward。
-    /// DynamicForward(SOCKS): 解析 CONNECT 请求头并转发，略复杂，作为后续任务。
+    /// DynamicForward(SOCKS): 解析 CONNECT 请求头后经 SSH 通道转发。
     pub async fn create_tunnel(
         &self,
         session_id: Uuid,
         rule: PortForwardRule,
         ssh_client: Option<SshClientHandle>,
     ) -> Result<Uuid, CoreError> {
+        let ssh_client = ssh_client.ok_or_else(|| {
+            CoreError::ConnectionError("SSH connection required for port forwarding".into())
+        })?;
         let tunnel_id = Uuid::new_v4();
         info!("Creating tunnel: id={}, rule={:?}", tunnel_id, rule);
 
@@ -152,16 +237,13 @@ impl TunnelManager {
         let local_addr = listener.local_addr()
             .map_err(|e| CoreError::Internal(format!("Failed to get local addr: {}", e)))?;
 
-        info!("Tunnel listening on: {} (ssh_client={})", local_addr, ssh_client.is_some());
+        info!("Tunnel listening on: {}", local_addr);
 
         let tunnels = self.tunnels.clone();
         let rule_for_task = rule.clone();
         let tunnel_id_for_task = tunnel_id;
         // ssh_client 实际参与转发:
-        // - Some: 每条接入连接通过 SSH direct-tcpip 通道转发(russh::Channel<Msg>),
-        //   数据流走 server,不直连目标主机。
-        // - None: 直连目标主机(plain TCP 代理,用于 Telnet/Serial session 的隧道)。
-        // Arc<RwLock<...>> 跨 loop 迭代需要 clone;Option 不 Copy。
+        // 每条接入连接均通过 SSH direct-tcpip 通道转发。
         let ssh_client_ref = ssh_client;
 
         // 启动监听任务
@@ -190,17 +272,6 @@ impl TunnelManager {
                         tokio::spawn(async move {
                             let res = match direction {
                                 ForwardDirection::Local => {
-                                    forward_local(ssh_client_for_task, inbound, &remote_host, remote_port, tid).await
-                                }
-                                ForwardDirection::Remote => {
-                                    // RemoteForward 需要 SSH 端向 server 申请监听 + 接收 server→client 通道;
-                                    // russh 不直接暴露 server-initiated channel 接收, 留 TODO。
-                                    // 当前 LocalForward 复用同一 inbound 走 SSH direct-tcpip 作 fallback
-                                    // (如果用户误用 RemoteForward 配置, 行为退化为 LocalForward 足够明显)。
-                                    warn!(
-                                        "Tunnel {}: RemoteForward not fully implemented; falling back to LocalForward semantics",
-                                        tid
-                                    );
                                     forward_local(ssh_client_for_task, inbound, &remote_host, remote_port, tid).await
                                 }
                                 ForwardDirection::Dynamic => {
@@ -352,15 +423,16 @@ impl TunnelManager {
 
 /// 内部 helper: LocalForward — inbound → remote_host:remote_port
 ///
-/// 优先走 SSH direct-tcpip(有 ssh_client), 否则 plain TCP。
+/// 始终通过 SSH direct-tcpip 转发。
 async fn forward_local(
-    ssh_client: Option<SshClientHandle>,
+    ssh_client: SshClientHandle,
     mut inbound: TcpStream,
     remote_host: &str,
     remote_port: u16,
     tid: Uuid,
 ) -> Result<(), String> {
-    if let Some(ssh) = ssh_client {
+    {
+        let ssh = ssh_client;
         let channel = {
             let client = ssh.read().await;
             client
@@ -391,34 +463,13 @@ async fn forward_local(
                 remote_host, remote_port, e
             )),
         }
-    } else {
-        match TcpStream::connect(format!("{}:{}", remote_host, remote_port)).await {
-            Ok(mut remote) => {
-                let (mut ri, mut wi) = inbound.split();
-                let (mut ro, mut wo) = remote.split();
-                let c2s = tokio::io::copy(&mut ri, &mut wo);
-                let s2c = tokio::io::copy(&mut ro, &mut wi);
-                let (c2s_res, s2c_res) = tokio::join!(c2s, s2c);
-                if let Err(e) = c2s_res {
-                    warn!("Tunnel {}: client→remote (tcp) copy error: {}", tid, e);
-                }
-                if let Err(e) = s2c_res {
-                    warn!("Tunnel {}: remote→client (tcp) copy error: {}", tid, e);
-                }
-                Ok(())
-            }
-            Err(e) => Err(format!(
-                "TCP connect to {}:{} failed: {}",
-                remote_host, remote_port, e
-            )),
-        }
     }
 }
 
 /// 内部 helper: DynamicForward (SOCKS5) — 解析客户端握手得到目标,
 /// 然后跟 LocalForward 一样转发到 host:port (从握手解析).
 async fn forward_dynamic_socks5(
-    ssh_client: Option<SshClientHandle>,
+    ssh_client: SshClientHandle,
     mut inbound: TcpStream,
     tid: Uuid,
 ) -> Result<(), String> {
@@ -531,6 +582,42 @@ mod tests {
     use super::*;
     use rshell_api::types::{ForwardDirection, PortForwardRule};
 
+    #[tokio::test]
+    async fn legacy_remote_rule_is_skipped_without_changing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tunnels.toml");
+        let sid = Uuid::new_v4();
+        let content = format!(
+            "[rules]\n\"{sid}\" = [\n  {{ bind_address = '127.0.0.1', bind_port = 0, remote_host = 'local', remote_port = 22, direction = 'Local' }},\n  {{ bind_address = '127.0.0.1', bind_port = 0, remote_host = 'legacy', remote_port = 22, direction = 'Remote' }},\n  {{ bind_address = '127.0.0.1', bind_port = 0, remote_host = '', remote_port = 0, direction = 'Dynamic' }}\n]\n"
+        );
+        std::fs::write(&path, &content).unwrap();
+        let mgr = TunnelManager::new(Arc::new(EventBus::new())).with_persistence(path.clone());
+
+        let pending = mgr.restore_pending_rules().await;
+
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().any(|(_, r)| r.direction == ForwardDirection::Local));
+        assert!(pending.iter().any(|(_, r)| r.direction == ForwardDirection::Dynamic));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+
+        let info = mgr.restore_pending_rules_info().await;
+        assert_eq!(info.unsupported.len(), 1);
+        assert_eq!(info.unsupported[0].session_id, sid);
+        assert_eq!(info.unsupported[0].reason, "Remote forwarding is not supported");
+
+        mgr.save_to_disk().await;
+        let after_save = std::fs::read_to_string(&path).unwrap();
+        assert!(after_save.contains("direction = \"Remote\""));
+        assert!(after_save.contains("legacy"));
+    }
+
+    #[tokio::test]
+    async fn tunnel_needs_an_ssh_connection() {
+        let mgr = TunnelManager::new(Arc::new(EventBus::new()));
+        let result = mgr.create_tunnel(Uuid::new_v4(), make_rule("example.com", 0), None).await;
+        assert!(result.is_err());
+    }
+
     fn make_rule(host: &str, port: u16) -> PortForwardRule {
         PortForwardRule {
             bind_address: "127.0.0.1".to_string(),
@@ -554,12 +641,19 @@ mod tests {
         let pending = mgr.restore_pending_rules().await;
         assert!(pending.is_empty());
 
-        // 端口 0 由操作系统分配，避免 macOS 对低端口的权限限制。
+        // 持久化测试只注入规则，不需要建立真实 SSH 连接或监听器。
         let sid = Uuid::new_v4();
-        let tid = mgr
-            .create_tunnel(sid, make_rule("example.com", 0), None)
-            .await
-            .unwrap();
+        let tid = Uuid::new_v4();
+        mgr.tunnels.write().await.insert(tid, ActiveTunnel {
+            id: tid,
+            session_id: sid,
+            rule: make_rule("example.com", 0),
+            state: TunnelState::Active,
+            bytes_transferred: 0,
+            connections_count: 0,
+            listener_handle: None,
+        });
+        mgr.save_to_disk().await;
         let saved = std::fs::read_to_string(&tmp).unwrap();
         assert!(saved.contains(&sid.to_string()));
         assert!(saved.contains("example.com"));

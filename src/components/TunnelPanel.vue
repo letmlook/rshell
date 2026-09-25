@@ -2,12 +2,10 @@
 /**
  * TunnelPanel —— 切片 8
  *
- * 隧道管理三栏:本地(Local Forward)/远端(Remote Forward)/动态(Dynamic SOCKS)。
- * 切片 8 受限:`direct-tcpip` 未实现(docs/08 #3),仅做 IPC 接入与 UI。
- * 真实转发留待后续 rshell-protocol 接入 russh-direct-tcpip channel。
+ * 本地端口转发与动态 SOCKS5 隧道管理。
  */
 import { onMounted, ref } from "vue";
-import { listTunnels, createTunnel, closeTunnel } from "../ipc/client";
+import { listTunnels, listPendingTunnels, createTunnel, closeTunnel } from "../ipc/client";
 import type { Uuid, PortForwardRule, ActiveTunnelInfo } from "../ipc/types";
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
@@ -15,8 +13,9 @@ const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: fa
 const items = ref<ActiveTunnelInfo[]>([]);
 const loading = ref(false);
 const error = ref<string | null>(null);
+const unsupported = ref<string[]>([]);
 
-const draftType = ref<"Local" | "Remote" | "Dynamic">("Local");
+const draftType = ref<"Local" | "Dynamic">("Local");
 const draftSession = ref<Uuid | null>(null);
 const draftBind = ref("127.0.0.1:8080");
 const draftTarget = ref("localhost:80");
@@ -24,7 +23,11 @@ const draftTarget = ref("localhost:80");
 async function refresh() {
   loading.value = true;
   try {
-    items.value = (await listTunnels()) as unknown as ActiveTunnelInfo[];
+    const [active, pending] = await Promise.all([listTunnels(), listPendingTunnels()]);
+    items.value = active;
+    unsupported.value = pending.unsupported.map(
+      (rule) => `${rule.session_id}: ${rule.reason}`,
+    );
   } catch (e) {
     error.value = String(e);
   } finally {
@@ -46,7 +49,6 @@ async function add() {
   const bind = parseEndpoint(draftBind.value);
   const target = parseEndpoint(draftTarget.value);
   // 设计 §4.2 的 PortForwardRule 是单一 struct,通过 direction 字段区分。
-  // direct-tcpip 转发实现是后续切片(本次仅 IPC 接入)。
   const rule: PortForwardRule = {
     bind_address: bind.host,
     bind_port: bind.port,
@@ -81,12 +83,14 @@ onMounted(refresh);
       <el-button size="small" :loading="loading" @click="refresh">刷新</el-button>
     </header>
     <p v-if="error" class="error">{{ error }}</p>
+    <p v-for="message in unsupported" :key="message" class="error">
+      旧隧道规则已跳过：{{ message }}
+    </p>
 
     <el-form inline size="small" class="add-form" @submit.prevent="add">
       <el-form-item label="类型">
         <el-select v-model="draftType" style="width: 110px">
           <el-option label="Local" value="Local" />
-          <el-option label="Remote" value="Remote" />
           <el-option label="Dynamic" value="Dynamic" />
         </el-select>
       </el-form-item>

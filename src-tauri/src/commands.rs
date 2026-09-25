@@ -560,7 +560,10 @@ pub async fn disable_plugin(plugin_id: String, state: State<'_, AppState>) -> Re
         .map_err(IpcError::from)?;
     Ok(())
 }
-use rshell_api::types::{SshKeyInfo, ThemeInfo};
+use rshell_api::types::{ActiveTunnelInfo, PendingTunnelInfo, SshKeyInfo, ThemeInfo};
+
+cmd!(list_tunnels() -> Tunnels(Vec<ActiveTunnelInfo>) = AppCommand::ListTunnels);
+cmd!(list_pending_tunnels() -> PendingTunnels(PendingTunnelInfo) = AppCommand::ListPendingTunnels);
 
 // ListKeys:返回 Vec<SshKeyInfo>
 cmd!(list_keys() -> Keys(Vec<SshKeyInfo>) = AppCommand::ListKeys);

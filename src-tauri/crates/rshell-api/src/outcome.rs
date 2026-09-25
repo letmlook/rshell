@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::{
-    ActiveTunnelInfo, PluginInfo, PortForwardRule, QuickCommand, RemoteFileEntry,
+    ActiveTunnelInfo, PendingTunnelInfo, PluginInfo, QuickCommand, RemoteFileEntry,
     SessionConfig, SshKeyInfo, ThemeInfo, Trigger,
 };
 
@@ -40,7 +40,7 @@ pub enum CommandOutcome {
     /// 响应 `ListThemes`
     Themes(ThemeInfo),
     /// 响应 `ListPendingTunnels`
-    PendingTunnels(Vec<(Uuid, PortForwardRule)>),
+    PendingTunnels(PendingTunnelInfo),
     /// 响应 `BrowseRemoteDir`
     RemoteDir {
         path: String,
@@ -118,7 +118,7 @@ mod tests {
                 available_themes: vec![],
                 available_schemes: vec![],
             }),
-            CommandOutcome::PendingTunnels(vec![]),
+            CommandOutcome::PendingTunnels(PendingTunnelInfo { rules: vec![], unsupported: vec![] }),
             CommandOutcome::RemoteDir {
                 path: String::new(),
                 entries: vec![],

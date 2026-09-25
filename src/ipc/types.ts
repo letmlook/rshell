@@ -99,7 +99,12 @@ export interface PortForwardRule {
   direction: ForwardDirection;
 }
 
-export type ForwardDirection = "Local" | "Remote" | "Dynamic";
+export type ForwardDirection = "Local" | "Dynamic";
+
+export interface PendingTunnelInfo {
+  rules: Array<[Uuid, PortForwardRule]>;
+  unsupported: Array<{ session_id: Uuid; reason: string }>;
+}
 
 export type TunnelState = "Active" | "Suspended" | { Error: string };
 

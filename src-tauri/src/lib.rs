@@ -83,7 +83,10 @@ pub fn run() {
             let transfer_service = Arc::new(TransferService::new(event_bus.clone()));
             let key_manager = Arc::new(KeyManager::new(keys_dir, event_bus.clone()));
             let master_password = Arc::new(MasterPassword::new(event_bus.clone()));
-            let tunnel_manager = Arc::new(TunnelManager::new(event_bus.clone()));
+            let tunnel_manager = Arc::new(
+                TunnelManager::new(event_bus.clone())
+                    .with_persistence(data_root.join("tunnels.toml")),
+            );
             let host_key_manager = Arc::new(HostKeyManager::new(
                 known_hosts_path,
                 event_bus.clone(),
@@ -152,6 +155,8 @@ pub fn run() {
             commands::resume_transfer,
             commands::cancel_transfer,
             commands::browse_remote_dir,
+            commands::list_tunnels,
+            commands::list_pending_tunnels,
             commands::generate_ssh_key,
             commands::import_private_key,
             commands::delete_ssh_key,

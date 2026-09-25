@@ -112,8 +112,20 @@ pub struct PortForwardRule {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ForwardDirection {
     Local,
-    Remote,
     Dynamic,
+}
+
+/// 从旧配置读取但无法启动的隧道规则。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnsupportedTunnelRule {
+    pub session_id: Uuid,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingTunnelInfo {
+    pub rules: Vec<(Uuid, PortForwardRule)>,
+    pub unsupported: Vec<UnsupportedTunnelRule>,
 }
 
 /// 隧道状态
@@ -395,7 +407,7 @@ pub enum ProtocolType {
 
 #[cfg(test)]
 mod protocol_contract_tests {
-    use super::{Protocol, ProtocolType};
+    use super::{ForwardDirection, Protocol, ProtocolType};
 
     #[test]
     fn removed_rdp_protocol_is_rejected() {
@@ -404,6 +416,13 @@ mod protocol_contract_tests {
         assert!(serde_json::from_str::<Protocol>("\"SSH\"").is_ok());
         assert!(serde_json::from_str::<Protocol>("\"Telnet\"").is_ok());
         assert!(serde_json::from_str::<Protocol>("\"Serial\"").is_ok());
+    }
+
+    #[test]
+    fn unsupported_remote_forward_is_rejected() {
+        assert!(serde_json::from_str::<ForwardDirection>("\"Remote\"").is_err());
+        assert!(serde_json::from_str::<ForwardDirection>("\"Local\"").is_ok());
+        assert!(serde_json::from_str::<ForwardDirection>("\"Dynamic\"").is_ok());
     }
 }
 

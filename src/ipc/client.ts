@@ -9,6 +9,8 @@ import type {
   ConnectionState,
   PathBuf,
   PortForwardRule,
+  ActiveTunnelInfo,
+  PendingTunnelInfo,
   Protocol,
   ProtocolType,
   QuickCommand,
@@ -108,8 +110,8 @@ export const browseRemoteDir = (session_id: Uuid, path: string) =>
 export const createTunnel = (session_id: Uuid, rule: PortForwardRule) =>
   call({ CreateTunnel: { session_id, rule } });
 export const closeTunnel = (tunnel_id: Uuid) => call({ CloseTunnel: { tunnel_id } });
-export const listTunnels = () => call<{ tunnels: unknown[] }>({ ListTunnels: null });
-export const listPendingTunnels = () => call({ ListPendingTunnels: null });
+export const listTunnels = () => call<ActiveTunnelInfo[]>({ ListTunnels: null });
+export const listPendingTunnels = () => call<PendingTunnelInfo>({ ListPendingTunnels: null });
 export const restoreTunnel = (session_id: Uuid, rule: PortForwardRule) =>
   call({ RestoreTunnel: { session_id, rule } });
 export const suspendTunnel = (tunnel_id: Uuid) => call({ SuspendTunnel: { tunnel_id } });

@@ -219,8 +219,8 @@ impl CommandDispatcher {
 
             // ===== 隧道命令 =====
             AppCommand::CreateTunnel { session_id, rule } => {
-                let ssh_client = self.session_service.get_ssh_client(session_id).await.ok();
-                self.tunnel_manager.create_tunnel(session_id, rule, ssh_client).await?;
+                let ssh_client = self.session_service.get_ssh_client(session_id).await?;
+                self.tunnel_manager.create_tunnel(session_id, rule, Some(ssh_client)).await?;
                 Ok(CommandOutcome::None)
             }
             AppCommand::CloseTunnel { tunnel_id } => {
@@ -228,13 +228,13 @@ impl CommandDispatcher {
                 Ok(CommandOutcome::None)
             }
             AppCommand::ListPendingTunnels => {
-                let pending = self.tunnel_manager.restore_pending_rules().await;
-                info!(count = pending.len(), "UI requested pending tunnels");
+                let pending = self.tunnel_manager.restore_pending_rules_info().await;
+                info!(count = pending.rules.len(), unsupported = pending.unsupported.len(), "UI requested pending tunnels");
                 Ok(CommandOutcome::PendingTunnels(pending))
             }
             AppCommand::RestoreTunnel { session_id, rule } => {
-                let ssh_client = self.session_service.get_ssh_client(session_id).await.ok();
-                self.tunnel_manager.create_tunnel(session_id, rule, ssh_client).await?;
+                let ssh_client = self.session_service.get_ssh_client(session_id).await?;
+                self.tunnel_manager.create_tunnel(session_id, rule, Some(ssh_client)).await?;
                 Ok(CommandOutcome::None)
             }
             AppCommand::SuspendTunnel { tunnel_id } => {
