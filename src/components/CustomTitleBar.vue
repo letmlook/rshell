@@ -67,10 +67,6 @@ async function close() {
   }
 }
 
-async function onDragDoubleClick() {
-  await toggleMaximize();
-}
-
 let unlistenResize: (() => void) | null = null;
 let mounted = false;
 
@@ -168,7 +164,6 @@ defineExpose({
     <div
       class="titlebar-center is-draggable"
       data-tauri-drag-region
-      @dblclick="onDragDoubleClick"
     >
       <span class="current-label">
         {{ currentLabel || (store.current?.name ?? "RShell — 远程终端客户端") }}
