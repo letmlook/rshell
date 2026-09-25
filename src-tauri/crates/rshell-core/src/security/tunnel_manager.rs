@@ -554,22 +554,23 @@ mod tests {
         let pending = mgr.restore_pending_rules().await;
         assert!(pending.is_empty());
 
-        // create_tunnel 需要绑端口, 选一个高位端口避免冲突
+        // 端口 0 由操作系统分配，避免 macOS 对低端口的权限限制。
         let sid = Uuid::new_v4();
         let tid = mgr
-            .create_tunnel(sid, make_rule("example.com", 80), None)
+            .create_tunnel(sid, make_rule("example.com", 0), None)
             .await
             .unwrap();
-        // 等 create_tunnel 的 save 完成
+        let saved = std::fs::read_to_string(&tmp).unwrap();
+        assert!(saved.contains(&sid.to_string()));
+        assert!(saved.contains("example.com"));
+
         mgr.close_tunnel(tid).await.unwrap();
 
         // 现在应能从磁盘读出
         let mgr2 = TunnelManager::new(Arc::new(crate::event_bus::EventBus::new()))
             .with_persistence(tmp.clone());
         let pending = mgr2.restore_pending_rules().await;
-        // close_tunnel 已经把 tunnels 移除了,所以 save 出的应该为空
-        // (closed tunnels 不再持久化)
-        let _ = pending; // 主要是触发"读盘能跑通"
+        assert!(pending.is_empty());
         let _ = std::fs::remove_file(&tmp);
     }
 

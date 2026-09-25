@@ -19,9 +19,7 @@ pub struct UnixPty {
     #[cfg(unix)]
     master: Option<File>,
     #[cfg(unix)]
-    slave: Option<File>,
-    #[cfg(unix)]
-    slave_path: Option<String>,
+    _slave: Option<File>,
 }
 
 impl UnixPty {
@@ -86,8 +84,7 @@ impl UnixPty {
 
             Ok(Self {
                 master: Some(master),
-                slave: Some(slave),
-                slave_path: Some(slave_path),
+                _slave: Some(slave),
             })
         }
     }
@@ -130,7 +127,7 @@ impl Pty for UnixPty {
         #[cfg(unix)]
         {
             if let Some(ref mut master) = self.master {
-                master.write(buf)?;
+                master.write_all(buf)?;
                 master.flush()?;
                 return Ok(buf.len());
             }

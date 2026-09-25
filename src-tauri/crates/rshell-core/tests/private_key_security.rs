@@ -52,7 +52,7 @@ fn ssh_key_info_json_never_contains_private_key() {
 
 #[test]
 fn ssh_key_info_field_set_is_whitelisted() {
-    let v: serde_json::Value = serde_json::to_value(&sample_info()).unwrap();
+    let v: serde_json::Value = serde_json::to_value(sample_info()).unwrap();
     let obj = v.as_object().expect("SshKeyInfo must serialize as object");
     let allowed: std::collections::HashSet<&str> = [
         "id",

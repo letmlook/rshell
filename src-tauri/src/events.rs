@@ -33,12 +33,17 @@ fn emit_one(app_handle: &AppHandle, event: &AppEvent) {
 
 /// 从 `AppEvent` 派生稳定的日志标签。
 ///
-/// 不维护枚举变体名镜像 —— 序列化为 `serde_json::Value` 后读顶层 `"kind"` 字段
-/// (serde tagged enum 默认带 kind 标签;若未来调整 derive,本函数会回退到 "unknown")。
+/// AppEvent 使用 Serde 默认的外部标签格式：无负载变体是字符串，
+/// 有负载变体是以变体名为唯一键的对象。
 fn event_kind_label(event: &AppEvent) -> String {
     serde_json::to_value(event)
         .ok()
-        .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(|s| s.to_string())))
+        .and_then(|v| {
+            v.as_str().map(str::to_string).or_else(|| {
+                v.as_object()
+                    .and_then(|fields| fields.keys().next().cloned())
+            })
+        })
         .unwrap_or_else(|| "unknown".to_string())
 }
 
