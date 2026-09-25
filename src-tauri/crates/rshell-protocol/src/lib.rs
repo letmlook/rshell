@@ -4,9 +4,7 @@
 //! - SSH（含 SFTP）
 //! - Telnet
 //! - Serial
-//! - RDP
 
-pub mod rdp;
 pub mod serial;
 pub mod ssh;
 pub mod telnet;

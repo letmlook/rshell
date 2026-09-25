@@ -31,7 +31,7 @@ export interface SessionConfig {
   auth_method: AuthMethod;
 }
 
-export type Protocol = "SSH" | "Telnet" | "Serial" | "RDP";
+export type Protocol = "SSH" | "Telnet" | "Serial";
 
 export type AuthMethod =
   | { Password: { username: string; password: string } }
@@ -257,7 +257,7 @@ export interface TerminalColorScheme {
 
 // ===== 多协议配置 =====
 
-export type ProtocolType = "SSH" | "Telnet" | "Serial" | "RDP";
+export type ProtocolType = "SSH" | "Telnet" | "Serial";
 
 export interface SerialConfig {
   port: string;
@@ -275,15 +275,6 @@ export interface TelnetConfig {
   host: string;
   port: number;
   terminal_type: string;
-}
-
-export interface RdpConfig {
-  host: string;
-  port: number;
-  username: string;
-  domain: string | null;
-  width: number;
-  height: number;
 }
 
 // ===== 插件 =====

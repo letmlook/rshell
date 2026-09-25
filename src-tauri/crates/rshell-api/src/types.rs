@@ -27,7 +27,6 @@ pub enum Protocol {
     SSH,
     Telnet,
     Serial,
-    RDP,
 }
 
 /// 认证方式
@@ -392,7 +391,20 @@ pub enum ProtocolType {
     SSH,
     Telnet,
     Serial,
-    RDP,
+}
+
+#[cfg(test)]
+mod protocol_contract_tests {
+    use super::{Protocol, ProtocolType};
+
+    #[test]
+    fn removed_rdp_protocol_is_rejected() {
+        assert!(serde_json::from_str::<Protocol>("\"RDP\"").is_err());
+        assert!(serde_json::from_str::<ProtocolType>("\"RDP\"").is_err());
+        assert!(serde_json::from_str::<Protocol>("\"SSH\"").is_ok());
+        assert!(serde_json::from_str::<Protocol>("\"Telnet\"").is_ok());
+        assert!(serde_json::from_str::<Protocol>("\"Serial\"").is_ok());
+    }
 }
 
 /// 串口配置
@@ -428,17 +440,6 @@ pub struct TelnetConfig {
     pub host: String,
     pub port: u16,
     pub terminal_type: String,
-}
-
-/// RDP 配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RdpConfig {
-    pub host: String,
-    pub port: u16,
-    pub username: String,
-    pub domain: Option<String>,
-    pub width: u32,
-    pub height: u32,
 }
 
 // ===== 插件系统 =====

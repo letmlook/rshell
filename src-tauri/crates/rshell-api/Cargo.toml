@@ -12,3 +12,6 @@ serde = { workspace = true }
 uuid = { workspace = true }
 ts-rs = { workspace = true, features = ["serde-compat"] }
 # 注意：不依赖 GPUI、tokio 或其他运行时
+
+[dev-dependencies]
+serde_json = { workspace = true }
