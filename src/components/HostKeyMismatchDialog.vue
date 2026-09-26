@@ -41,6 +41,9 @@ const visible = computed(() => store.current !== null);
       <p class="warning">
         ⚠️ 连接前请确认以上指纹与服务器管理员公布的一致。指纹不一致可能意味着中间人攻击。
       </p>
+      <p v-if="store.error" class="decision-error" role="alert">
+        决策提交失败：{{ store.error }}。连接会在超时后被拒绝，请重试或检查后端状态。
+      </p>
     </template>
     <template #footer>
       <el-button @click="store.reject()">拒绝</el-button>
@@ -77,5 +80,13 @@ const visible = computed(() => store.current !== null);
   color: var(--el-color-warning);
   font-size: 12px;
   margin: 8px 0 0;
+}
+.decision-error {
+  margin: 12px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--el-color-danger);
+  border-radius: 4px;
+  color: var(--el-color-danger);
+  font-size: 12px;
 }
 </style>

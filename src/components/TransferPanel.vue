@@ -30,6 +30,8 @@ export interface TransferItem {
 const props = defineProps<{
   expanded: boolean;
   items: TransferItem[];
+  /** 队列读取失败时的提示；非空时优先于空状态展示 */
+  error?: string | null;
   /** 队列高度,折叠后不占空间 */
   height?: number;
 }>();
@@ -127,6 +129,9 @@ function phaseClass(p: TransferPhase): string {
         </svg>
       </button>
     </header>
+    <p v-if="error" class="panel-load-error" role="alert">
+      传输队列读取失败：{{ error }}（下表可能不是最新状态）
+    </p>
     <div v-if="expanded && tab === 'transfer'" class="panel-body">
       <el-table :data="merged" size="small" empty-text="暂无传输任务" class="xfer-table">
         <el-table-column prop="name" label="名称" min-width="180" />
@@ -198,6 +203,14 @@ function phaseClass(p: TransferPhase): string {
 }
 .transfer-panel.is-expanded {
   height: var(--rs-transfer-panel-h-expanded);
+}
+.panel-load-error {
+  margin: 6px 10px 0;
+  padding: 6px 8px;
+  border: 1px solid var(--el-color-danger);
+  border-radius: 4px;
+  color: var(--el-color-danger);
+  font-size: 12px;
 }
 
 .panel-bar {

@@ -13,29 +13,24 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
-use rshell_api::events::AppEvent;
 use rshell_api::types::{HostKeyEntry, TrustLevel};
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::error::CoreError;
-use crate::event_bus::EventBus;
 
 /// 主机密钥管理器
 pub struct HostKeyManager {
     /// host:port -> HostKeyEntry
     entries: Arc<RwLock<HashMap<String, HostKeyEntry>>>,
     known_hosts_path: PathBuf,
-    event_bus: Arc<EventBus>,
 }
 
 impl HostKeyManager {
     /// 创建新的主机密钥管理器
-    pub fn new(known_hosts_path: PathBuf, event_bus: Arc<EventBus>) -> Self {
+    pub fn new(known_hosts_path: PathBuf) -> Self {
         let manager = Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
             known_hosts_path,
-            event_bus,
         };
 
         // 加载 known_hosts 文件
@@ -147,61 +142,8 @@ impl HostKeyManager {
         Ok(())
     }
 
-    /// 检查主机密钥
-    ///
-    /// `key_blob` 应是 OpenSSH 编码的 base64 公钥（无 keytype 前缀）。
-    ///
-    /// 返回：
-    /// - `Ok(None)`：首次见到，需要用户确认
-    /// - `Ok(Some(true))`：匹配已知密钥
-    /// - `Ok(Some(false))`：密钥不匹配（可能中间人攻击）
-    pub async fn check_host_key(
-        &self,
-        host: &str,
-        port: u16,
-        _key_type: &str,
-        key_blob: &str,
-    ) -> Result<Option<bool>, CoreError> {
-        let key = format!("{}:{}", host, port);
-        let entries = self.entries.read().expect("host key lock poisoned");
-
-        if let Some(entry) = entries.get(&key) {
-            if entry.fingerprint == key_blob {
-                info!("Host key matches: {}:{}", host, port);
-                Ok(Some(true))
-            } else if entry.trust_level == TrustLevel::Trusted {
-                warn!(
-                    "Host key mismatch for {}:{}! Expected: {}, Got: {}",
-                    host, port, entry.fingerprint, key_blob
-                );
-                self.event_bus.publish(AppEvent::HostKeyMismatch {
-                    // 这个分支是 host_key_manager 在 verify 阶段发现已知 key 但
-                    // 实际收到的不匹配 — 它跟握手期间 SshHandler 的"未知 key"
-                    // 是两个不同的路径;这里发的事件 UI 端应作为"严重告警"展示,
-                    // 不应回 AppCommand::DecideHostKey(那会回 SshHandler 阻塞的
-                    // oneshot)。decision_id 留零,UI 端通过 host/port 区分。
-                    decision_id: Uuid::nil(),
-                    host: host.to_string(),
-                    port,
-                    key_type: String::new(),
-                    expected: entry.fingerprint.clone(),
-                    received: key_blob.to_string(),
-                    public_key_blob: String::new(),
-                });
-                Ok(Some(false))
-            } else {
-                Ok(None)
-            }
-        } else {
-            info!(
-                "New host: {}:{} with key blob length {}",
-                host,
-                port,
-                key_blob.len()
-            );
-            Ok(None)
-        }
-    }
+    // 已知条目但指纹不一致（可能中间人）由协议层 rshell-protocol::ssh::client
+    // 的 verify_known_hosts → check_server_key 决策链处理，不再在此重复判定。
 
     /// 信任主机密钥
     ///
@@ -304,22 +246,21 @@ mod tests {
     async fn permanent_trust_persists_across_manager_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("known_hosts");
-        let bus = Arc::new(EventBus::new());
-        let manager = HostKeyManager::new(path.clone(), bus.clone());
+        let manager = HostKeyManager::new(path.clone());
         manager
             .trust_host_key("example.test", 2222, "ssh-ed25519", "AAAAkey")
             .await
             .unwrap();
-        assert!(std::fs::read_to_string(&path)
-            .unwrap()
-            .contains("[example.test]:2222 ssh-ed25519 AAAAkey"));
-        let restored = HostKeyManager::new(path, bus);
-        assert_eq!(
-            restored
-                .check_host_key("example.test", 2222, "ssh-ed25519", "AAAAkey")
-                .await
-                .unwrap(),
-            Some(true)
-        );
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("[example.test]:2222 ssh-ed25519 AAAAkey"));
+
+        // 重启后应从磁盘恢复条目（握手期的比对由协议层 verify_known_hosts 负责）
+        let restored = HostKeyManager::new(path);
+        let entries = restored.entries.read().unwrap();
+        let entry = entries
+            .get("example.test:2222")
+            .expect("重启后条目应被加载");
+        assert_eq!(entry.fingerprint, "AAAAkey");
+        assert_eq!(entry.trust_level, TrustLevel::Trusted);
     }
 }

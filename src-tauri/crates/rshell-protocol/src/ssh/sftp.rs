@@ -11,6 +11,9 @@ use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info};
 
+/// 单次读写分块大小（64 KiB）
+const CHUNK_SIZE: usize = 64 * 1024;
+
 /// SFTP 客户端
 ///
 /// 封装 russh_sftp::client::SftpSession，提供高层文件操作接口。
@@ -89,45 +92,63 @@ impl SftpClient {
         Ok(entries)
     }
 
-    /// 上传本地文件到远程
-    pub async fn upload(&self, local: &PathBuf, remote: &str) -> Result<u64, ProtocolError> {
+    /// 上传本地文件到远程（分块写入，边传边回调进度）
+    pub async fn upload<F>(
+        &self,
+        local: &PathBuf,
+        remote: &str,
+        mut progress: F,
+    ) -> Result<u64, ProtocolError>
+    where
+        F: FnMut(u64, u64),
+    {
         info!(local = %local.display(), remote = %remote, "Uploading file");
 
-        let data = tokio::fs::read(local).await.map_err(|e| {
-            ProtocolError::ProtocolError(format!("Failed to read local file: {}", e))
+        let total = tokio::fs::metadata(local)
+            .await
+            .map_err(|e| ProtocolError::ProtocolError(format!("Failed to stat local file: {}", e)))?
+            .len();
+
+        let mut source = tokio::fs::File::open(local).await.map_err(|e| {
+            ProtocolError::ProtocolError(format!("Failed to open local file: {}", e))
         })?;
 
-        let total = data.len() as u64;
-
-        let mut file = self.session.create(remote).await.map_err(|e| {
+        let mut target = self.session.create(remote).await.map_err(|e| {
             ProtocolError::ProtocolError(format!("Failed to create remote file: {}", e))
         })?;
 
-        file.write_all(&data).await.map_err(|e| {
-            ProtocolError::ProtocolError(format!("Failed to write remote file: {}", e))
-        })?;
+        let copied =
+            copy_with_progress(&mut source, &mut target, total, CHUNK_SIZE, &mut progress).await?;
+        drop(target);
 
-        // 关闭文件（通过 drop）
-        drop(file);
-
-        info!(remote = %remote, bytes = total, "Upload completed");
-        Ok(total)
+        info!(remote = %remote, bytes = copied, "Upload completed");
+        Ok(copied)
     }
 
-    /// 下载远程文件到本地
-    pub async fn download(&self, remote: &str, local: &PathBuf) -> Result<u64, ProtocolError> {
+    /// 下载远程文件到本地（分块写入，边传边回调进度）
+    pub async fn download<F>(
+        &self,
+        remote: &str,
+        local: &PathBuf,
+        mut progress: F,
+    ) -> Result<u64, ProtocolError>
+    where
+        F: FnMut(u64, u64),
+    {
         info!(remote = %remote, local = %local.display(), "Downloading file");
 
-        let mut file = self.session.open(remote).await.map_err(|e| {
+        let total = self
+            .session
+            .metadata(remote)
+            .await
+            .map_err(|e| {
+                ProtocolError::ProtocolError(format!("Failed to stat remote file: {}", e))
+            })?
+            .len();
+
+        let mut source = self.session.open(remote).await.map_err(|e| {
             ProtocolError::ProtocolError(format!("Failed to open remote file: {}", e))
         })?;
-
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).await.map_err(|e| {
-            ProtocolError::ProtocolError(format!("Failed to read remote file: {}", e))
-        })?;
-
-        let total = data.len() as u64;
 
         // 确保本地目录存在
         if let Some(parent) = local.parent() {
@@ -135,13 +156,15 @@ impl SftpClient {
                 ProtocolError::ProtocolError(format!("Failed to create local dir: {}", e))
             })?;
         }
-
-        tokio::fs::write(local, &data).await.map_err(|e| {
-            ProtocolError::ProtocolError(format!("Failed to write local file: {}", e))
+        let mut target = tokio::fs::File::create(local).await.map_err(|e| {
+            ProtocolError::ProtocolError(format!("Failed to create local file: {}", e))
         })?;
 
-        info!(remote = %remote, bytes = total, "Download completed");
-        Ok(total)
+        let copied =
+            copy_with_progress(&mut source, &mut target, total, CHUNK_SIZE, &mut progress).await?;
+
+        info!(remote = %remote, bytes = copied, "Download completed");
+        Ok(copied)
     }
 
     /// 获取远程文件元数据
@@ -242,5 +265,116 @@ impl SftpClient {
             .await
             .map_err(|e| ProtocolError::ProtocolError(format!("close failed: {}", e)))?;
         Ok(())
+    }
+}
+
+/// 分块拷贝，进度变化时回调 `(bytes_done, total)`。
+///
+/// 开始前先回调一次 `(0, total)`，返回前保证发出终帧；
+/// 声明的 `total` 与实际拷贝字节数不一致（源在传输期间被改写）时报错，
+/// 避免远端留下被截断的文件。
+async fn copy_with_progress<R, W, F>(
+    reader: &mut R,
+    writer: &mut W,
+    total: u64,
+    chunk_size: usize,
+    progress: &mut F,
+) -> Result<u64, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    F: FnMut(u64, u64),
+{
+    progress(0, total);
+
+    let mut buf = vec![0u8; chunk_size.max(1)];
+    let mut done: u64 = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| ProtocolError::ProtocolError(format!("read failed during copy: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        writer
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| ProtocolError::ProtocolError(format!("write failed during copy: {e}")))?;
+        done += n as u64;
+        progress(done, total);
+    }
+    writer
+        .flush()
+        .await
+        .map_err(|e| ProtocolError::ProtocolError(format!("flush failed during copy: {e}")))?;
+
+    if total > 0 && done != total {
+        return Err(ProtocolError::ProtocolError(format!(
+            "source changed during transfer: expected {total} bytes, copied {done}"
+        )));
+    }
+    Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn copy_reports_monotonic_progress_and_exact_final_total() {
+        let payload = vec![7u8; 1000];
+        let mut reader: &[u8] = payload.as_slice();
+        let mut writer: Vec<u8> = Vec::new();
+        let mut calls: Vec<(u64, u64)> = Vec::new();
+
+        let copied = copy_with_progress(&mut reader, &mut writer, 1000, 128, &mut |done, total| {
+            calls.push((done, total));
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(copied, 1000);
+        assert_eq!(writer.len(), 1000);
+        assert!(calls.len() > 1, "1000 字节 / 128 分块应产生多次回调");
+        assert_eq!(calls[0], (0, 1000), "开始前应先报一次 (0, total)");
+        let mut prev = 0u64;
+        for (done, total) in &calls {
+            assert_eq!(*total, 1000);
+            assert!(*done >= prev, "进度不允许回退");
+            prev = *done;
+        }
+        assert_eq!(calls.last().copied(), Some((1000, 1000)));
+    }
+
+    #[tokio::test]
+    async fn copy_accepts_unknown_total_but_still_reports_bytes() {
+        let payload = vec![1u8; 300];
+        let mut reader: &[u8] = payload.as_slice();
+        let mut writer: Vec<u8> = Vec::new();
+        let mut last = (0u64, 0u64);
+
+        let copied = copy_with_progress(&mut reader, &mut writer, 0, 64, &mut |d, t| last = (d, t))
+            .await
+            .unwrap();
+
+        assert_eq!(copied, 300);
+        assert_eq!(last.0, 300);
+    }
+
+    #[tokio::test]
+    async fn copy_rejects_when_source_shrinks_mid_transfer() {
+        let payload = vec![0u8; 500];
+        let mut reader: &[u8] = payload.as_slice();
+        let mut writer: Vec<u8> = Vec::new();
+
+        let err = copy_with_progress(&mut reader, &mut writer, 1000, 64, &mut |_, _| {})
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{err:?}").contains("source changed"),
+            "实际错误: {err:?}"
+        );
     }
 }

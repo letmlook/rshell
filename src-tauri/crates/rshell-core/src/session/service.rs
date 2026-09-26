@@ -1262,7 +1262,6 @@ mod tests {
             )),
             host_key_manager: Arc::new(crate::security::host_key_manager::HostKeyManager::new(
                 dir.path().join("known_hosts"),
-                bus.clone(),
             )),
             theme_manager: Arc::new(crate::theme::ThemeManager::new(bus.clone())),
             event_bus: bus,

@@ -99,6 +99,8 @@ export interface TransferTaskInfo {
   state: TransferTaskState;
   bytes_transferred: number;
   total_bytes: number;
+  /** 当前传输速度（字节/秒），仅 Transferring 状态有值 */
+  speed_bps: number;
   error_message: string | null;
 }
 

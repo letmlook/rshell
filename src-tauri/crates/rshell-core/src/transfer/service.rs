@@ -74,6 +74,8 @@ pub struct TransferTask {
     pub last_update: Option<std::time::Instant>,
     /// 上次更新时的字节数（用于计算速度）
     pub last_bytes: u64,
+    /// 当前传输速度（字节/秒）。仅在 Transferring 期间有值，其余状态由前端归零显示。
+    pub speed_bps: f64,
 }
 
 impl TransferTask {
@@ -108,8 +110,41 @@ impl From<TransferTask> for TransferTaskInfo {
             },
             bytes_transferred: task.bytes_transferred,
             total_bytes: task.total_bytes,
+            speed_bps: task.speed_bps,
             error_message: task.error_message,
         }
+    }
+}
+
+/// 进度事件最短发布间隔：避免每个分块都触发一次前端全量队列刷新。
+const PROGRESS_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// 进度事件节流：间隔内的帧丢弃，首帧与终帧无条件发出。
+struct ProgressThrottle {
+    last_sent: Option<std::time::Instant>,
+    min_interval: std::time::Duration,
+}
+
+impl ProgressThrottle {
+    fn new(min_interval: std::time::Duration) -> Self {
+        Self {
+            last_sent: None,
+            min_interval,
+        }
+    }
+
+    fn should_emit(&mut self, done: u64, total: u64) -> bool {
+        let final_frame = total > 0 && done >= total;
+        let now = std::time::Instant::now();
+        let emit = final_frame
+            || match self.last_sent {
+                None => true,
+                Some(sent) => sent.elapsed() >= self.min_interval,
+            };
+        if emit {
+            self.last_sent = Some(now);
+        }
+        emit
     }
 }
 
@@ -175,6 +210,7 @@ impl TransferService {
             started_at: None,
             last_update: None,
             last_bytes: 0,
+            speed_bps: 0.0,
         };
 
         {
@@ -224,6 +260,7 @@ impl TransferService {
             started_at: None,
             last_update: None,
             last_bytes: 0,
+            speed_bps: 0.0,
         };
 
         {
@@ -291,6 +328,32 @@ impl TransferService {
         let tasks = self.tasks.clone();
         let event_bus = self.event_bus.clone();
         tokio::spawn(async move {
+            // SFTP 拷贝循环里只能同步回调（不能在回调里 await 写锁），
+            // 所以回调只做节流后投递，由独立 forwarder 任务落表并广播。
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+            let forward_tasks = tasks.clone();
+            let forward_bus = event_bus.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Some((bytes, total)) = progress_rx.recv().await {
+                    TransferService::apply_progress(
+                        &forward_tasks,
+                        &forward_bus,
+                        task_id,
+                        bytes,
+                        total,
+                    )
+                    .await;
+                }
+            });
+
+            let mut throttle = ProgressThrottle::new(PROGRESS_MIN_INTERVAL);
+            let mut progress = move |done: u64, total: u64| {
+                if throttle.should_emit(done, total) {
+                    let _ = progress_tx.send((done, total));
+                }
+            };
+
             let result = async {
                 let ssh = ssh_client.read().await;
                 let channel = ssh
@@ -304,54 +367,24 @@ impl TransferService {
 
                 match task.direction {
                     TransferDirection::Upload => {
-                        let bytes = sftp
-                            .upload(&task.local_path, &task.remote_path)
+                        sftp.upload(&task.local_path, &task.remote_path, &mut progress)
                             .await
                             .map_err(|e| format!("Upload failed: {}", e))?;
-
-                        // 更新进度
-                        {
-                            let mut tasks = tasks.write().await;
-                            if let Some(t) = tasks.get_mut(&task_id) {
-                                t.bytes_transferred = bytes;
-                                t.total_bytes = bytes;
-                            }
-                        }
-
-                        event_bus.publish(AppEvent::TransferProgress {
-                            task_id,
-                            bytes,
-                            total: bytes,
-                            speed_bps: 0.0,
-                        });
                     }
                     TransferDirection::Download => {
-                        let bytes = sftp
-                            .download(&task.remote_path, &task.local_path)
+                        sftp.download(&task.remote_path, &task.local_path, &mut progress)
                             .await
                             .map_err(|e| format!("Download failed: {}", e))?;
-
-                        // 更新进度
-                        {
-                            let mut tasks = tasks.write().await;
-                            if let Some(t) = tasks.get_mut(&task_id) {
-                                t.bytes_transferred = bytes;
-                                t.total_bytes = bytes;
-                            }
-                        }
-
-                        event_bus.publish(AppEvent::TransferProgress {
-                            task_id,
-                            bytes,
-                            total: bytes,
-                            speed_bps: 0.0,
-                        });
                     }
                 }
 
                 Ok::<(), String>(())
             }
             .await;
+
+            // 关闭发送端 → forwarder 排空最后一批进度后自行退出
+            drop(progress);
+            let _ = forwarder.await;
 
             match result {
                 Ok(()) => {
@@ -434,42 +467,64 @@ impl TransferService {
     }
 
     /// 更新传输进度
+    ///
+    /// 抽成关联函数 `apply_progress` 是为了让 execute_transfer 里的
+    /// forwarder 任务只持有 `tasks` / `event_bus` 的克隆即可复用同一逻辑。
     pub async fn update_progress(
         &self,
         task_id: Uuid,
         bytes_transferred: u64,
         total_bytes: u64,
     ) -> Result<(), CoreError> {
-        let mut tasks = self.tasks.write().await;
+        Self::apply_progress(
+            &self.tasks,
+            &self.event_bus,
+            task_id,
+            bytes_transferred,
+            total_bytes,
+        )
+        .await;
+        Ok(())
+    }
 
-        if let Some(task) = tasks.get_mut(&task_id) {
-            // 计算传输速度
-            let speed_bps = if let Some(last_update) = task.last_update {
-                let elapsed = last_update.elapsed().as_secs_f64();
-                if elapsed > 0.0 {
-                    let bytes_delta = bytes_transferred.saturating_sub(task.last_bytes);
-                    (bytes_delta as f64) / elapsed
-                } else {
-                    0.0
-                }
+    /// 更新进度并广播：写任务表（含速度计算）+ 发布 `TransferProgress`
+    async fn apply_progress(
+        tasks: &Arc<RwLock<HashMap<Uuid, TransferTask>>>,
+        event_bus: &Arc<EventBus>,
+        task_id: Uuid,
+        bytes_transferred: u64,
+        total_bytes: u64,
+    ) {
+        let mut tasks = tasks.write().await;
+        let Some(task) = tasks.get_mut(&task_id) else {
+            return;
+        };
+
+        // 速度 = 自上次更新以来的字节增量 / 间隔（用更新前的旧值计算）
+        let speed_bps = if let Some(last_update) = task.last_update {
+            let elapsed = last_update.elapsed().as_secs_f64();
+            if elapsed > 0.0 {
+                let bytes_delta = bytes_transferred.saturating_sub(task.last_bytes);
+                (bytes_delta as f64) / elapsed
             } else {
                 0.0
-            };
+            }
+        } else {
+            0.0
+        };
 
-            task.bytes_transferred = bytes_transferred;
-            task.total_bytes = total_bytes;
-            task.last_update = Some(std::time::Instant::now());
-            task.last_bytes = bytes_transferred;
+        task.bytes_transferred = bytes_transferred;
+        task.total_bytes = total_bytes;
+        task.last_update = Some(std::time::Instant::now());
+        task.last_bytes = bytes_transferred;
+        task.speed_bps = speed_bps;
 
-            self.event_bus.publish(AppEvent::TransferProgress {
-                task_id,
-                bytes: bytes_transferred,
-                total: total_bytes,
-                speed_bps,
-            });
-        }
-
-        Ok(())
+        event_bus.publish(AppEvent::TransferProgress {
+            task_id,
+            bytes: bytes_transferred,
+            total: total_bytes,
+            speed_bps,
+        });
     }
 
     /// 标记传输完成
@@ -575,6 +630,7 @@ mod tests {
             started_at: None,
             last_update: None,
             last_bytes: 0,
+            speed_bps: 0.0,
         }
     }
 
@@ -743,6 +799,7 @@ mod tests {
             started_at: None,
             last_update: None,
             last_bytes: 0,
+            speed_bps: 0.0,
         };
         assert!((task.progress() - 0.5).abs() < f64::EPSILON);
 
@@ -760,7 +817,66 @@ mod tests {
             started_at: None,
             last_update: None,
             last_bytes: 0,
+            speed_bps: 0.0,
         };
         assert_eq!(zero.progress(), 0.0);
+    }
+
+    #[test]
+    fn progress_throttle_emits_first_immediately_and_final_frame_always() {
+        let mut t = ProgressThrottle::new(std::time::Duration::from_secs(60));
+        assert!(t.should_emit(0, 1000), "首帧必须立即发出");
+        assert!(!t.should_emit(128, 1000), "间隔内的中间帧要被节流");
+        assert!(!t.should_emit(256, 1000));
+        assert!(t.should_emit(1000, 1000), "终帧必须无条件发出");
+
+        let mut fast = ProgressThrottle::new(std::time::Duration::ZERO);
+        assert!(fast.should_emit(1, 1000));
+        assert!(fast.should_emit(2, 1000));
+    }
+
+    #[tokio::test]
+    async fn apply_progress_updates_task_and_publishes_nonzero_speed() {
+        let event_bus = Arc::new(EventBus::new());
+        let svc = TransferService::new(event_bus.clone());
+        let id = Uuid::new_v4();
+        {
+            let mut tasks = svc.tasks.write().await;
+            let mut task = make_task(id, TransferTaskState::Transferring);
+            // 500ms 前进过 0 字节 → 500 字节 / 0.5s = 1000 B/s
+            task.last_update =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(500));
+            task.last_bytes = 0;
+            tasks.insert(id, task);
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        event_bus.subscribe(move |event| {
+            if let AppEvent::TransferProgress {
+                bytes,
+                total,
+                speed_bps,
+                ..
+            } = event
+            {
+                sink.lock().unwrap().push((*bytes, *total, *speed_bps));
+            }
+        });
+
+        TransferService::apply_progress(&svc.tasks, &svc.event_bus, id, 500, 1000).await;
+
+        {
+            let tasks = svc.tasks.read().await;
+            let task = tasks.get(&id).unwrap();
+            assert_eq!(task.bytes_transferred, 500);
+            assert_eq!(task.total_bytes, 1000);
+            assert!(task.speed_bps > 0.0, "speed_bps 应为正数");
+        }
+
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].0, events[0].1), (500, 1000));
+        assert!(events[0].2 > 0.0, "广播出去的速度也要是正数");
     }
 }

@@ -104,6 +104,8 @@ pub struct TransferTaskInfo {
     pub state: TransferTaskState,
     pub bytes_transferred: u64,
     pub total_bytes: u64,
+    /// 当前传输速度（字节/秒），仅 Transferring 状态有值
+    pub speed_bps: f64,
     pub error_message: Option<String>,
 }
 

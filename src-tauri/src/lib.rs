@@ -99,8 +99,7 @@ pub fn run() {
                 TunnelManager::new(event_bus.clone())
                     .with_persistence(data_root.join("tunnels.toml")),
             );
-            let host_key_manager =
-                Arc::new(HostKeyManager::new(known_hosts_path, event_bus.clone()));
+            let host_key_manager = Arc::new(HostKeyManager::new(known_hosts_path));
             let theme_manager = Arc::new(ThemeManager::new(event_bus.clone()));
 
             // SessionService restores saved sessions during construction.

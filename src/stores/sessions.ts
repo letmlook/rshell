@@ -64,13 +64,25 @@ export const useSessionsStore = defineStore("sessions", () => {
   }
 
   async function disconnect(id: Uuid) {
-    await disconnectSession(id);
+    try {
+      await disconnectSession(id);
+    } catch (e) {
+      error.value = String(e);
+      throw e;
+    }
+    error.value = null;
     connectionState.value.set(id, "disconnected");
     connectionState.value = new Map(connectionState.value);
   }
 
   async function deleteSessionById(id: Uuid) {
-    await deleteSession(id);
+    try {
+      await deleteSession(id);
+    } catch (e) {
+      error.value = String(e);
+      throw e;
+    }
+    error.value = null;
     await refresh();
   }
 

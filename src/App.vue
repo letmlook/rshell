@@ -34,15 +34,15 @@ import WorkspaceToolbar, {
   type WorkspaceKind,
   type PanelKind,
 } from "./components/WorkspaceToolbar.vue";
-import TransferPanel, { type TransferItem, type TransferPhase } from "./components/TransferPanel.vue";
+import TransferPanel, { type TransferItem } from "./components/TransferPanel.vue";
 import { listTransfers } from "./ipc/client";
 import { subscribeAppEvents } from "./ipc/events";
-import type { TransferTaskInfo } from "./ipc/types";
 import {
   DEFAULT_SIDEBAR_WIDTH,
   clampSidebarWidth,
   maxSidebarWidthForViewport,
 } from "./utils/workspaceLayout";
+import { toTransferItem } from "./utils/transferItem";
 import { useSessionsStore } from "./stores/sessions";
 import { useHostKeyStore } from "./stores/hostKey";
 import { useThemeStore } from "./stores/theme";
@@ -67,30 +67,20 @@ const activeTransferSession = ref<Uuid | null>(null);
 const transferWorkspace = ref<InstanceType<typeof TransferWorkspace> | null>(null);
 const transferCapabilities = ref({ upload: false, download: false, createFolder: false, delete: false, refresh: false, sync: false });
 const transferItems = ref<TransferItem[]>([]);
+/** 队列读取/订阅失败的提示；非空时 TransferPanel 就地展示（区别于"确实没有任务"） */
+const transferLoadError = ref<string | null>(null);
 let unlistenTransfers: (() => void) | null = null;
 let mounted = false;
 
-function toTransferItem(task: TransferTaskInfo): TransferItem {
-  const phase: Record<TransferTaskInfo["state"], TransferPhase> = {
-    Pending: "queued", Transferring: "active", Paused: "paused",
-    Completed: "done", Failed: "failed", Cancelled: "cancelled",
-  };
-  return {
-    id: task.id,
-    name: task.remote_path.split("/").pop() || task.remote_path,
-    phase: phase[task.state],
-    progress: task.total_bytes ? task.bytes_transferred / task.total_bytes : 0,
-    size: task.total_bytes,
-    local: task.local_path,
-    remote: task.remote_path,
-    speed: 0,
-    error: task.error_message,
-  };
-}
-
 async function refreshTransfers() {
-  try { transferItems.value = (await listTransfers()).map(toTransferItem); }
-  catch (error) { console.error("无法读取传输队列", error); }
+  try {
+    transferItems.value = (await listTransfers()).map(toTransferItem);
+    transferLoadError.value = null;
+  } catch (error) {
+    // 不能静默：面板必须能区分「读取失败」与「确实没有任务」
+    transferLoadError.value = String(error);
+    console.error("无法读取传输队列", error);
+  }
 }
 
 const sidebarWidth = ref(DEFAULT_SIDEBAR_WIDTH);
@@ -227,7 +217,14 @@ onMounted(async () => {
     });
     if (mounted) unlistenTransfers = stop;
     else stop();
-  } catch (error) { console.error("无法订阅传输队列", error); }
+  } catch (error) {
+    console.error("无法订阅传输队列", error);
+    transferLoadError.value = String(error);
+    ElNotification.error({
+      title: "传输事件订阅失败",
+      message: "传输进度与结果将不再自动刷新，请重启应用。",
+    });
+  }
 });
 
 onBeforeUnmount(() => {
@@ -353,6 +350,7 @@ onBeforeUnmount(() => {
             <TransferPanel
               :expanded="transferPanelExpanded"
               :items="transferItems"
+              :error="transferLoadError"
               @toggle="transferPanelExpanded = !transferPanelExpanded"
             />
           </div>

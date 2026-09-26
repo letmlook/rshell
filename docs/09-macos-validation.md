@@ -11,21 +11,23 @@ macOS 本机，Rust stable 1.98.1，Tauri 2 + Vue 3 + xterm.js。依赖由 `npm 
 以下结果来自最终审查修复及 Rust 格式化后的重新执行：
 
 - `npm run typecheck`：通过。
-- `npm test`：13 个文件，49 项通过。
+- `npm test`：18 个文件，65 项通过。
 - `npm run test:scripts`：2 项通过。
 - `npm run build`：通过，Vite 6.4.3。
 - `npm run check:docs`：14 份当前文档通过。
 - `cargo fmt --all --check`：通过。
 - `cargo clippy --workspace --all-targets -- -D warnings`：通过。
-- `cargo test --workspace --quiet`：149 项单元/集成测试通过，1 个既有文档示例忽略，其余文档测试无失败。
+- `cargo test --workspace --quiet`：154 项单元/集成测试通过，1 个既有文档示例忽略，其余文档测试无失败。
 
 同时构建 Tauri 与运行 rustdoc 时曾出现 `E0463`（找不到 tauri crate）；停止重叠构建后，文档测试及全工作区测试均串行复跑通过，未通过禁用文档测试规避错误。
 
 早期 App 测试出现 jsdom Canvas 能力提示，已通过 mock 与测试无关的终端子组件消除；真实渲染测试边界保持明确。Vite 仍报告 bundle 大小与注解警告。初始 `npm audit` 报告 6 项 advisory；Vite 6.4.3、Vitest 4.1.11、nanoid 3.3.19 更新后重新安装，最终 audit 报告 0 项。该结果仅对应 npm 已知漏洞数据库，不代表完整安全审计。
 
-macOS 构建脚本回归通过（2/2），覆盖图标资源存在性、工作目录、Tauri 调用、target 参数和失败退出码。前端最终类型检查与 49 项测试通过，当前文档契约通过（14 份文档）。其中 3 项标题栏集成测试执行 Cargo.lock 对应的 Tauri 原生拖动脚本和生成权限清单；本机全部实际执行，没有跳过。仅前端安装且缺少 Cargo 依赖/权限清单时，这 3 项会明确跳过，基础权限断言仍会执行。
+macOS 构建脚本回归通过（2/2），覆盖图标资源存在性、工作目录、Tauri 调用、target 参数和失败退出码。前端最终类型检查与 65 项测试通过，当前文档契约通过（14 份文档）。其中 3 项标题栏集成测试执行 Cargo.lock 对应的 Tauri 原生拖动脚本和生成权限清单；本机全部实际执行，没有跳过。仅前端安装且缺少 Cargo 依赖/权限清单时，这 3 项会明确跳过，基础权限断言仍会执行。
 
 独立审查发现的 SSH 子通道输出隔离、连接取消/删除竞争、退出清理、协议请求锁、串口取消丢字节、Telnet resize、通知文案、新终端配色和传输错误详情均已修复并通过定向复审。新增本地真实 SSH 传输回归覆盖 shell 输入、尺寸、独立子通道数据与 EOF；它不等于完整 SFTP 文件系统或外部服务器验收。
+
+本轮另修复：SFTP 传输改为 64 KiB 分块拷贝并按 200ms 节流广播进度，速度随 `TransferTaskInfo` 快照下发；删除不可达的 `HostKeyManager::check_host_key` 及其连带死状态，前端对 nil `decision_id` 决策事件做防御；断开/删除会话与传输队列读取失败不再静默；pause/resume 核心接口无界面入口已在功能与限制中记录。真实 SSH/SFTP 服务器上的进度观感、面板错误展示等 GUI 项仍属未执行验收，不因单元测试通过而勾选。
 
 ## 原生开发启动
 
