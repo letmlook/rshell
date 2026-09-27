@@ -2,9 +2,15 @@ import { describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import App from "../../src/App.vue";
 import { subscribeAppEvents } from "../../src/ipc/events";
-import { listTransfers } from "../../src/ipc/client";
+import { listTransfers, pauseTransfer, resumeTransfer } from "../../src/ipc/client";
 import TransferPanel from "../../src/components/TransferPanel.vue";
 import ElementPlus from "element-plus";
+
+const { listTransfersMock, pauseTransferMock, resumeTransferMock } = vi.hoisted(() => ({
+  listTransfersMock: vi.fn().mockResolvedValue([]),
+  pauseTransferMock: vi.fn().mockResolvedValue(undefined),
+  resumeTransferMock: vi.fn().mockResolvedValue(undefined),
+}));
 
 vi.mock("../../src/components/TerminalPane.vue", () => ({ default: { name: "TerminalPane", template: "<div />" } }));
 
@@ -26,7 +32,11 @@ vi.mock("../../src/stores/hostKey", () => ({
 vi.mock("../../src/stores/theme", () => ({
   useThemeStore: () => ({ refresh: vi.fn().mockResolvedValue(undefined), subscribeEvents: vi.fn().mockResolvedValue(undefined), disposeEvents: vi.fn() }),
 }));
-vi.mock("../../src/ipc/client", () => ({ listTransfers: vi.fn().mockResolvedValue([]) }));
+vi.mock("../../src/ipc/client", () => ({
+  listTransfers: listTransfersMock,
+  pauseTransfer: pauseTransferMock,
+  resumeTransfer: resumeTransferMock,
+}));
 vi.mock("../../src/ipc/events", () => ({ subscribeAppEvents: vi.fn().mockResolvedValue(vi.fn()) }));
 
 describe("App layout", () => {
@@ -106,5 +116,52 @@ describe("App layout", () => {
     await flushPromises();
     second.unmount();
     expect(secondStop).toHaveBeenCalledOnce();
+  });
+
+  it("calls pauseTransfer exactly once for repeated pause clicks and refreshes the queue after success", async () => {
+    pauseTransferMock.mockClear();
+    listTransfersMock.mockReset();
+    listTransfersMock.mockResolvedValue([]);
+    const wrapper = mount(App, { global: { plugins: [ElementPlus], stubs: childStubs } });
+    const panel = wrapper.findComponent(TransferPanel);
+    await panel.vm.$emit("pause", "transfer-1");
+    await panel.vm.$emit("pause", "transfer-1");
+    await flushPromises();
+    expect(vi.mocked(pauseTransfer)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(pauseTransfer)).toHaveBeenCalledWith("transfer-1");
+    // After the IPC call resolves, App.vue asks the backend for the latest
+    // queue snapshot so the panel reflects the real phase.
+    expect(vi.mocked(listTransfers).mock.calls.length).toBeGreaterThanOrEqual(2);
+    wrapper.unmount();
+  });
+
+  it("surfaces a failure notification when pauseTransfer rejects, without mutating phase", async () => {
+    pauseTransferMock.mockReset();
+    pauseTransferMock.mockRejectedValueOnce(new Error("transmission already finished"));
+    listTransfersMock.mockReset();
+    listTransfersMock.mockResolvedValue([]);
+    const wrapper = mount(App, { global: { plugins: [ElementPlus], stubs: { ...childStubs, TransferPanel: false } } });
+    const panel = wrapper.findComponent(TransferPanel);
+    await panel.vm.$emit("pause", "transfer-2");
+    await flushPromises();
+    const errorBanner = wrapper.find('[data-test="xfer-action-error"]');
+    expect(errorBanner.exists()).toBe(true);
+    expect(errorBanner.text()).toContain("transmission already finished");
+    wrapper.unmount();
+  });
+
+  it("routes resume events to resumeTransfer and tracks pending task ids independently", async () => {
+    pauseTransferMock.mockClear();
+    resumeTransferMock.mockClear();
+    listTransfersMock.mockReset();
+    listTransfersMock.mockResolvedValue([]);
+    const wrapper = mount(App, { global: { plugins: [ElementPlus], stubs: childStubs } });
+    const panel = wrapper.findComponent(TransferPanel);
+    await panel.vm.$emit("resume", "transfer-3");
+    await panel.vm.$emit("pause", "transfer-4");
+    await flushPromises();
+    expect(vi.mocked(resumeTransfer)).toHaveBeenCalledWith("transfer-3");
+    expect(vi.mocked(pauseTransfer)).toHaveBeenCalledWith("transfer-4");
+    wrapper.unmount();
   });
 });

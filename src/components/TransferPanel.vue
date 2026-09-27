@@ -4,12 +4,18 @@
  *
  * Xftp 底部传输面板:
  *   - 折叠态:28px 高的 [传输|日志] tab bar
- *   - 展开态:全宽列表面板,字段:名称·状态·进度条·大小·本地路径 ←→ 远程路径·速度·估计剩余·经过时间
+ *   - 展开态:全宽列表面板,字段:名称·状态·进度条·大小·本地路径 ←→ 远程路径·速度·估计剩余·经过时间·暂停/恢复
  *
  * 进度条颜色映射到 --rs-progress-*
  * 状态点复用签名元素
  *
  * 数据来自后端真实传输队列快照。
+ *
+ * 暂停/恢复控制:
+ *   - 仅对 `active` 任务渲染"暂停"按钮,仅对 `paused` 任务渲染"继续"按钮。
+ *   - 按钮调用期间由调用方控制,本组件只发出 pause(taskId) / resume(taskId) 事件。
+ *   - 进行中(`pendingTaskIds`)的按钮自动禁用,避免重复点击。
+ *   - 失败提示由调用方写入 `actionError`,本组件原样展示,不做乐观更新。
  */
 import { computed, ref } from "vue";
 
@@ -34,15 +40,37 @@ const props = defineProps<{
   error?: string | null;
   /** 队列高度,折叠后不占空间 */
   height?: number;
+  /** 暂停/恢复调用中的任务 ID；用于禁用对应按钮 */
+  pendingTaskIds?: ReadonlySet<string>;
+  /** 上一次 pause/resume 调用的错误；非空时在面板顶部展示一行 */
+  actionError?: string | null;
 }>();
 
 const emit = defineEmits<{
   (e: "toggle"): void;
+  (e: "pause", taskId: string): void;
+  (e: "resume", taskId: string): void;
 }>();
 
 const tab = ref<"transfer" | "log">("transfer");
 
 const merged = computed<TransferItem[]>(() => props.items);
+
+function isPending(taskId: string): boolean {
+  return props.pendingTaskIds?.has(taskId) ?? false;
+}
+
+function onPause(taskId: string, event: Event) {
+  event.stopPropagation();
+  if (isPending(taskId)) return;
+  emit("pause", taskId);
+}
+
+function onResume(taskId: string, event: Event) {
+  event.stopPropagation();
+  if (isPending(taskId)) return;
+  emit("resume", taskId);
+}
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -129,27 +157,29 @@ function phaseClass(p: TransferPhase): string {
         </svg>
       </button>
     </header>
-    <p v-if="error" class="panel-load-error" role="alert">
+    <p v-if="actionError" class="panel-load-error" role="alert" data-test="xfer-action-error">
+      {{ actionError }}
+    </p>
+    <p v-else-if="error" class="panel-load-error" role="alert">
       传输队列读取失败：{{ error }}（下表可能不是最新状态）
     </p>
     <div v-if="expanded && tab === 'transfer'" class="panel-body">
-      <el-table :data="merged" size="small" empty-text="暂无传输任务" class="xfer-table">
-        <el-table-column prop="name" label="名称" min-width="180" />
-        <el-table-column label="错误详情" min-width="220">
-          <template #default="{ row }">
-            <span v-if="row.phase === 'failed'" role="alert">{{ row.error || '传输失败，请检查连接和文件权限后重试。' }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="状态" width="100">
-          <template #default="{ row }">
+      <div v-if="merged.length === 0" class="empty-state">暂无传输任务</div>
+      <ul v-else class="xfer-list" role="list">
+        <li
+          v-for="row in merged"
+          :key="row.id"
+          class="xfer-row"
+          :data-row-id="row.id"
+        >
+          <div class="xfer-col xfer-name" :title="row.name">{{ row.name }}</div>
+          <div class="xfer-col xfer-phase">
             <span class="phase">
               <span class="rs-status-dot" :class="phaseClass(row.phase)" />
               {{ phaseLabel(row.phase) }}
             </span>
-          </template>
-        </el-table-column>
-        <el-table-column label="进度" width="170">
-          <template #default="{ row }">
+          </div>
+          <div class="xfer-col xfer-progress">
             <div class="progress">
               <div
                 class="progress-fill"
@@ -158,31 +188,44 @@ function phaseClass(p: TransferPhase): string {
               />
             </div>
             <span class="progress-label">{{ Math.round(row.progress * 100) }}%</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="大小" width="90">
-          <template #default="{ row }">{{ fmtSize(row.size) }}</template>
-        </el-table-column>
-        <el-table-column label="本地路径" min-width="180">
-          <template #default="{ row }">
-            <code class="path">{{ row.local }}</code>
-          </template>
-        </el-table-column>
-        <el-table-column label="↔" width="32" align="center">
-          <template #default>↔</template>
-        </el-table-column>
-        <el-table-column label="远程路径" min-width="180">
-          <template #default="{ row }">
-            <code class="path">{{ row.remote }}</code>
-          </template>
-        </el-table-column>
-        <el-table-column label="速度" width="90">
-          <template #default="{ row }">{{ fmtSpeed(row.speed) }}</template>
-        </el-table-column>
-        <el-table-column label="估计剩余" width="100">
-          <template #default="{ row }">{{ fmtRemaining(row) }}</template>
-        </el-table-column>
-      </el-table>
+          </div>
+          <div class="xfer-col xfer-size">{{ fmtSize(row.size) }}</div>
+          <div class="xfer-col xfer-path"><code class="path" :title="row.local">{{ row.local }}</code></div>
+          <div class="xfer-col xfer-arrow">↔</div>
+          <div class="xfer-col xfer-path"><code class="path" :title="row.remote">{{ row.remote }}</code></div>
+          <div class="xfer-col xfer-speed">{{ fmtSpeed(row.speed) }}</div>
+          <div class="xfer-col xfer-remaining">{{ fmtRemaining(row) }}</div>
+          <div class="xfer-col xfer-error" v-if="row.phase === 'failed'" role="alert">
+            {{ row.error || '传输失败，请检查连接和文件权限后重试。' }}
+          </div>
+          <div class="xfer-col xfer-actions">
+            <button
+              v-if="row.phase === 'active'"
+              type="button"
+              class="xfer-action"
+              data-test="xfer-pause"
+              :data-task-id="row.id"
+              aria-label="暂停传输"
+              :disabled="isPending(row.id)"
+              @click="onPause(row.id, $event)"
+            >
+              暂停
+            </button>
+            <button
+              v-if="row.phase === 'paused'"
+              type="button"
+              class="xfer-action"
+              data-test="xfer-resume"
+              :data-task-id="row.id"
+              aria-label="继续传输"
+              :disabled="isPending(row.id)"
+              @click="onResume(row.id, $event)"
+            >
+              继续
+            </button>
+          </div>
+        </li>
+      </ul>
     </div>
     <div v-else-if="expanded && tab === 'log'" class="panel-body log">
       <p class="log-line">传输错误会显示在任务状态中。</p>
@@ -278,12 +321,42 @@ function phaseClass(p: TransferPhase): string {
 .log-line { margin: 2px 0; }
 .log-time { color: var(--rs-fg-disabled); margin-right: var(--rs-s-2); }
 
-.xfer-table {
-  --el-table-bg-color: var(--rs-bg-panel);
-  --el-table-tr-bg-color: var(--rs-bg-panel);
-  --el-table-border-color: var(--rs-border);
-  width: 100%;
+.empty-state {
+  padding: var(--rs-s-3);
+  color: var(--rs-fg-muted);
+  font-size: var(--rs-fs-xs);
 }
+
+.xfer-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.xfer-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1.5fr) 96px 170px 80px minmax(140px, 1.4fr) 32px minmax(140px, 1.4fr) 80px 90px 120px;
+  align-items: center;
+  gap: var(--rs-s-2);
+  padding: var(--rs-s-2) var(--rs-s-3);
+  border-bottom: 1px solid var(--rs-border);
+  font-size: var(--rs-fs-xs);
+}
+.xfer-row:last-child { border-bottom: none; }
+.xfer-col {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--rs-fg);
+}
+.xfer-error {
+  grid-column: 1 / -1;
+  color: var(--el-color-danger);
+  font-size: var(--rs-fs-xs);
+  margin-top: var(--rs-s-1);
+}
+
 .phase {
   display: inline-flex;
   align-items: center;
@@ -324,5 +397,27 @@ function phaseClass(p: TransferPhase): string {
   font-family: var(--rs-font-mono);
   font-size: var(--rs-fs-xs);
   color: var(--rs-fg-muted);
+}
+
+.xfer-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.xfer-action {
+  background: var(--rs-bg-surface);
+  border: 1px solid var(--rs-border);
+  color: var(--rs-fg);
+  border-radius: var(--rs-radius-1);
+  padding: 4px 10px;
+  font-size: var(--rs-fs-xs);
+  cursor: pointer;
+}
+.xfer-action:hover:not(:disabled) {
+  background: var(--rs-bg-surface-hover);
+  border-color: var(--rs-accent);
+}
+.xfer-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 </style>

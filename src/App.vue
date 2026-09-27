@@ -36,7 +36,7 @@ import WorkspaceToolbar, {
   type PanelKind,
 } from "./components/WorkspaceToolbar.vue";
 import TransferPanel, { type TransferItem } from "./components/TransferPanel.vue";
-import { listTransfers } from "./ipc/client";
+import { listTransfers, pauseTransfer, resumeTransfer } from "./ipc/client";
 import { subscribeAppEvents } from "./ipc/events";
 import {
   DEFAULT_SIDEBAR_WIDTH,
@@ -70,6 +70,10 @@ const transferCapabilities = ref({ upload: false, download: false, createFolder:
 const transferItems = ref<TransferItem[]>([]);
 /** 队列读取/订阅失败的提示；非空时 TransferPanel 就地展示（区别于"确实没有任务"） */
 const transferLoadError = ref<string | null>(null);
+/** 最近一次 pause/resume 调用的错误；面板顶部红条展示，不静默 */
+const transferActionError = ref<string | null>(null);
+/** 当前正在调用 pauseTransfer/resumeTransfer 的任务 ID，用于禁用按钮 */
+const transferPendingIds = ref(new Set<string>());
 let unlistenTransfers: (() => void) | null = null;
 let mounted = false;
 
@@ -81,6 +85,35 @@ async function refreshTransfers() {
     // 不能静默：面板必须能区分「读取失败」与「确实没有任务」
     transferLoadError.value = String(error);
     console.error("无法读取传输队列", error);
+  }
+}
+
+function actionLabel(action: "pause" | "resume") {
+  return action === "pause" ? "暂停" : "继续";
+}
+
+async function runTransferAction(taskId: string, action: "pause" | "resume") {
+  if (transferPendingIds.value.has(taskId)) return;
+  transferActionError.value = null;
+  const next = new Set(transferPendingIds.value);
+  next.add(taskId);
+  transferPendingIds.value = next;
+  try {
+    if (action === "pause") {
+      await pauseTransfer(taskId as Uuid);
+    } else {
+      await resumeTransfer(taskId as Uuid);
+    }
+    // 后端事件或队列刷新决定最终 phase；这里不写乐观状态。
+    await refreshTransfers();
+  } catch (error) {
+    transferActionError.value = `${actionLabel(action)}失败：${String(error)}`;
+    ElNotification.error({ title: `${actionLabel(action)}传输失败`, message: String(error) });
+    console.error(`${actionLabel(action)}传输失败`, error);
+  } finally {
+    const remaining = new Set(transferPendingIds.value);
+    remaining.delete(taskId);
+    transferPendingIds.value = remaining;
   }
 }
 
@@ -352,7 +385,11 @@ onBeforeUnmount(() => {
               :expanded="transferPanelExpanded"
               :items="transferItems"
               :error="transferLoadError"
+              :action-error="transferActionError"
+              :pending-task-ids="transferPendingIds"
               @toggle="transferPanelExpanded = !transferPanelExpanded"
+              @pause="(taskId) => runTransferAction(taskId, 'pause')"
+              @resume="(taskId) => runTransferAction(taskId, 'resume')"
             />
           </div>
         </div>
