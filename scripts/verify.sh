@@ -41,6 +41,9 @@ npm run check:docs
 npm run check:bundle
 npm run test:scripts
 
+# Cargo must run from the workspace root (src-tauri/), not the repo root,
+# because the project has no top-level Cargo.toml.
+cd "$RSHELL_REPO_ROOT/src-tauri"
 RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1 cargo fmt --all --check
 RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1 cargo clippy --workspace --all-targets -- -D warnings
 RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1 cargo test --workspace
