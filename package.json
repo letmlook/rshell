@@ -11,6 +11,8 @@
     "test": "vitest run",
     "check:docs": "node scripts/check-docs.mjs",
     "test:scripts": "node --test scripts/*.test.mjs",
+    "verify": "bash scripts/verify.sh",
+    "audit": "bash scripts/audit.sh",
     "test:watch": "vitest",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
