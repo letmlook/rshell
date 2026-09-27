@@ -18,4 +18,10 @@ Cargo 命令一律通过 `RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1` 触�
 - `npm run test:scripts` 检查包装脚本（包含 build、check-docs、新增的 automation）的命令、工作目录、target、env 与错误透传，不执行完整发布构建。
 - `npm run check:docs` 检查当前用户文档中的架构、启动命令、移除范围说明、凭据边界与本地链接；带日期的历史设计与执行计划不作为产品手册扫描。
 
+## macOS 发布预检与产物校验
+
+- `bash scripts/macos-release-preflight.sh [--unsigned] [app-path]`：确认 Bundle ID、`Contents/Info.plist` 完整、app 路径存在。`--unsigned` 模式只校验这些条件，CI 与本地都可跑；不传则要求同时设置 `APPLE_SIGNING_IDENTITY` 与 `APPLE_NOTARY_PROFILE`，并执行 `codesign --verify --deep --strict`、`xcrun notarytool submit --wait`、`xcrun stapler staple`、`spctl --assess`。脚本不会回显任何凭据，也不会与 `--unsigned` 同时接受签名/公证变量。
+- `bash scripts/macos-verify-app.sh <app-path>`：对已经构建好的 `.app` 验证 Bundle ID、严格代码签名和 Gatekeeper 评估；不执行签名或公证，仅作为产物验收工具。
+- `app-path` 默认为 `src-tauri/target/release/bundle/macos/RShell.app`（或调试包 `src-tauri/target/debug/bundle/macos/RShell.app`），调试 `.app` 体积不作为发布体积结论。
+
 完整环境说明见 [macOS 开发环境](../docs/07-project-setup-guide.md)，证据见 [验证记录](../docs/09-macos-validation.md)。

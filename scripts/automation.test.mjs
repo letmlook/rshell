@@ -335,3 +335,235 @@ test('check-build-output.mjs requires a populated dist directory', () => {
     cleanup(fixture);
   }
 });
+
+// --- macOS preflight / verify-app -------------------------------------------
+
+function makeAppBundle(parent, bundleId = 'com.letmlook.rshell') {
+  const dir = join(parent, 'RShell.app');
+  mkdirSync(join(dir, 'Contents'), { recursive: true });
+  writeFileSync(
+    join(dir, 'Contents', 'Info.plist'),
+    `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict><key>CFBundleIdentifier</key><string>${bundleId}</string></dict>
+</plist>
+`,
+  );
+  return dir;
+}
+
+function fakePlistBuddy(home) {
+  writeFileSync(
+    join(home, 'PlistBuddy'),
+    [
+      '#!/bin/sh',
+      'exec /usr/libexec/PlistBuddy "$@"',
+      '',
+    ].join('\n'),
+    { mode: 0o700 },
+  );
+}
+
+function runPreflight(args, { cwd, env = {}, unsetSecrets = true } = {}) {
+  const script = join(root, 'scripts/macos-release-preflight.sh');
+  const finalEnv = { ...process.env, ...env };
+  if (unsetSecrets) {
+    delete finalEnv.APPLE_SIGNING_IDENTITY;
+    delete finalEnv.APPLE_NOTARY_PROFILE;
+  }
+  return spawnSync('bash', [script, ...args], {
+    cwd: cwd ?? root,
+    env: finalEnv,
+    encoding: 'utf8',
+    timeout: 15000,
+  });
+}
+
+function runVerifyApp(args, { cwd, env = {} } = {}) {
+  const script = join(root, 'scripts/macos-verify-app.sh');
+  return spawnSync('bash', [script, ...args], {
+    cwd: cwd ?? root,
+    env: { ...process.env, ...env },
+    encoding: 'utf8',
+    timeout: 15000,
+  });
+}
+
+test('macos-release-preflight.sh --unsigned succeeds without secrets when the bundle is correct', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-preflight-'));
+  try {
+    fakePlistBuddy(fixture);
+    const app = makeAppBundle(fixture);
+    const env = { PATH: `${fixture}:${process.env.PATH}` };
+    const result = runPreflight(['--unsigned', app], { env });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /Preflight \(unsigned\)/);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('macos-release-preflight.sh refuses --unsigned when signing/notary secrets are set', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-preflight-'));
+  try {
+    fakePlistBuddy(fixture);
+    const app = makeAppBundle(fixture);
+    const env = {
+      PATH: `${fixture}:${process.env.PATH}`,
+      APPLE_SIGNING_IDENTITY: 'Developer ID Application: Example (XXXXXXXXXX)',
+      APPLE_NOTARY_PROFILE: 'rshell-notary',
+    };
+    const result = runPreflight(['--unsigned', app], { env, unsetSecrets: false });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Refusing to mix --unsigned with signing\/notary credentials/);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('macos-release-preflight.sh signed mode fails when APPLE_SIGNING_IDENTITY is missing', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-preflight-'));
+  try {
+    fakePlistBuddy(fixture);
+    const app = makeAppBundle(fixture);
+    const env = {
+      PATH: `${fixture}:${process.env.PATH}`,
+      APPLE_NOTARY_PROFILE: 'rshell-notary',
+    };
+    const result = runPreflight([app], { env });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /APPLE_SIGNING_IDENTITY and APPLE_NOTARY_PROFILE must be set/);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('macos-release-preflight.sh signed mode fails when APPLE_NOTARY_PROFILE is missing', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-preflight-'));
+  try {
+    fakePlistBuddy(fixture);
+    const app = makeAppBundle(fixture);
+    const env = {
+      PATH: `${fixture}:${process.env.PATH}`,
+      APPLE_SIGNING_IDENTITY: 'Developer ID Application: Example (XXXXXXXXXX)',
+    };
+    const result = runPreflight([app], { env });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /APPLE_SIGNING_IDENTITY and APPLE_NOTARY_PROFILE must be set/);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('macos-release-preflight.sh reports a missing app bundle with a clear error', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-preflight-'));
+  try {
+    const missing = join(fixture, 'Missing.app');
+    const result = runPreflight(['--unsigned', missing]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /App bundle not found/);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('macos-release-preflight.sh rejects unexpected Bundle IDs', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-preflight-'));
+  try {
+    fakePlistBuddy(fixture);
+    const app = makeAppBundle(fixture, 'com.example.rshell');
+    const env = { PATH: `${fixture}:${process.env.PATH}` };
+    const result = runPreflight(['--unsigned', app], { env });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Unexpected Bundle ID/);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('macos-release-preflight.sh supports app paths containing spaces', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-preflight-'));
+  try {
+    fakePlistBuddy(fixture);
+    const parentWithSpace = join(fixture, 'path with space');
+    mkdirSync(parentWithSpace, { recursive: true });
+    const app = makeAppBundle(parentWithSpace);
+    const env = { PATH: `${fixture}:${process.env.PATH}` };
+    const result = runPreflight(['--unsigned', app], { env });
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('macos-release-preflight.sh rejects unknown flags with exit code 2', () => {
+  const result = runPreflight(['--bogus']);
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /Unknown flag/);
+});
+
+test('macos-release-preflight.sh never echoes signing or notary secrets', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-preflight-'));
+  try {
+    fakePlistBuddy(fixture);
+    const app = makeAppBundle(fixture);
+    const identity = 'SECRET-SIGNING-IDENTITY-XYZ';
+    const profile = 'SECRET-NOTARY-PROFILE-XYZ';
+    const env = {
+      PATH: `${fixture}:${process.env.PATH}`,
+      APPLE_SIGNING_IDENTITY: identity,
+      APPLE_NOTARY_PROFILE: profile,
+    };
+    const result = runPreflight(['--unsigned', app], { env, unsetSecrets: false });
+    assert.match(result.stdout + result.stderr, /Refusing to mix --unsigned with signing\/notary credentials/);
+    assert.ok(!result.stdout.includes(identity), 'identity leaked to stdout');
+    assert.ok(!result.stderr.includes(identity), 'identity leaked to stderr');
+    assert.ok(!result.stdout.includes(profile), 'notary profile leaked to stdout');
+    assert.ok(!result.stderr.includes(profile), 'notary profile leaked to stderr');
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('macos-verify-app.sh rejects usage errors', () => {
+  assert.equal(runVerifyApp([]).status, 2);
+  assert.equal(runVerifyApp(['one', 'two']).status, 2);
+});
+
+test('macos-verify-app.sh reports a missing bundle', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-verify-'));
+  try {
+    const result = runVerifyApp([join(fixture, 'Missing.app')]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /App bundle not found/);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('macos-verify-app.sh rejects bundles without Contents/Info.plist', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-verify-'));
+  try {
+    const dir = join(fixture, 'RShell.app');
+    mkdirSync(dir, { recursive: true });
+    const result = runVerifyApp([dir]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Missing Contents\/Info\.plist/);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('macos-verify-app.sh rejects bundles with the wrong Bundle ID', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-verify-'));
+  try {
+    fakePlistBuddy(fixture);
+    const app = makeAppBundle(fixture, 'com.example.rshell');
+    const env = { PATH: `${fixture}:${process.env.PATH}` };
+    const result = runVerifyApp([app], { env });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Unexpected Bundle ID/);
+  } finally {
+    cleanup(fixture);
+  }
+});
