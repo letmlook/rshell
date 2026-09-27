@@ -322,32 +322,9 @@ impl SessionService {
         info!(session_id = %session_id, "Connecting session");
         let attempt = Uuid::new_v4();
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        // Atomically claim the session before any network await.
-        let config = {
-            let _lifecycle = self.lifecycle.lock().await;
-            let mut sessions = self.sessions.write().await;
-            let state = sessions
-                .get_mut(&session_id)
-                .ok_or_else(|| CoreError::NotFound(format!("Session {} not found", session_id)))?;
-            if matches!(
-                state.connection_state,
-                ConnectionState::Connecting | ConnectionState::Connected
-            ) {
-                return Err(CoreError::InvalidState(format!(
-                    "Session {session_id} is already connecting or connected"
-                )));
-            }
-            state.connection_state = ConnectionState::Connecting;
-            state.attempt = Some(attempt);
-            state.cancel_connect = Some(cancel_tx);
-            self.event_bus
-                .publish(rshell_api::AppEvent::ConnectionStateChanged {
-                    session_id,
-                    state: ConnectionState::Connecting,
-                    info: None,
-                });
-            state.config.clone()
-        };
+        let config = self
+            .claim_connection(session_id, attempt, cancel_tx)
+            .await?;
         let result = tokio::select! {
             result = self.connect_attempt(session_id, config, attempt) => result,
             _ = cancel_rx => Err(CoreError::InvalidState("Connection attempt cancelled".into())),
@@ -372,6 +349,38 @@ impl SessionService {
             }
         }
         result
+    }
+
+    /// Claim and snapshot before network I/O; lifecycle mutations coordinate here.
+    async fn claim_connection(
+        &self,
+        session_id: Uuid,
+        attempt: Uuid,
+        cancel_tx: oneshot::Sender<()>,
+    ) -> Result<SessionConfig, CoreError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let mut sessions = self.sessions.write().await;
+        let state = sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| CoreError::NotFound(format!("Session {} not found", session_id)))?;
+        if matches!(
+            state.connection_state,
+            ConnectionState::Connecting | ConnectionState::Connected
+        ) {
+            return Err(CoreError::InvalidState(format!(
+                "Session {session_id} is already connecting or connected"
+            )));
+        }
+        state.connection_state = ConnectionState::Connecting;
+        state.attempt = Some(attempt);
+        state.cancel_connect = Some(cancel_tx);
+        self.event_bus
+            .publish(rshell_api::AppEvent::ConnectionStateChanged {
+                session_id,
+                state: ConnectionState::Connecting,
+                info: None,
+            });
+        Ok(state.config.clone())
     }
 
     async fn connect_attempt(
@@ -957,6 +966,13 @@ impl SessionService {
         let state = sessions
             .get_mut(&id)
             .ok_or_else(|| CoreError::NotFound(format!("Session {id} not found")))?;
+        // connect() has captured the destination but may not have resolved its
+        // credential yet. Keep that pair stable until the attempt completes.
+        if state.connection_state == ConnectionState::Connecting {
+            return Err(CoreError::InvalidState(
+                "Cannot update a session while it is connecting".into(),
+            ));
+        }
         let present = match &credential {
             CredentialUpdate::Keep => has_credential(&state.config),
             CredentialUpdate::Set(credential) => !credential.secret.is_empty(),
@@ -1747,6 +1763,80 @@ mod tests {
         );
         restarted.delete_session(id).await.unwrap();
         assert!(credentials.entries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connecting_snapshot_cannot_resolve_replacement_hosts_password() {
+        use crate::session::repository::tests::{set, MemoryCredentials};
+        let tmp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let repo = Arc::new(SessionRepository::new(tmp.path().into(), credentials));
+        let svc = Arc::new(make_service_with_repo(repo.clone()));
+        let original = make_config("original", "host-a.test");
+        let id = svc
+            .create_session_with_credential(
+                original.clone(),
+                Some(SessionCredential {
+                    secret: "password-a".into(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Exercise the same snapshot and auth boundaries as connect(), but
+        // deterministically pause in between while the update runs to completion.
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let connecting = {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                let (cancel_tx, _cancel_rx) = oneshot::channel();
+                let snapshot = svc
+                    .claim_connection(id, Uuid::new_v4(), cancel_tx)
+                    .await
+                    .unwrap();
+                captured_tx.send(()).unwrap();
+                resume_rx.await.unwrap();
+                let ResolvedAuthMethod::Password { password, .. } =
+                    svc.resolve_auth(&snapshot).unwrap()
+                else {
+                    panic!("expected password auth");
+                };
+                (snapshot.host, password)
+            })
+        };
+        captured_rx.await.unwrap();
+        let mut replacement = original;
+        replacement.host = "host-b.test".into();
+        let update = svc
+            .update_session_with_credential(id, replacement.clone(), set("password-b"))
+            .await;
+        resume_tx.send(()).unwrap();
+        let (host, password) = connecting.await.unwrap();
+        assert_eq!(host, "host-a.test");
+        assert!(
+            password == "password-a",
+            "original host must only receive its original password"
+        );
+        assert!(matches!(update, Err(CoreError::InvalidState(_))));
+        let stored = repo.load(id).unwrap().unwrap();
+        assert_eq!(stored.host, "host-a.test");
+        assert!(repo.credential(&stored).unwrap().as_deref() == Some("password-a"));
+
+        // Cancellation releases the update restriction and preserves reconnect.
+        svc.disconnect(id).await.unwrap();
+        svc.update_session_with_credential(id, replacement, set("password-b"))
+            .await
+            .unwrap();
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let next = svc
+            .claim_connection(id, Uuid::new_v4(), cancel_tx)
+            .await
+            .unwrap();
+        assert_eq!(next.host, "host-b.test");
+        assert!(
+            matches!(svc.resolve_auth(&next), Ok(ResolvedAuthMethod::Password { password, .. }) if password == "password-b")
+        );
     }
 
     #[tokio::test]
