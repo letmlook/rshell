@@ -9,8 +9,8 @@
 //! - `send_input` / `resize_terminal` / `attach_terminal`
 
 use rshell_api::types::{
-    ComposeTarget, PluginInfo, RemoteFileEntry, SessionConfig, TerminalColorScheme,
-    TransferTaskInfo,
+    ComposeTarget, CredentialUpdate, PluginInfo, RemoteFileEntry, SessionConfig, SessionCredential,
+    TerminalColorScheme, TransferTaskInfo,
 };
 use rshell_api::{AppCommand, CommandOutcome};
 use tauri::ipc::Channel;
@@ -100,11 +100,16 @@ pub async fn disconnect_session(
 pub async fn update_session(
     id: Uuid,
     config: SessionConfig,
+    credential: CredentialUpdate,
     state: State<'_, AppState>,
 ) -> Result<(), IpcError> {
     state
         .dispatcher
-        .dispatch(AppCommand::UpdateSession { id, config })
+        .dispatch(AppCommand::UpdateSession {
+            id,
+            config,
+            credential,
+        })
         .await
         .map_err(IpcError::from)?;
     Ok(())
@@ -157,11 +162,12 @@ pub async fn resize_terminal(
 #[tauri::command]
 pub async fn create_session(
     config: SessionConfig,
+    credential: Option<SessionCredential>,
     state: State<'_, AppState>,
 ) -> Result<Uuid, IpcError> {
     let outcome = state
         .dispatcher
-        .dispatch(AppCommand::CreateSession { config })
+        .dispatch(AppCommand::CreateSession { config, credential })
         .await
         .map_err(IpcError::from)?;
     match outcome {

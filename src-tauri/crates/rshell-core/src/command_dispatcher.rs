@@ -196,12 +196,20 @@ impl CommandDispatcher {
                 self.session_service.disconnect(session_id).await?;
                 Ok(CommandOutcome::None)
             }
-            AppCommand::CreateSession { config } => {
+            // 凭据仓库接线由 Task 5 完成；这里显式标记尚未处理的命令输入。
+            AppCommand::CreateSession {
+                config,
+                credential: _,
+            } => {
                 let id = self.session_service.create_session(config).await?;
                 // 切片 1.2：CreateSession 此前只返回 Ok(()) —— 修复点见设计 §3.2
                 Ok(CommandOutcome::SessionId(id))
             }
-            AppCommand::UpdateSession { id, config } => {
+            AppCommand::UpdateSession {
+                id,
+                config,
+                credential: _,
+            } => {
                 self.session_service.update_session(id, config).await?;
                 Ok(CommandOutcome::None)
             }

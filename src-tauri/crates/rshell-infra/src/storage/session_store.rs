@@ -136,7 +136,7 @@ mod tests {
             protocol: Protocol::SSH,
             auth_method: AuthMethod::Password {
                 username: "root".to_string(),
-                password: "password123".to_string(),
+                has_password: true,
             },
             serial_config: None,
         }

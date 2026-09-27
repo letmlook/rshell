@@ -35,9 +35,15 @@ export interface SessionConfig {
 export type Protocol = "SSH" | "Telnet" | "Serial";
 
 export type AuthMethod =
-  | { Password: { username: string; password: string } }
-  | { PublicKey: { username: string; key_path: PathBuf; passphrase: string | null } }
-  | { KeyboardInteractive: { username: string; password: string | null } };
+  | { Password: { username: string; has_password: boolean } }
+  | { PublicKey: { username: string; key_path: PathBuf; has_passphrase: boolean } }
+  | { KeyboardInteractive: { username: string; has_password: boolean } };
+
+export interface SessionCredential {
+  secret: string;
+}
+
+export type CredentialUpdate = "Keep" | { Set: SessionCredential } | "Clear";
 
 export type ConnectionState =
   | "Connecting"
@@ -322,8 +328,8 @@ export type AppCommand =
   // 会话
   | { ConnectSession: { session_id: Uuid } }
   | { DisconnectSession: { session_id: Uuid } }
-  | { CreateSession: { config: SessionConfig } }
-  | { UpdateSession: { id: Uuid; config: SessionConfig } }
+  | { CreateSession: { config: SessionConfig; credential: SessionCredential | null } }
+  | { UpdateSession: { id: Uuid; config: SessionConfig; credential: CredentialUpdate } }
   | { DeleteSession: { id: Uuid } }
   // 终端
   | { SendInput: { session_id: Uuid; data: number[] } }

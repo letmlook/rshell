@@ -23,7 +23,7 @@ use crate::types::{
 pub enum CommandOutcome {
     /// 全部写操作(create/update/delete/connect/disconnect/send_input/resize/...)
     None,
-    /// 响应 `ListSessions`
+    /// 响应 `ListSessions`；SessionConfig 只包含认证描述符，不包含凭据。
     Sessions(Vec<SessionConfig>),
     /// 响应 `CreateSession` —— 此前返回值被丢弃,前端拿不到新会话 id
     SessionId(Uuid),

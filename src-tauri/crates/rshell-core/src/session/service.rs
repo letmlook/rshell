@@ -7,12 +7,12 @@ use crate::security::host_key_decision::HostKeyDecisionRegistry;
 use crate::session::repository::SessionRepository;
 use crate::terminal::service::TerminalService;
 use rshell_api::types::{
-    ConnectionInfo, ConnectionState, FileType, Protocol, RemoteFileEntry, SessionConfig,
-    TriggerAction,
+    AuthMethod, ConnectionInfo, ConnectionState, FileType, Protocol, RemoteFileEntry,
+    SessionConfig, TriggerAction,
 };
 use rshell_protocol::serial::{SerialConfig as ProtocolSerialConfig, SerialConnection};
 use rshell_protocol::ssh::sftp::SftpClient;
-use rshell_protocol::ssh::SshClient;
+use rshell_protocol::ssh::{ResolvedAuthMethod, SshClient};
 use rshell_protocol::telnet::TelnetConnection;
 use rshell_protocol::Connection;
 use std::collections::HashMap;
@@ -52,6 +52,51 @@ fn validate_session_config(config: &SessionConfig) -> Result<(), CoreError> {
         }
     }
     Ok(())
+}
+
+/// 凭据仓库接入前的安全边界：有存储凭据标志时禁止用空值代替。
+fn resolve_auth_bridge(config: &SessionConfig) -> Result<ResolvedAuthMethod, CoreError> {
+    let missing = || CoreError::InvalidState("Stored session credential is unavailable".into());
+    match &config.auth_method {
+        AuthMethod::Password {
+            username,
+            has_password,
+        } => {
+            if *has_password {
+                return Err(missing());
+            }
+            Ok(ResolvedAuthMethod::Password {
+                username: username.clone(),
+                password: String::new(),
+            })
+        }
+        AuthMethod::PublicKey {
+            username,
+            key_path,
+            has_passphrase,
+        } => {
+            if *has_passphrase {
+                return Err(missing());
+            }
+            Ok(ResolvedAuthMethod::PublicKey {
+                username: username.clone(),
+                key_path: key_path.clone(),
+                passphrase: None,
+            })
+        }
+        AuthMethod::KeyboardInteractive {
+            username,
+            has_password,
+        } => {
+            if *has_password {
+                return Err(missing());
+            }
+            Ok(ResolvedAuthMethod::KeyboardInteractive {
+                username: username.clone(),
+                password: None,
+            })
+        }
+    }
 }
 
 /// Destructive SFTP operations accept only an absolute, unambiguous non-root path.
@@ -347,7 +392,8 @@ impl SessionService {
         // 遇到未知 host key 时,SshHandler::check_server_key 会在 EventBus 上发
         // HostKeyMismatch { decision_id, ... } 然后同步 block_on 等 UI 端的
         // AppCommand::DecideHostKey。
-        let mut client = SshClient::new(config.clone());
+        let auth = resolve_auth_bridge(&config)?;
+        let mut client = SshClient::new(config.clone(), auth);
         let sink: Arc<dyn rshell_protocol::ssh::HostKeyDecisionSink> =
             self.host_key_registry.clone();
 
@@ -1063,10 +1109,47 @@ mod tests {
             protocol: Protocol::SSH,
             auth_method: AuthMethod::Password {
                 username: "user".to_string(),
-                password: "pw".to_string(),
+                has_password: true,
             },
             serial_config: None,
         }
+    }
+
+    #[test]
+    fn unresolved_stored_credential_fails_closed_but_intentional_empty_password_is_valid() {
+        let mut config = make_config("credential", "example.test");
+        assert!(matches!(
+            resolve_auth_bridge(&config),
+            Err(CoreError::InvalidState(_))
+        ));
+        config.auth_method = AuthMethod::Password {
+            username: "user".into(),
+            has_password: false,
+        };
+        assert!(
+            matches!(resolve_auth_bridge(&config), Ok(ResolvedAuthMethod::Password { password, .. }) if password.is_empty())
+        );
+        config.auth_method = AuthMethod::PublicKey {
+            username: "user".into(),
+            key_path: "/tmp/id_ed25519".into(),
+            has_passphrase: true,
+        };
+        assert!(matches!(
+            resolve_auth_bridge(&config),
+            Err(CoreError::InvalidState(_))
+        ));
+        config.auth_method = AuthMethod::PublicKey {
+            username: "user".into(),
+            key_path: "/tmp/id_ed25519".into(),
+            has_passphrase: false,
+        };
+        assert!(matches!(
+            resolve_auth_bridge(&config),
+            Ok(ResolvedAuthMethod::PublicKey {
+                passphrase: None,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1074,6 +1157,10 @@ mod tests {
         let svc = Arc::new(make_service());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut cfg = make_config("pending", "127.0.0.1");
+        cfg.auth_method = AuthMethod::Password {
+            username: "user".into(),
+            has_password: false,
+        };
         cfg.port = listener.local_addr().unwrap().port();
         let id = svc.create_session(cfg).await.unwrap();
         let first = {

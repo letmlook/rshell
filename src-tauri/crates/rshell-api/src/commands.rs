@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::{
-    ComposeTarget, PortForwardRule, QuickCommand, SessionConfig, SshKeyType, TerminalColorScheme,
-    Trigger, TrustHostKeyDecision,
+    ComposeTarget, CredentialUpdate, PortForwardRule, QuickCommand, SessionConfig,
+    SessionCredential, SshKeyType, TerminalColorScheme, Trigger, TrustHostKeyDecision,
 };
 
 /// 前端发送的所有命令
@@ -35,11 +35,13 @@ pub enum AppCommand {
     /// 创建新会话
     CreateSession {
         config: SessionConfig,
+        credential: Option<SessionCredential>,
     },
     /// 更新会话配置
     UpdateSession {
         id: Uuid,
         config: SessionConfig,
+        credential: CredentialUpdate,
     },
     /// 删除会话
     DeleteSession {

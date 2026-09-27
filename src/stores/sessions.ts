@@ -6,7 +6,7 @@
  */
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
-import type { SessionConfig, Uuid } from "../ipc/types";
+import type { SessionConfig, SessionCredential, Uuid } from "../ipc/types";
 import {
   listSessions,
   createSession,
@@ -45,8 +45,8 @@ export const useSessionsStore = defineStore("sessions", () => {
     }
   }
 
-  async function create(cfg: SessionConfig) {
-    const id = await createSession(cfg);
+  async function create(cfg: SessionConfig, credential: SessionCredential | null) {
+    const id = await createSession(cfg, credential);
     await refresh();
     return id;
   }

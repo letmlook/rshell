@@ -25,6 +25,8 @@ import type {
   TrustHostKeyDecision,
   Uuid,
   ComposeTarget,
+  CredentialUpdate,
+  SessionCredential,
 } from "./types";
 
 // ===== 通用 helper =====
@@ -59,11 +61,11 @@ async function call<T = unknown>(cmd: AppCommand): Promise<T> {
 // 不再包 `{ sessions: [...] }`。`create_session` 直接返回 `Uuid`(新会话 id)。
 export const listSessions = () => call<SessionConfig[]>({ ListSessions: null });
 
-export const createSession = (config: SessionConfig) =>
-  call<Uuid>({ CreateSession: { config } });
+export const createSession = (config: SessionConfig, credential: SessionCredential | null) =>
+  call<Uuid>({ CreateSession: { config, credential } });
 
-export const updateSession = (id: Uuid, config: SessionConfig) =>
-  call({ UpdateSession: { id, config } });
+export const updateSession = (id: Uuid, config: SessionConfig, credential: CredentialUpdate) =>
+  call({ UpdateSession: { id, config, credential } });
 
 export const deleteSession = (id: Uuid) => call({ DeleteSession: { id } });
 

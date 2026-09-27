@@ -28,7 +28,7 @@ impl ShellOutput {
     }
 }
 
-use rshell_api::types::{AuthMethod, SessionConfig};
+use rshell_api::types::SessionConfig;
 use ssh_key::HashAlg;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -39,6 +39,7 @@ use crate::{Connection, ProtocolError};
 /// SSH 客户端
 pub struct SshClient {
     config: SessionConfig,
+    auth: ResolvedAuthMethod,
     /// 连接句柄
     handle: Option<russh::client::Handle<SshHandler>>,
     /// 当前会话通道
@@ -47,6 +48,23 @@ pub struct SshClient {
     data_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
     /// 发送数据的通道（供 Handler 使用）
     shell_output: Arc<Mutex<ShellOutput>>,
+}
+
+/// 每次连接临时解析的认证材料。不得序列化或存入 SessionConfig。
+pub enum ResolvedAuthMethod {
+    Password {
+        username: String,
+        password: String,
+    },
+    PublicKey {
+        username: String,
+        key_path: PathBuf,
+        passphrase: Option<String>,
+    },
+    KeyboardInteractive {
+        username: String,
+        password: Option<String>,
+    },
 }
 
 enum ShellRequest {
@@ -396,20 +414,21 @@ impl russh::client::Handler for SshHandler {
     }
 }
 
-/// 从 AuthMethod 提取用户名
-fn get_username(auth: &AuthMethod) -> &str {
+/// 从本次连接的认证材料提取用户名
+fn get_username(auth: &ResolvedAuthMethod) -> &str {
     match auth {
-        AuthMethod::Password { username, .. } => username,
-        AuthMethod::PublicKey { username, .. } => username,
-        AuthMethod::KeyboardInteractive { username, .. } => username,
+        ResolvedAuthMethod::Password { username, .. } => username,
+        ResolvedAuthMethod::PublicKey { username, .. } => username,
+        ResolvedAuthMethod::KeyboardInteractive { username, .. } => username,
     }
 }
 
 impl SshClient {
     /// 创建新的 SSH 客户端
-    pub fn new(config: SessionConfig) -> Self {
+    pub fn new(config: SessionConfig, auth: ResolvedAuthMethod) -> Self {
         Self {
             config,
+            auth,
             handle: None,
             channel: None,
             data_rx: None,
@@ -499,10 +518,10 @@ impl SshClient {
             .as_mut()
             .ok_or_else(|| ProtocolError::ConnectionFailed("Not connected".to_string()))?;
 
-        let username = get_username(&self.config.auth_method);
+        let username = get_username(&self.auth);
 
-        match &self.config.auth_method {
-            AuthMethod::Password { password, .. } => {
+        match &self.auth {
+            ResolvedAuthMethod::Password { password, .. } => {
                 let success = handle
                     .authenticate_password(username, password)
                     .await
@@ -514,7 +533,7 @@ impl SshClient {
                     ));
                 }
             }
-            AuthMethod::PublicKey {
+            ResolvedAuthMethod::PublicKey {
                 key_path,
                 passphrase,
                 ..
@@ -535,7 +554,7 @@ impl SshClient {
                     ));
                 }
             }
-            AuthMethod::KeyboardInteractive { password, .. } => {
+            ResolvedAuthMethod::KeyboardInteractive { password, .. } => {
                 // 键盘交互认证
                 let response = handle
                     .authenticate_keyboard_interactive_start(username, None::<String>)
@@ -821,6 +840,75 @@ impl Connection for SshClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rshell_api::types::AuthMethod;
+
+    #[test]
+    fn resolved_password_is_kept_outside_public_session_config() {
+        let config = SessionConfig {
+            id: Uuid::nil(),
+            name: "test".into(),
+            folder_id: None,
+            host: "example.test".into(),
+            port: 22,
+            protocol: rshell_api::types::Protocol::SSH,
+            auth_method: AuthMethod::Password {
+                username: "alice".into(),
+                has_password: true,
+            },
+            serial_config: None,
+        };
+        let auth = ResolvedAuthMethod::Password {
+            username: "alice".into(),
+            password: "sample-secret-password".into(),
+        };
+        let client = SshClient::new(config, auth);
+        assert!(matches!(
+            client.config.auth_method,
+            AuthMethod::Password {
+                has_password: true,
+                ..
+            }
+        ));
+        assert!(
+            matches!(client.auth, ResolvedAuthMethod::Password { password, .. } if password == "sample-secret-password")
+        );
+    }
+
+    #[test]
+    fn resolved_public_key_passphrase_is_kept_outside_public_session_config() {
+        let config = SessionConfig {
+            id: Uuid::nil(),
+            name: "test".into(),
+            folder_id: None,
+            host: "example.test".into(),
+            port: 22,
+            protocol: rshell_api::types::Protocol::SSH,
+            auth_method: AuthMethod::PublicKey {
+                username: "alice".into(),
+                key_path: "/tmp/id_ed25519".into(),
+                has_passphrase: true,
+            },
+            serial_config: None,
+        };
+        let client = SshClient::new(
+            config,
+            ResolvedAuthMethod::PublicKey {
+                username: "alice".into(),
+                key_path: "/tmp/id_ed25519".into(),
+                passphrase: Some("sample-secret-passphrase".into()),
+            },
+        );
+        assert!(matches!(
+            client.config.auth_method,
+            AuthMethod::PublicKey {
+                has_passphrase: true,
+                ..
+            }
+        ));
+        assert!(
+            matches!(client.auth, ResolvedAuthMethod::PublicKey { passphrase: Some(value), .. } if value == "sample-secret-passphrase")
+        );
+    }
 
     struct AcceptTestHost;
     impl HostKeyDecisionSink for AcceptTestHost {
@@ -917,19 +1005,25 @@ mod tests {
                     .unwrap();
             let _ = running.await;
         });
-        let mut client = SshClient::new(SessionConfig {
-            id: Uuid::new_v4(),
-            name: "loopback".into(),
-            folder_id: None,
-            host: "127.0.0.1".into(),
-            port,
-            protocol: rshell_api::types::Protocol::SSH,
-            auth_method: AuthMethod::Password {
+        let mut client = SshClient::new(
+            SessionConfig {
+                id: Uuid::new_v4(),
+                name: "loopback".into(),
+                folder_id: None,
+                host: "127.0.0.1".into(),
+                port,
+                protocol: rshell_api::types::Protocol::SSH,
+                auth_method: AuthMethod::Password {
+                    username: "test".into(),
+                    has_password: true,
+                },
+                serial_config: None,
+            },
+            ResolvedAuthMethod::Password {
                 username: "test".into(),
                 password: "test".into(),
             },
-            serial_config: None,
-        });
+        );
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             client
                 .connect_ssh(Some(Arc::new(AcceptTestHost)))
@@ -1018,12 +1112,18 @@ mod tests {
             protocol: rshell_api::types::Protocol::SSH,
             auth_method: AuthMethod::Password {
                 username: "root".to_string(),
-                password: "test".to_string(),
+                has_password: true,
             },
             serial_config: None,
         };
 
-        let client = SshClient::new(config);
+        let client = SshClient::new(
+            config,
+            ResolvedAuthMethod::Password {
+                username: "root".into(),
+                password: "test".into(),
+            },
+        );
         assert!(client.handle.is_none());
         assert!(client.channel.is_none());
     }

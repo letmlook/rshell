@@ -47,7 +47,7 @@ async function submit() {
       auth_method: {
         Password: {
           username: form.value.protocol === "SSH" ? form.value.username : "",
-          password: form.value.protocol === "SSH" ? form.value.password : "",
+          has_password: form.value.protocol === "SSH" && form.value.password.length > 0,
         },
       },
       serial_config: isSerial ? {
@@ -59,7 +59,10 @@ async function submit() {
         flow_control: form.value.flowControl,
       } : null,
     };
-    const id = await store.create(cfg);
+    const credential = form.value.protocol === "SSH" && form.value.password.length > 0
+      ? { secret: form.value.password }
+      : null;
+    const id = await store.create(cfg, credential);
     emit("created", id);
     emit("close");
   } catch (e) {

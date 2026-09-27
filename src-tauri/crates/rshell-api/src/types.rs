@@ -36,17 +36,39 @@ pub enum Protocol {
 pub enum AuthMethod {
     Password {
         username: String,
-        password: String,
+        has_password: bool,
     },
     PublicKey {
         username: String,
         key_path: PathBuf,
-        passphrase: Option<String>,
+        has_passphrase: bool,
     },
     KeyboardInteractive {
         username: String,
-        password: Option<String>,
+        has_password: bool,
     },
+}
+
+/// 仅作为命令输入传递，不属于可持久化或可回传的会话配置。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SessionCredential {
+    pub secret: String,
+}
+
+impl std::fmt::Debug for SessionCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionCredential")
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// 更新会话凭据时的显式意图。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CredentialUpdate {
+    Keep,
+    Set(SessionCredential),
+    Clear,
 }
 
 /// 连接状态
