@@ -83,7 +83,10 @@ pub fn run() {
             ));
             let host_key_registry = Arc::new(HostKeyDecisionRegistry::new(event_bus.clone()));
 
-            let session_repository = Arc::new(SessionRepository::with_default_path());
+            let credentials = Arc::new(rshell_infra::credentials::SystemCredentialStore::new(
+                "com.letmlook.rshell.credentials",
+            ));
+            let session_repository = Arc::new(SessionRepository::with_default_path(credentials));
             let session_service = Arc::new(SessionService::with_repository(
                 event_bus.clone(),
                 terminal_service.clone(),

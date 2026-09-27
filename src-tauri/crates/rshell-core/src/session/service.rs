@@ -4,11 +4,11 @@ use crate::error::CoreError;
 use crate::event_bus::EventBus;
 use crate::script::trigger_engine::TriggerEngine;
 use crate::security::host_key_decision::HostKeyDecisionRegistry;
-use crate::session::repository::SessionRepository;
+use crate::session::repository::{has_credential, set_presence, SessionRepository};
 use crate::terminal::service::TerminalService;
 use rshell_api::types::{
-    AuthMethod, ConnectionInfo, ConnectionState, FileType, Protocol, RemoteFileEntry,
-    SessionConfig, TriggerAction,
+    AuthMethod, ConnectionInfo, ConnectionState, CredentialUpdate, FileType, Protocol,
+    RemoteFileEntry, SessionConfig, SessionCredential, TriggerAction,
 };
 use rshell_protocol::serial::{SerialConfig as ProtocolSerialConfig, SerialConnection};
 use rshell_protocol::ssh::sftp::SftpClient;
@@ -54,46 +54,30 @@ fn validate_session_config(config: &SessionConfig) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// 凭据仓库接入前的安全边界：有存储凭据标志时禁止用空值代替。
-fn resolve_auth_bridge(config: &SessionConfig) -> Result<ResolvedAuthMethod, CoreError> {
+fn resolved_auth(
+    config: &SessionConfig,
+    secret: Option<String>,
+) -> Result<ResolvedAuthMethod, CoreError> {
     let missing = || CoreError::InvalidState("Stored session credential is unavailable".into());
+    if has_credential(config) && secret.is_none() {
+        return Err(missing());
+    }
     match &config.auth_method {
-        AuthMethod::Password {
-            username,
-            has_password,
-        } => {
-            if *has_password {
-                return Err(missing());
-            }
-            Ok(ResolvedAuthMethod::Password {
-                username: username.clone(),
-                password: String::new(),
-            })
-        }
+        AuthMethod::Password { username, .. } => Ok(ResolvedAuthMethod::Password {
+            username: username.clone(),
+            password: secret.unwrap_or_default(),
+        }),
         AuthMethod::PublicKey {
-            username,
-            key_path,
-            has_passphrase,
-        } => {
-            if *has_passphrase {
-                return Err(missing());
-            }
-            Ok(ResolvedAuthMethod::PublicKey {
-                username: username.clone(),
-                key_path: key_path.clone(),
-                passphrase: None,
-            })
-        }
-        AuthMethod::KeyboardInteractive {
-            username,
-            has_password,
-        } => {
-            if *has_password {
-                return Err(missing());
-            }
+            username, key_path, ..
+        } => Ok(ResolvedAuthMethod::PublicKey {
+            username: username.clone(),
+            key_path: key_path.clone(),
+            passphrase: secret,
+        }),
+        AuthMethod::KeyboardInteractive { username, .. } => {
             Ok(ResolvedAuthMethod::KeyboardInteractive {
                 username: username.clone(),
-                password: None,
+                password: secret,
             })
         }
     }
@@ -209,6 +193,7 @@ enum ProtocolRequest {
 
 /// 会话服务 - 管理会话的生命周期
 pub struct SessionService {
+    mutations: Mutex<()>,
     lifecycle: Arc<Mutex<()>>,
     /// 会话状态映射
     sessions: Arc<RwLock<HashMap<Uuid, SessionState>>>,
@@ -229,6 +214,15 @@ pub struct SessionService {
 }
 
 impl SessionService {
+    fn resolve_auth(&self, config: &SessionConfig) -> Result<ResolvedAuthMethod, CoreError> {
+        let secret = match &self.repository {
+            Some(repo) => repo.credential(config).map_err(|_| {
+                CoreError::InvalidState("Stored session credential is unavailable".into())
+            })?,
+            None => None,
+        };
+        resolved_auth(config, secret)
+    }
     /// 创建新的会话服务
     pub fn new(
         event_bus: Arc<EventBus>,
@@ -275,6 +269,7 @@ impl SessionService {
             }
         }
         Self {
+            mutations: Mutex::new(()),
             lifecycle: Arc::new(Mutex::new(())),
             sessions: Arc::new(RwLock::new(restored)),
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -291,6 +286,7 @@ impl SessionService {
     /// 读取失败（路径不存在 / 解析失败）记录 warn! 但不中断启动 —— 用户首次启动属正常空态。
     #[instrument(skip(self))]
     pub async fn load_from_disk(&self) {
+        let _mutation = self.mutations.lock().await;
         let Some(repo) = self.repository.as_ref() else {
             debug!("load_from_disk: no repository configured, skip");
             return;
@@ -392,7 +388,7 @@ impl SessionService {
         // 遇到未知 host key 时,SshHandler::check_server_key 会在 EventBus 上发
         // HostKeyMismatch { decision_id, ... } 然后同步 block_on 等 UI 端的
         // AppCommand::DecideHostKey。
-        let auth = resolve_auth_bridge(&config)?;
+        let auth = self.resolve_auth(&config)?;
         let mut client = SshClient::new(config.clone(), auth);
         let sink: Arc<dyn rshell_protocol::ssh::HostKeyDecisionSink> =
             self.host_key_registry.clone();
@@ -880,16 +876,41 @@ impl SessionService {
     /// 创建会话
     #[instrument(skip(self, config))]
     pub async fn create_session(&self, config: SessionConfig) -> Result<Uuid, CoreError> {
+        self.create_session_with_credential(config, None).await
+    }
+
+    #[instrument(skip(self, config, credential))]
+    pub async fn create_session_with_credential(
+        &self,
+        mut config: SessionConfig,
+        credential: Option<SessionCredential>,
+    ) -> Result<Uuid, CoreError> {
         validate_session_config(&config)?;
+        let _mutation = self.mutations.lock().await;
+        let _lifecycle = self.lifecycle.lock().await;
         let id = config.id;
+        if self.sessions.read().await.contains_key(&id) {
+            return Err(CoreError::InvalidState("Session already exists".into()));
+        }
+        set_presence(
+            &mut config,
+            credential.as_ref().is_some_and(|c| !c.secret.is_empty()),
+        );
+        if self.repository.is_none() && has_credential(&config) {
+            return Err(CoreError::StorageError(
+                "Credential repository is required".into(),
+            ));
+        }
         info!(session_id = %id, name = %config.name, "Creating session");
 
         // 切片 1.0：先落盘再入内存。落盘失败时阻断 create —— 避免出现
         // "内存有但磁盘无"的不可恢复分裂状态（设计 §4.5 完成判据前提）。
         if let Some(repo) = self.repository.as_ref() {
-            repo.save(&config).map_err(|e| {
-                CoreError::StorageError(format!("save session {} failed: {}", id, e))
-            })?;
+            repo.save(
+                &config,
+                credential.map_or(CredentialUpdate::Clear, CredentialUpdate::Set),
+            )
+            .map_err(|e| CoreError::StorageError(format!("save session {} failed: {}", id, e)))?;
         }
 
         let state = SessionState {
@@ -913,26 +934,50 @@ impl SessionService {
     /// 更新会话
     #[instrument(skip(self, config))]
     pub async fn update_session(&self, id: Uuid, config: SessionConfig) -> Result<(), CoreError> {
+        self.update_session_with_credential(id, config, CredentialUpdate::Keep)
+            .await
+    }
+
+    #[instrument(skip(self, config, credential))]
+    pub async fn update_session_with_credential(
+        &self,
+        id: Uuid,
+        mut config: SessionConfig,
+        credential: CredentialUpdate,
+    ) -> Result<(), CoreError> {
         validate_session_config(&config)?;
+        let _mutation = self.mutations.lock().await;
         if id != config.id {
             return Err(CoreError::InvalidState(
                 "Session ID cannot be changed".into(),
             ));
         }
+        let _lifecycle = self.lifecycle.lock().await;
+        let mut sessions = self.sessions.write().await;
+        let state = sessions
+            .get_mut(&id)
+            .ok_or_else(|| CoreError::NotFound(format!("Session {id} not found")))?;
+        let present = match &credential {
+            CredentialUpdate::Keep => has_credential(&state.config),
+            CredentialUpdate::Set(credential) => !credential.secret.is_empty(),
+            CredentialUpdate::Clear => false,
+        };
+        set_presence(&mut config, present);
+        if self.repository.is_none() && present {
+            return Err(CoreError::StorageError(
+                "Credential repository is required".into(),
+            ));
+        }
         info!(session_id = %id, "Updating session");
 
         if let Some(repo) = self.repository.as_ref() {
-            repo.save(&config).map_err(|e| {
+            repo.save(&config, credential).map_err(|e| {
                 CoreError::StorageError(format!("save session {} failed: {}", id, e))
             })?;
         }
 
-        let mut sessions = self.sessions.write().await;
-        if let Some(state) = sessions.get_mut(&id) {
-            state.config = config;
-        } else {
-            return Err(CoreError::NotFound(format!("Session {} not found", id)));
-        }
+        state.config = config;
+        drop(sessions);
 
         self.event_bus
             .publish(rshell_api::AppEvent::SessionUpdated { session_id: id });
@@ -944,12 +989,20 @@ impl SessionService {
     /// 删除会话
     #[instrument(skip(self))]
     pub async fn delete_session(&self, id: Uuid) -> Result<(), CoreError> {
+        let _mutation = self.mutations.lock().await;
         info!(session_id = %id, "Deleting session");
 
+        let mut cleanup_error = None;
         if let Some(repo) = self.repository.as_ref() {
-            repo.delete(id).map_err(|e| {
-                CoreError::StorageError(format!("delete session {} failed: {}", id, e))
-            })?;
+            if let Err(error) = repo.delete(id) {
+                let error = CoreError::StorageError(format!("delete session {id} failed: {error}"));
+                // Metadata deletion is committed before Keychain cleanup. Do
+                // not leave a connectable in-memory session after that commit.
+                if !matches!(repo.load(id), Ok(None)) {
+                    return Err(error);
+                }
+                cleanup_error = Some(error);
+            }
         }
 
         // Invalidate and remove atomically; a concurrent reconnect cannot slip
@@ -960,7 +1013,10 @@ impl SessionService {
             .publish(rshell_api::AppEvent::SessionListChanged);
 
         debug!(session_id = %id, "Session deleted");
-        Ok(())
+        match cleanup_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// 获取会话状态
@@ -1119,7 +1175,7 @@ mod tests {
     fn unresolved_stored_credential_fails_closed_but_intentional_empty_password_is_valid() {
         let mut config = make_config("credential", "example.test");
         assert!(matches!(
-            resolve_auth_bridge(&config),
+            make_service().resolve_auth(&config),
             Err(CoreError::InvalidState(_))
         ));
         config.auth_method = AuthMethod::Password {
@@ -1127,7 +1183,7 @@ mod tests {
             has_password: false,
         };
         assert!(
-            matches!(resolve_auth_bridge(&config), Ok(ResolvedAuthMethod::Password { password, .. }) if password.is_empty())
+            matches!(make_service().resolve_auth(&config), Ok(ResolvedAuthMethod::Password { password, .. }) if password.is_empty())
         );
         config.auth_method = AuthMethod::PublicKey {
             username: "user".into(),
@@ -1135,7 +1191,7 @@ mod tests {
             has_passphrase: true,
         };
         assert!(matches!(
-            resolve_auth_bridge(&config),
+            make_service().resolve_auth(&config),
             Err(CoreError::InvalidState(_))
         ));
         config.auth_method = AuthMethod::PublicKey {
@@ -1144,7 +1200,7 @@ mod tests {
             has_passphrase: false,
         };
         assert!(matches!(
-            resolve_auth_bridge(&config),
+            make_service().resolve_auth(&config),
             Ok(ResolvedAuthMethod::PublicKey {
                 passphrase: None,
                 ..
@@ -1325,20 +1381,19 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
-    async fn dispatcher_resizes_live_telnet_and_remembers_preconnect_size() {
+    fn make_dispatcher(
+        svc: Arc<SessionService>,
+        path: &Path,
+    ) -> crate::command_dispatcher::CommandDispatcher {
         use crate::command_dispatcher::{CommandDispatcher, Services};
-        use tokio::io::AsyncReadExt;
-        let svc = Arc::new(make_service());
         let bus = svc.event_bus.clone();
-        let dir = tempfile::tempdir().unwrap();
-        let dispatcher = CommandDispatcher::new(Services {
+        CommandDispatcher::new(Services {
             session_service: svc.clone(),
             terminal_service: svc.terminal_service.clone(),
             transfer_service: Arc::new(crate::transfer::service::TransferService::new(bus.clone())),
             trigger_engine: svc.trigger_engine.clone(),
             key_manager: Arc::new(crate::security::key_manager::KeyManager::new(
-                dir.path().join("keys"),
+                path.join("keys"),
                 bus.clone(),
             )),
             master_password: Arc::new(crate::security::master_password::MasterPassword::new(
@@ -1348,12 +1403,20 @@ mod tests {
                 bus.clone(),
             )),
             host_key_manager: Arc::new(crate::security::host_key_manager::HostKeyManager::new(
-                dir.path().join("known_hosts"),
+                path.join("known_hosts"),
             )),
             theme_manager: Arc::new(crate::theme::ThemeManager::new(bus.clone())),
             event_bus: bus,
             host_key_registry: svc.host_key_registry.clone(),
-        });
+        })
+    }
+
+    #[tokio::test]
+    async fn dispatcher_resizes_live_telnet_and_remembers_preconnect_size() {
+        use tokio::io::AsyncReadExt;
+        let svc = Arc::new(make_service());
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(svc.clone(), dir.path());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut cfg = make_config("resize", "127.0.0.1");
         cfg.protocol = Protocol::Telnet;
@@ -1649,13 +1712,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credentials_survive_restart_without_appearing_in_lists() {
+        use crate::session::repository::tests::MemoryCredentials;
+        use rshell_api::types::{CredentialUpdate, SessionCredential};
+        let tmp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let repo = Arc::new(SessionRepository::new(
+            tmp.path().into(),
+            credentials.clone(),
+        ));
+        let svc = make_service_with_repo(repo.clone());
+        let cfg = make_config("secure", "example.test");
+        let id = svc
+            .create_session_with_credential(
+                cfg,
+                Some(SessionCredential {
+                    secret: "lifecycle-secret".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        let mut listed = svc.list_sessions().await.unwrap().pop().unwrap();
+        assert!(!serde_json::to_string(&listed)
+            .unwrap()
+            .contains("lifecycle-secret"));
+        listed.name = "renamed".into();
+        svc.update_session_with_credential(id, listed, CredentialUpdate::Keep)
+            .await
+            .unwrap();
+        let restarted = make_service_with_repo(repo);
+        let cfg = restarted.list_sessions().await.unwrap().pop().unwrap();
+        assert!(
+            matches!(restarted.resolve_auth(&cfg), Ok(ResolvedAuthMethod::Password { password, .. }) if password == "lifecycle-secret")
+        );
+        restarted.delete_session(id).await.unwrap();
+        assert!(credentials.entries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_credential_fails_before_network_and_never_publishes_connected() {
+        use crate::session::repository::tests::MemoryCredentials;
+        use rshell_api::types::SessionCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let repo = Arc::new(SessionRepository::new(
+            tmp.path().into(),
+            credentials.clone(),
+        ));
+        let svc = make_service_with_repo(repo);
+        let id = svc
+            .create_session_with_credential(
+                make_config("missing", "example.test"),
+                Some(SessionCredential {
+                    secret: "temporary".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = events.clone();
+        svc.event_bus
+            .subscribe(move |event| collected.lock().unwrap().push(event.clone()));
+        credentials.entries.lock().unwrap().clear();
+        assert!(matches!(
+            svc.connect(id).await,
+            Err(CoreError::InvalidState(_))
+        ));
+        assert_eq!(
+            svc.get_state(id).await.unwrap(),
+            ConnectionState::Disconnected
+        );
+        for event in events.lock().unwrap().iter() {
+            assert!(!matches!(
+                event,
+                AppEvent::ConnectionStateChanged {
+                    state: ConnectionState::Connected,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_metadata_write_keeps_memory_and_credentials_unchanged() {
+        use crate::session::repository::tests::{set, MemoryCredentials};
+        use rshell_api::types::SessionCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let repo = Arc::new(SessionRepository::new(
+            tmp.path().into(),
+            credentials.clone(),
+        ));
+        let svc = make_service_with_repo(repo);
+        let cfg = make_config("original", "example.test");
+        let id = svc
+            .create_session_with_credential(
+                cfg.clone(),
+                Some(SessionCredential {
+                    secret: "original-secret".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        let file = tmp.path().join(format!("{id}.toml"));
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let mut changed = cfg.clone();
+        changed.name = "changed".into();
+        assert!(svc
+            .update_session_with_credential(id, changed, set("new-secret"))
+            .await
+            .is_err());
+        assert_eq!(svc.list_sessions().await.unwrap()[0].name, "original");
+        assert!(
+            matches!(svc.resolve_auth(&cfg), Ok(ResolvedAuthMethod::Password { password, .. }) if password == "original-secret")
+        );
+        let create = make_config("failed-create", "example.test");
+        std::fs::create_dir(tmp.path().join(format!("{}.toml", create.id))).unwrap();
+        assert!(svc
+            .create_session_with_credential(
+                create,
+                Some(SessionCredential {
+                    secret: "new-secret".into()
+                })
+            )
+            .await
+            .is_err());
+        assert_eq!(svc.list_sessions().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn credential_cleanup_failure_still_removes_deleted_metadata_from_memory() {
+        use crate::session::repository::tests::MemoryCredentials;
+        use rshell_api::types::SessionCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let repo = Arc::new(SessionRepository::new(
+            tmp.path().into(),
+            credentials.clone(),
+        ));
+        let svc = make_service_with_repo(repo.clone());
+        let id = svc
+            .create_session_with_credential(
+                make_config("delete", "example.test"),
+                Some(SessionCredential {
+                    secret: "delete-secret".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        *credentials.fail.lock().unwrap() = true;
+        assert!(svc.delete_session(id).await.is_err());
+        assert!(repo.load(id).unwrap().is_none());
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+        *credentials.fail.lock().unwrap() = false;
+        svc.delete_session(id).await.unwrap();
+        assert!(credentials.entries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_routes_create_and_update_credentials_without_echoing_secrets() {
+        use crate::session::repository::tests::{set, MemoryCredentials};
+        use rshell_api::{AppCommand, CommandOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let repo = Arc::new(SessionRepository::new(
+            dir.path().join("sessions"),
+            credentials,
+        ));
+        let svc = Arc::new(make_service_with_repo(repo));
+        let dispatcher = make_dispatcher(svc.clone(), dir.path());
+        let config = make_config("dispatch", "example.test");
+        let id = config.id;
+        dispatcher
+            .dispatch(AppCommand::CreateSession {
+                config: config.clone(),
+                credential: Some(SessionCredential {
+                    secret: "dispatcher-secret".into(),
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(svc.resolve_auth(&config), Ok(ResolvedAuthMethod::Password { password, .. }) if password == "dispatcher-secret")
+        );
+        dispatcher
+            .dispatch(AppCommand::UpdateSession {
+                id,
+                config: config.clone(),
+                credential: set("replacement-secret"),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(svc.resolve_auth(&config), Ok(ResolvedAuthMethod::Password { password, .. }) if password == "replacement-secret")
+        );
+        let result = dispatcher.dispatch(AppCommand::ListSessions).await.unwrap();
+        let CommandOutcome::Sessions(sessions) = result else {
+            panic!("expected sessions");
+        };
+        // Tauri unwraps the outcome and serializes this payload.
+        let json = serde_json::to_string(&sessions).unwrap();
+        assert!(!json.contains("dispatcher-secret"));
+        assert!(!json.contains("replacement-secret"));
+    }
+
+    #[tokio::test]
     async fn test_session_persistence_roundtrip() {
         // 用 tempfile 给一个隔离目录,模拟"进程重启"。
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().to_path_buf();
 
         // 第一个生命周期:create ×2 → 落盘。
-        let repo_a = Arc::new(SessionRepository::new(path.clone()));
+        let credentials = Arc::new(crate::session::repository::tests::MemoryCredentials::default());
+        let repo_a = Arc::new(SessionRepository::new(path.clone(), credentials.clone()));
         let svc_a = make_service_with_repo(repo_a.clone());
         let cfg_a = make_config("alpha", "host-a");
         let id_a = svc_a.create_session(cfg_a).await.unwrap();
@@ -1664,7 +1934,7 @@ mod tests {
         drop(svc_a); // 显式 drop,模拟进程退出
 
         // 第二个生命周期:重新构造 → load_from_disk → 应能列回两条。
-        let repo_b = Arc::new(SessionRepository::new(path));
+        let repo_b = Arc::new(SessionRepository::new(path, credentials));
         let svc_b = make_service_with_repo(repo_b);
         svc_b.load_from_disk().await;
         let restored = svc_b.list_sessions().await.unwrap();
@@ -1678,7 +1948,10 @@ mod tests {
     async fn test_delete_removes_from_disk() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().to_path_buf();
-        let repo = Arc::new(SessionRepository::new(path.clone()));
+        let repo = Arc::new(SessionRepository::new(
+            path.clone(),
+            Arc::new(crate::session::repository::tests::MemoryCredentials::default()),
+        ));
         let svc = make_service_with_repo(repo.clone());
         let cfg = make_config("x", "host-x");
         let id = svc.create_session(cfg).await.unwrap();
