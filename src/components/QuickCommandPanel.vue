@@ -5,7 +5,7 @@
  * 快速命令列表 + 执行（弹输入框 → 选目标会话 → 调 execute_quick_command）。
  */
 import { onBeforeUnmount, onMounted, ref } from "vue";
-import { ElMessageBox } from "element-plus";
+import { ElMessageBox } from "element-plus/es/components/message-box/index.mjs";
 import { createQuickCommand, deleteQuickCommand, listQuickCommands, executeQuickCommand } from "../ipc/client";
 import { subscribeAppEvents } from "../ipc/events";
 import { useSessionsStore } from "../stores/sessions";

@@ -1,0 +1,25 @@
+/* Element Plus per-component styles. Each line matches a component imported
+ * in src/element-plus.ts; keep the two files in sync so unused components
+ * never reach the bundle. The build-output contract enforces a 500 KiB cap
+ * on every emitted JS chunk, so adding a component here usually requires
+ * also importing it in src/element-plus.ts. */
+@import "element-plus/theme-chalk/el-button.css";
+@import "element-plus/theme-chalk/el-button-group.css";
+@import "element-plus/theme-chalk/el-checkbox.css";
+@import "element-plus/theme-chalk/el-dialog.css";
+@import "element-plus/theme-chalk/el-dropdown.css";
+@import "element-plus/theme-chalk/el-dropdown-item.css";
+@import "element-plus/theme-chalk/el-dropdown-menu.css";
+@import "element-plus/theme-chalk/el-empty.css";
+@import "element-plus/theme-chalk/el-form.css";
+@import "element-plus/theme-chalk/el-form-item.css";
+@import "element-plus/theme-chalk/el-input.css";
+@import "element-plus/theme-chalk/el-input-number.css";
+@import "element-plus/theme-chalk/el-loading.css";
+@import "element-plus/theme-chalk/el-option.css";
+@import "element-plus/theme-chalk/el-select.css";
+@import "element-plus/theme-chalk/el-switch.css";
+@import "element-plus/theme-chalk/el-table.css";
+@import "element-plus/theme-chalk/el-table-column.css";
+@import "element-plus/theme-chalk/el-tag.css";
+/* el-tooltip ships an empty stylesheet; do not import it. */

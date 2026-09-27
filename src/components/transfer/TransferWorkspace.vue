@@ -13,7 +13,8 @@
  */
 import { computed, ref, watch } from "vue";
 import { open, confirm } from "@tauri-apps/plugin-dialog";
-import { ElMessage, ElMessageBox } from "element-plus";
+import { ElMessage } from "element-plus/es/components/message/index.mjs";
+import { ElMessageBox } from "element-plus/es/components/message-box/index.mjs";
 import FileBrowserPane, { type FsEntry } from "./FileBrowserPane.vue";
 import type { Uuid } from "../../ipc/types";
 import {

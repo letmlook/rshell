@@ -125,6 +125,7 @@ test('verify.sh runs each expected step in the documented order', () => {
       'test',
       'run build',
       'run check:docs',
+      'run check:bundle',
       'run test:scripts',
       'fmt --all --check',
       'clippy --workspace --all-targets -- -D warnings',
@@ -246,6 +247,90 @@ test('audit.sh propagates child exit codes unchanged', () => {
   try {
     const result = runAudit([], { cwd: fixture, fixture });
     assert.equal(result.status, 17, `expected cargo audit failure to propagate, got ${result.status}: ${result.stderr}`);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+// --- Build-output contract ----------------------------------------------------
+
+function makeDistWith(thresholdBytes, { withSourcemap = false } = {}) {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-build-output-'));
+  const assets = join(fixture, 'assets');
+  mkdirSync(assets, { recursive: true });
+  const small = Buffer.alloc(thresholdBytes - 1, 0);
+  writeFileSync(join(assets, 'vendor-vue.js'), small);
+  writeFileSync(join(assets, 'vendor-element-plus.js'), small);
+  writeFileSync(join(assets, 'vendor-xterm.js'), small);
+  writeFileSync(join(assets, 'vendor-dockview.js'), small);
+  writeFileSync(join(assets, 'vendor-pinia.js'), small);
+  writeFileSync(join(assets, 'app.js'), small);
+  if (withSourcemap) writeFileSync(join(assets, 'app.js.map'), small);
+  return fixture;
+}
+
+function runCheckBuildOutput(distDir, extra = {}) {
+  return spawnSync('node', [join(root, 'scripts/check-build-output.mjs'), distDir], {
+    cwd: root,
+    env: { ...process.env, ...extra },
+    encoding: 'utf8',
+    timeout: 10000,
+  });
+}
+
+test('check-build-output.mjs accepts a dist whose JS chunks stay under the limit', () => {
+  const fixture = makeDistWith(500_000);
+  try {
+    const result = runCheckBuildOutput(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Build output OK/);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('check-build-output.mjs fails when any JS chunk exceeds the 500 KiB limit', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-build-output-'));
+  const assets = join(fixture, 'assets');
+  mkdirSync(assets, { recursive: true });
+  writeFileSync(join(assets, 'small.js'), Buffer.alloc(10_000, 0));
+  writeFileSync(join(assets, 'huge.js'), Buffer.alloc(600_000, 0));
+  try {
+    const result = runCheckBuildOutput(fixture);
+    assert.notEqual(result.status, 0, 'oversized chunk must fail');
+    assert.match(result.stderr, /huge\.js is 600000 bytes/);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('check-build-output.mjs fails when production builds emit sourcemaps', () => {
+  const fixture = makeDistWith(500_000, { withSourcemap: true });
+  try {
+    const result = runCheckBuildOutput(fixture);
+    assert.notEqual(result.status, 0, 'production sourcemap must fail');
+    assert.match(result.stderr, /sourcemap/);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('check-build-output.mjs tolerates sourcemaps when RSHELL_SOURCEMAP=1', () => {
+  const fixture = makeDistWith(500_000, { withSourcemap: true });
+  try {
+    const result = runCheckBuildOutput(fixture, { RSHELL_SOURCEMAP: '1' });
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('check-build-output.mjs requires a populated dist directory', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'rshell-build-output-'));
+  try {
+    const result = runCheckBuildOutput(fixture);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /No build artifacts found/);
   } finally {
     cleanup(fixture);
   }

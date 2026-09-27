@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "RShell",
   "version": "0.1.0",
-  "identifier": "com.rshell.app",
+  "identifier": "com.letmlook.rshell",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:51820",

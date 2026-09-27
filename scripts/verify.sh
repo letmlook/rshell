@@ -38,6 +38,7 @@ npm run typecheck
 npm test
 npm run build
 npm run check:docs
+npm run check:bundle
 npm run test:scripts
 
 RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1 cargo fmt --all --check

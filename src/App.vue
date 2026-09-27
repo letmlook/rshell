@@ -20,7 +20,8 @@
  */
 import { onBeforeUnmount, onMounted, ref, markRaw, computed } from "vue";
 import { DockviewVue } from "dockview-vue";
-import { ElMessage, ElNotification } from "element-plus";
+import { ElMessage } from "element-plus/es/components/message/index.mjs";
+import { ElNotification } from "element-plus/es/components/notification/index.mjs";
 import "dockview-vue/dist/styles/dockview.css";
 import TerminalPane from "./components/TerminalPane.vue";
 import TransferWorkspace from "./components/transfer/TransferWorkspace.vue";
