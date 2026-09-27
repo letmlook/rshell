@@ -29,6 +29,24 @@ for (const file of ['README.md', 'docs/07-project-setup-guide.md']) {
     if (!body.includes(command)) errors.push(`${file}: missing ${command}`);
   }
 }
+
+const credentialDocs = new Map();
+for (const file of ['README.md', 'docs/08-incomplete-features.md', 'docs/09-macos-validation.md']) {
+  credentialDocs.set(file, await readFile(resolve(root, file), 'utf8'));
+}
+const allCredentialDocs = [...credentialDocs.values()].join('\n');
+if (!/(?:密码|凭据|口令).{0,40}(?:保存在|存放在|使用).{0,16}(?:macOS )?(?:钥匙串|Keychain)/i.test(allCredentialDocs)) {
+  errors.push('credential docs: must identify macOS Keychain as the credential store');
+}
+if (!/迁移|migrat/i.test(allCredentialDocs) || !/旧版|legacy|明文/.test(allCredentialDocs)) {
+  errors.push('credential docs: must explain migration of legacy plaintext credentials');
+}
+if (!/缺失|missing/i.test(allCredentialDocs) || !/重新输入|重新保存|re-enter|re-entering|resave|save again/i.test(allCredentialDocs)) {
+  errors.push('credential docs: must explain how to recover a missing Keychain entry');
+}
+if (/会话 TOML 仍可能包含明文认证信息|主密码服务尚未加密会话存储|主密码(?![^。\n]*(?:不是|并非))[^。\n]*(?:凭据保险库|密码库|vault)/i.test(allCredentialDocs)) {
+  errors.push('credential docs: must not claim session secrets remain plaintext or that the master password is the credential vault');
+}
 if (errors.length) {
   console.error(errors.join('\n'));
   process.exitCode = 1;
