@@ -19,6 +19,7 @@
 - 修正 macOS Bundle ID。
 - 对前端第三方大依赖做稳定的手工分包，消除单个 500 KiB 以上 JavaScript chunk 的警告。
 - 加入 macOS CI，覆盖仓库当前定义的前端、文档、脚本、Rust 与依赖审计检查。
+- 将重复的验证、审计和 macOS 发布预检固化为仓库脚本，本地与 CI 复用同一入口。
 - 将 `.omo/` 作为本地代理状态忽略。
 - 更新当前限制、迁移、签名公证和真实环境验收说明。
 
@@ -96,7 +97,16 @@
 
 ## 持续集成与审计
 
-新增 macOS GitHub Actions 工作流，使用锁文件安装并依次运行：
+重复性工作不得分别复制到 CI YAML、文档和人工操作说明中。新增以下可独立运行、失败即非零退出的脚本：
+
+- `scripts/verify.sh`：运行前端类型检查、测试、构建、文档契约、构建脚本测试，以及 Rust fmt、Clippy 和工作区测试。
+- `scripts/audit.sh`：固定使用 npm 官方 registry 执行 npm audit，并对 `src-tauri/Cargo.lock` 执行 RustSec 审计；缺少审计工具时给出明确安装提示并失败，不把“未执行”当作通过。
+- `scripts/macos-release-preflight.sh`：检查 Bundle ID、产物路径、签名身份/notarytool 配置是否齐全，并支持只做不需要秘密的本地预检。
+- `scripts/macos-verify-app.sh <app-path>`：检查应用 Bundle ID、代码签名和 Gatekeeper 结果，输出可保存到验收记录的证据。
+
+脚本负责工作目录切换、稳定环境变量和错误传播；不打印证书密码、notarytool 凭据或会话秘密。脚本自身通过 Node 测试覆盖命令顺序、参数转发、缺失依赖和失败退出码。现有 `scripts/build.sh` 保留单一构建职责，不与总体验证脚本重复实现构建逻辑。
+
+新增 macOS GitHub Actions 工作流，使用锁文件安装后调用上述共享脚本。`scripts/verify.sh` 的实际检查包括：
 
 - `npm ci`
 - `npm run typecheck`
@@ -108,13 +118,14 @@
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
-- RustSec 对 `src-tauri/Cargo.lock` 的审计
+
+随后由 `scripts/audit.sh` 完成 npm 和 RustSec 审计。CI YAML 只负责运行环境、缓存和调用脚本，不重新展开脚本内部命令。
 
 审计使用官方 npm registry，避免本地 npmmirror 不实现 audit API。第三方 Action 固定到不可变提交 SHA；CI 不读取发布证书或真实服务器秘密。
 
 ## 签名、公证和外部验收
 
-仓库文档列出 release 构建、签名、公证和 Gatekeeper 验证命令及所需环境变量名称，但不保存证书或凭据。没有 Developer ID 和 notarytool 凭据时，CI 只验证未签名构建。
+仓库文档以共享脚本为唯一操作入口，列出 release 构建、签名、公证和 Gatekeeper 验证所需环境变量名称，但不复制脚本内部命令，也不保存证书或凭据。没有 Developer ID 和 notarytool 凭据时，CI 只运行无秘密预检和未签名构建。
 
 真实 SSH/SFTP、主机密钥、隧道、物理串口和人工手势继续保留为未完成清单。能由本地回环测试覆盖的协议行为进入自动测试；必须依赖外设或外部服务的项目提供可重复步骤和证据记录位置。
 
@@ -128,6 +139,7 @@
 - 会话连接：断言只在连接时解析凭据，缺失凭据明确失败。
 - 传输 UI：断言状态对应操作、事件和错误处理。
 - 构建：断言 Bundle ID、分包结果、工作流命令和忽略规则。
+- 脚本：断言统一验证、审计和 macOS 发布预检/验证入口的命令顺序、参数传递与失败传播。
 - 最终运行仓库定义的全部前端与 Rust 验收命令，并重新构建 macOS 调试 App。
 
 ## 完成标准
@@ -137,6 +149,7 @@
 - 活跃传输可从界面暂停，暂停传输可恢复，失败可见。
 - Bundle ID 无 Tauri 警告，生产构建无单个超阈值 JS chunk 警告。
 - CI 文件覆盖全部本地验收命令及 npm/RustSec 审计。
+- 本地、CI 和发布文档复用仓库脚本，不维护互相漂移的重复命令清单。
 - 工作区不再因 `.omo/` 变脏。
 - 自动测试和 macOS 调试 App 构建通过。
 - 签名、公证及真实外部环境条目只在取得真实证据后勾选。
