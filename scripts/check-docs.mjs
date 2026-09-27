@@ -49,6 +49,48 @@ const currentPlaintextClaim = allCredentialDocs.split(/[。；;\n]|(?:，|,)?(?:
 if (currentPlaintextClaim || /主密码[^。\n]*(?:尚未|未成为|并未)[^。\n]*(?:会话存储|加密保险库)|主密码(?![^。\n]*(?:不是|并非))[^。\n]*(?:凭据保险库|密码库|vault)/i.test(allCredentialDocs)) {
   errors.push('credential docs: must not claim session secrets remain plaintext or that the master password is the credential vault');
 }
+
+// Release-readiness docs must point operators at the shared script entry
+// points (verify, audit, preflight, verify-app) instead of duplicating
+// internal commands. README, CONTRIBUTING, docs/07 and docs/08 each have to
+// surface at least one of these references.
+const releaseReadinessDocs = ['README.md', 'CONTRIBUTING.md', 'docs/07-project-setup-guide.md', 'docs/08-incomplete-features.md'];
+const releaseBody = (await Promise.all(releaseReadinessDocs.map(file => readFile(resolve(root, file), 'utf8')))).join('\n');
+if (!/scripts\/verify\.sh/.test(releaseBody) || !/scripts\/audit\.sh/.test(releaseBody)) {
+  errors.push('release-readiness docs: must reference scripts/verify.sh and scripts/audit.sh');
+}
+if (!/scripts\/macos-release-preflight\.sh/.test(releaseBody) || !/scripts\/macos-verify-app\.sh/.test(releaseBody)) {
+  errors.push('release-readiness docs: must reference scripts/macos-release-preflight.sh and scripts/macos-verify-app.sh');
+}
+if (!/com\.letmlook\.rshell/.test(releaseBody)) {
+  errors.push('release-readiness docs: must state the exact Bundle ID com.letmlook.rshell');
+}
+if (!/APPLE_SIGNING_IDENTITY/.test(releaseBody) || !/APPLE_NOTARY_PROFILE/.test(releaseBody)) {
+  errors.push('release-readiness docs: must name APPLE_SIGNING_IDENTITY and APPLE_NOTARY_PROFILE explicitly');
+}
+
+// Dated historical records may still mention the old RShell identifier,
+// but no current doc may pretend com.rshell.app is still shipping.
+for (const file of files) {
+  const body = await readFile(resolve(root, file), 'utf8');
+  if (/com\.rshell\.app/.test(body)) {
+    errors.push(`${file}: must not mention the old com.rshell.app Bundle ID`);
+  }
+}
+
+// The release-readiness docs must continue to admit that signing,
+// notarization, real SSH/SFTP, tunnels, gestures, plugins, and physical
+// serial ports remain unverified without external evidence.
+const honestLimits = ['docs/08-incomplete-features.md', 'docs/09-macos-validation.md'];
+const limitsBody = (await Promise.all(honestLimits.map(file => readFile(resolve(root, file), 'utf8')))).join('\n');
+const requiredLimits = ['签名', '公证', '物理串口|Serial', 'SSH', 'SFTP'];
+for (const phrase of requiredLimits) {
+  const regex = new RegExp(phrase);
+  if (!regex.test(limitsBody)) {
+    errors.push(`release-readiness docs: must keep "${phrase}" listed as unverified external validation`);
+  }
+}
+
 if (errors.length) {
   console.error(errors.join('\n'));
   process.exitCode = 1;

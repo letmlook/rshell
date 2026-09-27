@@ -19,19 +19,14 @@ Tauri 自动启动 Vite，开发地址为 `http://localhost:51820`。仅 `npm ru
 
 ## 检查
 
+仓库的本地校验只走两条共享入口脚本；命令细节以 [scripts/README.md](../scripts/README.md) 为准，不要在文档或 PR 里复制脚本内部的命令清单。
+
 ```bash
-npm run typecheck
-npm test
-npm run test:scripts
-npm run build
-npm run check:docs
-cd src-tauri
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+npm run verify   # 走 scripts/verify.sh：前端类型检查/测试/构建/文档/脚本测试 + Rust fmt/clippy/test
+npm run audit    # 走 scripts/audit.sh：npm audit (官方 registry) + cargo audit (Cargo.lock)
 ```
 
-Rust workspace 在 `src-tauri/`，不要从根目录运行 cargo 检查。
+`scripts/verify.sh --skip-install` 跳过 `npm ci`，适用于依赖已安装的快速复跑。Rust workspace 在 `src-tauri/`，不要从根目录运行 cargo 检查；脚本会自动切到正确目录并设置 `RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1`。
 
 本机 rustup 曾因 rust-analyzer 自动更新冲突失败。已有完整 stable 时：
 

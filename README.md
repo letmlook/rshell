@@ -45,19 +45,16 @@ RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1 npm run tauri:dev
 
 ## 验证
 
+仓库的本地与 CI 校验只走两条共享入口脚本，命令细节不复制到文档里：
+
 ```bash
-npm run typecheck
-npm test
-npm run test:scripts
-npm run build
-npm run check:docs
-cd src-tauri
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+npm run verify   # 走 scripts/verify.sh：前端检查/测试/构建/文档/脚本测试 + Rust fmt/clippy/test
+npm run audit    # 走 scripts/audit.sh：npm audit (官方 registry) + cargo audit (Cargo.lock)
 ```
 
-自动化检查、真实启动结果及尚未执行的外部设备/服务器场景，统一记录在 [macOS 验证记录](docs/09-macos-validation.md)。测试通过不能替代真实 SSH/SFTP 服务端或物理串口验证。
+仅在不需要 npm ci 的快速复跑时使用 `bash scripts/verify.sh --skip-install`。
+
+Bundle ID 与脚本细节见 [scripts/README.md](scripts/README.md)。自动化检查、真实启动结果及尚未执行的外部设备/服务器场景，统一记录在 [macOS 验证记录](docs/09-macos-validation.md)。测试通过不能替代真实 SSH/SFTP 服务端或物理串口验证。
 
 ## 代码结构
 

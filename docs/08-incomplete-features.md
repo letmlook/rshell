@@ -26,6 +26,16 @@ SSH 密码和密钥口令存放在 macOS 钥匙串（Keychain），会话 TOML �
 
 RDP 已删除。Remote Forward、FTP/FTPS、Windows ConPTY、截图、录屏、目录递归传输、完整插件生态和新协议均不是本轮新增目标。没有后端支撑的入口被移除，不以按钮占位冒充实现。
 
+## macOS 发布预检与签名/公证
+
+桌面构建入口仍为 `npm run tauri:build`，产物 Bundle ID 为 `com.letmlook.rshell`；本地与 CI 的预检/审计只走仓库脚本：
+
+- `bash scripts/macos-release-preflight.sh --unsigned <app-path>`：不接触签名/公证凭据，验证 Bundle ID、Info.plist、目录布局。
+- `bash scripts/macos-release-preflight.sh <app-path>`：要求设置 `APPLE_SIGNING_IDENTITY` 与 `APPLE_NOTARY_PROFILE`，执行 `codesign --verify --deep --strict`、`xcrun notarytool submit --wait`、`xcrun stapler staple`、`spctl --assess`。脚本不会回显任一凭据。
+- `bash scripts/macos-verify-app.sh <app-path>`：校验已构建产物的 Bundle ID、严格代码签名与 Gatekeeper 评估。
+
+在 Developer ID 证书、notarytool 凭据和真实公证步骤落地之前，CI 与本地文档只允许运行 `--unsigned` 预检与 `macos-verify-app.sh`，不允许把未签名/未公证的 `.app` 写为“已发布”。签名与公证的成功证据将单独记录到 [macOS 验证](09-macos-validation.md)。
+
 ## 尚待真实环境验收
 
 自动检查、调试应用打包和基础 GUI 交互证据见 [macOS 验证](09-macos-validation.md)。未执行的 GUI 写操作、真实 SSH/SFTP 与隧道、物理串口、签名公证不能仅凭单元测试标记完成。

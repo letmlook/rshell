@@ -1,6 +1,6 @@
 # macOS 验证记录
 
-日期：2026-09-26。分支：`codex/macos-hardening`。此记录区分代码检查、自动测试、原生进程启动和真实交互，不将未执行项记为通过。
+日期：2026-09-27。分支：`codex/release-hardening`（凭据加固与发布就绪合并入 main）。此记录区分代码检查、自动测试、原生进程启动和真实交互，不将未执行项记为通过。
 
 ## 环境
 
@@ -8,16 +8,12 @@ macOS 本机，Rust stable 1.98.1，Tauri 2 + Vue 3 + xterm.js。依赖由 `npm 
 
 ## 自动检查
 
-以下结果来自最终审查修复及 Rust 格式化后的重新执行：
+本轮同时运行仓库内统一入口脚本（与 CI 复用同一份逻辑，命令清单见 [scripts/README.md](../scripts/README.md)）：
 
-- `npm run typecheck`：通过。
-- `npm test`：18 个文件，65 项通过。
-- `npm run test:scripts`：2 项通过。
-- `npm run build`：通过，Vite 6.4.3。
-- `npm run check:docs`：14 份当前文档通过。
-- `cargo fmt --all --check`：通过。
-- `cargo clippy --workspace --all-targets -- -D warnings`：通过。
-- `cargo test --workspace --quiet`：154 项单元/集成测试通过，1 个既有文档示例忽略，其余文档测试无失败。
+- `npm run verify`（`scripts/verify.sh`）：前端 `typecheck` / `test` / `build` / `check:docs` / `check:bundle` / `test:scripts`，Rust `fmt` / `clippy --workspace --all-targets -- -D warnings` / `test --workspace`，全部 0 失败。
+- `npm run audit`（`scripts/audit.sh`）：`npm audit --registry=https://registry.npmjs.org` 与 `RUSTUP_TOOLCHAIN=stable cargo audit --file src-tauri/Cargo.lock`，本地开发机需先 `cargo install cargo-audit --version 0.22.2 --locked`，否则脚本立即以非零退出并指出安装命令。
+
+`npm test` 累计 75 项通过（20 文件），`node --test scripts/*.test.mjs` 累计 32 项通过；`npm run check:bundle` 在 macOS 调试包构建后扫描 `dist/assets/` 并断言每个 JS chunk ≤ 500 KiB、无 `.map`，最大 chunk 403 KiB（vendor-xterm）。
 
 同时构建 Tauri 与运行 rustdoc 时曾出现 `E0463`（找不到 tauri crate）；停止重叠构建后，文档测试及全工作区测试均串行复跑通过，未通过禁用文档测试规避错误。
 
@@ -53,6 +49,21 @@ macOS 构建脚本回归通过（2/2），覆盖图标资源存在性、工作�
 标题栏操作曾在原生控制台出现 `window.start_dragging not allowed`。已补充最小窗口拖动权限并删除与 Tauri 原生脚本重复的 Vue 双击处理，4 项新增回归先失败后通过。重新打包启动后的控制台未再出现该权限错误，独立复审通过。自动化指针操作未取得窗口位置变化及双击切换的确定证据，因此这两项物理手势仍保留人工复测，不将脚本回归当成实机手势通过。测试结束后已关闭应用，没有保存测试会话或改动用户凭据。
 
 以上面板可达性不等于服务器、物理设备或写操作端到端验收。
+
+## macOS 应用打包与发布预检
+
+Bundle ID 本轮统一为 `com.letmlook.rshell`。`src-tauri/target/debug/bundle/macos/RShell.app/Contents/Info.plist` 的 `CFBundleIdentifier` 已通过 PlistBuddy 校对为 `com.letmlook.rshell`，Tauri 不再发出 identifier 警告。
+
+CI 工作流（`.github/workflows/ci.yml`）在 macOS runner 上调用：
+
+1. `bash scripts/verify.sh --skip-install`
+2. `bash scripts/audit.sh`
+3. `npm run tauri:build -- --debug --bundles app`
+4. `bash scripts/macos-release-preflight.sh --unsigned src-tauri/target/debug/bundle/macos/RShell.app`
+
+第三方 action 全部按提交 SHA 锁定（`checkout@11d5960a326750d5838078e36cf38b85af677262`、`setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020`、`cache@0057852bfaa89a56745cba8c7296529d2fc39830`），并使用 `cargo install cargo-audit --version 0.22.2 --locked`；不允许把签名/公证凭据写入 CI。
+
+本地开发机同样使用 `bash scripts/macos-release-preflight.sh --unsigned <app-path>` 完成预检；带签名的预检需要显式提供 `APPLE_SIGNING_IDENTITY` 与 `APPLE_NOTARY_PROFILE`，脚本不会回显任一变量。
 
 ## 真实环境验收清单
 

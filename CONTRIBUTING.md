@@ -14,20 +14,16 @@
 
 ## 环境与检查
 
+所有本地校验都走仓库内共享脚本；命令细节见 [scripts/README.md](scripts/README.md)，不要在文档或 PR 描述里复制脚本内部命令。
+
 ```bash
-npm ci
-npm run typecheck
-npm test
-npm run test:scripts
-npm run build
-npm run check:docs
-cd src-tauri
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+npm run verify   # scripts/verify.sh：前端类型检查/测试/构建/文档/脚本测试 + Rust fmt/clippy/test
+npm run audit    # scripts/audit.sh：npm audit (官方 registry) + cargo audit (Cargo.lock)
 ```
 
-桌面调试和打包命令分别为 `npm run tauri:dev`、`npm run tauri:build`。详情见 [环境指南](docs/07-project-setup-guide.md)。
+快速复跑可用 `bash scripts/verify.sh --skip-install` 跳过 `npm ci`。
+
+桌面调试和打包命令分别为 `npm run tauri:dev`、`npm run tauri:build`。macOS 调试 `.app` 的预检用 `bash scripts/macos-release-preflight.sh --unsigned <app-path>`，已构建产物的合规检查用 `bash scripts/macos-verify-app.sh <app-path>`。详情见 [环境指南](docs/07-project-setup-guide.md)。
 
 ## 代码约定
 
