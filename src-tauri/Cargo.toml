@@ -51,6 +51,7 @@ tempfile = "3"
 tokio-test = "0.4"
 static_assertions = "1"
 ts-rs = { version = "12", features = ["uuid-impl", "serde-compat"] }
+keyring = { version = "=4.2.0", features = ["v1"] }
 
 # Tauri 2.0
 tauri = { version = "2", features = [] }

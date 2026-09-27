@@ -6,5 +6,6 @@
 //! - PTY 抽象（pty）
 
 pub mod crypto;
+pub mod credentials;
 pub mod pty;
 pub mod storage;

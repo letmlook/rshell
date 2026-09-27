@@ -12,6 +12,7 @@
 //! CI 加 `git diff --exit-code src/ipc/generated.ts` 拦截漂移（设计 §3.6）。
 
 pub mod commands;
+pub mod credentials;
 pub mod events;
 pub mod outcome;
 pub mod types;
