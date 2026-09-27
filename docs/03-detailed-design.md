@@ -34,7 +34,7 @@ Local/Dynamic 隧道建立监听前必须取得 SSH 连接，不得降级为直�
 
 macOS 默认数据位于 `~/Library/Application Support/rshell/`：`sessions/`、`keys/`、`known_hosts`、`tunnels.toml`、`quick-commands.json`、`triggers.json`。自动化配置损坏时保留文件并阻止覆盖。
 
-重要限制：会话 TOML 按 SessionConfig 保存，可能包含明文密码/口令。主密码服务是独立的内存加密服务，并未成为会话存储的加密保险库。不要公开这些文件、私钥或含凭据的自动化。主题选择与传输队列不保证跨启动恢复。
+SSH 密码和密钥口令保存在 macOS 钥匙串（Keychain）；会话 TOML 只保存凭据元数据。读取旧版会话时会将明文凭据迁移到钥匙串并重写文件以移除秘密；缺少钥匙串条目时连接失败关闭，需编辑会话、重新输入凭据并保存。主密码用于应用锁定/验证，不是凭据保险库。不要公开私钥或含凭据的自动化。主题选择与传输队列不保证跨启动恢复。
 
 ## 自动化与插件
 

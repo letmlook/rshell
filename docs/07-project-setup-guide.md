@@ -45,7 +45,7 @@ jsdom 缺少 Canvas/WebGL，终端测试可能有 Canvas 提示；真实渲染�
 
 ## 数据与权限
 
-默认数据位于 `~/Library/Application Support/rshell/`。会话可能含明文密码，私钥、快速命令、触发器和日志也可能敏感，不要共享整个数据目录或提交到 Git。主密码服务尚未加密会话存储。
+默认数据位于 `~/Library/Application Support/rshell/`。SSH 密码和密钥口令存放在 macOS 钥匙串（Keychain），会话 TOML 只含凭据元数据；旧版会话的明文凭据会在读取时迁移到钥匙串并从文件移除。钥匙串条目缺失时连接失败关闭，编辑会话、重新输入凭据并保存可恢复连接；主密码用于应用锁定/验证，不是凭据保险库。私钥、快速命令、触发器和日志也可能敏感，不要共享整个数据目录或提交到 Git。
 
 本地文件先通过目录选择器授权，SFTP 先连接 SSH 会话。Telnet 使用实际服务端 TCP 端口；Serial 使用实际 `/dev/cu.*` 或 `/dev/tty.*` 和匹配参数。
 
