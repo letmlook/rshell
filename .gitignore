@@ -42,3 +42,6 @@ dist/
 
 # Tauri 构建产物 (src-tauri/target/ 由子目录 .gitignore 兜底)
 .worktrees/
+
+# 本地 Agent 状态目录（不参与仓库历史）
+.omo/

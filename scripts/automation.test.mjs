@@ -567,3 +567,71 @@ test('macos-verify-app.sh rejects bundles with the wrong Bundle ID', () => {
     cleanup(fixture);
   }
 });
+
+// --- Repository CI / ignore policy ------------------------------------------
+
+const ciWorkflowPath = join(root, '.github/workflows/ci.yml');
+
+function readCiWorkflow() {
+  return readFileSync(ciWorkflowPath, 'utf8');
+}
+
+test('.omo/ is ignored so local Agent state does not pollute the workspace', () => {
+  const ignore = readFileSync(join(root, '.gitignore'), 'utf8');
+  assert.match(ignore, /^\.omo\//m, '.gitignore must list .omo/ to keep Agent state out of the tree');
+});
+
+test('macOS CI workflow pins every third-party action to a full commit SHA', () => {
+  const workflow = readCiWorkflow();
+  // Each `uses:` must reference a 40-character SHA, never a moving tag.
+  for (const match of workflow.matchAll(/uses:\s*([^@\s]+)@([0-9a-f]+)/g)) {
+    const action = match[1];
+    const sha = match[2];
+    assert.ok(/^[0-9a-f]{40}$/.test(sha), `${action} must be pinned to a full 40-char SHA, got "${sha}"`);
+  }
+  // Spot-check the SHAs recorded in the release-readiness plan so a future
+  // bump requires an explicit decision instead of a silent tag update.
+  assert.match(workflow, /actions\/checkout@11d5960a326750d5838078e36cf38b85af677262/);
+  assert.match(workflow, /actions\/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020/);
+  assert.match(workflow, /actions\/cache@0057852bfaa89a56745cba8c7296529d2fc39830/);
+});
+
+test('macOS CI workflow delegates to the shared scripts and does not duplicate their commands', () => {
+  const workflow = readCiWorkflow();
+  assert.match(workflow, /bash scripts\/verify\.sh --skip-install/);
+  assert.match(workflow, /bash scripts\/audit\.sh/);
+  assert.match(workflow, /bash scripts\/macos-release-preflight\.sh --unsigned/);
+  // The workflow must not re-implement the verification or audit chain.
+  for (const duplicate of [
+    /npm run typecheck/,
+    /npm run check:docs/,
+    /npm run test:scripts/,
+    /cargo fmt/,
+    /cargo clippy/,
+    /cargo test --workspace/,
+    /npm audit/,
+    /cargo audit/,
+  ]) {
+    assert.ok(
+      !duplicate.test(workflow),
+      `CI workflow duplicates shared-script command ${duplicate}; call the script instead`,
+    );
+  }
+});
+
+test('macOS CI workflow installs cargo-audit 0.22.2 with --locked', () => {
+  const workflow = readCiWorkflow();
+  assert.match(workflow, /cargo install cargo-audit --version 0\.22\.2 --locked/);
+});
+
+test('macOS CI workflow pins Rust toolchain via RUSTUP_* env, not a fixed toolchain file', () => {
+  const workflow = readCiWorkflow();
+  assert.match(workflow, /RUSTUP_TOOLCHAIN:\s*stable/);
+  assert.match(workflow, /RUSTUP_NO_UPDATE_CHECK:\s*1/);
+  // No "rust-toolchain:" file pinning is allowed in CI; the project ships
+  // rust-toolchain.toml for local use only.
+  const toolchainFile = readFileSync(join(root, 'rust-toolchain.toml'), 'utf8');
+  assert.ok(!workflow.includes('rust-toolchain:'), 'CI must not depend on rust-toolchain.toml');
+  // Sanity: the file itself still exists.
+  assert.match(toolchainFile, /\[toolchain\]/);
+});

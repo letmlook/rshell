@@ -1,0 +1,60 @@
+name: macos-verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs on the same ref so we do not pile up redundant
+# macOS runners while a push supersedes a PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_NO_UPDATE_CHECK: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 20
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Rust toolchain and cargo-audit
+        run: |
+          rustup component add clippy rustfmt
+          cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Run shared verification
+        run: bash scripts/verify.sh --skip-install
+
+      - name: Run shared dependency audits
+        run: bash scripts/audit.sh
+
+      - name: Build macOS debug bundle
+        run: npm run tauri:build -- --debug --bundles app
+
+      - name: Run macOS release preflight (unsigned)
+        run: bash scripts/macos-release-preflight.sh --unsigned src-tauri/target/debug/bundle/macos/RShell.app
