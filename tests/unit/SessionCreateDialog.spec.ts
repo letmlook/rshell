@@ -46,6 +46,31 @@ describe("SessionCreateDialog", () => {
     expect(config.auth_method).toEqual({ Password: { username: "alice", has_password: true } });
     expect(JSON.stringify(config)).not.toContain("sample-secret-password");
     expect(credential).toEqual({ secret: "sample-secret-password" });
+    await vi.waitFor(() => expect(password!.value).toBe(""));
+    wrapper.unmount();
+  });
+
+  it.each(["cancel", "dialog-close", "parent-hide"])("clears password after %s and reopening", async (dismissal) => {
+    const wrapper = mount(SessionCreateDialog, {
+      props: { visible: true }, attachTo: document.body,
+      global: { plugins: [createPinia(), ElementPlus] },
+    });
+    await nextTick();
+    const password = document.body.querySelector<HTMLInputElement>('input[type="password"]')!;
+    password.value = "dismissed-secret";
+    password.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    if (dismissal === "cancel") {
+      Array.from(document.body.querySelectorAll("button")).find((b) => b.textContent?.includes("取消"))!.click();
+    } else if (dismissal === "dialog-close") {
+      document.body.querySelector<HTMLButtonElement>(".el-dialog__headerbtn")!.click();
+    } else {
+      await wrapper.setProps({ visible: false });
+    }
+    await nextTick();
+    await wrapper.setProps({ visible: false });
+    await wrapper.setProps({ visible: true });
+    expect(document.body.querySelector<HTMLInputElement>('input[type="password"]')!.value).toBe("");
     wrapper.unmount();
   });
 

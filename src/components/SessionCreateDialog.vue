@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import { useSessionsStore } from "../stores/sessions";
 import type { Protocol, SerialFlowControl, SerialParity, SessionConfig, Uuid } from "../ipc/types";
 
@@ -25,6 +25,15 @@ const form = ref({
 
 const submitting = ref(false);
 const error = ref<string | null>(null);
+
+watch(() => props.visible, (visible) => {
+  if (!visible) form.value.password = "";
+});
+
+function close() {
+  form.value.password = "";
+  emit("close");
+}
 
 async function submit() {
   submitting.value = true;
@@ -63,8 +72,9 @@ async function submit() {
       ? { secret: form.value.password }
       : null;
     const id = await store.create(cfg, credential);
+    form.value.password = "";
     emit("created", id);
-    emit("close");
+    close();
   } catch (e) {
     error.value = String(e);
   } finally {
@@ -73,7 +83,7 @@ async function submit() {
 }
 
 function onUpdateVisible(v: boolean) {
-  if (!v) emit("close");
+  if (!v) close();
 }
 </script>
 
@@ -83,7 +93,7 @@ function onUpdateVisible(v: boolean) {
     title="新建会话"
     width="480px"
     @update:model-value="onUpdateVisible"
-    @close="emit('close')"
+    @close="close"
   >
     <el-form label-width="80px" @submit.prevent="submit">
       <el-form-item label="协议">
@@ -144,7 +154,7 @@ function onUpdateVisible(v: boolean) {
       <p v-if="error" style="color: var(--el-color-danger)">{{ error }}</p>
     </el-form>
     <template #footer>
-      <el-button @click="emit('close')">取消</el-button>
+      <el-button @click="close">取消</el-button>
       <el-button type="primary" :loading="submitting" @click="submit">创建</el-button>
     </template>
   </el-dialog>

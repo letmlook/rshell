@@ -15,6 +15,7 @@ import { computed, ref } from "vue";
 import { useSessionsStore } from "../stores/sessions";
 import type { Uuid } from "../ipc/types";
 import type { SessionConfig } from "../ipc/types";
+import SessionCredentialDialog from "./SessionCredentialDialog.vue";
 
 const emit = defineEmits<{
   (e: "select", id: Uuid): void;
@@ -26,6 +27,7 @@ const emit = defineEmits<{
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
 
 const store = useSessionsStore();
+const credentialSession = ref<SessionConfig | null>(null);
 
 interface TreeNode {
   id: string;
@@ -112,6 +114,10 @@ function ctxDisconnect() {
   if (!contextMenu.value.session) return;
   store.disconnect(contextMenu.value.session.id).catch(console.warn);
 }
+function ctxUpdateCredential() {
+  credentialSession.value = contextMenu.value.session;
+  contextMenu.value.visible = false;
+}
 function ctxDelete() {
   if (!contextMenu.value.session) return;
   if (confirm(`确定删除会话 ${contextMenu.value.session.name} ?`)) {
@@ -145,6 +151,14 @@ function ctxDelete() {
       class="search"
     />
     <p v-if="store.error" class="error">{{ store.error }}</p>
+    <div v-if="store.loadIssues.length" class="error" role="alert">
+      <p>部分会话加载失败。请检查会话配置和钥匙串访问权限后重试。</p>
+      <p v-for="issue in store.loadIssues" :key="issue.session_id ?? 'storage'">
+        {{ issue.session_id ?? '会话存储' }}: {{ issue.message }}
+      </p>
+      <button class="ctx-item" :disabled="store.retryingLoad" @click="store.retryLoad()">重试加载</button>
+    </div>
+    <SessionCredentialDialog v-if="credentialSession" :session="credentialSession" @close="credentialSession = null" />
 
     <div v-if="groups.length === 0" class="empty">
       <p>暂无会话</p>
@@ -189,6 +203,7 @@ function ctxDelete() {
     >
       <button class="ctx-item" @click="ctxConnect">连接</button>
       <button class="ctx-item" @click="ctxDisconnect">断开</button>
+      <button v-if="contextMenu.session?.protocol === 'SSH'" class="ctx-item" @click="ctxUpdateCredential">更新凭据</button>
       <div class="ctx-sep" />
       <button class="ctx-item" @click="ctxOpenSftp">打开 SFTP</button>
       <button class="ctx-item" @click="ctxOpenTerminal">打开终端</button>

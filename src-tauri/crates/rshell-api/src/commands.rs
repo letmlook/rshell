@@ -273,6 +273,10 @@ pub enum AppCommand {
     // 解决 view.update_*() 从未被调用的问题——UI 在 mount 时 + 每次 refresh button 时调用。
     /// 拉取所有会话列表
     ListSessions,
+    /// Persistent startup/migration failures, safe to query after subscribing.
+    ListSessionLoadIssues,
+    /// Retry loading saved sessions after storage/Keychain remediation.
+    RetrySessionLoad,
     /// 拉取所有活动隧道列表
     ListTunnels,
     /// 拉取所有 SSH 密钥列表

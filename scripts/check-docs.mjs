@@ -40,7 +40,13 @@ if (!/迁移|migrat/i.test(allCredentialDocs) || !/旧版|legacy|明文/.test(al
 if (!/缺失|missing/i.test(allCredentialDocs) || !/重新输入|重新保存|re-enter|re-entering|resave|save again/i.test(allCredentialDocs)) {
   errors.push('credential docs: must explain how to recover a missing Keychain entry');
 }
-if (/会话.{0,50}(?:可能含|可能包含|仍可能包含).{0,10}明文|会话 TOML 仍可能包含明文认证信息|主密码[^。\n]*(?:尚未|未成为|并未)[^。\n]*(?:会话存储|加密保险库)|主密码(?![^。\n]*(?:不是|并非))[^。\n]*(?:凭据保险库|密码库|vault)/i.test(allCredentialDocs)) {
+// Evaluate separate claims so a truthful legacy migration sentence cannot
+// hide a current-state claim later in the same paragraph.
+const plaintextClaim = /会话.{0,50}(?:可能含|可能包含|仍可能包含).{0,10}明文/i;
+const currentPlaintextClaim = allCredentialDocs.split(/[。；;\n]|(?:，|,)?(?:但是|但|然而)/).some(claim =>
+  plaintextClaim.test(claim) && !/^\s*(?:[-*]\s*)?(?:读取)?旧版/.test(claim),
+);
+if (currentPlaintextClaim || /主密码[^。\n]*(?:尚未|未成为|并未)[^。\n]*(?:会话存储|加密保险库)|主密码(?![^。\n]*(?:不是|并非))[^。\n]*(?:凭据保险库|密码库|vault)/i.test(allCredentialDocs)) {
   errors.push('credential docs: must not claim session secrets remain plaintext or that the master password is the credential vault');
 }
 if (errors.length) {

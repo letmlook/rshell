@@ -6,13 +6,16 @@
  */
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
-import type { SessionConfig, SessionCredential, Uuid } from "../ipc/types";
+import type { SessionConfig, SessionCredential, SessionLoadIssue, Uuid } from "../ipc/types";
 import {
   listSessions,
   createSession,
   connectSession,
   disconnectSession,
   deleteSession,
+  listSessionLoadIssues,
+  retrySessionLoad,
+  updateSession,
 } from "../ipc/client";
 import { subscribeAppEvents } from "../ipc/events";
 
@@ -26,6 +29,8 @@ export const useSessionsStore = defineStore("sessions", () => {
   const masterPasswordRequired = ref(false); // 切片 6：监听 MasterPasswordRequired 事件
   const loading = ref(false);
   const error = ref<string | null>(null);
+  const loadIssues = ref<SessionLoadIssue[]>([]);
+  const retryingLoad = ref(false);
   let unlisten: (() => void) | null = null;
   let subscriptionGeneration = 0;
 
@@ -37,7 +42,9 @@ export const useSessionsStore = defineStore("sessions", () => {
     loading.value = true;
     error.value = null;
     try {
-      items.value = await listSessions();
+      const [sessions, issues] = await Promise.all([listSessions(), listSessionLoadIssues()]);
+      items.value = sessions;
+      loadIssues.value = issues;
     } catch (e) {
       error.value = String(e);
     } finally {
@@ -49,6 +56,25 @@ export const useSessionsStore = defineStore("sessions", () => {
     const id = await createSession(cfg, credential);
     await refresh();
     return id;
+  }
+
+  async function retryLoad() {
+    retryingLoad.value = true;
+    try {
+      await retrySessionLoad();
+      await refresh();
+    } catch (e) {
+      error.value = String(e);
+    } finally {
+      retryingLoad.value = false;
+    }
+  }
+
+  async function updateCredential(id: Uuid, credential: SessionCredential) {
+    const config = items.value.find((session) => session.id === id);
+    if (!config) throw new Error("会话不存在，请刷新后重试");
+    await updateSession(id, config, { Set: credential });
+    await refresh();
   }
 
   async function connect(id: Uuid) {
@@ -115,6 +141,10 @@ export const useSessionsStore = defineStore("sessions", () => {
     masterPasswordRequired,
     loading,
     error,
+    loadIssues,
+    retryingLoad,
+    retryLoad,
+    updateCredential,
     refresh,
     create,
     connect,

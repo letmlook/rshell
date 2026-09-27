@@ -8,7 +8,7 @@ use crate::session::repository::{has_credential, set_presence, SessionRepository
 use crate::terminal::service::TerminalService;
 use rshell_api::types::{
     AuthMethod, ConnectionInfo, ConnectionState, CredentialUpdate, FileType, Protocol,
-    RemoteFileEntry, SessionConfig, SessionCredential, TriggerAction,
+    RemoteFileEntry, SessionConfig, SessionCredential, SessionLoadIssue, TriggerAction,
 };
 use rshell_protocol::serial::{SerialConfig as ProtocolSerialConfig, SerialConnection};
 use rshell_protocol::ssh::sftp::SftpClient;
@@ -193,6 +193,7 @@ enum ProtocolRequest {
 
 /// 会话服务 - 管理会话的生命周期
 pub struct SessionService {
+    load_issues: RwLock<Vec<SessionLoadIssue>>,
     mutations: Mutex<()>,
     lifecycle: Arc<Mutex<()>>,
     /// 会话状态映射
@@ -214,6 +215,9 @@ pub struct SessionService {
 }
 
 impl SessionService {
+    pub async fn list_load_issues(&self) -> Vec<SessionLoadIssue> {
+        self.load_issues.read().await.clone()
+    }
     fn resolve_auth(&self, config: &SessionConfig) -> Result<ResolvedAuthMethod, CoreError> {
         let secret = match &self.repository {
             Some(repo) => repo.credential(config).map_err(|_| {
@@ -249,10 +253,12 @@ impl SessionService {
         repository: Option<Arc<SessionRepository>>,
     ) -> Self {
         let mut restored = HashMap::new();
+        let mut load_issues = Vec::new();
         if let Some(repo) = &repository {
             match repo.list_all() {
-                Ok(configs) => {
-                    for config in configs {
+                Ok(report) => {
+                    load_issues = report.issues;
+                    for config in report.sessions {
                         restored.insert(
                             config.id,
                             SessionState {
@@ -265,10 +271,11 @@ impl SessionService {
                         );
                     }
                 }
-                Err(e) => warn!(error = %e, "Could not restore saved sessions"),
+                Err(_) => load_issues.push(Self::storage_load_issue()),
             }
         }
         Self {
+            load_issues: RwLock::new(load_issues),
             mutations: Mutex::new(()),
             lifecycle: Arc::new(Mutex::new(())),
             sessions: Arc::new(RwLock::new(restored)),
@@ -282,8 +289,14 @@ impl SessionService {
         }
     }
 
-    /// 切片 1.0：从磁盘把已保存会话灌进内存 HashMap。
-    /// 读取失败（路径不存在 / 解析失败）记录 warn! 但不中断启动 —— 用户首次启动属正常空态。
+    fn storage_load_issue() -> SessionLoadIssue {
+        SessionLoadIssue {
+            session_id: None,
+            message: "Could not read saved sessions. Check storage access, then retry.".into(),
+        }
+    }
+
+    /// Retry failed loads without replacing an existing live session state.
     #[instrument(skip(self))]
     pub async fn load_from_disk(&self) {
         let _mutation = self.mutations.lock().await;
@@ -291,29 +304,29 @@ impl SessionService {
             debug!("load_from_disk: no repository configured, skip");
             return;
         };
-        let configs = match repo.list_all() {
+        let report = match repo.list_all() {
             Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "load_from_disk: list_all failed; continuing with empty in-memory state");
+            Err(_) => {
+                *self.load_issues.write().await = vec![Self::storage_load_issue()];
                 return;
             }
         };
+        *self.load_issues.write().await = report.issues;
         let mut sessions = self.sessions.write().await;
-        for cfg in configs {
+        for cfg in report.sessions {
             let id = cfg.id;
-            sessions.insert(
-                id,
-                SessionState {
-                    config: cfg,
-                    connection_state: ConnectionState::Disconnected,
-                    connection_info: None,
-                    attempt: None,
-                    cancel_connect: None,
-                },
-            );
+            sessions.entry(id).or_insert_with(|| SessionState {
+                config: cfg,
+                connection_state: ConnectionState::Disconnected,
+                connection_info: None,
+                attempt: None,
+                cancel_connect: None,
+            });
             debug!(session_id = %id, "load_from_disk: restored");
         }
         info!(count = sessions.len(), "load_from_disk complete");
+        self.event_bus
+            .publish(rshell_api::AppEvent::SessionListChanged);
     }
 
     /// 连接到会话
@@ -915,11 +928,9 @@ impl SessionService {
         // 切片 1.0：先落盘再入内存。落盘失败时阻断 create —— 避免出现
         // "内存有但磁盘无"的不可恢复分裂状态（设计 §4.5 完成判据前提）。
         if let Some(repo) = self.repository.as_ref() {
-            repo.save(
-                &config,
-                credential.map_or(CredentialUpdate::Clear, CredentialUpdate::Set),
-            )
-            .map_err(|e| CoreError::StorageError(format!("save session {} failed: {}", id, e)))?;
+            repo.create(&config, credential).map_err(|e| {
+                CoreError::StorageError(format!("save session {} failed: {}", id, e))
+            })?;
         }
 
         let state = SessionState {
@@ -1222,6 +1233,39 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn keyboard_interactive_resolves_only_when_password_is_declared() {
+        use crate::session::repository::tests::{set, MemoryCredentials};
+        use rshell_api::credentials::{CredentialKey, CredentialKind};
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let repo = Arc::new(SessionRepository::new(
+            dir.path().into(),
+            credentials.clone(),
+        ));
+        let svc = make_service_with_repo(repo.clone());
+        let mut cfg = make_config("interactive", "example.test");
+        cfg.auth_method = AuthMethod::KeyboardInteractive {
+            username: "interactive-user".into(),
+            has_password: true,
+        };
+        assert!(svc.resolve_auth(&cfg).is_err());
+        repo.save(&cfg, set("interactive-secret")).unwrap();
+        assert!(
+            matches!(svc.resolve_auth(&cfg), Ok(ResolvedAuthMethod::KeyboardInteractive { username, password: Some(password) }) if username == "interactive-user" && password == "interactive-secret")
+        );
+        credentials.entries.lock().unwrap().remove(&CredentialKey {
+            session_id: cfg.id,
+            kind: CredentialKind::Password,
+        });
+        assert!(svc.resolve_auth(&cfg).is_err());
+        set_presence(&mut cfg, false);
+        *credentials.fail.lock().unwrap() = true;
+        assert!(
+            matches!(svc.resolve_auth(&cfg), Ok(ResolvedAuthMethod::KeyboardInteractive { username, password: None }) if username == "interactive-user")
+        );
     }
 
     #[tokio::test]
@@ -1763,6 +1807,125 @@ mod tests {
         );
         restarted.delete_session(id).await.unwrap();
         assert!(credentials.entries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn credential_free_creates_do_not_require_keychain() {
+        use crate::session::repository::tests::MemoryCredentials;
+        let tmp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        *credentials.fail.lock().unwrap() = true;
+        let repo = Arc::new(SessionRepository::new(tmp.path().into(), credentials));
+        let svc = make_service_with_repo(repo);
+        for protocol in [Protocol::Telnet, Protocol::Serial, Protocol::SSH] {
+            for credential in [
+                None,
+                Some(SessionCredential {
+                    secret: String::new(),
+                }),
+            ] {
+                let mut cfg = make_config("no secret", "localhost");
+                cfg.protocol = protocol;
+                if protocol == Protocol::Serial {
+                    cfg.serial_config = Some(rshell_api::types::SerialConfig {
+                        port: "/dev/cu.test".into(),
+                        baud_rate: 115200,
+                        data_bits: 8,
+                        stop_bits: 1,
+                        parity: rshell_api::types::SerialParity::None,
+                        flow_control: rshell_api::types::SerialFlowControl::None,
+                    });
+                }
+                let id = svc
+                    .create_session_with_credential(cfg, credential)
+                    .await
+                    .unwrap();
+                let stored = svc
+                    .list_sessions()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .unwrap();
+                assert!(!has_credential(&stored));
+            }
+        }
+        assert_eq!(svc.list_sessions().await.unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn migration_issues_survive_startup_and_retry_without_exposing_secrets() {
+        use crate::session::repository::tests::MemoryCredentials;
+        use rshell_api::{AppCommand, CommandOutcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let path = tmp.path().join(format!("{id}.toml"));
+        let bytes = format!("id = '{id}'\nname = 'legacy'\nhost = 'localhost'\nport = 22\nprotocol = 'SSH'\n[auth_method.Password]\nusername = 'user'\npassword = 'migration-secret'\n");
+        std::fs::write(&path, &bytes).unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        *credentials.fail.lock().unwrap() = true;
+        let repo = Arc::new(SessionRepository::new(
+            tmp.path().into(),
+            credentials.clone(),
+        ));
+        let svc = Arc::new(make_service_with_repo(repo));
+        let dispatcher = make_dispatcher(svc.clone(), tmp.path());
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+        assert!(svc.connect(id).await.is_err());
+        let issues = svc.list_load_issues().await;
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].session_id, Some(id));
+        assert!(!serde_json::to_string(&issues)
+            .unwrap()
+            .contains("migration-secret"));
+        let outcome = dispatcher
+            .dispatch(AppCommand::ListSessionLoadIssues)
+            .await
+            .unwrap();
+        let CommandOutcome::SessionLoadIssues(stored) = outcome else {
+            panic!("unexpected load issues outcome");
+        };
+        assert_eq!(stored, issues);
+        // The Tauri command serializes the extracted payload, not the internal
+        // tagged dispatcher enum (whose list variants are not JSON payloads).
+        assert!(!serde_json::to_string(&stored)
+            .unwrap()
+            .contains("migration-secret"));
+        assert_eq!(svc.list_load_issues().await, issues);
+        dispatcher
+            .dispatch(AppCommand::RetrySessionLoad)
+            .await
+            .unwrap();
+        assert_eq!(svc.list_load_issues().await, issues);
+        let mut replacement = make_config("replacement", "localhost");
+        replacement.id = id;
+        assert!(svc.create_session(replacement).await.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        *credentials.fail.lock().unwrap() = false;
+        dispatcher
+            .dispatch(AppCommand::RetrySessionLoad)
+            .await
+            .unwrap();
+        assert!(svc.list_load_issues().await.is_empty());
+        assert_eq!(svc.list_sessions().await.unwrap()[0].id, id);
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("migration-secret"));
+        // A repeat retry must not reset a live session or its connection attempt.
+        svc.sessions
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .connection_state = ConnectionState::Connecting;
+        dispatcher
+            .dispatch(AppCommand::RetrySessionLoad)
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.get_state(id).await.unwrap(),
+            ConnectionState::Connecting
+        );
     }
 
     #[tokio::test]

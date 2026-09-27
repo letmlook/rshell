@@ -10,7 +10,7 @@
     "typecheck": "vue-tsc --noEmit",
     "test": "vitest run",
     "check:docs": "node scripts/check-docs.mjs",
-    "test:scripts": "node --test scripts/build.test.mjs",
+    "test:scripts": "node --test scripts/*.test.mjs",
     "test:watch": "vitest",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",

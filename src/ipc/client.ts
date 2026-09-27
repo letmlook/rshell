@@ -27,6 +27,7 @@ import type {
   ComposeTarget,
   CredentialUpdate,
   SessionCredential,
+  SessionLoadIssue,
 } from "./types";
 
 // ===== 通用 helper =====
@@ -60,6 +61,8 @@ async function call<T = unknown>(cmd: AppCommand): Promise<T> {
 // 切片 1.2 起：后端 `list_sessions` 改用 §3.4 直接返回 `Vec<SessionConfig>`,
 // 不再包 `{ sessions: [...] }`。`create_session` 直接返回 `Uuid`(新会话 id)。
 export const listSessions = () => call<SessionConfig[]>({ ListSessions: null });
+export const listSessionLoadIssues = () => call<SessionLoadIssue[]>({ ListSessionLoadIssues: null });
+export const retrySessionLoad = () => call({ RetrySessionLoad: null });
 
 export const createSession = (config: SessionConfig, credential: SessionCredential | null) =>
   call<Uuid>({ CreateSession: { config, credential } });

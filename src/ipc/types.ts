@@ -68,6 +68,11 @@ export interface SessionInfo {
   state: ConnectionState;
 }
 
+export interface SessionLoadIssue {
+  session_id: Uuid | null;
+  message: string;
+}
+
 // ===== 文件传输相关 =====
 
 export interface RemoteFileEntry {
@@ -399,6 +404,8 @@ export type AppCommand =
   | { UnloadPlugin: { plugin_id: string } }
   // List / snapshot
   | { ListSessions: null }
+  | { ListSessionLoadIssues: null }
+  | { RetrySessionLoad: null }
   | { ListTunnels: null }
   | { ListKeys: null }
   | { ListPlugins: null }

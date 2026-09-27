@@ -7,6 +7,9 @@ const listSessions = vi.fn().mockResolvedValue([]);
 
 vi.mock("../../src/ipc/client", () => ({
   listSessions: (...a: unknown[]) => listSessions(...a),
+  listSessionLoadIssues: vi.fn().mockResolvedValue([]),
+  retrySessionLoad: vi.fn(),
+  updateSession: vi.fn(),
   createSession: vi.fn(),
   connectSession: vi.fn(),
   disconnectSession: (...a: unknown[]) => disconnectSession(...a),

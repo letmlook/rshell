@@ -549,6 +549,13 @@ impl CommandDispatcher {
                 // 设计 §3.2 死循环修复：直接返回数据,不再 publish *Snapshot。
                 Ok(CommandOutcome::Sessions(sessions))
             }
+            AppCommand::ListSessionLoadIssues => Ok(CommandOutcome::SessionLoadIssues(
+                self.session_service.list_load_issues().await,
+            )),
+            AppCommand::RetrySessionLoad => {
+                self.session_service.load_from_disk().await;
+                Ok(CommandOutcome::None)
+            }
             AppCommand::ListTunnels => {
                 let tunnels = self.tunnel_manager.list_tunnels().await;
                 Ok(CommandOutcome::Tunnels(tunnels))

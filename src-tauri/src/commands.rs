@@ -10,7 +10,7 @@
 
 use rshell_api::types::{
     ComposeTarget, CredentialUpdate, PluginInfo, RemoteFileEntry, SessionConfig, SessionCredential,
-    TerminalColorScheme, TransferTaskInfo,
+    SessionLoadIssue, TerminalColorScheme, TransferTaskInfo,
 };
 use rshell_api::{AppCommand, CommandOutcome};
 use tauri::ipc::Channel;
@@ -178,6 +178,16 @@ pub async fn create_session(
 
 // ListSessions:返回 Vec<SessionConfig>
 cmd!(list_sessions() -> Sessions(Vec<SessionConfig>) = AppCommand::ListSessions);
+cmd!(list_session_load_issues() -> SessionLoadIssues(Vec<SessionLoadIssue>) = AppCommand::ListSessionLoadIssues);
+#[tauri::command]
+pub async fn retry_session_load(state: State<'_, AppState>) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::RetrySessionLoad)
+        .await
+        .map_err(IpcError::from)?;
+    Ok(())
+}
 
 // 切片 4 新增：decide_host_key —— 把 UI 端的 host key 决策通过 dispatcher
 // 派发到 HostKeyDecisionRegistry.resolve(decision_id, decision),唤醒阻塞在

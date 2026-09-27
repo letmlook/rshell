@@ -181,6 +181,13 @@ pub struct UnsupportedTunnelRule {
     pub reason: String,
 }
 
+/// Persistent, sanitized diagnostics; never include raw TOML or backend errors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionLoadIssue {
+    pub session_id: Option<Uuid>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingTunnelInfo {
     pub rules: Vec<(Uuid, PortForwardRule)>,

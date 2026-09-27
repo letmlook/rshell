@@ -180,6 +180,10 @@ mod tests {
             "com.letmlook.rshell.credentials".into(),
             "session:123e4567-e89b-12d3-a456-426614174000:password".into()
         )));
+        assert!(backend.entries.lock().unwrap().contains_key(&(
+            "com.letmlook.rshell.credentials".into(),
+            "session:123e4567-e89b-12d3-a456-426614174000:passphrase".into()
+        )));
         store.delete(&password).unwrap();
         assert_eq!(store.get(&password).unwrap(), None);
         assert_eq!(

@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::types::{
     ActiveTunnelInfo, PendingTunnelInfo, PluginInfo, QuickCommand, RemoteFileEntry, SessionConfig,
-    SshKeyInfo, ThemeInfo, TransferTaskInfo, Trigger,
+    SessionLoadIssue, SshKeyInfo, ThemeInfo, TransferTaskInfo, Trigger,
 };
 
 /// 读命令返回结构化数据;写命令返回 `None`。
@@ -25,6 +25,7 @@ pub enum CommandOutcome {
     None,
     /// 响应 `ListSessions`；SessionConfig 只包含认证描述符，不包含凭据。
     Sessions(Vec<SessionConfig>),
+    SessionLoadIssues(Vec<SessionLoadIssue>),
     /// 响应 `CreateSession` —— 此前返回值被丢弃,前端拿不到新会话 id
     SessionId(Uuid),
     /// 响应 `ListTriggers` —— 修 §3.2 死循环
@@ -60,6 +61,7 @@ impl CommandOutcome {
         match self {
             Self::None => "none",
             Self::Sessions(_) => "sessions",
+            Self::SessionLoadIssues(_) => "session_load_issues",
             Self::SessionId(_) => "session_id",
             Self::Triggers(_) => "triggers",
             Self::QuickCommands(_) => "quick_commands",

@@ -39,7 +39,7 @@ use crate::{Connection, ProtocolError};
 /// SSH 客户端
 pub struct SshClient {
     config: SessionConfig,
-    auth: ResolvedAuthMethod,
+    auth: Option<ResolvedAuthMethod>,
     /// 连接句柄
     handle: Option<russh::client::Handle<SshHandler>>,
     /// 当前会话通道
@@ -428,7 +428,7 @@ impl SshClient {
     pub fn new(config: SessionConfig, auth: ResolvedAuthMethod) -> Self {
         Self {
             config,
-            auth,
+            auth: Some(auth),
             handle: None,
             channel: None,
             data_rx: None,
@@ -446,6 +446,11 @@ impl SshClient {
         &mut self,
         host_key_sink: Option<Arc<dyn HostKeyDecisionSink>>,
     ) -> Result<(), ProtocolError> {
+        // The attempt owns the only resolved auth value. Taking it before the
+        // first await also releases it if TCP/host-key negotiation is cancelled.
+        let auth = self.auth.take().ok_or_else(|| {
+            ProtocolError::AuthFailed("Authentication material already consumed".into())
+        })?;
         info!(
             "Connecting to SSH server {}:{}",
             self.config.host, self.config.port
@@ -499,7 +504,7 @@ impl SshClient {
         info!("SSH TCP connection established");
 
         // 进行认证
-        self.authenticate().await?;
+        self.authenticate(auth).await?;
 
         info!("SSH authentication successful");
 
@@ -512,15 +517,15 @@ impl SshClient {
     }
 
     /// 执行 SSH 认证
-    async fn authenticate(&mut self) -> Result<(), ProtocolError> {
+    async fn authenticate(&mut self, auth: ResolvedAuthMethod) -> Result<(), ProtocolError> {
         let handle = self
             .handle
             .as_mut()
             .ok_or_else(|| ProtocolError::ConnectionFailed("Not connected".to_string()))?;
 
-        let username = get_username(&self.auth);
+        let username = get_username(&auth);
 
-        match &self.auth {
+        match &auth {
             ResolvedAuthMethod::Password { password, .. } => {
                 let success = handle
                     .authenticate_password(username, password)
@@ -870,7 +875,7 @@ mod tests {
             }
         ));
         assert!(
-            matches!(client.auth, ResolvedAuthMethod::Password { password, .. } if password == "sample-secret-password")
+            matches!(client.auth, Some(ResolvedAuthMethod::Password { password, .. }) if password == "sample-secret-password")
         );
     }
 
@@ -906,7 +911,7 @@ mod tests {
             }
         ));
         assert!(
-            matches!(client.auth, ResolvedAuthMethod::PublicKey { passphrase: Some(value), .. } if value == "sample-secret-passphrase")
+            matches!(client.auth, Some(ResolvedAuthMethod::PublicKey { passphrase: Some(value), .. }) if value == "sample-secret-passphrase")
         );
     }
 
@@ -930,6 +935,7 @@ mod tests {
     #[derive(Default)]
     struct OutputTestServer {
         shell: Option<russh::ChannelId>,
+        allowed_key: Option<ssh_key::PublicKey>,
     }
 
     #[async_trait::async_trait]
@@ -937,10 +943,31 @@ mod tests {
         type Error = russh::Error;
         async fn auth_password(
             &mut self,
-            _: &str,
-            _: &str,
+            user: &str,
+            password: &str,
         ) -> Result<russh::server::Auth, Self::Error> {
-            Ok(russh::server::Auth::Accept)
+            Ok(if user == "test" && password == "test" {
+                russh::server::Auth::Accept
+            } else {
+                russh::server::Auth::Reject {
+                    proceed_with_methods: None,
+                }
+            })
+        }
+        async fn auth_publickey(
+            &mut self,
+            user: &str,
+            key: &ssh_key::PublicKey,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            Ok(
+                if user == "test" && self.allowed_key.as_ref() == Some(key) {
+                    russh::server::Auth::Accept
+                } else {
+                    russh::server::Auth::Reject {
+                        proceed_with_methods: None,
+                    }
+                },
+            )
         }
         async fn channel_open_session(
             &mut self,
@@ -1029,6 +1056,10 @@ mod tests {
                 .connect_ssh(Some(Arc::new(AcceptTestHost)))
                 .await
                 .unwrap();
+            assert!(
+                client.auth.is_none(),
+                "authenticated client retains credentials"
+            );
             let mut output = client.take_data_receiver().unwrap();
             assert_eq!(output.recv().await.unwrap(), b"shell output");
             client.send_data(b"input echo").await.unwrap();
@@ -1041,6 +1072,132 @@ mod tests {
         .await
         .unwrap();
         server.await.unwrap();
+    }
+
+    fn password_client(port: u16, password: &str) -> SshClient {
+        SshClient::new(
+            SessionConfig {
+                id: Uuid::new_v4(),
+                name: "credential boundary".into(),
+                folder_id: None,
+                host: "127.0.0.1".into(),
+                port,
+                protocol: rshell_api::types::Protocol::SSH,
+                auth_method: AuthMethod::Password {
+                    username: "test".into(),
+                    has_password: true,
+                },
+                serial_config: None,
+            },
+            ResolvedAuthMethod::Password {
+                username: "test".into(),
+                password: password.into(),
+            },
+        )
+    }
+
+    async fn auth_server(
+        allowed_key: Option<ssh_key::PublicKey>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let config = russh::server::Config {
+                keys: vec![ssh_key::PrivateKey::random(
+                    &mut ssh_key::rand_core::OsRng,
+                    ssh_key::Algorithm::Ed25519,
+                )
+                .unwrap()],
+                auth_rejection_time: std::time::Duration::ZERO,
+                ..Default::default()
+            };
+            if let Ok(running) = russh::server::run_stream(
+                Arc::new(config),
+                stream,
+                OutputTestServer {
+                    shell: None,
+                    allowed_key,
+                },
+            )
+            .await
+            {
+                let _ = running.await;
+            }
+        });
+        (port, server)
+    }
+
+    #[tokio::test]
+    async fn wrong_password_is_rejected_and_dropped() {
+        let (port, server) = auth_server(None).await;
+        let mut client = password_client(port, "wrong-password");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.connect_ssh(Some(Arc::new(AcceptTestHost))),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(ProtocolError::AuthFailed(_))));
+        assert!(client.auth.is_none());
+        client.disconnect_ssh().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn encrypted_private_key_authenticates_and_drops_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_ed25519");
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        key.encrypt(&mut ssh_key::rand_core::OsRng, "key-passphrase")
+            .unwrap()
+            .write_openssh_file(&path, ssh_key::LineEnding::LF)
+            .unwrap();
+        let (port, server) = auth_server(Some(key.public_key().clone())).await;
+        let mut client = password_client(port, "unused");
+        client.config.auth_method = AuthMethod::PublicKey {
+            username: "test".into(),
+            key_path: path.clone(),
+            has_passphrase: true,
+        };
+        client.auth = Some(ResolvedAuthMethod::PublicKey {
+            username: "test".into(),
+            key_path: path,
+            passphrase: Some("key-passphrase".into()),
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.connect_ssh(Some(Arc::new(AcceptTestHost))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(client.auth.is_none());
+        client.disconnect_ssh().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_failed_handshake_drop_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut client = password_client(port, "attempt-secret");
+        // A connected TCP socket that never speaks SSH leaves authentication pending.
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.connect_ssh(None)
+        )
+        .await
+        .is_err());
+        assert!(client.auth.is_none());
+        drop(listener);
+        let mut failed = password_client(port, "attempt-secret");
+        assert!(failed.connect_ssh(None).await.is_err());
+        assert!(failed.auth.is_none());
     }
 
     #[tokio::test]

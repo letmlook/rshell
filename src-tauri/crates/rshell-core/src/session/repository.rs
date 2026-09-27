@@ -3,7 +3,9 @@
 //! 提供会配置的持久化操作接口。
 
 use rshell_api::credentials::{CredentialKey, CredentialKind, CredentialStore};
-use rshell_api::types::{AuthMethod, CredentialUpdate, SessionConfig};
+use rshell_api::types::{
+    AuthMethod, CredentialUpdate, SessionConfig, SessionCredential, SessionLoadIssue,
+};
 use rshell_infra::storage::session_store::SessionStore;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -14,6 +16,12 @@ pub struct SessionRepository {
     store: SessionStore,
     credentials: Arc<dyn CredentialStore>,
     transaction: Mutex<()>,
+}
+
+#[derive(Default)]
+pub struct SessionLoadReport {
+    pub sessions: Vec<SessionConfig>,
+    pub issues: Vec<SessionLoadIssue>,
 }
 
 #[cfg(test)]
@@ -110,7 +118,7 @@ pub(crate) mod tests {
             assert_eq!(repo.load(id).unwrap().unwrap().id, id);
             assert_eq!(credentials.get(&key(id, kind)).unwrap().as_deref(), Some("sample-secret"));
             assert_safe(&path);
-            assert_eq!(repo.list_all().unwrap().len(), 1);
+            assert_eq!(repo.list_all().unwrap().sessions.len(), 1);
         }
     }
 
@@ -128,7 +136,9 @@ pub(crate) mod tests {
         *credentials.fail.lock().unwrap() = true;
         let repo = SessionRepository::new(dir.path().into(), credentials);
         assert!(repo.load(id).is_err());
-        assert!(repo.list_all().unwrap().is_empty());
+        let report = repo.list_all().unwrap();
+        assert!(report.sessions.is_empty());
+        assert_eq!(report.issues[0].session_id, Some(id));
         assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
     }
 
@@ -237,7 +247,7 @@ pub(crate) mod tests {
         let listed = repo.list_all();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
-        assert!(listed.unwrap().is_empty());
+        assert!(listed.unwrap().sessions.is_empty());
         assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
         assert!(credentials.entries.lock().unwrap().is_empty());
     }
@@ -308,6 +318,33 @@ impl SessionRepository {
     /// 使用默认路径创建仓库
     pub fn with_default_path(credentials: Arc<dyn CredentialStore>) -> Self {
         Self::new(SessionStore::default_path(), credentials)
+    }
+
+    /// Fresh metadata has no previous credential to clean up. Never reuse this
+    /// path for updates or failed legacy migrations with an existing file.
+    pub fn create(
+        &self,
+        session: &SessionConfig,
+        credential: Option<SessionCredential>,
+    ) -> anyhow::Result<()> {
+        let _guard = self
+            .transaction
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+        anyhow::ensure!(
+            self.store.load_pending(session.id)?.is_none(),
+            "Session already exists"
+        );
+        match credential {
+            Some(credential) if !credential.secret.is_empty() => {
+                self.save_locked(session, CredentialUpdate::Set(credential))
+            }
+            _ => {
+                let mut metadata = session.clone();
+                set_presence(&mut metadata, false);
+                self.store.save(&metadata)
+            }
+        }
     }
 
     /// 保存会话
@@ -421,20 +458,26 @@ impl SessionRepository {
     }
 
     /// 列出所有会话
-    pub fn list_all(&self) -> anyhow::Result<Vec<SessionConfig>> {
+    pub fn list_all(&self) -> anyhow::Result<SessionLoadReport> {
         let _guard = self
             .transaction
             .lock()
             .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
-        let mut sessions = Vec::new();
+        let mut report = SessionLoadReport::default();
         for id in self.store.list_ids()? {
             match self.load_locked(id) {
-                Ok(Some(config)) => sessions.push(config),
+                Ok(Some(config)) => report.sessions.push(config),
                 Ok(None) => {}
-                Err(_) => tracing::warn!(session_id = %id, "Could not load or migrate session"),
+                Err(_) => {
+                    tracing::warn!(session_id = %id, "Could not load or migrate session");
+                    report.issues.push(SessionLoadIssue {
+                        session_id: Some(id),
+                        message: "Could not load or migrate saved session. Check configuration and Keychain access, then retry.".into(),
+                    });
+                }
             }
         }
-        Ok(sessions)
+        Ok(report)
     }
 
     /// Resolve only at the SSH connection boundary; never cache in session state.
