@@ -17,7 +17,7 @@
 - 安全迁移现有包含明文秘密的会话 TOML。
 - 为传输中的任务提供暂停操作，为已暂停任务提供恢复操作，并显示失败原因。
 - 修正 macOS Bundle ID。
-- 对前端第三方大依赖做稳定的手工分包，消除单个 500 KiB 以上 JavaScript chunk 的警告。
+- 对前端第三方大依赖做稳定的手工分包，消除单个 500,000 字节以上 JavaScript chunk 的警告。
 - 加入 macOS CI，覆盖仓库当前定义的前端、文档、脚本、Rust 与依赖审计检查。
 - 将重复的验证、审计和 macOS 发布预检固化为仓库脚本，本地与 CI 复用同一入口。
 - 将 `.omo/` 作为本地代理状态忽略。
@@ -55,8 +55,9 @@
 
 ### 服务分层
 
+- `rshell-api` 定义不依赖平台的 `CredentialStore` 端口及错误类型，保持 crate 依赖单向。
 - `rshell-infra` 提供系统钥匙串适配器。
-- `rshell-core` 定义凭据存储抽象并在会话仓库/服务中协调元数据与秘密。
+- `rshell-core` 消费凭据存储端口，并在会话仓库/服务中协调元数据与秘密。
 - `rshell-protocol` 只接收一次连接所需的完整运行时认证数据，不直接访问钥匙串。
 - Tauri 层只做命令参数转换和错误映射。
 
@@ -91,7 +92,7 @@
 - Bundle ID 改为 `com.letmlook.rshell`。
 - Vite 使用稳定的 `manualChunks` 分组，将 Vue/Pinia、Element Plus、xterm、dockview 和其他依赖拆开；业务模块不为了追求数字进行不必要切分。
 - 生产 sourcemap 默认关闭；需要调试时通过显式环境变量开启。
-- 构建测试读取产物清单并断言没有单个超过约定阈值的 JavaScript chunk，同时保留 Vite 构建作为最终证据。
+- 构建测试读取产物清单并断言没有单个超过 500,000 字节的 JavaScript chunk，同时保留 Vite 构建作为最终证据。
 
 调试 `.app` 的体积不作为发布体积结论；发布体积只能由 release bundle 验证。
 
