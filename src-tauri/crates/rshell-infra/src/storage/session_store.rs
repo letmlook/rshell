@@ -102,7 +102,7 @@ fn decode(content: &str) -> anyhow::Result<(SessionConfig, Option<CredentialUpda
     };
     value["auth_method"] = toml::Value::try_from(auth).map_err(|_| invalid())?;
     let config = value.try_into().map_err(|_| invalid())?;
-    let migration = legacy.then(|| match secret {
+    let migration = legacy.then_some(match secret {
         Some(secret) if !secret.is_empty() => CredentialUpdate::Set(SessionCredential { secret }),
         _ => CredentialUpdate::Clear,
     });

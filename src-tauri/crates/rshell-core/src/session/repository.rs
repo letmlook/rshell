@@ -24,6 +24,225 @@ pub struct SessionLoadReport {
     pub issues: Vec<SessionLoadIssue>,
 }
 
+impl SessionRepository {
+    /// 创建新的仓库
+    pub fn new(path: PathBuf, credentials: Arc<dyn CredentialStore>) -> Self {
+        Self {
+            store: SessionStore::new(path),
+            credentials,
+            transaction: Mutex::new(()),
+        }
+    }
+
+    /// 使用默认路径创建仓库
+    pub fn with_default_path(credentials: Arc<dyn CredentialStore>) -> Self {
+        Self::new(SessionStore::default_path(), credentials)
+    }
+
+    /// Fresh metadata has no previous credential to clean up. Never reuse this
+    /// path for updates or failed legacy migrations with an existing file.
+    pub fn create(
+        &self,
+        session: &SessionConfig,
+        credential: Option<SessionCredential>,
+    ) -> anyhow::Result<()> {
+        let _guard = self
+            .transaction
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+        anyhow::ensure!(
+            self.store.load_pending(session.id)?.is_none(),
+            "Session already exists"
+        );
+        match credential {
+            Some(credential) if !credential.secret.is_empty() => {
+                self.save_locked(session, CredentialUpdate::Set(credential))
+            }
+            _ => {
+                let mut metadata = session.clone();
+                set_presence(&mut metadata, false);
+                self.store.save(&metadata)
+            }
+        }
+    }
+
+    /// 保存会话
+    pub fn save(&self, session: &SessionConfig, update: CredentialUpdate) -> anyhow::Result<()> {
+        let _guard = self
+            .transaction
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+        self.save_locked(session, update)
+    }
+
+    fn save_locked(&self, session: &SessionConfig, update: CredentialUpdate) -> anyhow::Result<()> {
+        let mut metadata = session.clone();
+        let kind = credential_kind(&metadata);
+        if matches!(update, CredentialUpdate::Keep) {
+            let previous = self.store.load(session.id)?;
+            if let Some(previous) = &previous {
+                anyhow::ensure!(
+                    credential_kind(previous) == kind,
+                    "Changing credential kind requires Set or Clear"
+                );
+            }
+            set_presence(&mut metadata, previous.as_ref().is_some_and(has_credential));
+            return self.store.save(&metadata);
+        }
+        let keys =
+            [CredentialKind::Password, CredentialKind::Passphrase].map(|kind| CredentialKey {
+                session_id: session.id,
+                kind,
+            });
+        let previous = [
+            self.credentials.get(&keys[0])?,
+            self.credentials.get(&keys[1])?,
+        ];
+        let secret = match &update {
+            CredentialUpdate::Set(credential) if !credential.secret.is_empty() => {
+                Some(credential.secret.as_str())
+            }
+            _ => None,
+        };
+        set_presence(&mut metadata, secret.is_some());
+        let result = (|| -> anyhow::Result<()> {
+            for key in &keys {
+                if key.kind == kind {
+                    if let Some(secret) = secret {
+                        self.credentials.set(key, secret)?;
+                        continue;
+                    }
+                }
+                self.credentials.delete(key)?;
+            }
+            self.store.save(&metadata)
+        })();
+        if let Err(error) = result {
+            let mut rollback_failed = false;
+            for (key, secret) in keys.iter().zip(previous.iter()) {
+                let restored = match secret {
+                    Some(secret) => self.credentials.set(key, secret),
+                    None => self.credentials.delete(key),
+                };
+                rollback_failed |= restored.is_err();
+            }
+            if rollback_failed {
+                return Err(anyhow::anyhow!(
+                    "Session save failed; credential rollback failed"
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// 加载会话
+    pub fn load(&self, id: Uuid) -> anyhow::Result<Option<SessionConfig>> {
+        let _guard = self
+            .transaction
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+        self.load_locked(id)
+    }
+
+    fn load_locked(&self, id: Uuid) -> anyhow::Result<Option<SessionConfig>> {
+        let Some((config, migration)) = self.store.load_pending(id)? else {
+            return Ok(None);
+        };
+        if let Some(update) = migration {
+            self.save_locked(&config, update)?;
+        }
+        Ok(Some(config))
+    }
+
+    /// 删除会话
+    pub fn delete(&self, id: Uuid) -> anyhow::Result<()> {
+        let _guard = self
+            .transaction
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+        self.store.delete(id)?;
+        // Attempt both entries even when one backend deletion fails.
+        let password = self.credentials.delete(&CredentialKey {
+            session_id: id,
+            kind: CredentialKind::Password,
+        });
+        let passphrase = self.credentials.delete(&CredentialKey {
+            session_id: id,
+            kind: CredentialKind::Passphrase,
+        });
+        password?;
+        passphrase?;
+        Ok(())
+    }
+
+    /// 列出所有会话
+    pub fn list_all(&self) -> anyhow::Result<SessionLoadReport> {
+        let _guard = self
+            .transaction
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+        let mut report = SessionLoadReport::default();
+        for id in self.store.list_ids()? {
+            match self.load_locked(id) {
+                Ok(Some(config)) => report.sessions.push(config),
+                Ok(None) => {}
+                Err(_) => {
+                    tracing::warn!(session_id = %id, "Could not load or migrate session");
+                    report.issues.push(SessionLoadIssue {
+                        session_id: Some(id),
+                        message: "Could not load or migrate saved session. Check configuration and Keychain access, then retry.".into(),
+                    });
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Resolve only at the SSH connection boundary; never cache in session state.
+    pub fn credential(&self, config: &SessionConfig) -> anyhow::Result<Option<String>> {
+        let _guard = self
+            .transaction
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+        if !has_credential(config) {
+            return Ok(None);
+        }
+        let secret = self.credentials.get(&CredentialKey {
+            session_id: config.id,
+            kind: credential_kind(config),
+        })?;
+        anyhow::ensure!(
+            secret.as_ref().is_some_and(|s| !s.is_empty()),
+            "Stored session credential is unavailable"
+        );
+        Ok(secret)
+    }
+}
+
+fn credential_kind(config: &SessionConfig) -> CredentialKind {
+    match config.auth_method {
+        AuthMethod::PublicKey { .. } => CredentialKind::Passphrase,
+        _ => CredentialKind::Password,
+    }
+}
+
+pub(crate) fn has_credential(config: &SessionConfig) -> bool {
+    match config.auth_method {
+        AuthMethod::Password { has_password, .. }
+        | AuthMethod::KeyboardInteractive { has_password, .. } => has_password,
+        AuthMethod::PublicKey { has_passphrase, .. } => has_passphrase,
+    }
+}
+
+pub(crate) fn set_presence(config: &mut SessionConfig, present: bool) {
+    match &mut config.auth_method {
+        AuthMethod::Password { has_password, .. }
+        | AuthMethod::KeyboardInteractive { has_password, .. } => *has_password = present,
+        AuthMethod::PublicKey { has_passphrase, .. } => *has_passphrase = present,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -302,224 +521,5 @@ pub(crate) mod tests {
         repo.save(&cfg, CredentialUpdate::Clear).unwrap();
         assert!(credentials.entries.lock().unwrap().is_empty());
         assert!(!has_credential(&repo.load(cfg.id).unwrap().unwrap()));
-    }
-}
-
-impl SessionRepository {
-    /// 创建新的仓库
-    pub fn new(path: PathBuf, credentials: Arc<dyn CredentialStore>) -> Self {
-        Self {
-            store: SessionStore::new(path),
-            credentials,
-            transaction: Mutex::new(()),
-        }
-    }
-
-    /// 使用默认路径创建仓库
-    pub fn with_default_path(credentials: Arc<dyn CredentialStore>) -> Self {
-        Self::new(SessionStore::default_path(), credentials)
-    }
-
-    /// Fresh metadata has no previous credential to clean up. Never reuse this
-    /// path for updates or failed legacy migrations with an existing file.
-    pub fn create(
-        &self,
-        session: &SessionConfig,
-        credential: Option<SessionCredential>,
-    ) -> anyhow::Result<()> {
-        let _guard = self
-            .transaction
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
-        anyhow::ensure!(
-            self.store.load_pending(session.id)?.is_none(),
-            "Session already exists"
-        );
-        match credential {
-            Some(credential) if !credential.secret.is_empty() => {
-                self.save_locked(session, CredentialUpdate::Set(credential))
-            }
-            _ => {
-                let mut metadata = session.clone();
-                set_presence(&mut metadata, false);
-                self.store.save(&metadata)
-            }
-        }
-    }
-
-    /// 保存会话
-    pub fn save(&self, session: &SessionConfig, update: CredentialUpdate) -> anyhow::Result<()> {
-        let _guard = self
-            .transaction
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
-        self.save_locked(session, update)
-    }
-
-    fn save_locked(&self, session: &SessionConfig, update: CredentialUpdate) -> anyhow::Result<()> {
-        let mut metadata = session.clone();
-        let kind = credential_kind(&metadata);
-        if matches!(update, CredentialUpdate::Keep) {
-            let previous = self.store.load(session.id)?;
-            if let Some(previous) = &previous {
-                anyhow::ensure!(
-                    credential_kind(previous) == kind,
-                    "Changing credential kind requires Set or Clear"
-                );
-            }
-            set_presence(&mut metadata, previous.as_ref().is_some_and(has_credential));
-            return self.store.save(&metadata);
-        }
-        let keys =
-            [CredentialKind::Password, CredentialKind::Passphrase].map(|kind| CredentialKey {
-                session_id: session.id,
-                kind,
-            });
-        let previous = [
-            self.credentials.get(&keys[0])?,
-            self.credentials.get(&keys[1])?,
-        ];
-        let secret = match &update {
-            CredentialUpdate::Set(credential) if !credential.secret.is_empty() => {
-                Some(credential.secret.as_str())
-            }
-            _ => None,
-        };
-        set_presence(&mut metadata, secret.is_some());
-        let result = (|| -> anyhow::Result<()> {
-            for key in &keys {
-                if key.kind == kind {
-                    if let Some(secret) = secret {
-                        self.credentials.set(key, secret)?;
-                        continue;
-                    }
-                }
-                self.credentials.delete(key)?;
-            }
-            self.store.save(&metadata)
-        })();
-        if let Err(error) = result {
-            let mut rollback_failed = false;
-            for (key, secret) in keys.iter().zip(previous.iter()) {
-                let restored = match secret {
-                    Some(secret) => self.credentials.set(key, secret),
-                    None => self.credentials.delete(key),
-                };
-                rollback_failed |= restored.is_err();
-            }
-            if rollback_failed {
-                return Err(anyhow::anyhow!(
-                    "Session save failed; credential rollback failed"
-                ));
-            }
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    /// 加载会话
-    pub fn load(&self, id: Uuid) -> anyhow::Result<Option<SessionConfig>> {
-        let _guard = self
-            .transaction
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
-        self.load_locked(id)
-    }
-
-    fn load_locked(&self, id: Uuid) -> anyhow::Result<Option<SessionConfig>> {
-        let Some((config, migration)) = self.store.load_pending(id)? else {
-            return Ok(None);
-        };
-        if let Some(update) = migration {
-            self.save_locked(&config, update)?;
-        }
-        Ok(Some(config))
-    }
-
-    /// 删除会话
-    pub fn delete(&self, id: Uuid) -> anyhow::Result<()> {
-        let _guard = self
-            .transaction
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
-        self.store.delete(id)?;
-        // Attempt both entries even when one backend deletion fails.
-        let password = self.credentials.delete(&CredentialKey {
-            session_id: id,
-            kind: CredentialKind::Password,
-        });
-        let passphrase = self.credentials.delete(&CredentialKey {
-            session_id: id,
-            kind: CredentialKind::Passphrase,
-        });
-        password?;
-        passphrase?;
-        Ok(())
-    }
-
-    /// 列出所有会话
-    pub fn list_all(&self) -> anyhow::Result<SessionLoadReport> {
-        let _guard = self
-            .transaction
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
-        let mut report = SessionLoadReport::default();
-        for id in self.store.list_ids()? {
-            match self.load_locked(id) {
-                Ok(Some(config)) => report.sessions.push(config),
-                Ok(None) => {}
-                Err(_) => {
-                    tracing::warn!(session_id = %id, "Could not load or migrate session");
-                    report.issues.push(SessionLoadIssue {
-                        session_id: Some(id),
-                        message: "Could not load or migrate saved session. Check configuration and Keychain access, then retry.".into(),
-                    });
-                }
-            }
-        }
-        Ok(report)
-    }
-
-    /// Resolve only at the SSH connection boundary; never cache in session state.
-    pub fn credential(&self, config: &SessionConfig) -> anyhow::Result<Option<String>> {
-        let _guard = self
-            .transaction
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
-        if !has_credential(config) {
-            return Ok(None);
-        }
-        let secret = self.credentials.get(&CredentialKey {
-            session_id: config.id,
-            kind: credential_kind(config),
-        })?;
-        anyhow::ensure!(
-            secret.as_ref().is_some_and(|s| !s.is_empty()),
-            "Stored session credential is unavailable"
-        );
-        Ok(secret)
-    }
-}
-
-fn credential_kind(config: &SessionConfig) -> CredentialKind {
-    match config.auth_method {
-        AuthMethod::PublicKey { .. } => CredentialKind::Passphrase,
-        _ => CredentialKind::Password,
-    }
-}
-
-pub(crate) fn has_credential(config: &SessionConfig) -> bool {
-    match config.auth_method {
-        AuthMethod::Password { has_password, .. }
-        | AuthMethod::KeyboardInteractive { has_password, .. } => has_password,
-        AuthMethod::PublicKey { has_passphrase, .. } => has_passphrase,
-    }
-}
-
-pub(crate) fn set_presence(config: &mut SessionConfig, present: bool) {
-    match &mut config.auth_method {
-        AuthMethod::Password { has_password, .. }
-        | AuthMethod::KeyboardInteractive { has_password, .. } => *has_password = present,
-        AuthMethod::PublicKey { has_passphrase, .. } => *has_passphrase = present,
     }
 }
