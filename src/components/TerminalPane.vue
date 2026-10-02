@@ -2,10 +2,14 @@
 /**
  * TerminalPane —— 切片 1.3 + 切片 2.4 搜索
  *
- * 设计 §4.3 流程 A:挂载 xterm → invoke('attach_terminal', { session_id, onData: ch })
+ * 设计 §4.3 流程 A:挂载 xterm → invoke('attach_terminal', { session_id, on_data: ch })
+ * （IPC 参数键契约：后端命令统一 rename_all = "snake_case"，键名与 Rust 形参一致）
  * → flush 积压 → 转 Attached。term.onData → invoke('send_input')。
  *
  * 切片 2.4:Element Plus 搜索栏 + @xterm/addon-search 的 findNext/findPrevious。
+ *
+ * PROB-13:attach_terminal 失败时面板内渲染错误状态条(可重试附加);
+ * sendInput/resizeTerminal 持续失败达阈值时弹一次性 ElMessage,不留仅 console 的故障路径。
  *
  * onContextLoss:WebGL addon 在某些环境下会触发 context loss,自动 fallback 到 canvas
  * (设计 §9 #3 + 切片 1.3 完成判据)。
@@ -18,6 +22,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { SearchAddon } from "@xterm/addon-search";
 import { Channel } from "@tauri-apps/api/core";
 import { invoke } from "@tauri-apps/api/core";
+import { ElMessage } from "element-plus/es/components/message/index.mjs";
 import { sendInput, resizeTerminal } from "../ipc/client";
 import type { Uuid } from "../ipc/types";
 import { useThemeStore } from "../stores/theme";
@@ -31,6 +36,8 @@ const props = defineProps<{
 const containerRef = ref<HTMLDivElement | null>(null);
 const searchBarVisible = ref(false);
 const searchTerm = ref("");
+/** attach_terminal 失败信息；非空时面板内渲染错误状态条（PROB-13，不再空白终端） */
+const attachError = ref<string | null>(null);
 let term: Terminal | null = null;
 let fit: FitAddon | null = null;
 let search: SearchAddon | null = null;
@@ -110,6 +117,54 @@ function onTerminalAction(event: Event) {
   if (detail.action === "clear") term?.clear();
 }
 
+// ── PROB-13：sendInput/resizeTerminal 持续失败的一次性可见提示 ──
+// 单次瞬时失败不打扰；连续失败达阈值说明后端链路故障（按键正被静默丢弃），
+// 弹一次 ElMessage；任一次成功即复位，允许下一轮持续失败再次提示。
+const IO_FAILURE_NOTICE_THRESHOLD = 3;
+let ioFailureStreak = 0;
+let ioFailureNotified = false;
+
+function noteIoSuccess() {
+  ioFailureStreak = 0;
+  ioFailureNotified = false;
+}
+
+function noteIoFailure(what: string, e: unknown) {
+  console.error(`[TerminalPane] ${what} failed`, e);
+  ioFailureStreak += 1;
+  if (ioFailureStreak >= IO_FAILURE_NOTICE_THRESHOLD && !ioFailureNotified) {
+    ioFailureNotified = true;
+    ElMessage.error(
+      "终端与后端通信持续失败：输入/尺寸调整未送达。请检查会话连接状态，必要时重连会话。",
+    );
+  }
+}
+
+/**
+ * attach_terminal：把字节流 Channel 注册到后端（幂等，可重试）。
+ * 失败时置 attachError 供面板内错误状态条展示，成功则清除。返回是否成功。
+ */
+async function attachTerminal(): Promise<boolean> {
+  if (!term || !channel) return false;
+  try {
+    await invoke("attach_terminal", {
+      session_id: props.sessionId,
+      on_data: channel,
+    });
+    attachError.value = null;
+    return true;
+  } catch (e) {
+    attachError.value = e instanceof Error ? e.message : String(e);
+    console.error("[TerminalPane] attach_terminal failed", e);
+    return false;
+  }
+}
+
+/** 错误状态条上的「重试附加」：真实重新执行 attach_terminal */
+async function retryAttach() {
+  await attachTerminal();
+}
+
 onMounted(async () => {
   if (!containerRef.value) return;
 
@@ -153,22 +208,16 @@ onMounted(async () => {
     }
   };
 
-  try {
-    await invoke("attach_terminal", {
-      sessionId: props.sessionId,
-      onData: channel,
-    });
-  } catch (e) {
-    console.error("[TerminalPane] attach_terminal failed", e);
-  }
+  // 失败时错误状态条已在面板内可见（PROB-13），不中断后续本地渲染与监听注册
+  await attachTerminal();
 
   // 前端 → 后端:键入数据直接转发（设计 §4.3 流程 A 末步）
   term.onData((data) => {
     const sid = props.sessionId;
     if (!sid) return;
-    sendInput(sid, new TextEncoder().encode(data)).catch((e) => {
-      console.error("[TerminalPane] send_input failed", e);
-    });
+    sendInput(sid, new TextEncoder().encode(data))
+      .then(() => noteIoSuccess())
+      .catch((e) => noteIoFailure("send_input", e));
   });
 
   // 切片 2.4:Ctrl+F 切换搜索栏（前端拦截 keydown,不让 xterm 接走）
@@ -184,9 +233,9 @@ onMounted(async () => {
         const { cols, rows } = term;
         const sid = props.sessionId;
         if (!sid) return;
-        resizeTerminal(sid, cols, rows).catch((e) => {
-          console.warn("[TerminalPane] resize_terminal failed", e);
-        });
+        resizeTerminal(sid, cols, rows)
+          .then(() => noteIoSuccess())
+          .catch((e) => noteIoFailure("resize_terminal", e));
       } catch {
         /* ignore fit errors during teardown */
       }
@@ -210,6 +259,13 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="terminal-pane-wrapper">
+    <!-- PROB-13：attach_terminal 失败时的错误状态条（替代空白终端） -->
+    <div v-if="attachError" class="terminal-error-bar" role="alert">
+      <span class="terminal-error-text">
+        终端连接失败：{{ attachError }}。请重试附加；若会话已断开，请先重连会话。
+      </span>
+      <el-button size="small" type="danger" plain @click="retryAttach">重试附加</el-button>
+    </div>
     <!-- 切片 2.4 搜索栏（默认隐藏） -->
     <div v-if="searchBarVisible" class="search-bar">
       <el-input
@@ -257,5 +313,27 @@ onBeforeUnmount(() => {
   border-radius: 4px;
   z-index: 10;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+.terminal-error-bar {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  max-width: 80%;
+  padding: 10px 14px;
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-color-danger, #f85149);
+  border-radius: 6px;
+  color: var(--el-color-danger, #f85149);
+  z-index: 20;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+.terminal-error-text {
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
 }
 </style>

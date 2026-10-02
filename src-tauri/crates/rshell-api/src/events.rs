@@ -82,9 +82,6 @@ pub enum AppEvent {
         /// ssh-keygen 风格的 base64 编码公钥 blob,用于用户交叉校验
         public_key_blob: String,
     },
-    /// 需要主密码
-    MasterPasswordRequired,
-
     // ===== 效率工具 =====
     /// 快速命令列表变化
     QuickCommandListChanged,
@@ -112,6 +109,11 @@ pub enum AppEvent {
     },
     /// 同步输入会话列表变化
     SyncInputSessionsChanged { session_ids: Vec<Uuid> },
+    /// 撰写窗格发送到某个目标会话失败
+    ///
+    /// 仅在部分失败（invoke 本身成功）时逐个发布，供 UI 弹出可见失败提示；
+    /// 全部失败时 send_text 直接返回聚合错误，走 invoke 拒绝路径。
+    ComposeSendFailed { session_id: Uuid, error: String },
 
     // ===== 安全事件 =====
     /// 密钥列表变化

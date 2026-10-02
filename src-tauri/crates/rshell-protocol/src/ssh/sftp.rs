@@ -9,10 +9,25 @@ use crate::ProtocolError;
 use rshell_api::types::{FilePermissions, FileType, RemoteFileEntry};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
 use tracing::{debug, info};
 
 /// 单次读写分块大小（64 KiB）
 const CHUNK_SIZE: usize = 64 * 1024;
+
+/// 传输控制信号
+///
+/// 由上层传输服务通过 `watch` 通道按 task_id 下发，cancel 与 pause 共用
+/// 同一通道；拷贝循环在每个分块前检查：暂停时挂起等待恢复，取消时立即中止。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferControl {
+    /// 继续传输
+    Run,
+    /// 暂停（在下一分块前挂起，恢复后从已传字节继续）
+    Pause,
+    /// 取消（在下一分块前中止，已写入的部分保留）
+    Cancel,
+}
 
 /// SFTP 客户端
 ///
@@ -93,10 +108,14 @@ impl SftpClient {
     }
 
     /// 上传本地文件到远程（分块写入，边传边回调进度）
+    ///
+    /// `control` 是 pause/resume/cancel 共用的控制信号：每个分块前检查一次，
+    /// 暂停时挂起等待恢复，取消时返回 `ProtocolError::TransferCancelled`。
     pub async fn upload<F>(
         &self,
         local: &PathBuf,
         remote: &str,
+        control: &mut watch::Receiver<TransferControl>,
         mut progress: F,
     ) -> Result<u64, ProtocolError>
     where
@@ -117,8 +136,15 @@ impl SftpClient {
             ProtocolError::ProtocolError(format!("Failed to create remote file: {}", e))
         })?;
 
-        let copied =
-            copy_with_progress(&mut source, &mut target, total, CHUNK_SIZE, &mut progress).await?;
+        let copied = copy_with_progress(
+            &mut source,
+            &mut target,
+            total,
+            CHUNK_SIZE,
+            control,
+            &mut progress,
+        )
+        .await?;
         drop(target);
 
         info!(remote = %remote, bytes = copied, "Upload completed");
@@ -126,10 +152,13 @@ impl SftpClient {
     }
 
     /// 下载远程文件到本地（分块写入，边传边回调进度）
+    ///
+    /// `control` 的语义与 [`Self::upload`] 相同。
     pub async fn download<F>(
         &self,
         remote: &str,
         local: &PathBuf,
+        control: &mut watch::Receiver<TransferControl>,
         mut progress: F,
     ) -> Result<u64, ProtocolError>
     where
@@ -160,8 +189,15 @@ impl SftpClient {
             ProtocolError::ProtocolError(format!("Failed to create local file: {}", e))
         })?;
 
-        let copied =
-            copy_with_progress(&mut source, &mut target, total, CHUNK_SIZE, &mut progress).await?;
+        let copied = copy_with_progress(
+            &mut source,
+            &mut target,
+            total,
+            CHUNK_SIZE,
+            control,
+            &mut progress,
+        )
+        .await?;
 
         info!(remote = %remote, bytes = copied, "Download completed");
         Ok(copied)
@@ -273,11 +309,14 @@ impl SftpClient {
 /// 开始前先回调一次 `(0, total)`，返回前保证发出终帧；
 /// 声明的 `total` 与实际拷贝字节数不一致（源在传输期间被改写）时报错，
 /// 避免远端留下被截断的文件。
+/// 每个分块前检查 `control`：暂停时在分块间挂起（字节停止增长，恢复后
+/// 从已传字节继续），取消时立即返回 `TransferCancelled`。
 async fn copy_with_progress<R, W, F>(
     reader: &mut R,
     writer: &mut W,
     total: u64,
     chunk_size: usize,
+    control: &mut watch::Receiver<TransferControl>,
     progress: &mut F,
 ) -> Result<u64, ProtocolError>
 where
@@ -290,6 +329,7 @@ where
     let mut buf = vec![0u8; chunk_size.max(1)];
     let mut done: u64 = 0;
     loop {
+        wait_for_run(control).await?;
         let n = reader
             .read(&mut buf)
             .await
@@ -317,9 +357,48 @@ where
     Ok(done)
 }
 
+/// 分块前的控制检查：`Cancel` 立即中止；`Pause` 挂起等待下一信号；
+/// 控制通道关闭（发送端已随任务清理）视同取消。
+///
+/// `borrow_and_update` 返回的 `Ref` 会在 match 结束后析构，因此先 match
+/// 归类、再在 Pause 分支外可变借用 `changed()` 等待，避免借用冲突。
+async fn wait_for_run(control: &mut watch::Receiver<TransferControl>) -> Result<(), ProtocolError> {
+    loop {
+        match *control.borrow_and_update() {
+            TransferControl::Cancel => return Err(ProtocolError::TransferCancelled),
+            TransferControl::Run => return Ok(()),
+            TransferControl::Pause => {}
+        }
+        control
+            .changed()
+            .await
+            .map_err(|_| ProtocolError::TransferCancelled)?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// 记录进度帧的共享 sink
+    type ProgressLog = Arc<Mutex<Vec<(u64, u64)>>>;
+
+    /// 等待拷贝循环推进到至少 `min_done` 字节
+    async fn wait_for_progress(log: &ProgressLog, min_done: u64) {
+        for _ in 0..1000 {
+            let done = log.lock().unwrap().last().map(|frame| frame.0).unwrap_or(0);
+            if done >= min_done {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("拷贝循环迟迟未产生进度");
+    }
+
+    fn last_done(log: &ProgressLog) -> u64 {
+        log.lock().unwrap().last().map(|frame| frame.0).unwrap_or(0)
+    }
 
     #[tokio::test]
     async fn copy_reports_monotonic_progress_and_exact_final_total() {
@@ -327,10 +406,16 @@ mod tests {
         let mut reader: &[u8] = payload.as_slice();
         let mut writer: Vec<u8> = Vec::new();
         let mut calls: Vec<(u64, u64)> = Vec::new();
+        let (_, mut control) = watch::channel(TransferControl::Run);
 
-        let copied = copy_with_progress(&mut reader, &mut writer, 1000, 128, &mut |done, total| {
-            calls.push((done, total));
-        })
+        let copied = copy_with_progress(
+            &mut reader,
+            &mut writer,
+            1000,
+            128,
+            &mut control,
+            &mut |done, total| calls.push((done, total)),
+        )
         .await
         .unwrap();
 
@@ -353,10 +438,18 @@ mod tests {
         let mut reader: &[u8] = payload.as_slice();
         let mut writer: Vec<u8> = Vec::new();
         let mut last = (0u64, 0u64);
+        let (_, mut control) = watch::channel(TransferControl::Run);
 
-        let copied = copy_with_progress(&mut reader, &mut writer, 0, 64, &mut |d, t| last = (d, t))
-            .await
-            .unwrap();
+        let copied = copy_with_progress(
+            &mut reader,
+            &mut writer,
+            0,
+            64,
+            &mut control,
+            &mut |d, t| last = (d, t),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(copied, 300);
         assert_eq!(last.0, 300);
@@ -367,14 +460,176 @@ mod tests {
         let payload = vec![0u8; 500];
         let mut reader: &[u8] = payload.as_slice();
         let mut writer: Vec<u8> = Vec::new();
+        let (_, mut control) = watch::channel(TransferControl::Run);
 
-        let err = copy_with_progress(&mut reader, &mut writer, 1000, 64, &mut |_, _| {})
-            .await
-            .unwrap_err();
+        let err = copy_with_progress(
+            &mut reader,
+            &mut writer,
+            1000,
+            64,
+            &mut control,
+            &mut |_, _| {},
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:?}").contains("source changed"),
             "实际错误: {err:?}"
         );
+    }
+
+    /// 大文件拷贝中途暂停：字节停止增长、拷贝不结束；恢复后继续直到完成。
+    #[tokio::test]
+    async fn copy_pauses_between_chunks_and_resumes() {
+        let (mut producer, mut consumer) = tokio::io::duplex(64);
+        let (control_tx, mut control) = watch::channel(TransferControl::Run);
+        let payload = vec![7u8; 4096];
+        let total = payload.len() as u64;
+
+        // 生产端按 20ms/块节拍写入：内存 duplex 上的拷贝会在 wait_for_progress
+        // 的一个采样窗口内跑完全程，暂停/取消必须在拷贝中途送达才有意义。
+        // 暂停后拷贝循环不再读取，64 字节缓冲写满后 write_all 挂起。
+        let producer_task = tokio::spawn(async move {
+            for chunk in payload.chunks(64) {
+                if producer.write_all(chunk).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+
+        let log: ProgressLog = Arc::new(Mutex::new(Vec::new()));
+        let progress_log = log.clone();
+        let copy_task = tokio::spawn(async move {
+            let mut sink: Vec<u8> = Vec::new();
+            let mut progress = move |done: u64, total: u64| {
+                progress_log.lock().unwrap().push((done, total));
+            };
+            let result = copy_with_progress(
+                &mut consumer,
+                &mut sink,
+                total,
+                64,
+                &mut control,
+                &mut progress,
+            )
+            .await;
+            (result, sink)
+        });
+
+        wait_for_progress(&log, 256).await;
+        control_tx.send(TransferControl::Pause).unwrap();
+
+        // 让在途分块落定后两次采样：暂停期间进度必须完全停止
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let paused_a = last_done(&log);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let paused_b = last_done(&log);
+
+        assert!(paused_a >= 256, "暂停前应已拷贝若干分块");
+        assert_eq!(paused_a, paused_b, "暂停期间字节不得继续增长");
+        assert!(!copy_task.is_finished(), "暂停中的拷贝不得提前结束");
+        assert!(!producer_task.is_finished(), "暂停期间生产端不得写完");
+
+        control_tx.send(TransferControl::Run).unwrap();
+        let (result, sink) = tokio::time::timeout(std::time::Duration::from_secs(5), copy_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let copied = result.unwrap();
+
+        assert_eq!(copied, total, "恢复后应从已传字节继续到完成");
+        assert_eq!(sink.len() as u64, total);
+        producer_task.await.unwrap();
+    }
+
+    /// 大文件拷贝中途取消：返回 TransferCancelled、不产生完成结果。
+    #[tokio::test]
+    async fn copy_cancels_between_chunks_without_completing() {
+        let (mut producer, mut consumer) = tokio::io::duplex(64);
+        let (control_tx, mut control) = watch::channel(TransferControl::Run);
+        let payload = vec![3u8; 4096];
+        let total = payload.len() as u64;
+
+        // 与暂停测试同款节拍：保证取消信号在拷贝中途（而非结束后）送达
+        let producer_task = tokio::spawn(async move {
+            for chunk in payload.chunks(64) {
+                if producer.write_all(chunk).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+
+        let log: ProgressLog = Arc::new(Mutex::new(Vec::new()));
+        let progress_log = log.clone();
+        let copy_task = tokio::spawn(async move {
+            let mut sink: Vec<u8> = Vec::new();
+            let mut progress = move |done: u64, total: u64| {
+                progress_log.lock().unwrap().push((done, total));
+            };
+            let result = copy_with_progress(
+                &mut consumer,
+                &mut sink,
+                total,
+                64,
+                &mut control,
+                &mut progress,
+            )
+            .await;
+            (result, sink)
+        });
+
+        wait_for_progress(&log, 256).await;
+        control_tx.send(TransferControl::Cancel).unwrap();
+
+        let (result, sink) = tokio::time::timeout(std::time::Duration::from_secs(5), copy_task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::TransferCancelled),
+            "实际错误: {err:?}"
+        );
+        assert!(sink.len() < total as usize, "取消时不得写入完整文件");
+        producer_task.await.ok();
+    }
+
+    /// 控制通道在暂停等待期间关闭（发送端已清理）时视同取消，拷贝不得永久挂起。
+    #[tokio::test]
+    async fn copy_aborts_when_control_channel_closes_while_paused() {
+        let (control_tx, mut control) = watch::channel(TransferControl::Pause);
+
+        let copy_task = tokio::spawn(async move {
+            let payload = vec![5u8; 1000];
+            let mut reader: &[u8] = payload.as_slice();
+            let mut writer: Vec<u8> = Vec::new();
+            let result = copy_with_progress(
+                &mut reader,
+                &mut writer,
+                1000,
+                64,
+                &mut control,
+                &mut |_, _| {},
+            )
+            .await;
+            (result, writer)
+        });
+
+        // 拷贝任务在首个分块前挂起；随后清理发送端，必须以取消收尾而非永久挂起
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(control_tx);
+
+        let (result, writer) = tokio::time::timeout(std::time::Duration::from_secs(5), copy_task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, ProtocolError::TransferCancelled));
+        assert!(writer.is_empty(), "未恢复前不得写入任何字节");
     }
 }

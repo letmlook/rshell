@@ -123,6 +123,8 @@ export interface PortForwardRule {
   remote_host: string;
   remote_port: number;
   direction: ForwardDirection;
+  /** 非回环 bind 已经过用户显式确认（PROB-23）；后端默认拒绝未确认的非回环监听 */
+  allow_non_loopback: boolean;
 }
 
 export type ForwardDirection = "Local" | "Dynamic";
@@ -468,7 +470,6 @@ export type AppEvent =
         public_key_blob: string;
       };
     }
-  | "MasterPasswordRequired"
   // 效率工具
   | "QuickCommandListChanged"
   | "TriggerListChanged"
@@ -482,6 +483,8 @@ export type AppEvent =
   | { TriggerActionFailed: { trigger_id: Uuid; session_id: Uuid; error: string } }
   | { ScriptFinished: { session_id: Uuid; result: ScriptResult } }
   | { SyncInputSessionsChanged: { session_ids: Uuid[] } }
+  // 撰写窗格：部分目标会话发送失败（全部失败时 invoke 直接报错，不发此事件）
+  | { ComposeSendFailed: { session_id: Uuid; error: string } }
   // 密钥
   | "SshKeyListChanged"
   | { SshKeyGenerated: { key: SshKeyInfo } }

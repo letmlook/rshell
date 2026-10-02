@@ -88,7 +88,7 @@ export const resizeTerminal = (session_id: Uuid, cols: number, rows: number) =>
 
 // 切片 2.2 删除（设计 §5）：CopySelection 上移到前端 ——
 // xterm.js 自持选区,后端不再发 ClipboardCopy 事件,前端用 navigator.clipboard
-// 或 tauri-plugin-clipboard-manager 直接写入。
+// 直接写入（不引入 clipboard 插件依赖）。
 
 export interface ThemeInfo {
   current_theme: string;
@@ -186,6 +186,7 @@ export const changeMasterPassword = (old_password: string, new_password: string)
 
 // ===== 主机密钥 =====
 
+// 仅 TrustPermanent 会持久化写入 known_hosts;Reject/TrustOnce 被后端拒绝并返回错误(PROB-06)
 export const trustHostKey = (
   host: string,
   port: number,

@@ -27,12 +27,14 @@ const statusLabel = computed(() => {
   return "未连接";
 });
 
+// SFTP 仅对 SSH 会话可用:传输工作区只在当前会话为 SSH 时显示 SFTP,
+// 无会话或 Telnet/Serial 会话显示 "—"(PROB-24);终端工作区显示会话真实协议。
 const protocolLabel = computed(() => {
-  if (props.workspace === "transfer") return "SFTP";
+  if (props.workspace === "transfer") {
+    return store.current?.protocol === "SSH" ? "SFTP" : "—";
+  }
   return store.current?.protocol ?? "—";
 });
-
-const encodingLabel = "UTF-8";
 </script>
 
 <template>
@@ -45,8 +47,6 @@ const encodingLabel = "UTF-8";
     <span class="status-item">{{ store.current?.name || "—" }}</span>
     <span class="status-sep" aria-hidden="true">·</span>
     <span class="status-item">{{ protocolLabel }}</span>
-    <span class="status-sep" aria-hidden="true">·</span>
-    <span class="status-item">{{ encodingLabel }}</span>
     <span class="status-sep" aria-hidden="true">·</span>
     <span class="spacer" />
     <span class="status-item muted">RShell v0.1.0</span>

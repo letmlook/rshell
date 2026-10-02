@@ -45,3 +45,4 @@ dist/
 
 # 本地 Agent 状态目录（不参与仓库历史）
 .omo/
+.mimosa/

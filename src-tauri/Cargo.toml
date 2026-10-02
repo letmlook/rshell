@@ -58,7 +58,6 @@ tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
-tauri-plugin-shell = "2"
 
 # 内部 crate (path deps 由 workspace 自动解析)
 rshell-api = { path = "crates/rshell-api" }
@@ -95,7 +94,6 @@ tauri-build = { workspace = true }
 tauri = { workspace = true }
 tauri-plugin-fs = { workspace = true }
 tauri-plugin-dialog = { workspace = true }
-tauri-plugin-shell = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

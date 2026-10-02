@@ -6,6 +6,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -16,6 +17,38 @@ use rshell_infra::crypto::hash::sha256_fingerprint;
 
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
+
+/// 根据公钥算法推导密钥类型；RSA 按模数位数区分 2048/4096
+fn ssh_key_type_of(public_key: &ssh_key::PublicKey) -> SshKeyType {
+    match public_key.algorithm() {
+        ssh_key::Algorithm::Ed25519 => SshKeyType::ED25519,
+        ssh_key::Algorithm::Rsa { .. } => {
+            let bits = match public_key.key_data() {
+                ssh_key::public::KeyData::Rsa(rsa) => rsa.n.as_bytes().len().saturating_mul(8),
+                _ => 0,
+            };
+            if bits >= 4096 {
+                SshKeyType::RSA4096
+            } else {
+                SshKeyType::RSA2048
+            }
+        }
+        ssh_key::Algorithm::Ecdsa { curve } => match curve {
+            ssh_key::EcdsaCurve::NistP256 => SshKeyType::ECDSA256,
+            ssh_key::EcdsaCurve::NistP384 => SshKeyType::ECDSA384,
+            ssh_key::EcdsaCurve::NistP521 => SshKeyType::ECDSA521,
+        },
+        _ => SshKeyType::ED25519,
+    }
+}
+
+/// 归一化 passphrase 参数：None 或空串均视为未设置口令
+fn effective_passphrase(passphrase: Option<&str>) -> Option<&str> {
+    match passphrase {
+        Some(p) if !p.is_empty() => Some(p),
+        _ => None,
+    }
+}
 
 /// 存储的 SSH 密钥
 #[derive(Debug, Clone)]
@@ -40,28 +73,181 @@ pub struct KeyManager {
 
 impl KeyManager {
     /// 创建新的密钥管理器
+    ///
+    /// 生成/导入的私钥都会落盘到 keys_dir/{uuid}.key，构造时必须扫描目录
+    /// 重建内存索引，否则重启后密钥从列表消失，磁盘上留下无法管理的孤儿文件。
     pub fn new(keys_dir: PathBuf, event_bus: Arc<EventBus>) -> Self {
         // 确保密钥目录存在
         let _ = std::fs::create_dir_all(&keys_dir);
 
+        let keys = Self::load_keys_from_dir(&keys_dir);
+
         Self {
-            keys: Arc::new(RwLock::new(HashMap::new())),
+            keys: Arc::new(RwLock::new(keys)),
             keys_dir,
             event_bus,
         }
     }
 
+    /// 扫描 keys_dir/*.key，从磁盘私钥文件重建内存索引
+    ///
+    /// 仅纳入文件名为 {uuid}.key 且可解析的私钥（口令加密的私钥同样可解析，
+    /// has_passphrase 按实际加密状态如实标记）；无法识别的文件
+    /// 保留在磁盘上并记录告警，不做静默删除。
+    fn load_keys_from_dir(keys_dir: &std::path::Path) -> HashMap<Uuid, StoredSshKey> {
+        let mut keys = HashMap::new();
+
+        let entries = match std::fs::read_dir(keys_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!("Failed to read keys dir {:?}: {}", keys_dir, e);
+                return keys;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("key") {
+                continue;
+            }
+
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                warn!("Skipping key file with unreadable name: {:?}", path);
+                continue;
+            };
+            let Ok(key_id) = Uuid::parse_str(stem) else {
+                warn!("Skipping key file with non-UUID name: {:?}", path);
+                continue;
+            };
+
+            let Ok(key_data) = std::fs::read(&path) else {
+                warn!("Failed to read key file: {:?}", path);
+                continue;
+            };
+
+            if let Some(stored) = Self::rebuild_stored_key(key_id, &key_data, &path) {
+                info!(
+                    "Restored SSH key from disk: id={}, fingerprint={}",
+                    key_id, stored.fingerprint
+                );
+                keys.insert(key_id, stored);
+            }
+        }
+
+        keys
+    }
+
+    /// 解析私钥数据，重建 StoredSshKey
+    ///
+    /// name 取自私钥注释（生成/导入时写入），无注释时退回文件名；
+    /// 口令加密的私钥注释在密文内无法读取，name 一律退回文件名；
+    /// created_at 取文件修改时间。
+    fn rebuild_stored_key(
+        key_id: Uuid,
+        key_data: &[u8],
+        path: &std::path::Path,
+    ) -> Option<StoredSshKey> {
+        let private_key = match ssh_key::PrivateKey::from_openssh(key_data) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!("Failed to parse key file {:?}: {}", path, e);
+                return None;
+            }
+        };
+
+        let public_key = private_key.public_key();
+        let public_key_bytes = match public_key.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("Failed to encode public key from {:?}: {}", path, e);
+                return None;
+            }
+        };
+        let fingerprint = sha256_fingerprint(&public_key_bytes);
+        let public_key_str = match public_key.to_openssh() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to encode public key from {:?}: {}", path, e);
+                return None;
+            }
+        };
+
+        let comment = private_key.comment().to_string();
+        let name = if comment.is_empty() {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("imported")
+                .to_string()
+        } else {
+            comment
+        };
+        let created_at = std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .map(chrono::DateTime::<Utc>::from)
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|_| Utc::now().to_rfc3339());
+
+        Some(StoredSshKey {
+            id: key_id,
+            name,
+            key_type: ssh_key_type_of(public_key),
+            fingerprint,
+            public_key_blob: public_key_str,
+            private_key_data: key_data.to_vec(),
+            comment: String::new(),
+            // PROB-10：has_passphrase 如实反映密钥加密状态，不再恒为 false
+            has_passphrase: private_key.is_encrypted(),
+            created_at,
+        })
+    }
+
+    /// 写入私钥文件；Unix 上创建时即以 0600 权限落盘，避免明文私钥窗口期可被其他用户读取
+    async fn write_key_file(path: &std::path::Path, data: &[u8]) -> Result<(), CoreError> {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+
+        let mut file = options.open(path).await.map_err(|e| {
+            CoreError::Internal(format!("Failed to save key file {:?}: {}", path, e))
+        })?;
+        file.write_all(data).await.map_err(|e| {
+            CoreError::Internal(format!("Failed to save key file {:?}: {}", path, e))
+        })?;
+        file.flush().await.map_err(|e| {
+            CoreError::Internal(format!("Failed to save key file {:?}: {}", path, e))
+        })?;
+        // 创建时已按 0600 落盘；若覆盖写入既有文件，OpenOptions 的 mode 不生效，
+        // 写入后统一收紧权限，确保私钥文件只对本用户可读（PROB-10）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(|e| {
+                    CoreError::Internal(format!(
+                        "Failed to restrict key file permissions {:?}: {}",
+                        path, e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     /// 生成新的 SSH 密钥对
+    ///
+    /// 传入非空 passphrase 时，私钥以 OpenSSH 口令加密（bcrypt-pbkdf 派生 +
+    /// AES256-CTR）落盘，`has_passphrase` 如实标记为 true；不静默忽略口令。
     pub async fn generate_key(
         &self,
         name: &str,
         key_type: SshKeyType,
-        _passphrase: Option<&str>,
+        passphrase: Option<&str>,
     ) -> Result<SshKeyInfo, CoreError> {
         info!("Generating SSH key: name={}, type={:?}", name, key_type);
 
         // 使用 ssh-key crate 生成密钥
-        let private_key = match key_type {
+        let mut private_key = match key_type {
             SshKeyType::ED25519 => ssh_key::PrivateKey::random(
                 &mut ssh_key::rand_core::OsRng,
                 ssh_key::Algorithm::Ed25519,
@@ -97,6 +283,9 @@ impl KeyManager {
             .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {}", e)))?,
         };
 
+        // 将密钥名写入注释：重启后从磁盘重建索引时可恢复名称
+        private_key.set_comment(name);
+
         // 获取公钥
         let public_key = private_key.public_key();
         let public_key_blob = public_key
@@ -111,7 +300,22 @@ impl KeyManager {
             .to_openssh()
             .map_err(|e| CoreError::Internal(format!("Failed to encode public key: {}", e)))?;
 
+        // PROB-10：非空口令必须真实生效——先写注释再加密，注释随私钥段一起
+        // 进入密文，解密后可恢复名称；公钥部分不受加密影响
+        let has_passphrase = match effective_passphrase(passphrase) {
+            Some(pass) => {
+                private_key = private_key
+                    .encrypt(&mut ssh_key::rand_core::OsRng, pass)
+                    .map_err(|e| {
+                        CoreError::Internal(format!("Failed to encrypt private key: {}", e))
+                    })?;
+                true
+            }
+            None => false,
+        };
+
         // 编码私钥 - to_openssh 返回 Zeroizing<String>，需要转换为 bytes
+        // （有口令时此处编码出的是加密 PEM，磁盘上不留明文私钥）
         let private_key_string = private_key
             .to_openssh(ssh_key::LineEnding::LF)
             .map_err(|e| CoreError::Internal(format!("Failed to encode private key: {}", e)))?;
@@ -128,15 +332,13 @@ impl KeyManager {
             public_key_blob: public_key_str.clone(),
             private_key_data: private_key_data.clone(),
             comment: String::new(),
-            has_passphrase: false,
+            has_passphrase,
             created_at: now.clone(),
         };
 
         // 保存到文件
         let key_file = self.keys_dir.join(format!("{}.key", id));
-        tokio::fs::write(&key_file, &private_key_data)
-            .await
-            .map_err(|e| CoreError::Internal(format!("Failed to save key file: {}", e)))?;
+        Self::write_key_file(&key_file, &private_key_data).await?;
 
         // 存储到内存
         self.keys.write().await.insert(id, stored_key);
@@ -148,7 +350,7 @@ impl KeyManager {
             fingerprint,
             public_key_blob: public_key_str,
             comment: String::new(),
-            has_passphrase: false,
+            has_passphrase,
             created_at: now,
         };
 
@@ -166,10 +368,15 @@ impl KeyManager {
     }
 
     /// 导入私钥文件
+    ///
+    /// - 传入非空 passphrase 且源文件未加密：以该口令加密后再落盘，
+    ///   `has_passphrase` 标记为 true，不静默忽略口令；
+    /// - 传入非空 passphrase 且源文件已加密：先校验口令，错误口令显式报错；
+    /// - 未传 passphrase：按源文件实际加密状态如实标记 `has_passphrase`。
     pub async fn import_private_key(
         &self,
         path: &std::path::Path,
-        _passphrase: Option<&str>,
+        passphrase: Option<&str>,
     ) -> Result<SshKeyInfo, CoreError> {
         info!("Importing private key from: {:?}", path);
 
@@ -178,7 +385,7 @@ impl KeyManager {
             .map_err(|e| CoreError::Internal(format!("Failed to read key file: {}", e)))?;
 
         // 尝试解码私钥
-        let private_key = ssh_key::PrivateKey::from_openssh(key_data.as_slice())
+        let mut private_key = ssh_key::PrivateKey::from_openssh(key_data.as_slice())
             .map_err(|e| CoreError::Internal(format!("Failed to decode key: {}", e)))?;
 
         // 获取公钥信息
@@ -187,17 +394,7 @@ impl KeyManager {
             .to_bytes()
             .map_err(|e| CoreError::Internal(format!("Failed to encode public key: {}", e)))?;
         let fingerprint = sha256_fingerprint(&public_key_blob);
-
-        let key_type = match public_key.algorithm() {
-            ssh_key::Algorithm::Ed25519 => SshKeyType::ED25519,
-            ssh_key::Algorithm::Rsa { .. } => SshKeyType::RSA4096,
-            ssh_key::Algorithm::Ecdsa { curve } => match curve {
-                ssh_key::EcdsaCurve::NistP256 => SshKeyType::ECDSA256,
-                ssh_key::EcdsaCurve::NistP384 => SshKeyType::ECDSA384,
-                ssh_key::EcdsaCurve::NistP521 => SshKeyType::ECDSA521,
-            },
-            _ => SshKeyType::ED25519,
-        };
+        let key_type = ssh_key_type_of(public_key);
 
         let public_key_str = public_key
             .to_openssh()
@@ -211,23 +408,58 @@ impl KeyManager {
             .to_string();
         let now = Utc::now().to_rfc3339();
 
+        // 将名称写入注释后重新编码保存：重启后可从磁盘重建索引时恢复名称。
+        // 注释在加密前写入：加密路径下注释随私钥段一起进入密文，解密后可恢复；
+        // 源文件本已加密时，OpenSSH 信封不携带明文注释，重启后 name 退回文件名。
+        private_key.set_comment(name.clone());
+
+        // PROB-10：has_passphrase 必须如实反映加密状态，口令不被静默忽略——
+        // 已加密密钥提供的口令先校验（错误口令显式报错），未加密密钥提供的
+        // 口令则加密后再落盘
+        let was_encrypted = private_key.is_encrypted();
+        let has_passphrase = match effective_passphrase(passphrase) {
+            Some(pass) if was_encrypted => {
+                // 仅校验口令；仍按原加密形式落盘，避免无谓的重加密
+                private_key.decrypt(pass).map_err(|_| {
+                    CoreError::InvalidState(format!(
+                        "Incorrect passphrase: cannot decrypt key from {:?}",
+                        path
+                    ))
+                })?;
+                true
+            }
+            Some(pass) => {
+                private_key = private_key
+                    .encrypt(&mut ssh_key::rand_core::OsRng, pass)
+                    .map_err(|e| {
+                        CoreError::Internal(format!("Failed to encrypt private key: {}", e))
+                    })?;
+                true
+            }
+            None => was_encrypted,
+        };
+
+        let stored_bytes = private_key
+            .to_openssh(ssh_key::LineEnding::LF)
+            .map_err(|e| CoreError::Internal(format!("Failed to encode key: {}", e)))?
+            .to_string()
+            .into_bytes();
+
         let stored_key = StoredSshKey {
             id,
             name: name.clone(),
             key_type,
             fingerprint: fingerprint.clone(),
             public_key_blob: public_key_str.clone(),
-            private_key_data: key_data.clone(),
+            private_key_data: stored_bytes.clone(),
             comment: String::new(),
-            has_passphrase: false,
+            has_passphrase,
             created_at: now.clone(),
         };
 
         // 保存到密钥目录
         let key_file = self.keys_dir.join(format!("{}.key", id));
-        tokio::fs::write(&key_file, &key_data)
-            .await
-            .map_err(|e| CoreError::Internal(format!("Failed to save key file: {}", e)))?;
+        Self::write_key_file(&key_file, &stored_bytes).await?;
 
         self.keys.write().await.insert(id, stored_key);
 
@@ -238,7 +470,7 @@ impl KeyManager {
             fingerprint,
             public_key_blob: public_key_str,
             comment: String::new(),
-            has_passphrase: false,
+            has_passphrase,
             created_at: now,
         };
 
@@ -254,17 +486,26 @@ impl KeyManager {
         Ok(key_info)
     }
 
-    /// 删除密钥
+    /// 删除密钥（内存索引与磁盘文件同步清理）
     pub async fn delete_key(&self, key_id: Uuid) -> Result<(), CoreError> {
         info!("Deleting SSH key: {}", key_id);
 
-        let key = self.keys.write().await.remove(&key_id);
-        if let Some(_key) = key {
-            // 删除文件
-            let key_file = self.keys_dir.join(format!("{}.key", key_id));
-            let _ = tokio::fs::remove_file(&key_file).await;
-        } else {
-            warn!("Key not found: {}", key_id);
+        // 先删磁盘文件：失败则保留内存索引供重试，避免留下"内存无、磁盘有"的孤儿文件
+        let key_file = self.keys_dir.join(format!("{}.key", key_id));
+        match tokio::fs::remove_file(&key_file).await {
+            Ok(()) => {}
+            // 文件本就不存在（例如磁盘索引未覆盖）视为已删除
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(CoreError::StorageError(format!(
+                    "Failed to delete key file {:?}: {}",
+                    key_file, e
+                )));
+            }
+        }
+
+        if self.keys.write().await.remove(&key_id).is_none() {
+            warn!("Key not found in memory index: {}", key_id);
         }
 
         self.event_bus.publish(AppEvent::SshKeyListChanged);
@@ -306,5 +547,220 @@ impl KeyManager {
             .ok_or_else(|| CoreError::NotFound(format!("Key not found: {}", key_id)))?;
 
         Ok(key.private_key_data.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_manager(dir: &tempfile::TempDir) -> KeyManager {
+        KeyManager::new(dir.path().to_path_buf(), Arc::new(EventBus::new()))
+    }
+
+    #[tokio::test]
+    async fn generated_key_survives_manager_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = new_manager(&dir);
+        let key = manager
+            .generate_key("work-key", SshKeyType::ED25519, None)
+            .await
+            .unwrap();
+        assert!(dir.path().join(format!("{}.key", key.id)).exists());
+
+        // 用同一 keys_dir 重建管理器，模拟应用重启：索引应从磁盘恢复
+        let restarted = new_manager(&dir);
+        let keys = restarted.list_keys().await;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].id, key.id);
+        assert_eq!(keys[0].fingerprint, key.fingerprint);
+        assert_eq!(keys[0].name, "work-key");
+    }
+
+    #[tokio::test]
+    async fn imported_key_survives_manager_restart() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("id_test");
+        let generated = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let pem = generated.to_openssh(ssh_key::LineEnding::LF).unwrap();
+        std::fs::write(&src, pem.as_bytes()).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = new_manager(&dir);
+        let imported = manager.import_private_key(&src, None).await.unwrap();
+
+        let restarted = new_manager(&dir);
+        let keys = restarted.list_keys().await;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].fingerprint, imported.fingerprint);
+        assert_eq!(keys[0].name, "id_test");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_disk_file_and_memory_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = new_manager(&dir);
+        let key = manager
+            .generate_key("doomed", SshKeyType::ED25519, None)
+            .await
+            .unwrap();
+
+        manager.delete_key(key.id).await.unwrap();
+
+        // 磁盘无 .key 残留，内存索引同步清空
+        assert!(!dir.path().join(format!("{}.key", key.id)).exists());
+        assert!(manager.list_keys().await.is_empty());
+
+        // 重启后（索引来自磁盘）删除同样应清理磁盘文件
+        let key = new_manager(&dir)
+            .generate_key("doomed-again", SshKeyType::ED25519, None)
+            .await
+            .unwrap();
+        let restarted = new_manager(&dir);
+        restarted.delete_key(key.id).await.unwrap();
+        assert!(!dir.path().join(format!("{}.key", key.id)).exists());
+        assert!(restarted.list_keys().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unrecognized_files_are_skipped_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"junk").unwrap();
+        std::fs::write(dir.path().join("stray.key"), b"not a valid private key").unwrap();
+
+        let manager = new_manager(&dir);
+        assert!(manager.list_keys().await.is_empty());
+        // 无法识别的文件保留在磁盘上，不做静默删除
+        assert!(dir.path().join("stray.key").exists());
+    }
+
+    #[tokio::test]
+    async fn generated_key_with_passphrase_is_encrypted_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = new_manager(&dir);
+        let key = manager
+            .generate_key("secret-key", SshKeyType::ED25519, Some("hunter2"))
+            .await
+            .unwrap();
+        assert!(key.has_passphrase);
+
+        // PROB-10：传口令必须真实加密，磁盘上不留明文私钥，且口令可解密
+        let bytes = std::fs::read(dir.path().join(format!("{}.key", key.id))).unwrap();
+        let parsed = ssh_key::PrivateKey::from_openssh(bytes.as_slice()).unwrap();
+        assert!(parsed.is_encrypted());
+        let decrypted = parsed.decrypt("hunter2").unwrap();
+        assert_eq!(
+            sha256_fingerprint(&decrypted.public_key().to_bytes().unwrap()),
+            key.fingerprint
+        );
+        assert!(parsed.decrypt("wrong-passphrase").is_err());
+
+        // 重启后 has_passphrase 从磁盘按实际加密状态恢复
+        let restarted = new_manager(&dir);
+        let keys = restarted.list_keys().await;
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].has_passphrase);
+    }
+
+    #[tokio::test]
+    async fn imported_unencrypted_key_with_passphrase_is_stored_encrypted() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("id_enc");
+        let generated = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let pem = generated.to_openssh(ssh_key::LineEnding::LF).unwrap();
+        std::fs::write(&src, pem.as_bytes()).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = new_manager(&dir);
+        let imported = manager
+            .import_private_key(&src, Some("key-pass"))
+            .await
+            .unwrap();
+        assert!(imported.has_passphrase);
+
+        // 口令不被静默忽略：落盘为加密 PEM，且口令可解密
+        let bytes = std::fs::read(dir.path().join(format!("{}.key", imported.id))).unwrap();
+        let parsed = ssh_key::PrivateKey::from_openssh(bytes.as_slice()).unwrap();
+        assert!(parsed.is_encrypted());
+        assert!(parsed.decrypt("key-pass").is_ok());
+
+        let restarted = new_manager(&dir);
+        let keys = restarted.list_keys().await;
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].has_passphrase);
+    }
+
+    #[tokio::test]
+    async fn import_of_encrypted_key_rejects_wrong_passphrase() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("id_enc");
+        let generated = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let encrypted = generated
+            .encrypt(&mut ssh_key::rand_core::OsRng, "right-pass")
+            .unwrap();
+        let pem = encrypted.to_openssh(ssh_key::LineEnding::LF).unwrap();
+        std::fs::write(&src, pem.as_bytes()).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = new_manager(&dir);
+
+        // 错误口令显式报错，而不是静默入库
+        let err = manager.import_private_key(&src, Some("wrong-pass")).await;
+        assert!(
+            matches!(err, Err(CoreError::InvalidState(_))),
+            "expected explicit passphrase error, got {:?}",
+            err
+        );
+
+        // 正确口令导入成功；不提供口令也导入成功，两种情况均如实标记
+        let with_pass = manager.import_private_key(&src, Some("right-pass")).await;
+        assert!(matches!(with_pass, Ok(ref info) if info.has_passphrase));
+        let without_pass = manager.import_private_key(&src, None).await;
+        assert!(matches!(without_pass, Ok(ref info) if info.has_passphrase));
+    }
+
+    #[tokio::test]
+    async fn empty_passphrase_is_treated_as_no_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = new_manager(&dir);
+        let key = manager
+            .generate_key("plain-key", SshKeyType::ED25519, Some(""))
+            .await
+            .unwrap();
+        assert!(!key.has_passphrase);
+
+        let bytes = std::fs::read(dir.path().join(format!("{}.key", key.id))).unwrap();
+        let parsed = ssh_key::PrivateKey::from_openssh(bytes.as_slice()).unwrap();
+        assert!(!parsed.is_encrypted());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn key_file_is_created_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = new_manager(&dir);
+        let key = manager
+            .generate_key("perm-key", SshKeyType::ED25519, None)
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(dir.path().join(format!("{}.key", key.id)))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

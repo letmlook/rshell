@@ -1,5 +1,6 @@
 # Read rshell workspace version from Cargo.toml.
-# Used by build.cmd and build.ps1 to avoid fragile cmd TOML parsing.
+# Formerly used by the removed build.cmd and build.ps1 (see scripts/README.md);
+# currently has no caller and is kept only to avoid accidental deletion.
 #
 # Outputs the version on stdout. Exits 0 on success, 1 if not found.
 

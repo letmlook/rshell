@@ -15,11 +15,11 @@
  *   │ StatusBar  (24px, 12 字段)                   │
  *   └─────────────────────────────────────────────┘
  *
- * 浮层:SessionCreateDialog / HostKeyMismatchDialog /
- *       MasterPasswordDialog
+ * 浮层:SessionCreateDialog / HostKeyMismatchDialog
  */
-import { onBeforeUnmount, onMounted, ref, markRaw, computed } from "vue";
+import { defineComponent, h, onBeforeUnmount, onMounted, ref, markRaw, computed, watch } from "vue";
 import { DockviewVue } from "dockview-vue";
+import type { DockviewApi, DockviewReadyEvent } from "dockview-vue";
 import { ElMessage } from "element-plus/es/components/message/index.mjs";
 import { ElNotification } from "element-plus/es/components/notification/index.mjs";
 import "dockview-vue/dist/styles/dockview.css";
@@ -27,7 +27,6 @@ import TerminalPane from "./components/TerminalPane.vue";
 import TransferWorkspace from "./components/transfer/TransferWorkspace.vue";
 import SessionCreateDialog from "./components/SessionCreateDialog.vue";
 import HostKeyMismatchDialog from "./components/HostKeyMismatchDialog.vue";
-import MasterPasswordDialog from "./components/MasterPasswordDialog.vue";
 import CustomTitleBar from "./components/CustomTitleBar.vue";
 import SidePanel, { type ToolSubview, type SettingsSubview } from "./components/SidePanel.vue";
 import StatusBar from "./components/StatusBar.vue";
@@ -126,7 +125,61 @@ const sidebarMaxWidth = computed(() =>
   maxSidebarWidthForViewport(viewportWidth.value),
 );
 
-const components = markRaw({ TerminalPane: TerminalPane as never });
+/**
+ * dockview 面板壳：dockview-vue 不渲染默认/具名插槽，面板组件由
+ * api.addPanel 按 components 注册表创建，且面板数据装在单个 `params`
+ * prop 里（结构 { params, api, containerApi }）。这里解出 sessionId
+ * 转发给 TerminalPane，保持 TerminalPane 的 sessionId prop 契约不变。
+ */
+const TerminalPanelView = defineComponent({
+  name: "TerminalPanelView",
+  props: { params: { type: Object, default: undefined } },
+  setup(panelProps) {
+    return () => {
+      const panelParams = panelProps.params as { params?: { sessionId?: Uuid } } | undefined;
+      const sessionId = panelParams?.params?.sessionId;
+      return sessionId ? h(TerminalPane, { sessionId }) : null;
+    };
+  },
+});
+
+// as never 与原 TerminalPane 注册同款：DefineComponent 全泛型签名和
+// dockview-vue 的 VueComponent 别名不完全兼容
+const components = markRaw({ terminal: TerminalPanelView as never });
+
+/** dockview 容器 ready 后的 api；终端面板只能经该 api 创建 */
+let dockviewApi: DockviewApi | null = null;
+
+/** 确保会话的终端面板存在：已创建则激活原面板，否则 addPanel 新建 */
+function ensureTerminalPanel(sessionId: Uuid) {
+  if (!dockviewApi) return;
+  const panelId = `terminal-${sessionId}`;
+  const existing = dockviewApi.getPanel(panelId);
+  if (existing) {
+    existing.api.setActive();
+    return;
+  }
+  dockviewApi.addPanel({
+    id: panelId,
+    component: "terminal",
+    params: { sessionId },
+  });
+}
+
+function onDockviewReady(event: DockviewReadyEvent) {
+  dockviewApi = event.api;
+  if (activeTerminal.value) ensureTerminalPanel(activeTerminal.value);
+}
+
+// 容器 v-if 卸载时 DockviewVue 已 dispose 其 api，清引用防误用
+function onDockviewUnmounted() {
+  dockviewApi = null;
+}
+
+// 会话切换发生在容器 ready 之后时，由本 watch 负责建面板/激活既有面板
+watch(activeTerminal, (id) => {
+  if (id) ensureTerminalPanel(id);
+});
 
 function setSidebarWidth(width: number) {
   sidebarWidth.value = clampSidebarWidth(width, sidebarMaxWidth.value);
@@ -248,6 +301,12 @@ onMounted(async () => {
       if (typeof event !== "string" && "TriggerActionFailed" in event) {
         ElNotification.error({ title: "触发器执行失败", message: event.TriggerActionFailed.error });
       }
+      if (typeof event !== "string" && "ComposeSendFailed" in event) {
+        ElNotification.error({
+          title: "撰写发送失败",
+          message: `会话 ${event.ComposeSendFailed.session_id}：${event.ComposeSendFailed.error}`,
+        });
+      }
     });
     if (mounted) unlistenTransfers = stop;
     else stop();
@@ -264,6 +323,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   mounted = false;
   window.removeEventListener("resize", onViewportResize);
+  dockviewApi = null;
   unlistenTransfers?.();
   store.disposeEvents();
   hostKeyStore.disposeEvents();
@@ -342,11 +402,9 @@ onBeforeUnmount(() => {
             v-if="activeTerminal"
             :components="components"
             style="width: 100%; height: 100%"
-          >
-            <template #terminal="{ params }">
-              <TerminalPane :session-id="params.sessionId" />
-            </template>
-          </DockviewVue>
+            @ready="onDockviewReady"
+            @vue:unmounted="onDockviewUnmounted"
+          />
           <div v-else class="empty">
             <div class="empty-content">
               <div class="empty-icon">⌬</div>
@@ -404,7 +462,6 @@ onBeforeUnmount(() => {
       @created="(id) => selectSession(id)"
     />
     <HostKeyMismatchDialog />
-    <MasterPasswordDialog />
   </div>
 </template>
 

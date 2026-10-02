@@ -12,6 +12,7 @@
  * 按 'group' 字段聚合成树,后端将来接入分组 API 后只需替换 buildTree。
  */
 import { computed, ref } from "vue";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { useSessionsStore } from "../stores/sessions";
 import type { Uuid } from "../ipc/types";
 import type { SessionConfig } from "../ipc/types";
@@ -118,10 +119,16 @@ function ctxUpdateCredential() {
   credentialSession.value = contextMenu.value.session;
   contextMenu.value.visible = false;
 }
-function ctxDelete() {
-  if (!contextMenu.value.session) return;
-  if (confirm(`确定删除会话 ${contextMenu.value.session.name} ?`)) {
-    store.delete?.(contextMenu.value.session.id).catch(console.warn);
+async function ctxDelete() {
+  const target = contextMenu.value.session;
+  if (!target) return;
+  // wry/WKWebView 不实现 JS confirm(), 必须走 plugin-dialog 原生确认框
+  const ok = await confirm(`确定删除会话 ${target.name} ?`, {
+    title: "删除会话",
+    kind: "warning",
+  });
+  if (ok) {
+    store.delete?.(target.id).catch(console.warn);
   }
 }
 </script>
@@ -205,7 +212,7 @@ function ctxDelete() {
       <button class="ctx-item" @click="ctxDisconnect">断开</button>
       <button v-if="contextMenu.session?.protocol === 'SSH'" class="ctx-item" @click="ctxUpdateCredential">更新凭据</button>
       <div class="ctx-sep" />
-      <button class="ctx-item" @click="ctxOpenSftp">打开 SFTP</button>
+      <button v-if="contextMenu.session?.protocol === 'SSH'" class="ctx-item" @click="ctxOpenSftp">打开 SFTP</button>
       <button class="ctx-item" @click="ctxOpenTerminal">打开终端</button>
       <div class="ctx-sep" />
       <button class="ctx-item ctx-danger" @click="ctxDelete">删除</button>

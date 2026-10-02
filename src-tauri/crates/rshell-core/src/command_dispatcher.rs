@@ -18,7 +18,7 @@ use crate::session::service::SessionService;
 use crate::terminal::service::TerminalService;
 use crate::theme::ThemeManager;
 use crate::transfer::service::TransferService;
-use rshell_api::{AppCommand, CommandOutcome};
+use rshell_api::{AppCommand, CommandOutcome, TrustHostKeyDecision};
 use rshell_plugin_sdk::loader::PluginLoader;
 use rshell_protocol::ssh::HostKeyDecision;
 use std::path::PathBuf;
@@ -432,8 +432,8 @@ impl CommandDispatcher {
                 Ok(CommandOutcome::None)
             }
             AppCommand::VerifyMasterPassword { password } => {
-                self.master_password.verify(&password).await?;
-                Ok(CommandOutcome::None)
+                let ok = self.master_password.verify(&password).await?;
+                Ok(CommandOutcome::Verified(ok))
             }
             AppCommand::ChangeMasterPassword {
                 old_password,
@@ -446,18 +446,34 @@ impl CommandDispatcher {
             }
 
             // ===== 安全：主机密钥 =====
+            // PROB-06:decision 必须消费。原实现用 `..` 丢弃 decision,导致传
+            // Reject/TrustOnce 也会把密钥永久写入 known_hosts。仅 TrustPermanent
+            // 允许落盘;Reject/TrustOnce 显式报错、不产生任何持久化条目 ——
+            // 会话内信任须走带 decision_id 的 DecideHostKey 决策链。
             AppCommand::TrustHostKey {
                 host,
                 port,
                 key_type,
                 public_key_blob,
-                ..
-            } => {
-                self.host_key_manager
-                    .trust_host_key(&host, port, &key_type, &public_key_blob)
-                    .await?;
-                Ok(CommandOutcome::None)
-            }
+                decision,
+            } => match decision {
+                TrustHostKeyDecision::TrustPermanent => {
+                    self.host_key_manager
+                        .trust_host_key(&host, port, &key_type, &public_key_blob)
+                        .await?;
+                    Ok(CommandOutcome::None)
+                }
+                TrustHostKeyDecision::TrustOnce => Err(CoreError::InvalidState(
+                    "TrustOnce is not accepted by the offline trust channel: \
+                         session-scoped trust must go through the DecideHostKey \
+                         decision chain; nothing was written to known_hosts"
+                        .into(),
+                )),
+                TrustHostKeyDecision::Reject => Err(CoreError::InvalidState(format!(
+                    "Host key trust for {host}:{port} was rejected; \
+                         nothing was written to known_hosts"
+                ))),
+            },
             AppCommand::DecideHostKey {
                 decision_id,
                 accept,
@@ -756,3 +772,151 @@ impl CommandDispatcher {
 
 // 切片 2.1 删除:`buffer_snapshot_to_text` 与 CopySelection arm 一并移除
 // —— 设计 §5 上移剪贴板到前端,xterm.js 自持选区,后端无需序列化整屏文本。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个不触碰真实用户目录的最小 dispatcher(无持久化仓库)。
+    fn make_dispatcher(dir: &std::path::Path) -> CommandDispatcher {
+        let event_bus = Arc::new(EventBus::new());
+        let terminal_service = Arc::new(TerminalService::new(event_bus.clone()));
+        let trigger_engine = Arc::new(TriggerEngine::new(event_bus.clone()));
+        let host_key_registry = Arc::new(
+            crate::security::host_key_decision::HostKeyDecisionRegistry::new(event_bus.clone()),
+        );
+        let session_service = Arc::new(SessionService::new(
+            event_bus.clone(),
+            terminal_service.clone(),
+            trigger_engine.clone(),
+            host_key_registry.clone(),
+        ));
+        CommandDispatcher::new(Services {
+            session_service,
+            terminal_service,
+            transfer_service: Arc::new(TransferService::new(event_bus.clone())),
+            trigger_engine,
+            key_manager: Arc::new(KeyManager::new(dir.join("keys"), event_bus.clone())),
+            master_password: Arc::new(MasterPassword::new(event_bus.clone())),
+            tunnel_manager: Arc::new(TunnelManager::new(event_bus.clone())),
+            host_key_manager: Arc::new(HostKeyManager::new(dir.join("known_hosts"))),
+            theme_manager: Arc::new(ThemeManager::new(event_bus.clone())),
+            event_bus,
+            host_key_registry,
+        })
+    }
+
+    /// PROB-05:VerifyMasterPassword 必须把 verify() 的 bool 透传为
+    /// `CommandOutcome::Verified`,薄壳(commands.rs)依赖该分支,否则报 outcome_mismatch。
+    /// 口令在运行期随机生成,不在源码中写入任何凭据字面量。
+    #[tokio::test]
+    async fn verify_master_password_yields_verified_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+
+        // 两个互不相同的运行期随机口令:一个用于 setup,另一个必然验证失败。
+        let correct = format!("pw-{}", Uuid::new_v4());
+        let wrong = format!("pw-{}", Uuid::new_v4());
+        assert_ne!(correct, wrong);
+
+        dispatcher
+            .dispatch(AppCommand::SetupMasterPassword {
+                password: correct.clone(),
+            })
+            .await
+            .unwrap();
+
+        let ok = dispatcher
+            .dispatch(AppCommand::VerifyMasterPassword { password: correct })
+            .await
+            .unwrap();
+        assert!(matches!(ok, CommandOutcome::Verified(true)));
+
+        let mismatch = dispatcher
+            .dispatch(AppCommand::VerifyMasterPassword { password: wrong })
+            .await
+            .unwrap();
+        assert!(matches!(mismatch, CommandOutcome::Verified(false)));
+    }
+
+    /// PROB-17:SendComposeText 在目标会话全部未连接时必须返回错误,
+    /// 薄壳 commands.rs 把该 Err 映射为 IpcError,前端 invoke 即拒绝,
+    /// 不得静默成功。
+    #[tokio::test]
+    async fn send_compose_text_all_targets_unreachable_fails() {
+        use rshell_api::types::ComposeTarget;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+
+        // 两个从未创建的会话 ID:全部不可达
+        let result = dispatcher
+            .dispatch(AppCommand::SendComposeText {
+                content: "hello".into(),
+                target: ComposeTarget::SelectedSessions(vec![Uuid::new_v4(), Uuid::new_v4()]),
+            })
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    /// PROB-06:TrustHostKey 必须按 decision 分派,三种 decision 的落盘行为各断言一次。
+    /// Reject/TrustOnce 不得产生 known_hosts 条目(内存与磁盘均无),
+    /// 仅 TrustPermanent 允许走 trust_host_key 落盘。
+    #[tokio::test]
+    async fn trust_host_key_only_persists_on_trust_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+        let known_hosts = dir.path().join("known_hosts");
+
+        // Reject:报错且不落盘
+        let rejected = dispatcher
+            .dispatch(AppCommand::TrustHostKey {
+                host: "reject.test".into(),
+                port: 2201,
+                key_type: "ssh-ed25519".into(),
+                public_key_blob: "AAAAreject".into(),
+                decision: TrustHostKeyDecision::Reject,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(rejected, CoreError::InvalidState(_)));
+
+        // TrustOnce:报错且不落盘(会话内信任须走带 decision_id 的 DecideHostKey)
+        let once = dispatcher
+            .dispatch(AppCommand::TrustHostKey {
+                host: "once.test".into(),
+                port: 2202,
+                key_type: "ssh-ed25519".into(),
+                public_key_blob: "AAAAonce".into(),
+                decision: TrustHostKeyDecision::TrustOnce,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(once, CoreError::InvalidState(_)));
+
+        // 两次非永久决策后:磁盘上没有 known_hosts 文件,内存中也没有任何条目
+        assert!(
+            !known_hosts.exists(),
+            "Reject/TrustOnce 不得创建 known_hosts 文件"
+        );
+        assert!(
+            dispatcher.host_key_manager().list_hosts().await.is_empty(),
+            "Reject/TrustOnce 不得产生内存信任条目"
+        );
+
+        // TrustPermanent:唯一允许落盘的决策
+        dispatcher
+            .dispatch(AppCommand::TrustHostKey {
+                host: "perm.test".into(),
+                port: 2203,
+                key_type: "ssh-ed25519".into(),
+                public_key_blob: "AAAAperm".into(),
+                decision: TrustHostKeyDecision::TrustPermanent,
+            })
+            .await
+            .unwrap();
+        let on_disk = std::fs::read_to_string(&known_hosts).unwrap();
+        assert!(on_disk.contains("[perm.test]:2203 ssh-ed25519 AAAAperm"));
+    }
+}

@@ -24,6 +24,8 @@ pub enum ProtocolError {
     ProtocolError(String),
     #[error("Timeout")]
     Timeout,
+    #[error("Transfer cancelled")]
+    TransferCancelled,
 }
 
 /// 连接 trait（所有协议的统一抽象）

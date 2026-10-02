@@ -10,7 +10,7 @@
  * 真正的解密/SSH 握手在后端 infra::crypto 完成。
  */
 import { onMounted, ref } from "vue";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
 import {
   listKeys,
   generateSshKey,
@@ -37,6 +37,23 @@ const genName = ref("");
 const genType = ref<SshKeyType>("ED25519");
 const genPassphrase = ref("");
 
+// 生成类型下拉:与后端 SshKeyType(src-tauri/crates/rshell-api/src/types.rs:354)逐一对齐,
+// value 由 SshKeyType 类型约束 —— 出现后端不存在的变体(如 "RSA"/"ECDSA")会直接编译报错,
+// 避免 serde unknown variant 导致生成必然失败。
+const genTypeOptions: ReadonlyArray<{ value: SshKeyType; label: string }> = [
+  { value: "ED25519", label: "ED25519" },
+  { value: "RSA2048", label: "RSA 2048" },
+  { value: "RSA4096", label: "RSA 4096" },
+  { value: "ECDSA256", label: "ECDSA 256" },
+  { value: "ECDSA384", label: "ECDSA 384" },
+  { value: "ECDSA521", label: "ECDSA 521" },
+];
+
+// 导入私钥的口令对话框状态: wry/WKWebView 不实现 window.prompt, 需要真实 el-dialog
+const importState = ref<{ path: string } | null>(null);
+const importPassphrase = ref("");
+const importing = ref(false);
+
 async function refresh() {
   loading.value = true;
   error.value = null;
@@ -55,13 +72,27 @@ async function importKey() {
     filters: [{ name: "SSH key", extensions: ["", "pem", "key", "pub"] }],
   });
   if (!path) return;
-  const passphrase = window.prompt("passphrase (留空 = 无口令):") ?? null;
+  importPassphrase.value = "";
+  importState.value = { path: path as string };
+}
+
+async function confirmImport() {
+  if (!importState.value || importing.value) return;
+  importing.value = true;
   try {
-    await importPrivateKey(path as string, passphrase);
+    await importPrivateKey(importState.value.path, importPassphrase.value || null);
+    cancelImport();
     await refresh();
   } catch (e) {
     error.value = String(e);
+  } finally {
+    importing.value = false;
   }
+}
+
+function cancelImport() {
+  importState.value = null;
+  importPassphrase.value = "";
 }
 
 async function generate() {
@@ -85,7 +116,12 @@ async function generate() {
 
 async function remove(id: Uuid) {
   const name = keys.value.find(key => key.id === id)?.name ?? id;
-  if (!window.confirm(`删除 SSH 密钥“${name}”？此操作无法撤销。`)) return;
+  // wry/WKWebView 不实现 window.confirm, 必须走 plugin-dialog 原生确认框
+  const ok = await confirm(`删除 SSH 密钥“${name}”？此操作无法撤销。`, {
+    title: "删除密钥",
+    kind: "warning",
+  });
+  if (!ok) return;
   try {
     await deleteSshKey(id);
     await refresh();
@@ -114,10 +150,13 @@ onMounted(refresh);
         <el-input v-model="genName" placeholder="name" style="width: 120px" />
       </el-form-item>
       <el-form-item>
-        <el-select v-model="genType" style="width: 100px">
-          <el-option label="ED25519" value="ED25519" />
-          <el-option label="RSA" value="RSA" />
-          <el-option label="ECDSA" value="ECDSA" />
+        <el-select v-model="genType" style="width: 120px">
+          <el-option
+            v-for="opt in genTypeOptions"
+            :key="opt.value"
+            :label="opt.label"
+            :value="opt.value"
+          />
         </el-select>
       </el-form-item>
       <el-form-item>
@@ -143,6 +182,30 @@ onMounted(refresh);
         </template>
       </el-table-column>
     </el-table>
+
+    <el-dialog
+      :model-value="importState !== null"
+      title="导入私钥"
+      width="440px"
+      @close="cancelImport"
+    >
+      <p class="import-path">{{ importState?.path }}</p>
+      <el-form label-width="80px" @submit.prevent="confirmImport">
+        <el-form-item label="口令">
+          <el-input
+            v-model="importPassphrase"
+            type="password"
+            show-password
+            autocomplete="new-password"
+            placeholder="留空 = 无口令"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="cancelImport">取消</el-button>
+        <el-button type="primary" :loading="importing" :disabled="importing" @click="confirmImport">导入</el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>
 
@@ -162,6 +225,13 @@ h3 {
 }
 .gen-form {
   margin-bottom: 12px;
+}
+.import-path {
+  margin: 0 0 12px;
+  font-family: monospace;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  word-break: break-all;
 }
 .error {
   color: var(--el-color-danger);

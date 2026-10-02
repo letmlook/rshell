@@ -10,7 +10,6 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use thiserror::Error;
 use tokio::task;
@@ -70,26 +69,31 @@ pub enum WasmValue {
     F64(f64),
     /// 字符串的 logical 形式(尚未与 linear memory 互转)
     ///
-    /// `From<WasmValue> for Val` 当前把 String 折叠为 `Val::I32(0)` —
-    /// 因为把字符串写入 plugin linear memory 需要 caller 持有 `Memory`,
-    /// 而 `execute` 的 `args: &[WasmValue]` 不携带 store/memory 引用。
+    /// 把字符串写入 plugin linear memory 需要 caller 持有 `Memory`,
+    /// 而 `execute` 的 `args: &[WasmValue]` 不携带 store/memory 引用,
+    /// 因此**不能**把 `String` 直接作为函数参数传入:`execute` 对
+    /// `String` 参数显式返回错误(不再静默折叠为 `Val::I32(0)`)。
     ///
     /// **生产用法**: 直接传 `I32` ptr + 字符串 bytes 通过 host function
     /// 写入 memory 后 invoke。或者使用 `marshal_string_input` 辅助。
     String(String),
 }
 
-impl From<WasmValue> for Val {
-    fn from(v: WasmValue) -> Self {
-        match v {
-            WasmValue::I32(i) => Val::I32(i),
-            WasmValue::I64(i) => Val::I64(i),
-            WasmValue::F32(f) => Val::F32(f.to_bits()),
-            WasmValue::F64(f) => Val::F64(f.to_bits()),
-            // 字符串需通过 linear memory 传递,本转换保留 0 作为 placeholder。
-            // 见 marshal_string_input 走真正路径。
-            WasmValue::String(_) => Val::I32(0),
-        }
+/// `WasmValue` → wasmtime `Val` 的窄化转换。
+///
+/// 字符串需经由 linear memory 传递(见 `marshal_string_input`),
+/// 在字符串序列化实现之前,`String` 参数显式报错,绝不静默折叠。
+fn wasm_value_to_val(v: WasmValue) -> Result<Val, SandboxError> {
+    match v {
+        WasmValue::I32(i) => Ok(Val::I32(i)),
+        WasmValue::I64(i) => Ok(Val::I64(i)),
+        WasmValue::F32(f) => Ok(Val::F32(f.to_bits())),
+        WasmValue::F64(f) => Ok(Val::F64(f.to_bits())),
+        WasmValue::String(_) => Err(SandboxError::ExecutionError(
+            "String arguments are not supported yet: marshal the string into linear \
+             memory via marshal_string_input and pass (ptr, len) as I32 instead"
+                .to_string(),
+        )),
     }
 }
 
@@ -279,7 +283,11 @@ impl WasmSandbox {
             )));
         }
 
-        let wasm_args: Vec<Val> = args.iter().cloned().map(Val::from).collect();
+        let wasm_args: Vec<Val> = args
+            .iter()
+            .cloned()
+            .map(wasm_value_to_val)
+            .collect::<Result<Vec<_>, _>>()?;
         let mut results = vec![Val::I32(0); result_count];
 
         func.call(&mut store, &wasm_args, &mut results)
@@ -298,16 +306,19 @@ impl WasmSandbox {
     }
 
     /// 异步版本：在 `spawn_blocking` 中执行 `execute`
+    ///
+    /// 通过把 `Arc<WasmSandbox>` clone 进闭包保证沙箱存活至任务结束，
+    /// 不再持有 `&self` 裸指针，插件 unload 与执行之间不存在
+    /// use-after-free 竞态。
     pub async fn execute_async(
-        &self,
-        module_name: &'static str,
-        func_name: &'static str,
+        self: Arc<Self>,
+        module_name: &str,
+        func_name: &str,
         args: Vec<WasmValue>,
     ) -> Result<Vec<WasmValue>, SandboxError> {
-        let _ = (Duration::from_millis(0),);
-        let sandbox = self as *const _ as usize;
-        let sandbox: &'static WasmSandbox = unsafe { &*(sandbox as *const WasmSandbox) };
-        let result = task::spawn_blocking(move || sandbox.execute(module_name, func_name, &args))
+        let module_name = module_name.to_string();
+        let func_name = func_name.to_string();
+        let result = task::spawn_blocking(move || self.execute(&module_name, &func_name, &args))
             .await
             .map_err(|e| SandboxError::JoinError(e.to_string()))?;
         result

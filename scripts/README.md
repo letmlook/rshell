@@ -14,7 +14,8 @@ Cargo 命令一律通过 `RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1` 触�
 ## 旧脚本保留范围
 
 - `bash scripts/build.sh [target-triple]`：`npm run tauri:build` 的薄包装，签名、公证、安装验收仍不由本脚本自动完成。
-- `scripts/build.ps1`、`scripts/build.cmd`、`scripts/read-version.ps1`：保留的历史 Windows 脚本，本轮未更新或验证，不作为当前构建入口。
+- 历史 Windows 脚本 `scripts/build.ps1` 与 `scripts/build.cmd` 已删除（2026-09-30）：它们按旧仓库布局在仓库根执行 `cargo build`，而 Rust workspace 现位于 `src-tauri/`（仓库根已无 Cargo.toml），按现状必然失败。Windows 本地构建同样使用 `npm run tauri:build`，由 Tauri CLI 进入 src-tauri workspace 并处理目标三元组。
+- `scripts/read-version.ps1`：读取 `src-tauri/Cargo.toml` 版本号的历史辅助脚本；原调用方（上述两个已删脚本）已移除，当前无入口使用，仅为避免误删保留。
 - `npm run test:scripts` 检查包装脚本（包含 build、check-docs、新增的 automation）的命令、工作目录、target、env 与错误透传，不执行完整发布构建。
 - `npm run check:docs` 检查当前用户文档中的架构、启动命令、移除范围说明、凭据边界与本地链接；带日期的历史设计与执行计划不作为产品手册扫描。
 

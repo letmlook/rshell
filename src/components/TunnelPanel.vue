@@ -4,7 +4,8 @@
  *
  * 本地端口转发与动态 SOCKS5 隧道管理。
  */
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
+import { ElMessageBox } from "element-plus/es/components/message-box/index.mjs";
 import { listTunnels, listPendingTunnels, createTunnel, closeTunnel } from "../ipc/client";
 import type { Uuid, PortForwardRule, ActiveTunnelInfo } from "../ipc/types";
 
@@ -41,6 +42,25 @@ function parseEndpoint(ep: string): { host: string; port: number } {
   return { host: ep.slice(0, idx), port: parseInt(ep.slice(idx + 1), 10) || 0 };
 }
 
+/**
+ * 判断监听地址是否为本机回环（PROB-23，与后端 is_loopback_bind_address 一致）：
+ * 接受 localhost、127.0.0.0/8、::1（含 [::1] 方括号写法）；其余一律按非回环处理。
+ */
+function isLoopbackHost(host: string): boolean {
+  const bare = host.trim().replace(/^\[/, "").replace(/\]$/, "");
+  if (bare.toLowerCase() === "localhost") return true;
+  const ipv4 = bare.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) return ipv4[1] === "127";
+  const lower = bare.toLowerCase();
+  return lower === "::1" || lower === "0:0:0:0:0:0:0:1";
+}
+
+/** 当前监听地址是否会把隧道暴露到本机之外（PROB-23） */
+const nonLoopbackBind = computed(() => {
+  const host = parseEndpoint(draftBind.value).host.trim();
+  return host !== "" && !isLoopbackHost(host);
+});
+
 async function add() {
   if (!draftSession.value) {
     error.value = "请先在主视图选择会话";
@@ -55,7 +75,22 @@ async function add() {
     remote_host: target.host,
     remote_port: target.port,
     direction: draftType.value,
+    allow_non_loopback: false,
   };
+  // PROB-23：非回环监听会把端口转发 / 无认证 SOCKS5 代理暴露给局域网，
+  // 必须经用户确认并携带 allow_non_loopback 标志，否则后端拒绝创建。
+  if (nonLoopbackBind.value) {
+    try {
+      await ElMessageBox.confirm(
+        `监听地址 “${bind.host}” 不是回环地址：隧道将暴露给局域网，同网段任何主机都能使用该 SSH 连接转发（SOCKS5 代理无认证）。确认继续？`,
+        "将暴露给局域网",
+        { type: "warning", confirmButtonText: "确认暴露并创建", cancelButtonText: "取消" },
+      );
+    } catch {
+      return; // 用户取消：不创建
+    }
+    rule.allow_non_loopback = true;
+  }
   try {
     await createTunnel(draftSession.value, rule);
     await refresh();
@@ -108,12 +143,15 @@ onMounted(refresh);
       </el-form-item>
     </el-form>
 
+    <p v-if="nonLoopbackBind" class="warn">
+      监听地址不是回环地址：创建时将要求二次确认，隧道将暴露给局域网（SOCKS5 代理无认证）。
+    </p>
     <el-empty v-if="items.length === 0" description="暂无隧道" />
     <el-table v-else :data="items" stripe size="small">
       <el-table-column prop="id" label="Tunnel ID" width="120" />
       <el-table-column label="状态" width="100">
         <template #default="{ row }">
-          {{ String(Object.keys(row.state || {})[0] || "—") }}
+          {{ typeof row.state === "string" ? row.state : Object.keys(row.state || {})[0] || "—" }}
         </template>
       </el-table-column>
       <el-table-column label="操作" width="80">
@@ -144,6 +182,10 @@ h3 {
 }
 .error {
   color: var(--el-color-danger);
+  font-size: 12px;
+}
+.warn {
+  color: var(--el-color-warning);
   font-size: 12px;
 }
 </style>

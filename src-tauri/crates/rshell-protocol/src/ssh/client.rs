@@ -2,6 +2,7 @@
 //!
 //! 基于 russh 实现 SSH 连接、认证、数据收发和终端大小调整。
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +37,25 @@ use uuid::Uuid;
 
 use crate::{Connection, ProtocolError};
 
+/// 空闲会话 keepalive 探测间隔。
+///
+/// 双向静默时每 15s 向服务器发送一次带应答的 keepalive
+/// （GLOBAL_REQUEST `keepalive@openssh.com`），防止空闲会话被强制断开、
+/// 同时让死链在约 60s 内被检出：russh 收到对端任何数据即重置探测计数，
+/// 连续 `keepalive_max`（russh 默认 3）+1 次探测无响应才以
+/// `KeepaliveTimeout` 断开。它取代旧的 `inactivity_timeout = 30s`——
+/// 该超时在双向静默（长时间无输出的命令、只读观察）时会把会话无提示
+/// 强制断开。
+const SSH_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 构建 russh 传输层配置：启用空闲 keepalive，不设 inactivity_timeout。
+fn transport_config(keepalive_interval: std::time::Duration) -> russh::client::Config {
+    russh::client::Config {
+        keepalive_interval: Some(keepalive_interval),
+        ..Default::default()
+    }
+}
+
 /// SSH 客户端
 pub struct SshClient {
     config: SessionConfig,
@@ -46,8 +66,16 @@ pub struct SshClient {
     channel: Option<mpsc::Sender<ShellRequest>>,
     /// 接收数据的通道
     data_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    /// `Connection::recv` 尚未消费完的上一条消息余量。
+    /// `recv_data()` 返回的是一条完整消息，若调用方 `buf` 装不下，
+    /// 余量必须留到下次 `recv`，否则终端输出会静默丢失
+    /// （与 serial 的 `pending_bytes` 同一契约，见 serial/mod.rs）。
+    recv_pending: VecDeque<u8>,
     /// 发送数据的通道（供 Handler 使用）
     shell_output: Arc<Mutex<ShellOutput>>,
+    /// 空闲 keepalive 探测间隔，默认 [`SSH_KEEPALIVE_INTERVAL`]。
+    /// 测试可调小以压缩时间线。
+    keepalive_interval: std::time::Duration,
 }
 
 /// 每次连接临时解析的认证材料。不得序列化或存入 SessionConfig。
@@ -121,7 +149,7 @@ pub(crate) struct SshHandler {
     host: String,
     /// 端口
     port: u16,
-    /// 已知的 known_hosts 文件路径（依次尝试：~/.ssh/known_hosts、用户配置）
+    /// 已知的 known_hosts 文件路径（受控来源，见 `build_known_hosts_paths`）
     known_hosts_paths: Vec<PathBuf>,
     /// 主机密钥决策 sink（未知 key 时通过它注册 + 等待 UI 决策）
     host_key_sink: Option<Arc<dyn HostKeyDecisionSink>>,
@@ -423,6 +451,30 @@ fn get_username(auth: &ResolvedAuthMethod) -> &str {
     }
 }
 
+/// 构建 known_hosts 搜索路径（按优先级），默认只含受控来源。
+///
+/// 信任主机密钥的决定必须来自用户。当前工作目录可能被启动环境
+/// （如 CLI 指定的目录）影响，目录里预置的 `known_hosts` 会在
+/// `verify_known_hosts` 中被当作已信任条目，绕过用户决策弹窗，
+/// 因此 cwd 相对路径默认禁用；本地开发确需时通过
+/// `RSHELL_ALLOW_CWD_KNOWN_HOSTS=1` 显式开启（见 `connect_ssh`）。
+fn build_known_hosts_paths(allow_cwd_relative: bool) -> Vec<PathBuf> {
+    let mut known_hosts_paths: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        known_hosts_paths.push(home.join(".ssh").join("known_hosts"));
+    }
+    // rshell 自有 known_hosts 文件（由 HostKeyManager 维护）
+    if let Some(mut data_dir) = dirs::data_local_dir() {
+        data_dir.push("rshell");
+        data_dir.push("known_hosts");
+        known_hosts_paths.push(data_dir);
+    }
+    if allow_cwd_relative {
+        known_hosts_paths.push(PathBuf::from("known_hosts"));
+    }
+    known_hosts_paths
+}
+
 impl SshClient {
     /// 创建新的 SSH 客户端
     pub fn new(config: SessionConfig, auth: ResolvedAuthMethod) -> Self {
@@ -432,7 +484,9 @@ impl SshClient {
             handle: None,
             channel: None,
             data_rx: None,
+            recv_pending: VecDeque::new(),
             shell_output: Arc::new(Mutex::new(ShellOutput::default())),
+            keepalive_interval: SSH_KEEPALIVE_INTERVAL,
         }
     }
 
@@ -463,25 +517,17 @@ impl SshClient {
             sender: Some(data_tx),
         }));
 
-        // 创建 SSH 配置
-        let ssh_config = Arc::new(russh::client::Config {
-            inactivity_timeout: Some(std::time::Duration::from_secs(30)),
-            ..Default::default()
-        });
+        // 创建 SSH 配置：空闲 keepalive 每 15s 探测一次，服务端应答会重置
+        // 探测计数，空闲会话长期存活；死链由 keepalive_max（默认 3）在约
+        // 60s 内检出。inactivity_timeout 保持禁用（见 transport_config）。
+        let ssh_config = Arc::new(transport_config(self.keepalive_interval));
 
-        // 构建 known_hosts 搜索路径（按优先级）
-        let mut known_hosts_paths: Vec<PathBuf> = Vec::new();
-        if let Some(home) = dirs::home_dir() {
-            known_hosts_paths.push(home.join(".ssh").join("known_hosts"));
-        }
-        // 也尝试 rshell 自有 known_hosts 文件（由 HostKeyManager 维护）
-        if let Some(mut data_dir) = dirs::data_local_dir() {
-            data_dir.push("rshell");
-            data_dir.push("known_hosts");
-            known_hosts_paths.push(data_dir);
-        }
-        // 最后尝试当前目录（开发环境）
-        known_hosts_paths.push(PathBuf::from("known_hosts"));
+        // 构建 known_hosts 搜索路径：默认仅受控来源；cwd 相对路径须用
+        // 显式环境变量开启，防止受攻击者影响的目录预置信任
+        // （见 build_known_hosts_paths 文档）。
+        let allow_cwd_known_hosts =
+            std::env::var("RSHELL_ALLOW_CWD_KNOWN_HOSTS").is_ok_and(|v| v == "1");
+        let known_hosts_paths = build_known_hosts_paths(allow_cwd_known_hosts);
 
         // 创建 Handler（带 host_key_sink）
         let handler = SshHandler {
@@ -693,6 +739,8 @@ impl SshClient {
 
         self.shell_output.lock().unwrap().close(None);
         self.data_rx = None;
+        // 断开后残留缓冲作废，后续 recv 因 data_rx 已置 None 报 ConnectionClosed
+        self.recv_pending.clear();
 
         info!("SSH disconnected");
         Ok(())
@@ -826,11 +874,21 @@ impl Connection for SshClient {
     }
 
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, ProtocolError> {
-        // 从通道读取数据到缓冲区
+        // 先消费上一条消息留在 recv_pending 里的余量
+        if !self.recv_pending.is_empty() {
+            let count = buf.len().min(self.recv_pending.len());
+            for byte in &mut buf[..count] {
+                *byte = self.recv_pending.pop_front().unwrap();
+            }
+            return Ok(count);
+        }
+        // 从通道读取一条完整消息；装不进 buf 的余量留待下次 recv，
+        // 不能截断丢弃——那会造成终端输出静默丢失
         match self.recv_data().await? {
             Some(data) => {
                 let len = data.len().min(buf.len());
                 buf[..len].copy_from_slice(&data[..len]);
+                self.recv_pending.extend(&data[len..]);
                 Ok(len)
             }
             None => Err(ProtocolError::ConnectionClosed),
@@ -846,6 +904,17 @@ impl Connection for SshClient {
 mod tests {
     use super::*;
     use rshell_api::types::AuthMethod;
+
+    #[test]
+    fn transport_config_keeps_alive_and_drops_no_idle_sessions() {
+        let config = transport_config(SSH_KEEPALIVE_INTERVAL);
+        assert_eq!(config.keepalive_interval, Some(SSH_KEEPALIVE_INTERVAL));
+        assert!(
+            config.inactivity_timeout.is_none(),
+            "inactivity_timeout 会把双向静默的空闲会话（无输出的长命令、只读观察）\
+             在超时后无提示强制断开，必须保持禁用；死链检出由 keepalive_max 负责"
+        );
+    }
 
     #[test]
     fn resolved_password_is_kept_outside_public_session_config() {
@@ -1074,6 +1143,72 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// 空闲会话在双向静默中存活（PROB-07 回归测试）。
+    ///
+    /// 把 keepalive 间隔压到 100ms，静默 700ms 覆盖 `keepalive_max`
+    /// （russh 默认 3）+1 个探测周期：若保活失效（探测无应答），russh
+    /// 会在第 5 次探测时报 `KeepaliveTimeout` 断开，随后的回显断言失败。
+    /// 静默期间无任何业务数据往来，会话必须保持可用。
+    #[tokio::test]
+    async fn idle_session_survives_bidirectional_silence_via_keepalive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let config = russh::server::Config {
+                keys: vec![key],
+                ..Default::default()
+            };
+            let running =
+                russh::server::run_stream(Arc::new(config), stream, OutputTestServer::default())
+                    .await
+                    .unwrap();
+            let _ = running.await;
+        });
+        let mut client = SshClient::new(
+            SessionConfig {
+                id: Uuid::new_v4(),
+                name: "idle keepalive".into(),
+                folder_id: None,
+                host: "127.0.0.1".into(),
+                port,
+                protocol: rshell_api::types::Protocol::SSH,
+                auth_method: AuthMethod::Password {
+                    username: "test".into(),
+                    has_password: true,
+                },
+                serial_config: None,
+            },
+            ResolvedAuthMethod::Password {
+                username: "test".into(),
+                password: "test".into(),
+            },
+        );
+        client.keepalive_interval = std::time::Duration::from_millis(100);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            client
+                .connect_ssh(Some(Arc::new(AcceptTestHost)))
+                .await
+                .unwrap();
+            let mut output = client.take_data_receiver().unwrap();
+            assert_eq!(output.recv().await.unwrap(), b"shell output");
+            // 双向静默：客户端不发送、服务器不输出任何业务数据。
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            // 静默结束后会话仍可用：输入被服务器回显。
+            client.send_data(b"still alive").await.unwrap();
+            assert_eq!(output.recv().await.unwrap(), b"still alive");
+            client.disconnect_ssh().await.unwrap();
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
     fn password_client(port: u16, password: &str) -> SshClient {
         SshClient::new(
             SessionConfig {
@@ -1126,6 +1261,40 @@ mod tests {
             }
         });
         (port, server)
+    }
+
+    #[tokio::test]
+    async fn connection_recv_keeps_overflow_bytes_for_next_call() {
+        // Connection::recv 契约：一条消息大于 buf 时余量必须留在客户端，
+        // 多次 recv 的字节总和按序无损（与 serial 的 pending_bytes 同一契约）。
+        let mut client = password_client(0, "unused");
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        client.data_rx = Some(data_rx);
+
+        // 256 字节的消息远大于 16 字节的 buf；第二条小消息验证
+        // 余量耗尽后新消息走正常路径且不与前一条串流。
+        let big: Vec<u8> = (0..=255u8).collect();
+        let small = b"ssh-echo-ok".to_vec();
+        data_tx.send(big.clone()).unwrap();
+        data_tx.send(small.clone()).unwrap();
+        drop(data_tx); // 消息消费完后 recv 应报 ConnectionClosed
+
+        let mut expected = big;
+        expected.extend_from_slice(&small);
+
+        let mut buf = [0u8; 16];
+        let mut received = Vec::new();
+        loop {
+            match Connection::recv(&mut client, &mut buf).await {
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(ProtocolError::ConnectionClosed) => break,
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+        assert_eq!(
+            received, expected,
+            "大于 buf 的消息经多次 recv 必须字节无损"
+        );
     }
 
     #[tokio::test]
@@ -1256,6 +1425,69 @@ mod tests {
         let (matched, previous) = handler.verify_known_hosts(&changed_key);
         assert!(!matched);
         assert_eq!(previous, Some(key.fingerprint(HashAlg::Sha256).to_string()));
+    }
+
+    #[test]
+    fn default_known_hosts_paths_exclude_cwd_relative_file() {
+        for path in build_known_hosts_paths(false) {
+            assert!(
+                path.is_absolute(),
+                "默认搜索路径必须全为绝对路径，cwd 相对路径不得混入：{}",
+                path.display()
+            );
+        }
+        assert!(
+            build_known_hosts_paths(true)
+                .iter()
+                .any(|p| !p.is_absolute()),
+            "显式开启后 cwd 相对路径才允许出现"
+        );
+    }
+
+    #[test]
+    fn cwd_preset_known_hosts_file_is_not_trusted_by_default() {
+        use ssh_key::public::{Ed25519PublicKey, KeyData};
+        let key = ssh_key::PublicKey::new(KeyData::Ed25519(Ed25519PublicKey([7; 32])), "");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("known_hosts"),
+            format!("[example.test]:2222 {}\n", key.to_openssh().unwrap()),
+        )
+        .unwrap();
+
+        fn handler_with(paths: Vec<PathBuf>) -> SshHandler {
+            let (data_tx, _) = mpsc::unbounded_channel();
+            SshHandler {
+                shell_output: Arc::new(Mutex::new(ShellOutput {
+                    channel: None,
+                    sender: Some(data_tx),
+                })),
+                host: "example.test".into(),
+                port: 2222,
+                known_hosts_paths: paths,
+                host_key_sink: None,
+            }
+        }
+
+        // 修改进程 cwd 影响其他依赖 cwd 的测试，串行化并保证恢复
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let (known_default, _) =
+            handler_with(build_known_hosts_paths(false)).verify_known_hosts(&key);
+        let (known_opt_in, _) =
+            handler_with(build_known_hosts_paths(true)).verify_known_hosts(&key);
+        let _ = std::env::set_current_dir(original_dir);
+
+        assert!(
+            !known_default,
+            "cwd 里预置的 known_hosts 不应被默认搜索路径命中并直接信任"
+        );
+        assert!(
+            known_opt_in,
+            "显式开启（RSHELL_ALLOW_CWD_KNOWN_HOSTS）后相对路径才参与匹配"
+        );
     }
 
     #[test]

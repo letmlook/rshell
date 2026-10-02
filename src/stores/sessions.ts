@@ -26,7 +26,6 @@ export const useSessionsStore = defineStore("sessions", () => {
   const currentId = ref<Uuid | null>(null);
   const connectionState = ref<Map<Uuid, ConnectionStateValue>>(new Map());
   const searchKeyword = ref(""); // 切片 3：会话列表过滤词（设计 §5）
-  const masterPasswordRequired = ref(false); // 切片 6：监听 MasterPasswordRequired 事件
   const loading = ref(false);
   const error = ref<string | null>(null);
   const loadIssues = ref<SessionLoadIssue[]>([]);
@@ -138,7 +137,6 @@ export const useSessionsStore = defineStore("sessions", () => {
     current,
     connectionState,
     searchKeyword,
-    masterPasswordRequired,
     loading,
     error,
     loadIssues,

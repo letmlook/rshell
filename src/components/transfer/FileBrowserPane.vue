@@ -13,14 +13,14 @@
 import { computed, ref, watch } from "vue";
 import { readDir, stat } from "@tauri-apps/plugin-fs";
 import { browseRemoteDir } from "../../ipc/client";
-import type { Uuid } from "../../ipc/types";
+import type { Uuid, FilePermissions } from "../../ipc/types";
 
 export interface FsEntry {
   name: string;
   size: number;
   is_dir: boolean;
   modified: string;
-  /** 仅远程:八进制文件属性 / 所有者 */
+  /** 仅远程:rwx 权限字符串(如 rwxr-xr-x),由 FilePermissions 拼出 */
   mode?: string;
   owner?: string;
 }
@@ -76,6 +76,23 @@ function fmtModified(iso: string): string {
   }
 }
 
+/** 由 FilePermissions 的九个布尔位拼出 rwx 权限字符串(如 rwxr-xr-x),无权限位以 - 表示 */
+function fmtPermissions(p: FilePermissions): string {
+  const triple = (r: boolean, w: boolean, x: boolean): string =>
+    `${r ? "r" : "-"}${w ? "w" : "-"}${x ? "x" : "-"}`;
+  return (
+    triple(p.owner_read, p.owner_write, p.owner_execute) +
+    triple(p.group_read, p.group_write, p.group_execute) +
+    triple(p.other_read, p.other_write, p.other_execute)
+  );
+}
+
+/** stat 失败是否因条目已不存在(ENOENT / os error 2);其余错误必须向用户显示真实原因 */
+function isEntryGone(e: unknown): boolean {
+  const msg = String(e).toLowerCase();
+  return msg.includes("enoent") || msg.includes("no such file") || msg.includes("os error 2");
+}
+
 async function load(path: string, pushHistory = true) {
   loading.value = true;
   errorText.value = null;
@@ -91,7 +108,7 @@ async function load(path: string, pushHistory = true) {
         modified: entry.modified && /^\d+$/.test(entry.modified)
           ? new Date(Number(entry.modified) * 1000).toISOString() : entry.modified,
         owner: entry.owner,
-        mode: entry.file_type,
+        mode: fmtPermissions(entry.permissions),
       }));
     } else if (props.mode === "remote") {
       throw new Error("请先连接 SSH 会话");
@@ -99,13 +116,20 @@ async function load(path: string, pushHistory = true) {
       const items = await readDir(path);
       entries.value = await Promise.all(items.map(async (item) => {
         const fullPath = joinPath(path, item.name);
-        const details = await stat(fullPath).catch(() => null);
-        return {
-          name: item.name,
-          size: details?.size ?? 0,
-          is_dir: item.isDirectory,
-          modified: details?.mtime?.toISOString() ?? "",
-        };
+        try {
+          const details = await stat(fullPath);
+          return {
+            name: item.name,
+            size: details.size,
+            is_dir: item.isDirectory,
+            modified: details.mtime?.toISOString() ?? "",
+          };
+        } catch (e) {
+          // ENOENT = 条目在 readDir 与 stat 之间被删除,允许占位;
+          // 其余错误(如 ACL 拒绝)必须抛出,由错误行展示真实原因,禁止静默回退为 0/空
+          if (!isEntryGone(e)) throw e;
+          return { name: item.name, size: 0, is_dir: item.isDirectory, modified: "" };
+        }
       }));
     } else {
       entries.value = [];

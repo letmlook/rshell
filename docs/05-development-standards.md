@@ -6,6 +6,8 @@
 
 Rust API 和 TypeScript 类型一起维护。命令修改核对 Tauri 注册、客户端参数和结果；事件修改核对外部标签序列化及监听释放。
 
+IPC 参数键契约：`src-tauri/src/commands.rs` 全部 `#[tauri::command]`（含 `cmd!` 宏模板）声明 `rename_all = "snake_case"`，前端 invoke 参数键与 Rust 形参名一致；Tauri 2 默认是 camelCase，不得裸加命令属性。`tests/unit/ipcContract.spec.ts` 对两侧做双向对账，新增命令必须同步两侧。
+
 ## 并发与错误
 
 - 克隆句柄后释放注册表锁，再等待网络或 reply。

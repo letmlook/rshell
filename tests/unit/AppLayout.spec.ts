@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { defineComponent, onMounted } from "vue";
 import { flushPromises, mount } from "@vue/test-utils";
 import App from "../../src/App.vue";
 import { subscribeAppEvents } from "../../src/ipc/events";
@@ -11,6 +12,18 @@ const { listTransfersMock, pauseTransferMock, resumeTransferMock } = vi.hoisted(
   pauseTransferMock: vi.fn().mockResolvedValue(undefined),
   resumeTransferMock: vi.fn().mockResolvedValue(undefined),
 }));
+
+// PROB-02：dockview-vue 真实实现不渲染插槽，面板只能经 ready 事件给出的
+// api.addPanel 创建。桩用这个可检视的假 api 复现该契约。
+const { dockviewApiMocks } = vi.hoisted(() => {
+  const panels = new Map<string, { id: string; api: { setActive: ReturnType<typeof vi.fn> } }>();
+  const addPanel = vi.fn((options: { id: string }) => {
+    const panel = { id: options.id, api: { setActive: vi.fn() } };
+    panels.set(options.id, panel);
+    return panel;
+  });
+  return { dockviewApiMocks: { panels, addPanel, getPanel: vi.fn((id: string) => panels.get(id)) } };
+});
 
 vi.mock("../../src/components/TerminalPane.vue", () => ({ default: { name: "TerminalPane", template: "<div />" } }));
 
@@ -40,6 +53,17 @@ vi.mock("../../src/ipc/client", () => ({
 vi.mock("../../src/ipc/events", () => ({ subscribeAppEvents: vi.fn().mockResolvedValue(vi.fn()) }));
 
 describe("App layout", () => {
+  // dockview 容器桩：经 ready 事件给出与真实库一致的 api 契约（见文件头部 PROB-02 注释）
+  const dockviewStub = defineComponent({
+    name: "DockviewVue",
+    props: ["components"],
+    emits: ["ready"],
+    template: "<div data-testid='dockview' />",
+    setup(_, { emit }) {
+      onMounted(() => emit("ready", { api: dockviewApiMocks }));
+    },
+  });
+
   const childStubs = {
     CustomTitleBar: { name: "CustomTitleBar", template: "<header data-testid='titlebar' />" },
     WorkspaceToolbar: {
@@ -55,14 +79,18 @@ describe("App layout", () => {
       template: "<aside data-testid='side-panel' />",
     },
     StatusBar: { name: "StatusBar", template: "<footer data-testid='statusbar' />" },
-    DockviewVue: { name: "DockviewVue", template: "<div data-testid='dockview'><slot name='terminal' /></div>" },
+    // dockview-vue 导出组件的解析名是编译注入的 __name: "dockview"（dist 实测），
+    // 不是导入名 DockviewVue；桩若匹配不上会挂载真实 dockview，jsdom 缺
+    // ResizeObserver 使 mounted 钩子抛错并毒化 Vue 调度器，拖垮同文件其余用例。
+    // 两个键指向同一桩：script setup 模板内联与否都能按解析名命中。
+    DockviewVue: dockviewStub,
+    dockview: dockviewStub,
     TerminalPane: { name: "TerminalPane", template: "<div data-testid='terminal-pane' />" },
     TransferWorkspace: { name: "TransferWorkspace", template: "<div data-testid='transfer-workspace' />" },
     TransferPanel: { name: "TransferPanel", template: "<div data-testid='transfer-panel' />" },
     SessionCreateDialog: { name: "SessionCreateDialog", template: "<div />" },
     HostKeyMismatchDialog: { name: "HostKeyMismatchDialog", template: "<div />" },
     TransferQueue: { name: "TransferQueue", template: "<div />" },
-    MasterPasswordDialog: { name: "MasterPasswordDialog", template: "<div />" },
     "el-button": { template: "<button />" },
   };
 
@@ -92,6 +120,46 @@ describe("App layout", () => {
     const wrapper = mount(App, { global: { stubs: childStubs } });
     expect(wrapper.find('[data-testid="side-panel"]').exists()).toBe(true);
     expect(wrapper.findComponent({ name: "ActivityBar" }).exists()).toBe(false);
+  });
+
+  it("creates the terminal panel through api.addPanel when a session is selected", async () => {
+    dockviewApiMocks.panels.clear();
+    dockviewApiMocks.addPanel.mockClear();
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    // 桩不再渲染插槽：选中会话前终端容器为空，也不存在 TerminalPane
+    expect(wrapper.find('[data-testid="dockview"]').exists()).toBe(false);
+    await wrapper.findComponent({ name: "SidePanel" }).vm.$emit("select-session", "session-42");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="dockview"]').exists()).toBe(true);
+    // 桩不渲染任何插槽：dockview 挂载后 TerminalPane 也不经插槽出现，
+    // 面板只能由 addPanel 创建 —— 桩或 App.vue 回归插槽方案时本断言失败。
+    expect(wrapper.find('[data-testid="terminal-pane"]').exists()).toBe(false);
+    expect(dockviewApiMocks.addPanel).toHaveBeenCalledTimes(1);
+    expect(dockviewApiMocks.addPanel).toHaveBeenCalledWith({
+      id: "terminal-session-42",
+      component: "terminal",
+      params: { sessionId: "session-42" },
+    });
+    wrapper.unmount();
+  });
+
+  it("re-activates the existing panel instead of duplicating it when switching back", async () => {
+    dockviewApiMocks.panels.clear();
+    dockviewApiMocks.addPanel.mockClear();
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    const sidePanel = wrapper.findComponent({ name: "SidePanel" });
+    await sidePanel.vm.$emit("select-session", "session-a");
+    await flushPromises();
+    await sidePanel.vm.$emit("select-session", "session-b");
+    await flushPromises();
+    await sidePanel.vm.$emit("select-session", "session-a");
+    await flushPromises();
+    expect(dockviewApiMocks.addPanel).toHaveBeenCalledTimes(2);
+    expect(dockviewApiMocks.addPanel).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "terminal-session-b", params: { sessionId: "session-b" } }),
+    );
+    expect(dockviewApiMocks.panels.get("terminal-session-a")?.api.setActive).toHaveBeenCalledOnce();
+    wrapper.unmount();
   });
 
   it("opens the sidebar and changes the selected panel from toolbar intent", async () => {

@@ -17,19 +17,9 @@
     "core:window:allow-is-maximized",
     "core:webview:default",
     "core:app:default",
-    "fs:default",
-    "fs:allow-read-text-file",
-    "fs:allow-read-file",
-    "fs:allow-write-text-file",
-    "fs:allow-write-file",
-    "fs:allow-exists",
-    "fs:allow-mkdir",
-    "fs:allow-remove",
-    "fs:allow-rename",
     "fs:allow-read-dir",
-    "dialog:default",
+    "fs:allow-stat",
     "dialog:allow-open",
-    "dialog:allow-save",
     "dialog:allow-message"
   ]
 }

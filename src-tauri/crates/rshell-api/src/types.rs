@@ -165,6 +165,11 @@ pub struct PortForwardRule {
     pub remote_host: String,
     pub remote_port: u16,
     pub direction: ForwardDirection,
+    /// 非回环 bind_address 已经过用户在 UI 上显式确认（PROB-23）。
+    /// `serde(default)` 兼容旧前端请求与旧持久化文件：缺省视为未确认，
+    /// 后端据此默认拒绝非回环监听。
+    #[serde(default)]
+    pub allow_non_loopback: bool,
 }
 
 /// 转发方向
