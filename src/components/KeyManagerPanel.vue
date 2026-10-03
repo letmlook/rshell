@@ -6,8 +6,11 @@
  * "只出 SshKeyInfo, 私钥永不过 IPC"。
  *
  * 后端 list_keys 返回的元数据(id/name/fingerprint/public_key_blob/...)
- * 展示在这里;用户点击"导入"通过 tauri-plugin-dialog 选本地文件;
- * 真正的解密/SSH 握手在后端 infra::crypto 完成。
+ * 展示在这里;用户点击"导入"通过 tauri-plugin-dialog 选本地文件。
+ *
+ * 能力边界(docs/08「核心接口与界面边界」)：密钥管理仅为托管存储——
+ * 此处生成/导入的私钥没有「关联到会话」入口、不参与会话认证；会话公钥
+ * 认证使用会话自身配置的外部私钥文件路径。界面提示与该边界一致。
  */
 import { onMounted, ref } from "vue";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
@@ -145,6 +148,11 @@ onMounted(refresh);
 
     <p v-if="error" class="error">{{ error }}</p>
 
+    <!-- R2-08：能力边界提示，与 docs/08「核心接口与界面边界」保持一致 -->
+    <p class="hint">
+      密钥管理仅为托管存储：此处生成/导入的私钥不参与会话认证（会话公钥认证使用会话自身配置的外部私钥文件）。
+    </p>
+
     <el-form inline size="small" class="gen-form" @submit.prevent="generate">
       <el-form-item label="生成">
         <el-input v-model="genName" placeholder="name" style="width: 120px" />
@@ -232,6 +240,11 @@ h3 {
   font-size: 12px;
   color: var(--el-text-color-secondary);
   word-break: break-all;
+}
+.hint {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
 }
 .error {
   color: var(--el-color-danger);

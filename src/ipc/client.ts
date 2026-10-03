@@ -53,7 +53,57 @@ function commandName(variant: string): string {
 
 async function call<T = unknown>(cmd: AppCommand): Promise<T> {
   const [name, payload] = commandToArgs(cmd);
-  return invoke<T>(name, payload);
+  try {
+    return await invoke<T>(name, payload);
+  } catch (e) {
+    if (isIpcErrorShape(e)) throw new IpcCallError(e);
+    throw e;
+  }
+}
+
+// ===== 后端错误形状转换（R2-02） =====
+//
+// Tauri 2 对实现了 Serialize 的 IpcError（src-tauri/src/error.rs）走
+// InvokeError(serde_json::Value) 整体序列化：前端 catch 到的是
+// { kind, message, session_id } 对象而非字符串，直接 String(e) 会显示成
+// "[object Object]"。这里在唯一入口 call() 统一转回可读 Error：
+// message 作展示文案，kind / session_id 挂在 error 属性上供调用方分支。
+
+/** 后端 IpcError 经 Tauri IPC 序列化后抵达前端的形状 */
+export interface IpcErrorShape {
+  kind: string;
+  message: string;
+  session_id?: string | null;
+}
+
+export function isIpcErrorShape(value: unknown): value is IpcErrorShape {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { kind?: unknown }).kind === "string" &&
+    typeof (value as { message?: unknown }).message === "string"
+  );
+}
+
+/** 可读的后端错误：String(e) 显示 message 而非 "[object Object]" */
+export class IpcCallError extends Error {
+  /** 稳定的机器可读判别串（not_found / connection / ...），供前端分支 */
+  readonly kind: string;
+  /** 可选会话 id，便于把错误挂到正确的会话行 */
+  readonly session_id: string | null;
+  constructor(shape: IpcErrorShape) {
+    super(shape.message);
+    this.name = "IpcError";
+    this.kind = shape.kind;
+    this.session_id = shape.session_id ?? null;
+  }
+}
+
+/** 任意 rejection 的可读文案：IpcError 对象取 message，其余维持原语义
+ * （Error 取 message、字符串原样），供绕过 call() 的终端 Channel 路径复用 */
+export function ipcErrorMessage(e: unknown): string {
+  if (isIpcErrorShape(e)) return e.message;
+  return e instanceof Error ? e.message : String(e);
 }
 
 // ===== 会话 =====

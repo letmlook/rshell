@@ -164,6 +164,69 @@ impl ProgressThrottle {
     }
 }
 
+/// 启动前的控制收口：暂停挂起、取消中止（与 sftp.rs 的 `wait_for_run` 同语义，
+/// 但作用于「打开 SFTP 通道之前」）——启动窗口内到达的暂停不会打开任何远端通道。
+async fn wait_for_run_before_start(
+    control: &mut watch::Receiver<TransferControl>,
+) -> Result<(), String> {
+    loop {
+        match *control.borrow_and_update() {
+            TransferControl::Cancel => return Err("transfer cancelled before start".to_string()),
+            TransferControl::Run => return Ok(()),
+            TransferControl::Pause => {}
+        }
+        control
+            .changed()
+            .await
+            .map_err(|_| "transfer cancelled before start".to_string())?;
+    }
+}
+
+/// R2-17：传输任务兜底清理守卫。
+///
+/// 任务体（tokio::spawn 的 async 块）在正常路径末尾 disarm；若中途 unwind
+///（panic），Drop 在任务自身的运行时上下文内再 spawn 一个后台清理：移除
+/// 控制通道条目并按失败写回终态——否则任务表永久停在非终态、control_channels
+/// 泄漏条目，后续 pause/resume/cancel 会对幽灵任务操作。
+struct TransferCleanupGuard {
+    task_id: Uuid,
+    tasks: Arc<RwLock<HashMap<Uuid, TransferTask>>>,
+    control_channels: Arc<RwLock<HashMap<Uuid, watch::Sender<TransferControl>>>>,
+    event_bus: Arc<EventBus>,
+    armed: bool,
+}
+
+impl TransferCleanupGuard {
+    /// 正常清理路径（控制通道移除 + 终态写回）完成后调用：Drop 不再兜底
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TransferCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop 运行在任务自己的运行时上下文里（同步上下文不能 await），
+        // 把兜底清理作为独立任务 spawn 出去。
+        let task_id = self.task_id;
+        let tasks = self.tasks.clone();
+        let control_channels = self.control_channels.clone();
+        let event_bus = self.event_bus.clone();
+        tokio::spawn(async move {
+            control_channels.write().await.remove(&task_id);
+            TransferService::finalize_transfer(
+                &tasks,
+                &event_bus,
+                task_id,
+                Err("transfer task panicked before finishing".to_string()),
+            )
+            .await;
+        });
+    }
+}
+
 /// 文件传输服务
 pub struct TransferService {
     /// 传输任务队列
@@ -351,18 +414,52 @@ impl TransferService {
             }
         };
 
-        // 建立 pause/resume/cancel 共用的控制通道，传输循环在每个分块前检查
-        let (control_tx, mut control_rx) = watch::channel(TransferControl::Run);
-        {
-            let mut controls = self.control_channels.write().await;
-            controls.insert(task_id, control_tx);
-        }
+        // 建立 pause/resume/cancel 共用的控制通道。
+        //
+        // 通道注册必须与启动决策在同一把 tasks 写锁临界区内完成：
+        // cancel/pause 在各自的 tasks 写锁内读取通道（锁序恒为
+        // tasks → control_channels），使「传输启动决策」与「取消/暂停决策」
+        // 互斥——provider await 期间到达的取消/暂停不会因通道尚不存在而丢失：
+        // 取消拦下启动，暂停则以 Pause 初值建通道，让循环首轮即挂起。
+        let mut control_rx = {
+            let mut tasks = self.tasks.write().await;
+            let Some(t) = tasks.get_mut(&task_id) else {
+                return Ok(());
+            };
+            if t.state == TransferTaskState::Cancelled {
+                // provider await 期间已被取消：不启动传输，保持 Cancelled 终态
+                info!(task_id = %task_id, "Transfer cancelled during startup; not executing");
+                return Ok(());
+            }
+            let paused_during_startup = t.state == TransferTaskState::Paused;
+            let initial = if paused_during_startup {
+                TransferControl::Pause
+            } else {
+                TransferControl::Run
+            };
+            let (control_tx, control_rx) = watch::channel(initial);
+            self.control_channels
+                .write()
+                .await
+                .insert(task_id, control_tx);
+            control_rx
+        };
 
         // 启动异步传输任务
         let tasks = self.tasks.clone();
         let control_channels = self.control_channels.clone();
         let event_bus = self.event_bus.clone();
         tokio::spawn(async move {
+            // R2-17：兜底守卫覆盖整个任务体——正常路径末尾 disarm；
+            // 中途 panic 时由 Drop 兜底移除控制通道并写回失败终态。
+            let mut cleanup_guard = TransferCleanupGuard {
+                task_id,
+                tasks: tasks.clone(),
+                control_channels: control_channels.clone(),
+                event_bus: event_bus.clone(),
+                armed: true,
+            };
+
             // SFTP 拷贝循环里只能同步回调（不能在回调里 await 写锁），
             // 所以回调只做节流后投递，由独立 forwarder 任务落表并广播。
             let (progress_tx, mut progress_rx) =
@@ -390,6 +487,9 @@ impl TransferService {
             };
 
             let result = async {
+                // 启动窗口内到达的暂停/取消在此收口：循环尚未触碰远端，
+                // 暂停挂起在打开 SFTP 通道之前，取消立即中止
+                wait_for_run_before_start(&mut control_rx).await?;
                 // 只在打开 SFTP 子通道时持有客户端读锁；SFTP 流独立于发送客户端，
                 // 拷贝循环（含暂停挂起期间）不得阻塞会话断开等需要写锁的操作。
                 let sftp = {
@@ -443,6 +543,9 @@ impl TransferService {
 
             // 终态写回：已被取消的任务保持 Cancelled，不广播 TransferCompleted/TransferFailed
             Self::finalize_transfer(&tasks, &event_bus, task_id, result).await;
+
+            // 正常清理已全部完成：解除守卫，Drop 不再兜底
+            cleanup_guard.disarm();
         });
 
         Ok(())
@@ -525,13 +628,15 @@ impl TransferService {
     /// 置 Paused 并通过控制通道通知传输循环在下一分块前挂起；
     /// 字节随即停止增长，恢复后从已传字节继续。
     pub async fn pause_transfer(&self, task_id: Uuid) -> Result<(), CoreError> {
-        // 先克隆发送端再锁任务表，保持 control_channels → tasks 的加锁顺序
-        let control = self.control_channels.read().await.get(&task_id).cloned();
+        // 与 execute_transfer 的启动临界区互斥：先锁任务表、锁内再读控制通道
+        // （锁序恒为 tasks → control_channels），通道注册前到达的暂停以
+        // Pause 初值建通道收口，不会丢失。
         let mut tasks = self.tasks.write().await;
 
         if let Some(task) = tasks.get_mut(&task_id) {
             if task.state == TransferTaskState::Transferring {
                 task.state = TransferTaskState::Paused;
+                let control = self.control_channels.read().await.get(&task_id).cloned();
                 // 传输循环已自行结束时发送失败（无接收端），按终态写回逻辑收尾
                 if let Some(control) = control {
                     let _ = control.send(TransferControl::Pause);
@@ -548,12 +653,13 @@ impl TransferService {
 
     /// 恢复传输任务
     pub async fn resume_transfer(&self, task_id: Uuid) -> Result<(), CoreError> {
-        let control = self.control_channels.read().await.get(&task_id).cloned();
+        // 与 pause_transfer 同序：tasks → control_channels
         let mut tasks = self.tasks.write().await;
 
         if let Some(task) = tasks.get_mut(&task_id) {
             if task.state == TransferTaskState::Paused {
                 task.state = TransferTaskState::Transferring;
+                let control = self.control_channels.read().await.get(&task_id).cloned();
                 // 唤醒挂起中的传输循环；发送失败说明循环已结束，由终态写回收尾
                 if let Some(control) = control {
                     let _ = control.send(TransferControl::Run);
@@ -570,16 +676,22 @@ impl TransferService {
 
     /// 取消传输任务
     ///
-    /// 置 Cancelled 并通过控制通道通知传输循环在下一分块前中止；
-    /// 循环结束后的终态写回会保持 Cancelled，不广播 TransferCompleted。
+    /// 仅非终态（Pending/Transferring/Paused）任务可取消：置 Cancelled 并通过
+    /// 控制通道通知传输循环在下一分块前中止；循环结束后的终态写回会保持
+    /// Cancelled，不广播 TransferCompleted。
     pub async fn cancel_transfer(&self, task_id: Uuid) -> Result<(), CoreError> {
-        let control = self.control_channels.read().await.get(&task_id).cloned();
+        // 与 execute_transfer 的启动临界区互斥：通道注册前到达的取消直接
+        // 拦下启动（execute_transfer 复查 Cancelled），不会丢信号。
         let mut tasks = self.tasks.write().await;
 
         if let Some(task) = tasks.get_mut(&task_id) {
-            if task.state != TransferTaskState::Completed {
+            // R2-07：终态（Completed/Failed/Cancelled）不得被改写——对 Failed
+            // 任务取消会让 error_message 与 Cancelled 并存，重复取消还会重置
+            // finished_at，均与 is_terminal「不会再发生状态变化」矛盾。
+            if !task.state.is_terminal() {
                 task.state = TransferTaskState::Cancelled;
                 task.finished_at = Some(std::time::Instant::now());
+                let control = self.control_channels.read().await.get(&task_id).cloned();
                 if let Some(control) = control {
                     let _ = control.send(TransferControl::Cancel);
                 }
@@ -656,16 +768,20 @@ impl TransferService {
     }
 
     /// 标记传输完成
+    ///
+    /// R2-21：仅非终态任务生效——终态（Completed/Failed/Cancelled）不得被改写。
     pub async fn mark_completed(&self, task_id: Uuid) -> Result<(), CoreError> {
         let mut tasks = self.tasks.write().await;
 
         if let Some(task) = tasks.get_mut(&task_id) {
-            task.state = TransferTaskState::Completed;
-            task.finished_at = Some(std::time::Instant::now());
-            info!(task_id = %task_id, "Transfer completed");
-            self.event_bus
-                .publish(AppEvent::TransferCompleted { task_id });
-            self.event_bus.publish(AppEvent::TransferQueueChanged);
+            if !task.state.is_terminal() {
+                task.state = TransferTaskState::Completed;
+                task.finished_at = Some(std::time::Instant::now());
+                info!(task_id = %task_id, "Transfer completed");
+                self.event_bus
+                    .publish(AppEvent::TransferCompleted { task_id });
+                self.event_bus.publish(AppEvent::TransferQueueChanged);
+            }
         }
         Self::prune_finished_tasks(&mut tasks);
 
@@ -673,17 +789,23 @@ impl TransferService {
     }
 
     /// 标记传输失败
+    ///
+    /// R2-21：仅非终态任务生效——provider 出错路径若在启动窗口内的取消
+    /// 之后到达，不得把已 Cancelled 的任务改写为 Failed、让取消意图被
+    /// 终态覆盖（与 R2-07 对 cancel_transfer 的守卫同类）。
     pub async fn mark_failed(&self, task_id: Uuid, error: String) -> Result<(), CoreError> {
         let mut tasks = self.tasks.write().await;
 
         if let Some(task) = tasks.get_mut(&task_id) {
-            task.state = TransferTaskState::Failed;
-            task.error_message = Some(error.clone());
-            task.finished_at = Some(std::time::Instant::now());
-            warn!(task_id = %task_id, error = %error, "Transfer failed");
-            self.event_bus
-                .publish(AppEvent::TransferFailed { task_id, error });
-            self.event_bus.publish(AppEvent::TransferQueueChanged);
+            if !task.state.is_terminal() {
+                task.state = TransferTaskState::Failed;
+                task.error_message = Some(error.clone());
+                task.finished_at = Some(std::time::Instant::now());
+                warn!(task_id = %task_id, error = %error, "Transfer failed");
+                self.event_bus
+                    .publish(AppEvent::TransferFailed { task_id, error });
+                self.event_bus.publish(AppEvent::TransferQueueChanged);
+            }
         }
         Self::prune_finished_tasks(&mut tasks);
 
@@ -856,6 +978,169 @@ mod tests {
         svc.cancel_transfer(id).await.unwrap();
         let t = svc.get_task(id).await.unwrap();
         assert_eq!(t.state, TransferTaskState::Completed); // 未变化
+    }
+
+    // ===== R2-07：终态不得被取消改写，非终态取消行为不变 =====
+
+    /// 验收：对 Failed 任务调用 cancel_transfer 后状态仍为 Failed——
+    /// error_message 与终态不被改写，也不广播队列刷新。
+    #[tokio::test]
+    async fn cancel_failed_task_is_noop() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+        {
+            let mut tasks = svc.tasks.write().await;
+            let mut task = make_task(id, TransferTaskState::Failed);
+            task.error_message = Some("disk full".to_string());
+            task.finished_at = Some(std::time::Instant::now());
+            tasks.insert(id, task);
+        }
+        let seen = collect_events(&svc);
+
+        svc.cancel_transfer(id).await.unwrap();
+
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(
+            t.state,
+            TransferTaskState::Failed,
+            "终态 Failed 不得被改写为 Cancelled"
+        );
+        assert_eq!(
+            t.error_message.as_deref(),
+            Some("disk full"),
+            "错误信息必须保留"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "终态任务的取消不得广播任何事件"
+        );
+    }
+
+    // ===== R2-17：兜底清理守卫 =====
+
+    /// 验收：任务体 unwind（panic）路径下，Drop 守卫兜底移除 control_channels
+    /// 条目并把任务写回终态——否则幽灵任务永久占用任务表与控制通道。
+    #[tokio::test]
+    async fn cleanup_guard_removes_channel_and_writes_terminal_state_on_unwind() {
+        let svc = Arc::new(make_service());
+        let id = Uuid::new_v4();
+        insert_task(&svc, make_task(id, TransferTaskState::Transferring)).await;
+        let mut rx = register_control(&svc, id).await;
+        let seen = collect_events(&svc);
+
+        {
+            // armed 状态下析构 = 模拟任务体中途 panic 的 unwind 路径
+            let guard = TransferCleanupGuard {
+                task_id: id,
+                tasks: svc.tasks.clone(),
+                control_channels: svc.control_channels.clone(),
+                event_bus: svc.event_bus.clone(),
+                armed: true,
+            };
+            drop(guard);
+        }
+
+        // Drop 内 spawn 的后台清理需要调度时间
+        for _ in 0..200 {
+            if svc.control_channels.read().await.get(&id).is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert!(
+            svc.control_channels.read().await.get(&id).is_none(),
+            "控制通道条目必须被移除"
+        );
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Failed, "终态必须被写回");
+        assert_eq!(
+            t.error_message.as_deref(),
+            Some("transfer task panicked before finishing")
+        );
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, AppEvent::TransferFailed { task_id, .. } if *task_id == id)),
+            "兜底写回必须广播 TransferFailed"
+        );
+        // 发送端已移除：等待控制信号会失败
+        assert!(rx.changed().await.is_err());
+    }
+
+    /// 正常路径 disarm 后 Drop 不再兜底：不覆盖已写回的终态、不重复清理
+    #[tokio::test]
+    async fn cleanup_guard_disarmed_drop_is_noop() {
+        let svc = Arc::new(make_service());
+        let id = Uuid::new_v4();
+        insert_task(&svc, make_task(id, TransferTaskState::Transferring)).await;
+        register_control(&svc, id).await;
+        let seen = collect_events(&svc);
+
+        {
+            let mut guard = TransferCleanupGuard {
+                task_id: id,
+                tasks: svc.tasks.clone(),
+                control_channels: svc.control_channels.clone(),
+                event_bus: svc.event_bus.clone(),
+                armed: true,
+            };
+            // 正常路径动作：移除控制通道 + 写回终态，然后 disarm
+            svc.control_channels.write().await.remove(&id);
+            svc.mark_completed(id).await.unwrap();
+            guard.disarm();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Completed, "终态不得被兜底覆盖");
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, AppEvent::TransferFailed { .. })),
+            "disarm 后不得再广播 TransferFailed"
+        );
+        assert!(svc.control_channels.read().await.get(&id).is_none());
+    }
+
+    /// 验收：非终态（Pending）取消行为不变
+    #[tokio::test]
+    async fn test_cancel_pending_task_moves_to_cancelled() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Pending));
+        }
+
+        svc.cancel_transfer(id).await.unwrap();
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Cancelled);
+    }
+
+    /// 验收：非终态（Paused）取消行为不变，且控制通道收到 Cancel
+    #[tokio::test]
+    async fn test_cancel_paused_task_moves_to_cancelled() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Paused));
+        }
+        let rx = register_control(&svc, id).await;
+
+        svc.cancel_transfer(id).await.unwrap();
+
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Cancelled);
+        assert_eq!(
+            *rx.borrow(),
+            TransferControl::Cancel,
+            "必须通知传输循环中止"
+        );
     }
 
     /// 在服务的控制通道上注册发送端，返回可在测试中观察的接收端
@@ -1061,6 +1346,78 @@ mod tests {
         svc.mark_completed(id).await.unwrap();
         let t = svc.get_task(id).await.unwrap();
         assert_eq!(t.state, TransferTaskState::Completed);
+    }
+
+    // ===== R2-21：mark_failed/mark_completed 不得改写终态 =====
+
+    /// 验收：对已 Cancelled 任务调用 mark_failed 后状态仍为 Cancelled，
+    /// 不写错误信息、不广播 TransferFailed。
+    #[tokio::test]
+    async fn mark_failed_keeps_cancelled_terminal_state() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+        insert_task(&svc, make_task(id, TransferTaskState::Cancelled)).await;
+        let seen = collect_events(&svc);
+
+        svc.mark_failed(id, "provider blew up after cancel".to_string())
+            .await
+            .unwrap();
+
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(
+            t.state,
+            TransferTaskState::Cancelled,
+            "取消终态不得被 mark_failed 改写为 Failed"
+        );
+        assert!(t.error_message.is_none(), "取消终态不得被写入错误信息");
+        assert!(seen.lock().unwrap().is_empty(), "终态不得再广播任何事件");
+    }
+
+    /// 同类守卫：mark_completed 也不得改写终态
+    #[tokio::test]
+    async fn mark_completed_keeps_failed_terminal_state() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+        {
+            let mut tasks = svc.tasks.write().await;
+            let mut task = make_task(id, TransferTaskState::Failed);
+            task.error_message = Some("disk full".to_string());
+            tasks.insert(id, task);
+        }
+        let seen = collect_events(&svc);
+
+        svc.mark_completed(id).await.unwrap();
+
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(t.state, TransferTaskState::Failed, "失败终态不得被改写");
+        assert_eq!(t.error_message.as_deref(), Some("disk full"));
+        assert!(seen.lock().unwrap().is_empty(), "终态不得再广播任何事件");
+    }
+
+    /// 验收：非终态任务的失败路径行为不变（Pending/Transferring/Paused 均可标记失败）
+    #[tokio::test]
+    async fn mark_failed_still_applies_to_non_terminal_states() {
+        for state in [
+            TransferTaskState::Pending,
+            TransferTaskState::Transferring,
+            TransferTaskState::Paused,
+        ] {
+            let svc = make_service();
+            let id = Uuid::new_v4();
+            insert_task(&svc, make_task(id, state)).await;
+            let seen = collect_events(&svc);
+
+            svc.mark_failed(id, "boom".to_string()).await.unwrap();
+
+            let t = svc.get_task(id).await.unwrap();
+            assert_eq!(t.state, TransferTaskState::Failed);
+            assert_eq!(t.error_message.as_deref(), Some("boom"));
+            assert!(seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, AppEvent::TransferFailed { task_id, .. } if *task_id == id)));
+        }
     }
 
     #[tokio::test]
@@ -1304,5 +1661,194 @@ mod tests {
         let t = svc.get_task(id).await.unwrap();
         assert_eq!(t.state, TransferTaskState::Cancelled);
         assert!(t.finished_at.is_some(), "取消后必须记录终态时间");
+    }
+
+    // ===== R2-01：provider await 窗口内的取消/暂停不得丢失 =====
+
+    use rshell_api::types::{AuthMethod, Protocol as ApiProtocol, SessionConfig};
+    use rshell_protocol::ssh::client::{ResolvedAuthMethod, SshClient};
+    use std::future::Future;
+
+    /// 可控 SSH provider：被调用时先通知 `entered`（测试据此确认已进入
+    /// provider await 窗口），随后阻塞在 `gate` 上，放行后返回一个未连接的
+    /// SshClient——其 open_sftp_channel 立即失败，可证明循环一旦真正启动
+    /// 必然触发终态写回。
+    fn gated_provider(
+        entered: Arc<tokio::sync::Notify>,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> SshClientProvider {
+        Arc::new(move |_session_id: Uuid| {
+            let entered = entered.clone();
+            let gate = gate.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                gate.notified().await;
+                let config = SessionConfig {
+                    id: Uuid::new_v4(),
+                    name: "race-test".into(),
+                    folder_id: None,
+                    host: "127.0.0.1".into(),
+                    port: 22,
+                    protocol: ApiProtocol::SSH,
+                    auth_method: AuthMethod::Password {
+                        username: "u".into(),
+                        has_password: true,
+                    },
+                    serial_config: None,
+                };
+                let auth = ResolvedAuthMethod::Password {
+                    username: "u".into(),
+                    password: "p".into(),
+                };
+                Ok(
+                    Arc::new(tokio::sync::RwLock::new(SshClient::new(config, auth)))
+                        as SshClientHandle,
+                )
+            })
+                as Pin<Box<dyn Future<Output = Result<SshClientHandle, CoreError>> + Send>>
+        })
+    }
+
+    /// 入队一个上传任务并等到 provider await 窗口内（provider 已被调用、
+    /// 正阻塞在 gate 上），返回 (任务 id, gate, 入队 future 句柄)。
+    async fn enqueue_into_provider_window(
+        svc: &Arc<TransferService>,
+    ) -> (
+        Uuid,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<Result<Uuid, CoreError>>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        svc.set_ssh_client_provider(gated_provider(entered.clone(), gate.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("source.txt");
+        std::fs::write(&local, b"payload").unwrap();
+        // tempdir 在本函数返回时会被删除导致路径失效：泄漏目录，
+        // 由测试进程退出统一回收（体量仅几字节）。
+        std::mem::forget(dir);
+
+        let enqueue = {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                svc.enqueue_upload(local, "/remote/file".into(), Uuid::new_v4())
+                    .await
+            })
+        };
+        // provider 已被调用 ⇒ 任务已置 Transferring、正卡在 await 窗口内
+        entered.notified().await;
+        let id = svc
+            .list_tasks()
+            .await
+            .first()
+            .expect("任务在进入 await 窗口前必须已入队")
+            .id;
+        (id, gate, enqueue)
+    }
+
+    /// 验收：await 窗口内的取消不得丢失——传输循环不得启动，终态保持
+    /// Cancelled 且与实际一致（本地文件未动、无完成/失败事件）。
+    #[tokio::test]
+    async fn cancel_during_provider_await_prevents_transfer_start() {
+        let svc = Arc::new(make_service());
+        let seen = collect_events(&svc);
+        let (id, gate, enqueue) = enqueue_into_provider_window(&svc).await;
+
+        // 窗口内取消：此刻控制通道尚未注册，取消不得因此丢失
+        svc.cancel_transfer(id).await.unwrap();
+        assert_eq!(
+            svc.get_task(id).await.unwrap().state,
+            TransferTaskState::Cancelled
+        );
+
+        // 放行 provider：execute_transfer 必须在同一把 tasks 写锁内复查
+        // Cancelled 并拦下启动（回归时这里会注册 Run 通道并 spawn 循环）
+        gate.notify_one();
+        enqueue.await.unwrap().expect("启动被拦下应返回 Ok");
+
+        // 给调度器留出时间：若回归（循环被启动），假客户端失败后会终态写回
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(
+            t.state,
+            TransferTaskState::Cancelled,
+            "取消终态不得被传输循环的写回改写"
+        );
+        assert!(t.error_message.is_none(), "取消不是失败，不得写入错误信息");
+        assert!(
+            !seen.lock().unwrap().iter().any(|e| matches!(
+                e,
+                AppEvent::TransferCompleted { .. } | AppEvent::TransferFailed { .. }
+            )),
+            "未启动的传输不得广播完成/失败事件"
+        );
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, AppEvent::TransferQueueChanged))
+                .count(),
+            2,
+            "只应有入队与取消两次队列刷新；若回归（循环启动后写回终态）会是 3 次"
+        );
+    }
+
+    /// 验收：await 窗口内的暂停不得丢失——控制通道以 Pause 初值建立，
+    /// 循环在打开 SFTP 通道前挂起，任务保持 Paused 等待恢复；恢复后循环
+    /// 真正前进（在假客户端上以失败收尾，证明挂起可恢复）。
+    #[tokio::test]
+    async fn pause_during_provider_await_suspends_loop_before_remote_contact() {
+        let svc = Arc::new(make_service());
+        let seen = collect_events(&svc);
+        let (id, gate, enqueue) = enqueue_into_provider_window(&svc).await;
+
+        // 窗口内暂停：此刻控制通道尚未注册，暂停不得因此丢失
+        svc.pause_transfer(id).await.unwrap();
+        assert_eq!(
+            svc.get_task(id).await.unwrap().state,
+            TransferTaskState::Paused
+        );
+
+        // 放行 provider：循环以 Pause 初值启动，必须在打开 SFTP 通道前挂起
+        gate.notify_one();
+        enqueue.await.unwrap().expect("启动照常返回 Ok");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(
+            t.state,
+            TransferTaskState::Paused,
+            "启动窗口内的暂停必须生效；回归时循环会照跑并在假客户端上失败改写为 Failed"
+        );
+        assert!(t.error_message.is_none(), "挂起中的任务不得写入错误信息");
+        assert!(
+            svc.control_channels.read().await.contains_key(&id),
+            "挂起中的循环必须仍持有控制通道等待恢复"
+        );
+        assert!(
+            !seen.lock().unwrap().iter().any(|e| matches!(
+                e,
+                AppEvent::TransferCompleted { .. } | AppEvent::TransferFailed { .. }
+            )),
+            "挂起中的传输不得广播完成/失败事件"
+        );
+
+        // 恢复后循环真正前进：假客户端打不开 SFTP 通道 → 按失败收尾
+        svc.resume_transfer(id).await.unwrap();
+        for _ in 0..200 {
+            if svc.get_task(id).await.unwrap().state.is_terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let t = svc.get_task(id).await.unwrap();
+        assert_eq!(
+            t.state,
+            TransferTaskState::Failed,
+            "恢复后挂起的循环应继续执行（假客户端上以失败收尾）"
+        );
+        assert!(t.error_message.is_some(), "失败收尾必须携带错误信息");
     }
 }

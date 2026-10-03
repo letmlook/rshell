@@ -7,38 +7,57 @@ import { listTransfers, pauseTransfer, resumeTransfer } from "../../src/ipc/clie
 import TransferPanel from "../../src/components/TransferPanel.vue";
 import ElementPlus from "element-plus";
 
-const { listTransfersMock, pauseTransferMock, resumeTransferMock } = vi.hoisted(() => ({
+const { listTransfersMock, pauseTransferMock, resumeTransferMock, sessionsStoreMock } = vi.hoisted(() => ({
   listTransfersMock: vi.fn().mockResolvedValue([]),
   pauseTransferMock: vi.fn().mockResolvedValue(undefined),
   resumeTransferMock: vi.fn().mockResolvedValue(undefined),
+  sessionsStoreMock: { store: null as { items: Array<{ id: string }>; [key: string]: unknown } | null },
 }));
 
 // PROB-02：dockview-vue 真实实现不渲染插槽，面板只能经 ready 事件给出的
-// api.addPanel 创建。桩用这个可检视的假 api 复现该契约。
+// api.addPanel 创建。桩用这个可检视的假 api 复现该契约；panels 以 getter
+// 复现真实 DockviewApi.panels（App.vue 的孤儿面板清理遍历该列表）。
 const { dockviewApiMocks } = vi.hoisted(() => {
-  const panels = new Map<string, { id: string; api: { setActive: ReturnType<typeof vi.fn> } }>();
+  const panelMap = new Map<
+    string,
+    { id: string; api: { setActive: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> } }
+  >();
   const addPanel = vi.fn((options: { id: string }) => {
-    const panel = { id: options.id, api: { setActive: vi.fn() } };
-    panels.set(options.id, panel);
+    const panel = { id: options.id, api: { setActive: vi.fn(), close: vi.fn() } };
+    panelMap.set(options.id, panel);
     return panel;
   });
-  return { dockviewApiMocks: { panels, addPanel, getPanel: vi.fn((id: string) => panels.get(id)) } };
+  return {
+    dockviewApiMocks: {
+      panelMap,
+      get panels() {
+        return Array.from(panelMap.values());
+      },
+      addPanel,
+      getPanel: vi.fn((id: string) => panelMap.get(id)),
+    },
+  };
 });
 
 vi.mock("../../src/components/TerminalPane.vue", () => ({ default: { name: "TerminalPane", template: "<div />" } }));
 
-vi.mock("../../src/stores/sessions", () => ({
-  useSessionsStore: () => ({
-    currentId: null,
+vi.mock("../../src/stores/sessions", async () => {
+  // 共享 reactive 实例：测试可以直接改 items 触发 App.vue 的会话列表 watch
+  const { reactive } = await import("vue");
+  const store = reactive({
+    currentId: null as string | null,
     current: null,
-    items: [],
-    connectionState: new Map(),
-    refresh: vi.fn().mockResolvedValue(undefined),
-    subscribeEvents: vi.fn().mockResolvedValue(undefined),
+    items: [] as Array<{ id: string; name?: string }>,
+    connectionState: new Map<string, string>(),
+    refresh: vi.fn(async () => {}),
+    subscribeEvents: vi.fn(async () => {}),
     disposeEvents: vi.fn(),
-    connect: vi.fn().mockResolvedValue(undefined),
-  }),
-}));
+    connect: vi.fn(async () => {}),
+    delete: vi.fn(async () => {}),
+  });
+  sessionsStoreMock.store = store;
+  return { useSessionsStore: () => store };
+});
 vi.mock("../../src/stores/hostKey", () => ({
   useHostKeyStore: () => ({ subscribeEvents: vi.fn().mockResolvedValue(undefined), disposeEvents: vi.fn() }),
 }));
@@ -123,7 +142,7 @@ describe("App layout", () => {
   });
 
   it("creates the terminal panel through api.addPanel when a session is selected", async () => {
-    dockviewApiMocks.panels.clear();
+    dockviewApiMocks.panelMap.clear();
     dockviewApiMocks.addPanel.mockClear();
     const wrapper = mount(App, { global: { stubs: childStubs } });
     // 桩不再渲染插槽：选中会话前终端容器为空，也不存在 TerminalPane
@@ -144,7 +163,7 @@ describe("App layout", () => {
   });
 
   it("re-activates the existing panel instead of duplicating it when switching back", async () => {
-    dockviewApiMocks.panels.clear();
+    dockviewApiMocks.panelMap.clear();
     dockviewApiMocks.addPanel.mockClear();
     const wrapper = mount(App, { global: { stubs: childStubs } });
     const sidePanel = wrapper.findComponent({ name: "SidePanel" });
@@ -158,7 +177,87 @@ describe("App layout", () => {
     expect(dockviewApiMocks.addPanel).toHaveBeenCalledWith(
       expect.objectContaining({ id: "terminal-session-b", params: { sessionId: "session-b" } }),
     );
-    expect(dockviewApiMocks.panels.get("terminal-session-a")?.api.setActive).toHaveBeenCalledOnce();
+    expect(dockviewApiMocks.panelMap.get("terminal-session-a")?.api.setActive).toHaveBeenCalledOnce();
+    wrapper.unmount();
+  });
+
+  // R2-03：dockview 默认标签自带关闭按钮，面板被关闭后 App 无回调可同步；
+  // 重复点击同一会话时 watch(activeTerminal) 因 Object.is 相等不触发，
+  // selectSession 必须直接确保面板重建，否则单会话下终端区域永久空白。
+  it("rebuilds the terminal panel after the user closes the tab and re-clicks the same session", async () => {
+    dockviewApiMocks.panelMap.clear();
+    dockviewApiMocks.addPanel.mockClear();
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    const sidePanel = wrapper.findComponent({ name: "SidePanel" });
+    await sidePanel.vm.$emit("select-session", "session-a");
+    await flushPromises();
+    expect(dockviewApiMocks.addPanel).toHaveBeenCalledTimes(1);
+    expect(dockviewApiMocks.panelMap.get("terminal-session-a")).toBeDefined();
+
+    // 模拟用户点击标签关闭按钮：面板从 dockview 注册表移除，App 侧无回调
+    dockviewApiMocks.panelMap.delete("terminal-session-a");
+
+    // 重新点击同一会话：面板必须被重建（回归时 watch 不触发，addPanel 仍为 1 次）
+    await sidePanel.vm.$emit("select-session", "session-a");
+    await flushPromises();
+    expect(dockviewApiMocks.addPanel).toHaveBeenCalledTimes(2);
+    expect(dockviewApiMocks.addPanel).toHaveBeenLastCalledWith({
+      id: "terminal-session-a",
+      component: "terminal",
+      params: { sessionId: "session-a" },
+    });
+    expect(dockviewApiMocks.panelMap.get("terminal-session-a")).toBeDefined();
+    wrapper.unmount();
+  });
+
+  // R2-12：删除已打开终端的会话后，对应面板必须同步关闭——否则残留指向
+  // 已删除会话的僵尸面板，键入只会触发 IO 失败提示。
+  it("closes the terminal panel of a session after it is deleted", async () => {
+    dockviewApiMocks.panelMap.clear();
+    dockviewApiMocks.addPanel.mockClear();
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    const sidePanel = wrapper.findComponent({ name: "SidePanel" });
+    await sidePanel.vm.$emit("select-session", "session-a");
+    await flushPromises();
+    expect(dockviewApiMocks.panelMap.get("terminal-session-a")).toBeDefined();
+
+    // 会话删除：真实路径 SessionListChanged → store.refresh 更新 items（不再含 session-a）。
+    // 回归时 close 不会被调用，面板残留。
+    if (!sessionsStoreMock.store) throw new Error("sessions store mock missing");
+    sessionsStoreMock.store.items = [{ id: "session-b" }];
+    await flushPromises();
+
+    expect(dockviewApiMocks.panelMap.get("terminal-session-a")?.api.close).toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  // R2-13：window 级 Ctrl+F/Escape 由 App.vue 统一拦截，仅路由到当前激活终端
+  //（sessionId 过滤在 TerminalPane 内完成）——回归时每个面板各自响应会多播。
+  it("routes window Ctrl+F/Escape to the active terminal only", async () => {
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    const seen: Array<{ sessionId: string; action: string }> = [];
+    const handler = (e: Event) => seen.push((e as CustomEvent<{ sessionId: string; action: string }>).detail);
+    window.addEventListener("rshell:terminal-action", handler);
+
+    // 无激活终端：快捷键不分发
+    window.dispatchEvent(new KeyboardEvent("keydown", { ctrlKey: true, key: "f" }));
+    await flushPromises();
+    expect(seen).toEqual([]);
+
+    await wrapper.findComponent({ name: "SidePanel" }).vm.$emit("select-session", "session-a");
+    await flushPromises();
+    window.dispatchEvent(new KeyboardEvent("keydown", { ctrlKey: true, key: "f" }));
+    await flushPromises();
+    expect(seen).toEqual([{ sessionId: "session-a", action: "find" }]);
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flushPromises();
+    expect(seen).toEqual([
+      { sessionId: "session-a", action: "find" },
+      { sessionId: "session-a", action: "closeFind" },
+    ]);
+
+    window.removeEventListener("rshell:terminal-action", handler);
     wrapper.unmount();
   });
 

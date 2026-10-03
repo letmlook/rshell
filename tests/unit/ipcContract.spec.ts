@@ -1,4 +1,4 @@
-// tests/unit/ipcContract.spec.ts - PROB-01 IPC 参数键契约对账
+// tests/unit/ipcContract.spec.ts - PROB-01 IPC 参数键契约对账 + R2-10/R2-11 三张对账表
 //
 // 契约（写入 src-tauri/src/commands.rs 文件头）：后端全部 #[tauri::command]
 // （含 cmd! 宏模板）声明 rename_all = "snake_case"，前端 invoke 的参数键必须
@@ -13,8 +13,17 @@
 // 3. 逐点断言参数键一致；带参后端命令必须有前端调用点（push_one_mb 白名单）；
 //    lib.rs generate_handler 注册表与 commands.rs 签名一一对应。
 //
+// R2-10/R2-11 追加三张对账表：
+// A. AppEvent 变体集：events.rs ↔ types.ts 逐变体一致（增删任一侧即失败）；
+//    且每个事件要么有后端发布点（AppEvent::X）、要么有前端监听（src/ 引用），
+//    0 监听事件必须在 EVENT_LISTENER_WHITELIST 白名单（0 发布点死变体无白名单）。
+// B. CommandOutcome 变体 ↔ client.ts call<T> 返回标注：每个变体要么在
+//    OUTCOME_RETURN_MAP 中登记（helper + 期望标注），要么在 OUTCOME_WHITELIST。
+// C. client.ts helper ↔ src/ 实际调用方：零调用的 helper 必须在
+//    HELPER_WHITELIST 白名单（删除某 helper 的最后一个调用点即失败）。
+//
 // 注入错误键名（如把 session_id 改成 sessionId）、去掉后端 rename_all、
-// 或新增命令漏掉一侧，都会让对应断言立即失败。
+// 在 events.rs/types.ts 增删变体、或新增命令漏掉一侧，都会让对应断言立即失败。
 //
 // 解析局限：键提取按括号深度扫描，契约文件不含含花括号的字符串字面量或
 // 行中注释；若未来出现此类内容，需同步升级这里的解析器。
@@ -269,5 +278,241 @@ describe("IPC 参数键契约（PROB-01）", () => {
     const unregistered = [...rustCommands.keys()].filter((name) => !registered.has(name));
     const unknown = [...registered].filter((name) => !rustCommands.has(name));
     expect({ unregistered, unknown }).toEqual({ unregistered: [], unknown: [] });
+  });
+});
+
+// ============================================================================
+// R2-10/R2-11 三张对账表：AppEvent / CommandOutcome / client.ts helper
+// ============================================================================
+
+const eventsRsSource = readFileSync("src-tauri/crates/rshell-api/src/events.rs", "utf8");
+const outcomeRsSource = readFileSync("src-tauri/crates/rshell-api/src/outcome.rs", "utf8");
+const typesTsSource = readFileSync("src/ipc/types.ts", "utf8");
+
+/** 解析 Rust 枚举顶层变体名（变体位于 4 空格缩进；字段/属性在更深缩进） */
+function parseRustEnumVariants(enumSource: string, enumName: string): string[] {
+  const code = stripCommentLines(enumSource);
+  const declIndex = code.indexOf(`pub enum ${enumName}`);
+  if (declIndex < 0) throw new Error(`enum ${enumName} not found`);
+  const bodyStart = code.indexOf("{", declIndex);
+  const bodyEnd = matchBrace(code, bodyStart);
+  if (bodyEnd < 0) throw new Error(`enum ${enumName} 括号不配对`);
+  const names: string[] = [];
+  for (const line of code.slice(bodyStart + 1, bodyEnd).split("\n")) {
+    const m = line.match(/^ {4}([A-Z][A-Za-z0-9]*)\s*(?:,|\{|\(|$)/);
+    if (m) names.push(m[1]);
+  }
+  return names;
+}
+
+/** 解析 types.ts 的 AppEvent union 变体名（字符串变体 + 单键对象变体） */
+function parseTsAppEventVariants(typesSource: string): string[] {
+  const start = typesSource.indexOf("export type AppEvent");
+  if (start < 0) throw new Error("AppEvent not found in types.ts");
+  // 类型别名终止于顶层（括号深度 0）的第一个 ";" —— 多行 payload 内部的
+  // "};"/";" 不能提前截断
+  let depth = 0;
+  let end = -1;
+  for (let i = start; i < typesSource.length; i++) {
+    const ch = typesSource[i];
+    if (ch === "{" || ch === "(") depth++;
+    else if (ch === "}" || ch === ")") depth--;
+    else if (ch === ";" && depth === 0) {
+      end = i;
+      break;
+    }
+  }
+  if (end < 0) throw new Error("AppEvent union 未闭合");
+  const code = stripCommentLines(typesSource.slice(start, end)).replace(/\n/g, " ");
+  const names = new Set<string>();
+  for (const m of code.matchAll(/\|\s*"(\w+)"/g)) names.add(m[1]);
+  for (const m of code.matchAll(/\|\s*\{\s*(\w+):/g)) names.add(m[1]);
+  return [...names];
+}
+
+/** 递归收集目录下（跳过 target/）全部 .rs 文件源码 */
+function walkRustSources(dir: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === "target") continue;
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...walkRustSources(full));
+    else if (entry.name.endsWith(".rs")) files.push(readFileSync(full, "utf8"));
+  }
+  return files;
+}
+
+const rustAppEventVariants = parseRustEnumVariants(eventsRsSource, "AppEvent");
+const tsAppEventVariants = parseTsAppEventVariants(typesTsSource);
+const rustOutcomeVariants = parseRustEnumVariants(outcomeRsSource, "CommandOutcome");
+
+/** 后端全部发布点（所有 .rs 源码中出现 AppEvent::<Variant> 的次数） */
+const publishCounts = new Map<string, number>(
+  rustAppEventVariants.map((name) => {
+    const re = new RegExp(`\\bAppEvent::${name}\\b`, "g");
+    let count = 0;
+    for (const source of walkRustSources("src-tauri")) {
+      count += (source.match(re) ?? []).length;
+    }
+    return [name, count];
+  }),
+);
+
+/** 前端监听计数：src/（除 types.ts 镜像）中出现该变体名的文件数 */
+const listenerFileCounts = new Map<string, number>(
+  rustAppEventVariants.map((name) => {
+    const re = new RegExp(`\\b${name}\\b`);
+    let count = 0;
+    for (const file of walkSources("src")) {
+      if (file.endsWith("src/ipc/types.ts")) continue;
+      if (re.test(readFileSync(file, "utf8"))) count++;
+    }
+    return [name, count];
+  }),
+);
+
+/**
+ * 0 监听事件白名单：后端已发布、当前无 UI 需求响应的反馈/信息性事件。
+ * 给事件接线后必须从此处移除；新增 0 监听事件必须登记并说明理由。
+ */
+const EVENT_LISTENER_WHITELIST = new Set([
+  "SessionUpdated", // 单会话元数据更新提示，前端经 SessionListChanged 全量刷新已覆盖
+  "ScriptFinished", // 脚本结果随命令返回值展示，无需事件分支
+  "SyncInputSessionsChanged", // 同步输入集合变化，UI 尚未消费（helper toggleSyncInput 同为未接线）
+  "SshKeyListChanged", // 密钥面板刷新由自身操作触发，无跨面板消费需求
+  "SshKeyGenerated", // 同上
+  "PublicKeyExported", // exportPublicKey helper 未接线（同 helper 白名单）
+  "MasterPasswordChanged", // 主密码状态由启动校验命令返回值决定
+  "MasterPasswordVerified", // 同上
+  "ColorSchemeListChanged", // 配色方案列表由 listThemes 返回值驱动
+  "PluginListUpdated", // 插件面板刷新由自身操作触发
+  "PluginStateChanged", // 同上
+  "PluginLoadFailed", // 加载失败经命令错误路径展示
+]);
+
+/** CommandOutcome 变体 → client.ts 返回标注（helper + 期望的 call<T> 文本） */
+const OUTCOME_RETURN_MAP: Record<string, { helper: string; typeText: string }> = {
+  Sessions: { helper: "listSessions", typeText: "SessionConfig[]" },
+  SessionLoadIssues: { helper: "listSessionLoadIssues", typeText: "SessionLoadIssue[]" },
+  SessionId: { helper: "createSession", typeText: "Uuid" },
+  Triggers: { helper: "listTriggers", typeText: "Trigger[]" },
+  QuickCommands: { helper: "listQuickCommands", typeText: "QuickCommand[]" },
+  Keys: { helper: "listKeys", typeText: "unknown[]" },
+  Tunnels: { helper: "listTunnels", typeText: "ActiveTunnelInfo[]" },
+  Plugins: { helper: "listPlugins", typeText: "PluginInfo[]" },
+  Themes: { helper: "listThemes", typeText: "ThemeInfo" },
+  PendingTunnels: { helper: "listPendingTunnels", typeText: "PendingTunnelInfo" },
+  RemoteDir: {
+    helper: "browseRemoteDir",
+    typeText: "{ path: string; entries: RemoteFileEntry[] }",
+  },
+  Transfers: { helper: "listTransfers", typeText: "TransferTaskInfo[]" },
+  Verified: { helper: "verifyMasterPassword", typeText: "boolean" },
+};
+
+/** 无 call<T> 返回标注的 CommandOutcome 变体白名单 */
+const OUTCOME_WHITELIST = new Set([
+  "None", // 写命令统一返回 None；前端 call() 不带 <T>
+  "PublicKey", // export_public_key 后端存在，前端 helper 未标注返回且无调用方（R2-10 同源死面）
+]);
+
+/**
+ * client.ts 零调用 helper 白名单：后端命令可用但 src/ 暂无调用方的薄壳。
+ * 任一 helper 接线后必须从此处移除。
+ */
+const HELPER_WHITELIST = new Set([
+  "cancelTransfer", // CancelTransfer 命令已注册，传输队列界面仅接线 pause/resume（docs/08）
+  "restoreTunnel", // 隧道磁盘恢复尚未接入 UI
+  "suspendTunnel", // 隧道挂起/恢复尚未接入 UI
+  "resumeTunnel",
+  "sendComposeText", // 撰写窗格尚未接入后端命令
+  "executeScript", // Rhai 宿主执行尚未接入 UI（docs/08：没有完整脚本编辑器）
+  "toggleSyncInput", // 同步输入开关尚未接后端
+  "exportPublicKey", // 后端命令存在，无 UI 入口（R2-10 CommandOutcome::PublicKey 同源）
+  "setupMasterPassword", // 主密码设置流程尚未接入 UI
+  "verifyMasterPassword", // 主密码验证流程尚未接入 UI（后端启动校验在用）
+  "changeMasterPassword", // 主密码修改流程尚未接入 UI
+  "trustHostKey", // 永久信任由后端 decide_host_key 持久化路径完成
+  "deleteHostKey", // 已保存主机密钥的删除入口尚未接入 UI
+  "importColorScheme", // 配色方案导入尚未接入 UI
+]);
+
+describe("IPC 事件契约（R2-10/R2-11）", () => {
+  it("events.rs 与 types.ts 的 AppEvent 变体集逐一对齐", () => {
+    const rustOnly = rustAppEventVariants.filter((n) => !tsAppEventVariants.includes(n));
+    const tsOnly = tsAppEventVariants.filter((n) => !rustAppEventVariants.includes(n));
+    expect({ rustOnly, tsOnly }).toEqual({ rustOnly: [], tsOnly: [] });
+  });
+
+  it("每个事件都有后端发布点（0 发布点死变体不允许）", () => {
+    const dead = rustAppEventVariants.filter((n) => (publishCounts.get(n) ?? 0) === 0);
+    expect(dead).toEqual([]);
+  });
+
+  it("每个事件都有前端监听（0 监听必须白名单）", () => {
+    const unlistened = rustAppEventVariants.filter(
+      (n) => (listenerFileCounts.get(n) ?? 0) === 0 && !EVENT_LISTENER_WHITELIST.has(n),
+    );
+    expect(unlistened).toEqual([]);
+  });
+
+  it("事件监听白名单只包含真实存在的事件（防止白名单腐化）", () => {
+    const unknown = [...EVENT_LISTENER_WHITELIST].filter(
+      (n) => !rustAppEventVariants.includes(n),
+    );
+    expect(unknown).toEqual([]);
+  });
+});
+
+describe("IPC 返回值契约（R2-11）", () => {
+  it("CommandOutcome 变体全部登记返回标注或白名单", () => {
+    const mapped = new Set([...Object.keys(OUTCOME_RETURN_MAP), ...OUTCOME_WHITELIST]);
+    const unregistered = rustOutcomeVariants.filter((n) => !mapped.has(n));
+    const phantom = [...mapped].filter((n) => !rustOutcomeVariants.includes(n));
+    expect({ unregistered, phantom }).toEqual({ unregistered: [], phantom: [] });
+  });
+
+  it("已登记变体的 client.ts helper 返回标注与契约一致", () => {
+    const problems: string[] = [];
+    for (const [variant, { helper, typeText }] of Object.entries(OUTCOME_RETURN_MAP)) {
+      if (!clientSource.includes(`call<${typeText}>({`)) {
+        problems.push(`${variant}: client.ts 缺少期望标注 call<${typeText}>({（helper: ${helper}）`);
+      }
+    }
+    expect(problems).toEqual([]);
+  });
+});
+
+describe("client.ts helper 调用方契约（R2-11）", () => {
+  const helperNames = [...clientSource.matchAll(/^export const (\w+)/gm)].map((m) => m[1]);
+
+  it("client.ts 确实导出了 IPC helper（解析器自检，防止正则失效空转）", () => {
+    expect(helperNames.length).toBeGreaterThan(30);
+    expect(helperNames).toContain("listSessions");
+    expect(helperNames).toContain("exportPublicKey");
+  });
+
+  it("每个 helper 在 src/ 都有调用方（零调用必须白名单）", () => {
+    const problems: string[] = [];
+    for (const name of helperNames) {
+      const re = new RegExp(`\\b${name}\\b`);
+      let callers = 0;
+      for (const file of walkSources("src")) {
+        if (file.endsWith("src/ipc/client.ts")) continue;
+        if (re.test(readFileSync(file, "utf8"))) {
+          callers++;
+          break;
+        }
+      }
+      if (callers === 0 && !HELPER_WHITELIST.has(name)) {
+        problems.push(`${name}: src/ 无调用方且不在 HELPER_WHITELIST`);
+      }
+    }
+    expect(problems).toEqual([]);
+  });
+
+  it("helper 白名单只包含真实存在的 helper（防止白名单腐化）", () => {
+    const unknown = [...HELPER_WHITELIST].filter((n) => !helperNames.includes(n));
+    expect(unknown).toEqual([]);
   });
 });

@@ -758,25 +758,28 @@ async fn forward_dynamic_socks5(
 }
 
 /// SOCKS5 握手: 读 greeting + request, 写回 reply.
+///
+/// 读取一律按需补满（read_exact 语义）：TCP 分段到达是合法行为，
+/// 单次 read 即判长会把分段握手的合法客户端误判为协议错误（R2-16）。
 async fn socks5_handshake(inbound: &mut TcpStream) -> Result<(String, u16), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // 1. 读 greeting: VER NMETHODS METHODS, 回 VER METHOD (0x00 = no auth)
-    let mut buf = [0u8; 512];
-    let n = inbound
-        .read(&mut buf)
+    //    先读 2 字节定长头，再按 NMETHODS 补齐 methods。
+    let mut header = [0u8; 2];
+    inbound
+        .read_exact(&mut header)
         .await
         .map_err(|e| format!("socks5 read greeting: {}", e))?;
-    if n < 2 || buf[0] != 0x05 {
-        return Err(format!("socks5 bad greeting: n={} ver={}", n, buf[0]));
+    if header[0] != 0x05 {
+        return Err(format!("socks5 bad greeting: ver={}", header[0]));
     }
-    let nmethods = buf[1] as usize;
-    if n < 2 + nmethods {
-        return Err(format!(
-            "socks5 greeting truncated: n={} nmethods={}",
-            n, nmethods
-        ));
-    }
+    let nmethods = header[1] as usize;
+    let mut methods = vec![0u8; nmethods];
+    inbound
+        .read_exact(&mut methods)
+        .await
+        .map_err(|e| format!("socks5 greeting truncated (nmethods={nmethods}): {}", e))?;
     // 强制 no-auth (即便客户端没列, RFC 允许 server 选)
     inbound
         .write_all(&[0x05, 0x00])
@@ -784,17 +787,16 @@ async fn socks5_handshake(inbound: &mut TcpStream) -> Result<(String, u16), Stri
         .map_err(|e| format!("socks5 write method: {}", e))?;
 
     // 2. 读请求: VER CMD RSV ATYP DST.ADDR DST.PORT
-    let n = inbound
-        .read(&mut buf)
+    //    先读 4 字节定长头，再按 ATYP 补齐地址+端口。
+    let mut head = [0u8; 4];
+    inbound
+        .read_exact(&mut head)
         .await
         .map_err(|e| format!("socks5 read request: {}", e))?;
-    if n < 7 {
-        return Err(format!("socks5 request too short: {}", n));
+    if head[0] != 0x05 {
+        return Err(format!("socks5 request bad ver: {}", head[0]));
     }
-    if buf[0] != 0x05 {
-        return Err(format!("socks5 request bad ver: {}", buf[0]));
-    }
-    let cmd = buf[1];
+    let cmd = head[1];
     if cmd != 0x01 {
         // 仅支持 CONNECT
         let _ = inbound
@@ -802,35 +804,46 @@ async fn socks5_handshake(inbound: &mut TcpStream) -> Result<(String, u16), Stri
             .await;
         return Err(format!("socks5 unsupported cmd: {}", cmd));
     }
-    let atyp = buf[3];
+    let atyp = head[3];
     let (host, port) = match atyp {
         0x01 => {
-            if n < 4 + 4 + 2 {
-                return Err("socks5 ipv4 truncated".to_string());
-            }
-            let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
-            let port = u16::from_be_bytes([buf[8], buf[9]]);
+            let mut addr = [0u8; 6]; // 4 字节地址 + 2 字节端口
+            inbound
+                .read_exact(&mut addr)
+                .await
+                .map_err(|e| format!("socks5 ipv4 truncated: {}", e))?;
+            let ip = std::net::Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
+            let port = u16::from_be_bytes([addr[4], addr[5]]);
             (ip.to_string(), port)
         }
         0x03 => {
-            let dlen = buf[4] as usize;
-            if n < 5 + dlen + 2 {
-                return Err("socks5 domain truncated".to_string());
-            }
-            let domain = std::str::from_utf8(&buf[5..5 + dlen])
+            let mut dlen_buf = [0u8; 1];
+            inbound
+                .read_exact(&mut dlen_buf)
+                .await
+                .map_err(|e| format!("socks5 domain length truncated: {}", e))?;
+            let dlen = dlen_buf[0] as usize;
+            let mut rest = vec![0u8; dlen + 2]; // 域名 + 端口
+            inbound
+                .read_exact(&mut rest)
+                .await
+                .map_err(|e| format!("socks5 domain truncated: {}", e))?;
+            let domain = std::str::from_utf8(&rest[..dlen])
                 .map_err(|e| format!("socks5 domain utf-8: {}", e))?
                 .to_string();
-            let port = u16::from_be_bytes([buf[5 + dlen], buf[6 + dlen]]);
+            let port = u16::from_be_bytes([rest[dlen], rest[dlen + 1]]);
             (domain, port)
         }
         0x04 => {
-            if n < 4 + 16 + 2 {
-                return Err("socks5 ipv6 truncated".to_string());
-            }
+            let mut addr = [0u8; 18]; // 16 字节地址 + 2 字节端口
+            inbound
+                .read_exact(&mut addr)
+                .await
+                .map_err(|e| format!("socks5 ipv6 truncated: {}", e))?;
             let mut octets = [0u8; 16];
-            octets.copy_from_slice(&buf[4..20]);
+            octets.copy_from_slice(&addr[..16]);
             let ip = std::net::Ipv6Addr::from(octets);
-            let port = u16::from_be_bytes([buf[20], buf[21]]);
+            let port = u16::from_be_bytes([addr[16], addr[17]]);
             (ip.to_string(), port)
         }
         _ => {
@@ -1567,5 +1580,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(r.is_err());
+    }
+
+    /// R2-16 验收：握手字节分段两次以上 write（每段 flush 并留出调度间隙），
+    /// 握手必须成功建立——TCP 分段到达是合法行为。回归时单次 read 即判长
+    /// 会报 "socks5 bad greeting: n=1" 并断开连接。
+    #[tokio::test]
+    async fn test_socks5_handshake_accepts_segmented_writes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let socks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut inbound, _)) = socks.accept().await {
+                let r = socks5_handshake(&mut inbound).await;
+                drop(inbound);
+                r
+            } else {
+                Err("accept failed".to_string())
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(socks_addr).await.unwrap();
+
+        // greeting 分段：VER | NMETHODS | METHODS（分段覆盖 2 字节定长头内部）
+        client.write_all(&[0x05]).await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.write_all(&[0x01]).await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.write_all(&[0x00]).await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+
+        // request 分段：VER CMD RSV ATYP | 域长 | 域名 | 端口
+        client.write_all(&[0x05, 0x01, 0x00, 0x03]).await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.write_all(&[0x09]).await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.write_all(b"localhost").await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.write_all(&[0x00, 0x50]).await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply[..2], &[0x05, 0x00]);
+
+        let (host, port) = tokio::time::timeout(std::time::Duration::from_millis(500), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 80);
     }
 }

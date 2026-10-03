@@ -1,6 +1,6 @@
 # 构建与文档检查脚本
 
-更新：2026-09-27。macOS 的正式入口是根目录的 `npm run tauri:dev` 和 `npm run tauri:build`。
+更新：2026-10-02（体检修复轮）。macOS 的正式入口是根目录的 `npm run tauri:dev` 和 `npm run tauri:build`。
 
 ## 仓库统一入口
 

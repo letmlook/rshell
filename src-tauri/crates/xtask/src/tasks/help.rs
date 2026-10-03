@@ -5,7 +5,7 @@ pub fn run() -> Result<(), String> {
     println!("  fmt      — cargo fmt --all");
     println!("  lint     — cargo clippy --workspace --all-targets -- -D warnings");
     println!("  test     — cargo test --workspace");
-    println!("  dev      — cargo run -p rshell-ui");
+    println!("  dev      — npm run tauri:dev（在仓库根目录）");
     println!("  build    — cargo build --release");
     println!();
     println!("或者直接用 `cargo xtask <subcommand>` 调用。");

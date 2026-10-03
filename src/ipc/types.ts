@@ -429,9 +429,9 @@ export type AppEvent =
       };
     }
   // 终端
-  | { TerminalTitleChanged: { session_id: Uuid; title: string } }
   // 切片 2.2 删除：TerminalOutput / TerminalBufferUpdated —— 设计 §2.2
   // 原始字节经 Channel<Vec<u8>> 直推 xterm.js,事件总线不再承担高频路径
+  // R2-10（2026-10）：TerminalTitleChanged 因后端 0 发布点删除
   // 会话
   | "SessionListChanged"
   | { SessionUpdated: { session_id: Uuid } }
@@ -447,15 +447,8 @@ export type AppEvent =
   | { TransferCompleted: { task_id: Uuid } }
   | { TransferFailed: { task_id: Uuid; error: string } }
   | "TransferQueueChanged"
-  | {
-      TransferTaskAdded: {
-        task_id: Uuid;
-        filename: string;
-        direction: TransferDirection;
-      };
-    }
-  | { TransferTaskCompleted: { task_id: Uuid } }
-  | { TransferTaskFailed: { task_id: Uuid; error: string } }
+  // R2-10（2026-10）：TransferTaskAdded / TransferTaskCompleted / TransferTaskFailed
+  // 因后端 0 发布点删除（前端监听 TransferProgress/TransferCompleted/TransferFailed）
   // 隧道
   | { TunnelStateChanged: { tunnel_id: Uuid; state: TunnelState } }
   // 安全
@@ -493,7 +486,7 @@ export type AppEvent =
   | { MasterPasswordVerified: { success: boolean } }
   // 隧道
   | "ActiveTunnelsChanged"
-  | { TunnelUpdated: { tunnel: ActiveTunnelInfo } }
+  // R2-10（2026-10）：TunnelUpdated 因后端 0 发布点删除
   // 主题
   | { ThemeChanged: { theme: AppTheme } }
   | { ColorSchemeChanged: { scheme: TerminalColorScheme } }
@@ -509,6 +502,8 @@ export type AppEvent =
   //   - TerminalOutput / TerminalBufferUpdated / TerminalBufferSnapshot / CellView / CellFlag
   // 数据改由 CommandOutcome 直接返回（§3.2 修复死循环 + §3.3 消除二义性）;
   // 剪贴板/缓冲上移前端。
+  // R2-10（2026-10）：PendingTunnelsSnapshot 在后端 events.rs 同步删除
+  //（此前仅本注释声称已删除、变体实际残留且 0 发布点，构成两侧漂移）。
 
 // ============================================================================
 // 工具:把判别式 union 扁平化成 {variant_name: payload} 用于 invoke 参数

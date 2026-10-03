@@ -23,7 +23,7 @@ import { SearchAddon } from "@xterm/addon-search";
 import { Channel } from "@tauri-apps/api/core";
 import { invoke } from "@tauri-apps/api/core";
 import { ElMessage } from "element-plus/es/components/message/index.mjs";
-import { sendInput, resizeTerminal } from "../ipc/client";
+import { ipcErrorMessage, sendInput, resizeTerminal } from "../ipc/client";
 import type { Uuid } from "../ipc/types";
 import { useThemeStore } from "../stores/theme";
 
@@ -101,20 +101,15 @@ function readXtermThemeFromCssVars(): ITheme {
   };
 }
 
-function onWindowKeydown(e: KeyboardEvent) {
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
-    e.preventDefault();
-    searchBarVisible.value = !searchBarVisible.value;
-  } else if (e.key === "Escape" && searchBarVisible.value) {
-    closeSearch();
-  }
-}
-
 function onTerminalAction(event: Event) {
-  const detail = (event as CustomEvent<{ sessionId: Uuid; action: "find" | "clear" }>).detail;
+  const detail = (event as CustomEvent<{ sessionId: Uuid; action: "find" | "clear" | "closeFind" }>)
+    .detail;
+  // R2-13：window 级快捷键（Ctrl+F/Escape）由 App.vue 统一拦截后经本事件
+  // 路由到当前激活终端；这里按 sessionId 过滤，非激活面板不响应。
   if (detail.sessionId !== props.sessionId) return;
   if (detail.action === "find") searchBarVisible.value = true;
   if (detail.action === "clear") term?.clear();
+  if (detail.action === "closeFind") closeSearch();
 }
 
 // ── PROB-13：sendInput/resizeTerminal 持续失败的一次性可见提示 ──
@@ -154,7 +149,7 @@ async function attachTerminal(): Promise<boolean> {
     attachError.value = null;
     return true;
   } catch (e) {
-    attachError.value = e instanceof Error ? e.message : String(e);
+    attachError.value = ipcErrorMessage(e);
     console.error("[TerminalPane] attach_terminal failed", e);
     return false;
   }
@@ -220,9 +215,8 @@ onMounted(async () => {
       .catch((e) => noteIoFailure("send_input", e));
   });
 
-  // 切片 2.4:Ctrl+F 切换搜索栏（前端拦截 keydown,不让 xterm 接走）
-  // 简化实现:监听 window keydown,xterm 不会消费 Ctrl 组合键。
-  window.addEventListener("keydown", onWindowKeydown);
+  // 切片 2.4:搜索栏经 rshell:terminal-action 路由（R2-13：window 级
+  // Ctrl+F/Escape 由 App.vue 统一拦截，避免多面板并存时同时作用于所有面板）。
   window.addEventListener("rshell:terminal-action", onTerminalAction);
 
   // 尺寸变化:前端权威 resize_terminal（设计 §4.2 表格"终端尺寸"行）
@@ -248,7 +242,6 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   detachSizeObserver?.();
   detachSizeObserver = null;
-  window.removeEventListener("keydown", onWindowKeydown);
   window.removeEventListener("rshell:terminal-theme", onTerminalTheme);
   window.removeEventListener("rshell:terminal-action", onTerminalAction);
   term?.dispose();

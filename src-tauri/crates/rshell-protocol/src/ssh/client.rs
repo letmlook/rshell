@@ -256,11 +256,15 @@ impl SshHandler {
         }
 
         let (host_part, port_part) = if let Some(idx) = pattern.find("]:") {
-            // [1.2.3.4]:2222 或 [hostname]:2222
+            // [1.2.3.4]:2222 或 [::1]:2222
             let host = &pattern[..idx + 1]; // 含 ']'
             let host = host.trim_start_matches('[').trim_end_matches(']');
             let port = &pattern[idx + 2..];
             (host.to_string(), Some(port.to_string()))
+        } else if pattern.parse::<std::net::IpAddr>().is_ok() {
+            // 裸 IPv6 字面量（如 "::1"）：冒号切分会得到错误 host/port。
+            // OpenSSH 对端口 22 的 IPv6 主机即写裸地址，按无端口=22 匹配（R2-06）
+            (pattern.to_string(), None)
         } else if let Some(idx) = pattern.rfind(':') {
             // host:port 或 host（无端口）
             let host = &pattern[..idx];
@@ -1440,8 +1444,39 @@ mod tests {
             build_known_hosts_paths(true)
                 .iter()
                 .any(|p| !p.is_absolute()),
-            "显式开启后 cwd 相对路径才允许出现"
+            "显式开启（RSHELL_ALLOW_CWD_KNOWN_HOSTS）后相对路径才允许出现"
         );
+    }
+
+    /// R2-06 验收：端口 22 的裸 IPv6 主机（OpenSSH 与本应用写侧均写裸地址）
+    /// 保存过的密钥必须被匹配命中，重连时不再触发 UI 决策弹框
+    #[test]
+    fn known_hosts_matches_bare_ipv6_host_on_default_port() {
+        use ssh_key::public::{Ed25519PublicKey, KeyData};
+        let key = ssh_key::PublicKey::new(KeyData::Ed25519(Ed25519PublicKey([9; 32])), "");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(&path, format!("::1 {}\n", key.to_openssh().unwrap())).unwrap();
+        let (data_tx, _) = mpsc::unbounded_channel();
+        let handler = SshHandler {
+            shell_output: Arc::new(Mutex::new(ShellOutput {
+                channel: None,
+                sender: Some(data_tx),
+            })),
+            host: "::1".into(),
+            port: 22,
+            known_hosts_paths: vec![path],
+            host_key_sink: None,
+        };
+        // pattern_matches 直接断言：裸 IPv6 命中、其他 IPv6 不命中、方括号写法不变
+        assert!(
+            handler.pattern_matches("::1"),
+            "pattern \"::1\" 与 host \"::1\"（端口 22）必须匹配命中"
+        );
+        assert!(!handler.pattern_matches("fe80::1"));
+        assert!(handler.pattern_matches("[::1]:22"));
+        // 命中即信任：verify 返回 (true, None)，不再弹确认框
+        assert_eq!(handler.verify_known_hosts(&key), (true, None));
     }
 
     #[test]

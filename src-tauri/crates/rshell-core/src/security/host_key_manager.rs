@@ -212,7 +212,7 @@ impl HostKeyManager {
 }
 
 /// 解析 OpenSSH host pattern 为 (host, port)
-/// 支持 `[host]:port` / `host:port` / `host` 三种格式
+/// 支持 `[host]:port` / `host:port` / `host` 及裸 IPv6 字面量（如 `::1`）
 fn parse_host_port(pattern: &str, default_port: u16) -> (String, u16) {
     let pattern = pattern.trim_end_matches(',');
     if let Some(idx) = pattern.find("]:") {
@@ -220,6 +220,11 @@ fn parse_host_port(pattern: &str, default_port: u16) -> (String, u16) {
         let host = host.trim_start_matches('[').trim_end_matches(']');
         let port = pattern[idx + 2..].parse::<u16>().unwrap_or(default_port);
         return (host.to_string(), port);
+    }
+    // 裸 IPv6 字面量：盲切 rfind(':') 会得到错误 host/port。OpenSSH 对
+    // 端口 22 的 IPv6 主机即写裸地址，按 default_port 处理（R2-06）
+    if pattern.parse::<std::net::IpAddr>().is_ok() {
+        return (pattern.to_string(), default_port);
     }
     if let Some(idx) = pattern.rfind(':') {
         let host = &pattern[..idx];
@@ -262,5 +267,49 @@ mod tests {
             .expect("重启后条目应被加载");
         assert_eq!(entry.fingerprint, "AAAAkey");
         assert_eq!(entry.trust_level, TrustLevel::Trusted);
+    }
+
+    /// R2-06 验收：端口 22 的 IPv6 主机写裸地址（OpenSSH 格式），重启加载
+    /// 时不得被 rfind(':') 误切成 host=":" port=1
+    #[tokio::test]
+    async fn ipv6_host_persists_as_bare_address_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let manager = HostKeyManager::new(path.clone());
+        manager
+            .trust_host_key("::1", 22, "ssh-ed25519", "AAAAkey6")
+            .await
+            .unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("::1 ssh-ed25519 AAAAkey6"),
+            "端口 22 的 IPv6 主机必须写裸地址，实际：{}",
+            on_disk
+        );
+
+        let restored = HostKeyManager::new(path);
+        let entries = restored.entries.read().unwrap();
+        let entry = entries
+            .get("::1:22")
+            .expect("裸 IPv6 条目应以 host=\"::1\" port=22 恢复");
+        assert_eq!(entry.host, "::1");
+        assert_eq!(entry.port, 22);
+    }
+
+    #[test]
+    fn parse_host_port_handles_ipv6_literals() {
+        // 裸 IPv6 按默认端口处理，不得切分冒号（回归：切出 host=":" port=1）
+        assert_eq!(parse_host_port("::1", 22), ("::1".to_string(), 22));
+        assert_eq!(parse_host_port("fe80::1", 22), ("fe80::1".to_string(), 22));
+        // 方括号与 host:port 写法行为不变
+        assert_eq!(parse_host_port("[::1]:2222", 22), ("::1".to_string(), 2222));
+        assert_eq!(
+            parse_host_port("example.test:2222", 22),
+            ("example.test".to_string(), 2222)
+        );
+        assert_eq!(
+            parse_host_port("example.test", 22),
+            ("example.test".to_string(), 22)
+        );
     }
 }

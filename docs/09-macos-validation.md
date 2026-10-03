@@ -1,6 +1,8 @@
 # macOS 验证记录
 
-日期：2026-09-27。分支：`codex/release-hardening`（凭据加固与发布就绪合并入 main）。此记录区分代码检查、自动测试、原生进程启动和真实交互，不将未执行项记为通过。
+本记录按轮次分节记日期（最新一轮：2026-10-03）。分支：`codex/release-hardening`（凭据加固与发布就绪合并入 main）。此记录区分代码检查、自动测试、原生进程启动和真实交互，不将未执行项记为通过。
+
+## 2026-09-27：凭据加固与发布就绪轮
 
 ## 环境
 
@@ -22,8 +24,6 @@ macOS 本机，Rust stable 1.98.1，Tauri 2 + Vue 3 + xterm.js。依赖由 `npm 
 macOS 构建脚本回归通过（2/2），覆盖图标资源存在性、工作目录、Tauri 调用、target 参数和失败退出码。前端最终类型检查与 65 项测试通过，当前文档契约通过（14 份文档）。其中 3 项标题栏集成测试执行 Cargo.lock 对应的 Tauri 原生拖动脚本和生成权限清单；本机全部实际执行，没有跳过。仅前端安装且缺少 Cargo 依赖/权限清单时，这 3 项会明确跳过，基础权限断言仍会执行。
 
 独立审查发现的 SSH 子通道输出隔离、连接取消/删除竞争、退出清理、协议请求锁、串口取消丢字节、Telnet resize、通知文案、新终端配色和传输错误详情均已修复并通过定向复审。新增本地真实 SSH 传输回归覆盖 shell 输入、尺寸、独立子通道数据与 EOF；它不等于完整 SFTP 文件系统或外部服务器验收。
-
-本轮另修复：SFTP 传输改为 64 KiB 分块拷贝并按 200ms 节流广播进度，速度随 `TransferTaskInfo` 快照下发；删除不可达的 `HostKeyManager::check_host_key` 及其连带死状态，前端对 nil `decision_id` 决策事件做防御；断开/删除会话与传输队列读取失败不再静默。传输 pause/resume 现已接入传输队列界面，并通过按任务控制通道在分块间真实挂起/恢复拷贝循环，取消保持 `cancelled` 终态且不广播完成事件；真实 SSH/SFTP 服务器上的暂停/恢复观感仍属未执行验收，不因单元测试通过而勾选。
 
 ## 原生开发启动
 
@@ -95,3 +95,15 @@ SSH 密码和密钥口令使用 macOS 钥匙串服务 `com.letmlook.rshell.crede
 当前用户文档不再使用旧 UI 架构或旧启动命令。RDP 仅作为已删除/拒绝输入的说明；运行时公共协议为 SSH、Telnet、Serial。历史设计和执行计划保留在 `docs/superpowers/`，不能作为当前功能承诺。
 
 凭据存储行为和未完成验收项见上文及 [功能与限制](08-incomplete-features.md)。
+
+## 2026-10-02：体检修复轮（commit 82304ca）
+
+独立审查发现的 SSH 子通道输出隔离、连接取消/删除竞争、退出清理、协议请求锁、串口取消丢字节、Telnet resize、通知文案、新终端配色和传输错误详情均已修复并通过定向复审。新增本地真实 SSH 传输回归覆盖 shell 输入、尺寸、独立子通道数据与 EOF；它不等于完整 SFTP 文件系统或外部服务器验收。
+
+本轮另修复：SFTP 传输改为 64 KiB 分块拷贝并按 200ms 节流广播进度，速度随 `TransferTaskInfo` 快照下发；删除不可达的 `HostKeyManager::check_host_key` 及其连带死状态，前端对 nil `decision_id` 决策事件做防御；断开/删除会话与传输队列读取失败不再静默。传输 pause/resume 现已接入传输队列界面，并通过按任务控制通道在分块间真实挂起/恢复拷贝循环，取消保持 `cancelled` 终态且不广播完成事件；真实 SSH/SFTP 服务器上的暂停/恢复观感仍属未执行验收，不因单元测试通过而勾选。
+
+## 2026-10-03：第二轮问题修复（R2-01～R2-20）
+
+第二轮体检的逐项修复记录见 [docs/11](11-known-issues-round2.md)：传输启动窗口的取消/暂停竞态与终态守卫（含修复中新立并已修复的 R2-21：mark_failed/mark_completed 终态守卫）、传输任务 panic 兜底清理、后端错误在前端的可读转换、终端面板关闭后重建与会话删除后的面板清理、搜索快捷键按激活终端路由、触发器删除确认、隧道面板事件订阅、RSA 生成位数、known_hosts 裸 IPv6 匹配、SOCKS5 分段握手、触发器正则预编译、xtask dev 入口、IPC 契约对账测试扩展、KeyManager 密钥能力边界文档，以及本记录按轮次分节。
+
+本轮验证口径为快速检查：`cargo fmt --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 0 告警；`cargo test` rshell-core 168 项、rshell-protocol 38 项、rshell-api 6 项通过；`npm run typecheck` 通过，`npm test` 110 项（23 文件）通过，文档契约检查通过；每项修复另附针对性单测或变异验证（见 docs/11 各条）。全量 `verify.sh` 本轮未运行，留待统一收口，不在此记为已执行。真实 SSH/SFTP 服务器、物理串口与签名公证仍未验证，上方验收清单状态不变。

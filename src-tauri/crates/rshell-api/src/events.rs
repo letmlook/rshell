@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::{
-    ActiveTunnelInfo, AppTheme, ConnectionInfo, ConnectionState, ScriptResult, SshKeyInfo,
-    TerminalColorScheme, TunnelState,
+    AppTheme, ConnectionInfo, ConnectionState, ScriptResult, SshKeyInfo, TerminalColorScheme,
+    TunnelState,
 };
 
 /// 后端发布的所有事件
@@ -23,11 +23,10 @@ pub enum AppEvent {
     },
 
     // ===== 终端输出 =====
-    /// 终端标题改变
-    TerminalTitleChanged { session_id: Uuid, title: String },
     // 注：原始字节通过 Tauri `Channel<Vec<u8>>` 直接推到前端 xterm（设计 §1 D1）
     // —— 切片 2.1 起删除 `TerminalOutput` 与 `TerminalBufferUpdated` 事件,
     // 详见 `docs/superpowers/specs/2026-07-31-tauri2-frontend-backend-split-design.md` §2.2
+    // R2-10（2026-10）：`TerminalTitleChanged` 因后端 0 发布点删除。
 
     // ===== 会话数据变化 =====
     /// 会话列表改变（前端需重新拉取）
@@ -49,16 +48,9 @@ pub enum AppEvent {
     TransferFailed { task_id: Uuid, error: String },
     /// 传输队列改变
     TransferQueueChanged,
-    /// 传输任务已添加
-    TransferTaskAdded {
-        task_id: Uuid,
-        filename: String,
-        direction: crate::types::TransferDirection,
-    },
-    /// 传输任务已完成
-    TransferTaskCompleted { task_id: Uuid },
-    /// 传输任务已失败
-    TransferTaskFailed { task_id: Uuid, error: String },
+    // R2-10（2026-10）：`TransferTaskAdded` / `TransferTaskCompleted` /
+    // `TransferTaskFailed` 因后端 0 发布点删除（前端监听 TransferProgress/
+    // TransferCompleted/TransferFailed + TransferQueueChanged）。
 
     // ===== 隧道状态 =====
     /// 隧道状态改变
@@ -98,10 +90,8 @@ pub enum AppEvent {
         session_id: Uuid,
         error: String,
     },
-    /// 待重建隧道列表变化 (从磁盘恢复但未在本次进程启动)
-    PendingTunnelsSnapshot {
-        rules: Vec<(Uuid, crate::types::PortForwardRule)>,
-    },
+    // R2-10（2026-10）：`PendingTunnelsSnapshot` 删除 —— 切片 2.2 即已声明删除
+    //（types.ts 注释亦如此记录），但变体一直残留且后端 0 发布点，构成镜像漂移。
     /// 脚本执行结果
     ScriptFinished {
         session_id: Uuid,
@@ -128,8 +118,7 @@ pub enum AppEvent {
     MasterPasswordVerified { success: bool },
     /// 活动隧道列表变化
     ActiveTunnelsChanged,
-    /// 隧道信息更新
-    TunnelUpdated { tunnel: ActiveTunnelInfo },
+    // R2-10（2026-10）：`TunnelUpdated` 因后端 0 发布点删除。
 
     // ===== 主题事件 =====
     /// 主题已切换

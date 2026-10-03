@@ -253,13 +253,26 @@ impl KeyManager {
                 ssh_key::Algorithm::Ed25519,
             )
             .map_err(|e| CoreError::Internal(format!("Failed to generate ED25519 key: {}", e)))?,
-            SshKeyType::RSA2048 | SshKeyType::RSA4096 => ssh_key::PrivateKey::random(
-                &mut ssh_key::rand_core::OsRng,
-                ssh_key::Algorithm::Rsa {
-                    hash: Some(ssh_key::HashAlg::Sha256),
-                },
-            )
-            .map_err(|e| CoreError::Internal(format!("Failed to generate RSA key: {}", e)))?,
+            SshKeyType::RSA2048 | SshKeyType::RSA4096 => {
+                // R2-05：ssh-key 的 PrivateKey::random 对 RSA 固定使用
+                // DEFAULT_RSA_KEY_SIZE(4096) 且无位数入参，两种请求都会生成
+                // 4096 位密钥、重启 rebuild 后标签翻转。必须按请求类型用
+                // RsaKeypair::random 以指定位数组装 KeypairData。
+                let bit_size = if key_type == SshKeyType::RSA2048 {
+                    2048
+                } else {
+                    4096
+                };
+                let rsa_keypair =
+                    ssh_key::private::RsaKeypair::random(&mut ssh_key::rand_core::OsRng, bit_size)
+                        .map_err(|e| {
+                            CoreError::Internal(format!("Failed to generate RSA key: {}", e))
+                        })?;
+                ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Rsa(rsa_keypair), "")
+                    .map_err(|e| {
+                        CoreError::Internal(format!("Failed to generate RSA key: {}", e))
+                    })?
+            }
             SshKeyType::ECDSA256 => ssh_key::PrivateKey::random(
                 &mut ssh_key::rand_core::OsRng,
                 ssh_key::Algorithm::Ecdsa {
@@ -762,5 +775,44 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// R2-05 验收：RSA2048 请求必须真实生成 2048 位模数、key_type 标签保持
+    /// RSA2048，重启 rebuild（ssh_key_type_of 按模数位归类）后标签不变。
+    /// 回归时恒生成 4096 位密钥且重启后标签翻转为 RSA4096。
+    #[tokio::test]
+    async fn generated_rsa2048_key_has_2048_bit_modulus_and_stable_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = new_manager(&dir);
+        let key = manager
+            .generate_key("rsa2048", SshKeyType::RSA2048, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            key.key_type,
+            SshKeyType::RSA2048,
+            "返回的 key_type 必须与请求一致"
+        );
+
+        // 私钥模数必须是 2048 位（回归：实际生成 4096 级密钥）。
+        // Mpint::as_bytes 在最高位为 1 时带一个前导零字节（实测 2048 位模数
+        // 计 257 字节），归类前剥掉该字节得到真实位数
+        let bytes = std::fs::read(dir.path().join(format!("{}.key", key.id))).unwrap();
+        let parsed = ssh_key::PrivateKey::from_openssh(bytes.as_slice()).unwrap();
+        let modulus_bits = match parsed.public_key().key_data() {
+            ssh_key::public::KeyData::Rsa(rsa) => {
+                let n = rsa.n.as_bytes();
+                let significant = if n.first() == Some(&0) { &n[1..] } else { n };
+                significant.len().saturating_mul(8)
+            }
+            other => panic!("expected RSA key, got {:?}", other.algorithm()),
+        };
+        assert_eq!(modulus_bits, 2048, "RSA2048 请求必须生成 2048 位模数");
+
+        // 重启 rebuild 后标签不变（修复前同一密钥会翻转为 RSA4096）
+        let restarted = new_manager(&dir);
+        let keys = restarted.list_keys().await;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_type, SshKeyType::RSA2048);
     }
 }

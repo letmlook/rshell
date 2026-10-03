@@ -6,7 +6,7 @@
 //! cargo xtask fmt      # cargo fmt --all
 //! cargo xtask lint     # cargo clippy --workspace --all-targets -- -D warnings
 //! cargo xtask test     # cargo test --workspace
-//! cargo xtask dev      # cargo run -p rshell-ui
+//! cargo xtask dev      # npm run tauri:dev（在仓库根目录）
 //! cargo xtask build    # cargo build --release
 //! ```
 
@@ -30,7 +30,7 @@ enum CommandKind {
     Lint,
     /// 运行 workspace 全部测试
     Test,
-    /// 启动 rshell-ui 开发版本
+    /// 启动 Tauri 开发环境（转发 npm run tauri:dev）
     Dev,
     /// release 构建
     Build,

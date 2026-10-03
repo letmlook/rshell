@@ -191,6 +191,9 @@ enum ProtocolRequest {
     Disconnect(oneshot::Sender<Result<(), CoreError>>),
 }
 
+/// R2-15：会话删除回调（壳层据此清理 TerminalChannels 等每会话资源）
+type SessionDeletedCallback = Arc<dyn Fn(Uuid) + Send + Sync>;
+
 /// 会话服务 - 管理会话的生命周期
 pub struct SessionService {
     load_issues: RwLock<Vec<SessionLoadIssue>>,
@@ -212,6 +215,10 @@ pub struct SessionService {
     /// 设为 `None` 时所有写操作仅落内存（向后兼容旧测试场景）；
     /// Tauri 壳 `setup` 阶段必须 `Some(...)` 以满足设计 §4.5 完成判据。
     repository: Option<Arc<SessionRepository>>,
+    /// R2-15：会话删除回调。壳层据此清理每会话资源（如 TerminalChannels 的
+    /// 双态 sink 条目）。仅在删除时触发——断开不触发，断开后重连的终端面板
+    /// 仍持有 Channel 句柄，清理会冻结其输出。
+    on_session_deleted: std::sync::RwLock<Option<SessionDeletedCallback>>,
 }
 
 impl SessionService {
@@ -286,7 +293,17 @@ impl SessionService {
             trigger_engine,
             host_key_registry,
             repository,
+            on_session_deleted: std::sync::RwLock::new(None),
         }
+    }
+
+    /// R2-15：注册会话删除回调（壳层用它清理 TerminalChannels 的 sink 条目）。
+    /// 同步 setter：Tauri setup 阶段（不能嵌套 block_on）即可注册。
+    pub fn set_on_session_deleted(&self, callback: SessionDeletedCallback) {
+        *self
+            .on_session_deleted
+            .write()
+            .expect("on_session_deleted lock poisoned") = Some(callback);
     }
 
     fn storage_load_issue() -> SessionLoadIssue {
@@ -1036,6 +1053,17 @@ impl SessionService {
         // between disconnect and deletion and publish into a deleted session.
         let _ = self.detach_session(id, true).await;
 
+        // R2-15：会话已删除，通知壳层清理该会话的终端 sink 条目等资源。
+        // 注意：仅删除触发；断开路径不触发（重连的终端面板仍持有 Channel）。
+        if let Some(callback) = self
+            .on_session_deleted
+            .read()
+            .expect("on_session_deleted lock poisoned")
+            .as_ref()
+        {
+            callback(id);
+        }
+
         self.event_bus
             .publish(rshell_api::AppEvent::SessionListChanged);
 
@@ -1648,6 +1676,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("not found"));
+    }
+
+    // ===== R2-15：会话删除回调（壳层据此清理 TerminalChannels sink 条目）=====
+
+    /// 验收：会话删除后壳层收到回调（据此移除 terminal_channels 中该
+    /// session_id 的条目——Buffering 固定预分配 256KiB，不能随历史会话累积）。
+    #[tokio::test]
+    async fn delete_session_fires_on_session_deleted_callback() {
+        let svc = make_service();
+        let deleted: Arc<std::sync::Mutex<Vec<Uuid>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = deleted.clone();
+        svc.set_on_session_deleted(Arc::new(move |id| sink.lock().unwrap().push(id)));
+
+        let id = svc.create_session(make_config("a", "host1")).await.unwrap();
+        svc.delete_session(id).await.unwrap();
+
+        assert_eq!(*deleted.lock().unwrap(), vec![id], "删除必须触发回调");
+    }
+
+    /// 设计决策：断开（非删除）不触发回调——断开后重连的终端面板仍持有
+    /// Channel 句柄，若此时清理 sink 条目，重连后输出将无法送达该面板。
+    #[tokio::test]
+    async fn disconnect_does_not_fire_on_session_deleted_callback() {
+        let svc = make_service();
+        let deleted: Arc<std::sync::Mutex<Vec<Uuid>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = deleted.clone();
+        svc.set_on_session_deleted(Arc::new(move |id| sink.lock().unwrap().push(id)));
+
+        let id = svc.create_session(make_config("a", "host1")).await.unwrap();
+        // 未连接会话上的断开是无害的 no-op，走与真实断开相同的 detach 路径
+        let _ = svc.disconnect(id).await;
+        assert!(deleted.lock().unwrap().is_empty(), "断开不得触发删除回调");
+
+        // 随后真正删除才触发
+        svc.delete_session(id).await.unwrap();
+        assert_eq!(*deleted.lock().unwrap(), vec![id]);
     }
 
     #[tokio::test]

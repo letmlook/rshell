@@ -94,6 +94,19 @@ pub fn run() {
                 Some(session_repository),
             ));
 
+            // R2-15：会话删除后清理 TerminalChannels 的 sink 条目——否则
+            // Buffering（256KiB 预分配）或 Attached 句柄随历史会话数无界累积。
+            // 仅删除触发；断开不触发（重连的终端面板仍持有 Channel 句柄）。
+            session_service.set_on_session_deleted({
+                let terminal_channels = terminal_channels.clone();
+                Arc::new(move |session_id| {
+                    let terminal_channels = terminal_channels.clone();
+                    tauri::async_runtime::spawn(async move {
+                        terminal_channels.detach(session_id).await;
+                    });
+                })
+            });
+
             let transfer_service = Arc::new(TransferService::new(event_bus.clone()));
             let key_manager = Arc::new(KeyManager::new(keys_dir, event_bus.clone()));
             let master_password = Arc::new(MasterPassword::new(event_bus.clone()));

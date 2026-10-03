@@ -4,9 +4,10 @@
  *
  * 本地端口转发与动态 SOCKS5 隧道管理。
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessageBox } from "element-plus/es/components/message-box/index.mjs";
 import { listTunnels, listPendingTunnels, createTunnel, closeTunnel } from "../ipc/client";
+import { subscribeAppEvents } from "../ipc/events";
 import type { Uuid, PortForwardRule, ActiveTunnelInfo } from "../ipc/types";
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
@@ -15,6 +16,11 @@ const items = ref<ActiveTunnelInfo[]>([]);
 const loading = ref(false);
 const error = ref<string | null>(null);
 const unsupported = ref<string[]>([]);
+
+// 事件订阅的生命周期（与 QuickCommandPanel 同款）：异步订阅完成可能晚于
+// unmount，用 active 门闩保证晚到的订阅被立即释放。
+let unlisten: (() => void) | null = null;
+let active = false;
 
 const draftType = ref<"Local" | "Dynamic">("Local");
 const draftSession = ref<Uuid | null>(null);
@@ -108,7 +114,29 @@ async function remove(id: Uuid) {
   }
 }
 
-onMounted(refresh);
+// R2-04：后端在会话断开时会把该会话隧道置 Error 并逐条发布
+// TunnelStateChanged + ActiveTunnelsChanged（tunnel_manager deactivate_session_tunnels）。
+// 面板打开期间不订阅这两个事件，状态列会一直停留旧的 Active 文案，直到手点刷新。
+onMounted(async () => {
+  active = true;
+  await refresh();
+  if (!active) return;
+  const stop = await subscribeAppEvents((event) => {
+    if (
+      event === "ActiveTunnelsChanged" ||
+      (typeof event !== "string" && "TunnelStateChanged" in event)
+    ) {
+      void refresh();
+    }
+  });
+  if (active) unlisten = stop;
+  else stop();
+});
+onBeforeUnmount(() => {
+  active = false;
+  unlisten?.();
+  unlisten = null;
+});
 </script>
 
 <template>

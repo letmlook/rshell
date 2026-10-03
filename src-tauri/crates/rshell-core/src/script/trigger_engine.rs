@@ -18,6 +18,9 @@ use uuid::Uuid;
 pub struct TriggerEngine {
     /// 触发器存储
     triggers: Arc<RwLock<HashMap<Uuid, Trigger>>>,
+    /// R2-18：按 trigger_id 预编译的正则缓存。创建/加载时编译一次，
+    /// check_output 热路径只做 is_match，不再每条输出块重新编译。
+    regex_cache: Arc<RwLock<HashMap<Uuid, Regex>>>,
     /// 事件总线
     event_bus: Arc<EventBus>,
     path: Option<PathBuf>,
@@ -35,6 +38,7 @@ impl TriggerEngine {
     pub fn new(event_bus: Arc<EventBus>) -> Self {
         Self {
             triggers: Arc::new(RwLock::new(HashMap::new())),
+            regex_cache: Arc::new(RwLock::new(HashMap::new())),
             event_bus,
             path: None,
             read_only: false,
@@ -42,25 +46,44 @@ impl TriggerEngine {
     }
 
     pub fn with_path(event_bus: Arc<EventBus>, path: PathBuf) -> Self {
-        let (triggers, writable) = match std::fs::read(&path) {
+        let (triggers, regex_cache, writable) = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<Vec<Trigger>>(&bytes) {
-                Ok(items) => (
-                    items.into_iter().map(|item| (item.id, item)).collect(),
-                    true,
-                ),
+                Ok(items) => {
+                    // R2-18：加载时预编译全部正则；非法正则不入缓存，
+                    // check_output 视为不匹配并告警（保留原有兜底语义）。
+                    let mut map = HashMap::new();
+                    let mut cache = HashMap::new();
+                    for item in items {
+                        if let TriggerCondition::RegexAppear(pattern) = &item.condition {
+                            match Regex::new(pattern) {
+                                Ok(re) => {
+                                    cache.insert(item.id, re);
+                                }
+                                Err(error) => {
+                                    warn!(trigger_id = %item.id, %error, "Invalid regex in stored trigger; treated as non-match");
+                                }
+                            }
+                        }
+                        map.insert(item.id, item);
+                    }
+                    (map, cache, true)
+                }
                 Err(error) => {
                     warn!(path = %path.display(), %error, "Trigger file is invalid; leaving it untouched");
-                    (HashMap::new(), false)
+                    (HashMap::new(), HashMap::new(), false)
                 }
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (HashMap::new(), HashMap::new(), true)
+            }
             Err(error) => {
                 warn!(path = %path.display(), %error, "Could not read triggers; leaving file untouched");
-                (HashMap::new(), false)
+                (HashMap::new(), HashMap::new(), false)
             }
         };
         Self {
             triggers: Arc::new(RwLock::new(triggers)),
+            regex_cache: Arc::new(RwLock::new(regex_cache)),
             event_bus,
             path: Some(path),
             read_only: !writable,
@@ -84,23 +107,26 @@ impl TriggerEngine {
 
     /// 创建触发器
     pub fn create_trigger(&self, trigger: Trigger) -> Result<Uuid, CoreError> {
-        match &trigger.condition {
-            TriggerCondition::RegexAppear(pattern) => {
-                if pattern.is_empty() {
+        // R2-18：校验时编译一次并保留，落库成功后写入缓存
+        let compiled =
+            match &trigger.condition {
+                TriggerCondition::RegexAppear(pattern) => {
+                    if pattern.is_empty() {
+                        return Err(CoreError::InvalidState(
+                            "Trigger regex cannot be empty".into(),
+                        ));
+                    }
+                    Some(Regex::new(pattern).map_err(|e| {
+                        CoreError::InvalidState(format!("Invalid trigger regex: {e}"))
+                    })?)
+                }
+                TriggerCondition::ExactMatch(text) if text.is_empty() => {
                     return Err(CoreError::InvalidState(
-                        "Trigger regex cannot be empty".into(),
+                        "Trigger match text cannot be empty".into(),
                     ));
                 }
-                Regex::new(pattern)
-                    .map_err(|e| CoreError::InvalidState(format!("Invalid trigger regex: {e}")))?;
-            }
-            TriggerCondition::ExactMatch(text) if text.is_empty() => {
-                return Err(CoreError::InvalidState(
-                    "Trigger match text cannot be empty".into(),
-                ));
-            }
-            _ => {}
-        }
+                _ => None,
+            };
         match &trigger.action {
             TriggerAction::SendText(text) | TriggerAction::ShowNotification(text)
                 if text.is_empty() =>
@@ -128,6 +154,12 @@ impl TriggerEngine {
         self.persist(&updated)?;
         *triggers = updated;
         drop(triggers);
+        if let Some(re) = compiled {
+            self.regex_cache
+                .write()
+                .map_err(|e| CoreError::Internal(e.to_string()))?
+                .insert(id, re);
+        }
 
         self.event_bus.publish(AppEvent::TriggerListChanged);
         debug!(trigger_id = %id, "Trigger created");
@@ -154,6 +186,10 @@ impl TriggerEngine {
         self.persist(&updated)?;
         *triggers = updated;
         drop(triggers);
+        self.regex_cache
+            .write()
+            .map_err(|e| CoreError::Internal(e.to_string()))?
+            .remove(&trigger_id);
 
         self.event_bus.publish(AppEvent::TriggerListChanged);
         debug!(trigger_id = %trigger_id, "Trigger deleted");
@@ -197,6 +233,9 @@ impl TriggerEngine {
     /// 检查终端输出是否匹配任何触发器
     ///
     /// 返回所有匹配的触发器动作列表。
+    /// R2-18：正则使用创建/加载时预编译的缓存（热路径只做 is_match，
+    /// 不再每条输出块重新编译）；缓存缺失（文件加载时的非法正则）视为
+    /// 不匹配并告警。
     pub fn check_output(
         &self,
         output: &str,
@@ -204,6 +243,10 @@ impl TriggerEngine {
     ) -> Result<Vec<TriggerMatch>, CoreError> {
         let triggers = self
             .triggers
+            .read()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let regex_cache = self
+            .regex_cache
             .read()
             .map_err(|e| CoreError::Internal(e.to_string()))?;
         let mut matches = Vec::new();
@@ -214,10 +257,10 @@ impl TriggerEngine {
             }
 
             let matched = match &trigger.condition {
-                TriggerCondition::RegexAppear(pattern) => match Regex::new(pattern) {
-                    Ok(re) => re.is_match(output),
-                    Err(e) => {
-                        warn!(trigger_id = %trigger.id, error = %e, "Invalid regex pattern");
+                TriggerCondition::RegexAppear(_) => match regex_cache.get(&trigger.id) {
+                    Some(re) => re.is_match(output),
+                    None => {
+                        warn!(trigger_id = %trigger.id, "Regex not cached (invalid pattern); treated as non-match");
                         false
                     }
                 },
@@ -328,6 +371,44 @@ mod tests {
             .unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].trigger_id, t.id);
+    }
+
+    // ===== R2-18：正则创建/加载时预编译缓存 =====
+
+    /// 从文件加载的触发器（with_path 路径）同样命中预编译缓存
+    #[test]
+    fn regex_trigger_loaded_from_file_matches_via_precompiled_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("triggers.json");
+        let t = make_trigger(
+            "re",
+            TriggerCondition::RegexAppear(r"(?i)error\s+\d+".to_string()),
+            TriggerAction::ShowNotification("error code".to_string()),
+        );
+        std::fs::write(&path, serde_json::to_vec_pretty(&vec![t]).unwrap()).unwrap();
+
+        let eng = TriggerEngine::with_path(Arc::new(EventBus::new()), path);
+        let matches = eng
+            .check_output("Got error 42 from server", Uuid::new_v4())
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+    }
+
+    /// 文件里的非法正则不入缓存：永不触发（保留加载路径的兜底语义）
+    #[test]
+    fn invalid_regex_loaded_from_file_never_fires() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("triggers.json");
+        let t = make_trigger(
+            "bad",
+            TriggerCondition::RegexAppear("(unclosed".to_string()),
+            TriggerAction::Disconnect,
+        );
+        std::fs::write(&path, serde_json::to_vec_pretty(&vec![t]).unwrap()).unwrap();
+
+        let eng = TriggerEngine::with_path(Arc::new(EventBus::new()), path);
+        let matches = eng.check_output("anything", Uuid::new_v4()).unwrap();
+        assert!(matches.is_empty());
     }
 
     #[test]

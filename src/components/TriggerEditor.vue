@@ -5,6 +5,7 @@
  * 触发器列表和动作编辑；远端输出匹配后由后端执行动作。
  */
 import { onBeforeUnmount, onMounted, ref } from "vue";
+import { ElMessageBox } from "element-plus/es/components/message-box/index.mjs";
 import { listTriggers, createTrigger, deleteTrigger, toggleTrigger } from "../ipc/client";
 import { subscribeAppEvents } from "../ipc/events";
 import type { Trigger, Uuid } from "../ipc/types";
@@ -59,7 +60,15 @@ async function toggle(t: Trigger) {
 }
 
 async function remove(t: Trigger) {
-  try { await deleteTrigger(t.id); } catch (e) { error.value = String(e); return; }
+  // R2-14：删除持久数据必须有确认流（与会话/密钥/快速命令/远程文件删除一致）。
+  // wry/WKWebView 不实现 window.confirm，走 ElMessageBox（QuickCommandPanel 同款）。
+  try {
+    await ElMessageBox.confirm(`删除触发器“${t.name}”？`, "确认删除", { type: "warning" });
+    await deleteTrigger(t.id);
+  } catch (e) {
+    if (e !== "cancel" && e !== "close") error.value = String(e);
+    return;
+  }
   await refresh();
 }
 

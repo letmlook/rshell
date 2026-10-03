@@ -176,10 +176,29 @@ function onDockviewUnmounted() {
   dockviewApi = null;
 }
 
-// 会话切换发生在容器 ready 之后时，由本 watch 负责建面板/激活既有面板
-watch(activeTerminal, (id) => {
-  if (id) ensureTerminalPanel(id);
-});
+// 面板的创建/激活由两条路径保证：selectSession 直接调 ensureTerminalPanel
+//（覆盖「面板被关闭后重击同一会话」——watch 因 Object.is 相等不会触发），
+// 容器首次挂载则由 onDockviewReady 兜底。activeTerminal 仅在 selectSession
+// 写入，不再需要针对创建/激活的 watch。
+
+// R2-12：会话被删除后，其 terminal-{id} 面板必须同步关闭——否则残留的
+// 面板指向已删除会话，键入只会触发 IO 失败提示。会话列表在删除路径
+// （store.deleteSessionById → SessionListChanged → store.refresh）后更新，
+// 这里对 items 做差集，把已消失会话的面板关掉。
+function closeOrphanTerminalPanels() {
+  if (!dockviewApi) return;
+  const alive = new Set(store.items.map((session) => session.id));
+  for (const panel of dockviewApi.panels) {
+    if (!panel.id.startsWith("terminal-")) continue;
+    const sessionId = panel.id.slice("terminal-".length);
+    if (!alive.has(sessionId)) dockviewApi.getPanel(panel.id)?.api.close();
+  }
+}
+
+watch(
+  () => store.items.map((session) => session.id),
+  () => closeOrphanTerminalPanels(),
+);
 
 function setSidebarWidth(width: number) {
   sidebarWidth.value = clampSidebarWidth(width, sidebarMaxWidth.value);
@@ -205,6 +224,10 @@ function toggleSidebar(expanded?: boolean) {
 async function selectSession(id: Uuid) {
   activeTerminal.value = id;
   store.currentId = id;
+  // 重复点击同一会话不会触发 watch(activeTerminal)（Object.is 相等），
+  // 面板被用户关闭后必须在这里直接重建。容器尚未挂载时 dockviewApi 为
+  // null，此调用是 no-op，由 onDockviewReady 兜底建面板。
+  ensureTerminalPanel(id);
   if (store.connectionState.get(id) === "connected" || store.connectionState.get(id) === "connecting") return;
   try {
     await store.connect(id);
@@ -264,9 +287,21 @@ async function disconnectCurrent() {
   catch (error) { ElMessage.error(`断开失败：${String(error)}`); }
 }
 
-function terminalAction(action: "find" | "clear") {
+function terminalAction(action: "find" | "clear" | "closeFind") {
   if (!activeTerminal.value) return;
   window.dispatchEvent(new CustomEvent("rshell:terminal-action", { detail: { sessionId: activeTerminal.value, action } }));
+}
+
+// R2-13：window 级快捷键只路由到当前激活终端。以前每个 TerminalPane 各自挂
+// window keydown，多面板并存时一次 Ctrl+F 会同时切换所有面板的搜索栏；
+// 现在统一在这里拦截，经 rshell:terminal-action（面板内按 sessionId 过滤）分发。
+function onGlobalKeydown(e: KeyboardEvent) {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    terminalAction("find");
+  } else if (e.key === "Escape") {
+    terminalAction("closeFind");
+  }
 }
 
 const currentConnectionState = computed(() => {
@@ -278,6 +313,7 @@ const currentConnectionState = computed(() => {
 onMounted(async () => {
   mounted = true;
   window.addEventListener("resize", onViewportResize);
+  window.addEventListener("keydown", onGlobalKeydown);
   await store.refresh();
   if (!mounted) return;
   await store.subscribeEvents();
@@ -323,6 +359,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   mounted = false;
   window.removeEventListener("resize", onViewportResize);
+  window.removeEventListener("keydown", onGlobalKeydown);
   dockviewApi = null;
   unlistenTransfers?.();
   store.disposeEvents();
