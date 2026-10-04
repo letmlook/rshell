@@ -142,3 +142,75 @@ describe("TransferPanel cancel/remove controls", () => {
     expect(wrapper.find('[data-test="xfer-action-error"]').text()).toContain("删除失败");
   });
 });
+
+describe("TransferPanel 队列生命周期菜单", () => {
+  it("disables the queue menu when there is no finished entry to clear", () => {
+    const wrapper = mountPanel({
+      items: [
+        { id: "t-active", name: "a", phase: "active", progress: 0.1, size: 10, local: "/a", remote: "/b", speed: 1 },
+        { id: "t-paused", name: "b", phase: "paused", progress: 0.1, size: 10, local: "/a", remote: "/b", speed: 0 },
+      ],
+    });
+    const toggle = wrapper.find('[data-test="xfer-bulk-toggle"]').element as HTMLButtonElement;
+    expect(toggle.disabled).toBe(true);
+  });
+
+  it("clears only the completed entries", async () => {
+    const wrapper = mountPanel();
+    await wrapper.find('[data-test="xfer-bulk-toggle"]').trigger("click");
+    await wrapper.find('[data-test="xfer-bulk-clearDone"]').trigger("click");
+    expect(wrapper.emitted("remove-many")).toEqual([[["t-done"]]]);
+  });
+
+  it("clears only the failed entries", async () => {
+    const wrapper = mountPanel();
+    await wrapper.find('[data-test="xfer-bulk-toggle"]').trigger("click");
+    await wrapper.find('[data-test="xfer-bulk-clearFailed"]').trigger("click");
+    expect(wrapper.emitted("remove-many")).toEqual([[["t-failed"]]]);
+  });
+
+  it("clears every terminal entry but never the active or paused ones", async () => {
+    const wrapper = mountPanel({
+      items: [
+        ...sampleItems,
+        { id: "t-cancelled", name: "c", phase: "cancelled", progress: 0.3, size: 10, local: "/a", remote: "/b", speed: 0 },
+      ],
+    });
+    await wrapper.find('[data-test="xfer-bulk-toggle"]').trigger("click");
+    await wrapper.find('[data-test="xfer-bulk-clearAll"]').trigger("click");
+    const ids = wrapper.emitted("remove-many")?.[0]?.[0] as string[];
+    expect(ids.sort()).toEqual(["t-cancelled", "t-done", "t-failed"]);
+    expect(ids).not.toContain("t-active");
+    expect(ids).not.toContain("t-paused");
+  });
+
+  // 进行中的任务不能被批量清除：其拷贝循环仍持有控制通道，必须先逐条取消
+  it("never includes in-flight tasks in any bulk target", async () => {
+    const wrapper = mountPanel();
+    await wrapper.find('[data-test="xfer-bulk-toggle"]').trigger("click");
+    for (const action of ["clearDone", "clearFailed", "clearCancelled", "clearAll"]) {
+      await wrapper.find(`[data-test="xfer-bulk-${action}"]`).trigger("click");
+      await wrapper.find('[data-test="xfer-bulk-toggle"]').trigger("click");
+    }
+    const calls = (wrapper.emitted("remove-many") ?? []).map((e) => e[0] as string[]);
+    for (const ids of calls) {
+      expect(ids).not.toContain("t-active");
+      expect(ids).not.toContain("t-paused");
+    }
+  });
+
+  it("closes the menu after an action is chosen", async () => {
+    const wrapper = mountPanel();
+    await wrapper.find('[data-test="xfer-bulk-toggle"]').trigger("click");
+    expect(wrapper.find('[data-test="xfer-bulk-menu"]').exists()).toBe(true);
+    await wrapper.find('[data-test="xfer-bulk-clearDone"]').trigger("click");
+    expect(wrapper.find('[data-test="xfer-bulk-menu"]').exists()).toBe(false);
+  });
+
+  it("emits nothing for an empty group", async () => {
+    const wrapper = mountPanel();
+    await wrapper.find('[data-test="xfer-bulk-toggle"]').trigger("click");
+    await wrapper.find('[data-test="xfer-bulk-clearCancelled"]').trigger("click");
+    expect(wrapper.emitted("remove-many")).toBeUndefined();
+  });
+});

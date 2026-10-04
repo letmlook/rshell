@@ -101,8 +101,45 @@ function readXtermThemeFromCssVars(): ITheme {
   };
 }
 
+/** 复制/粘贴需要剪贴板权限；无选中内容或剪贴板不可用时必须可见提示，不静默吞掉 */
+function noteClipboardFailure(action: "复制" | "粘贴", error: unknown) {
+  ElMessage.warning(`${action}失败：${String(error)}`);
+  console.error(`${action}失败`, error);
+}
+
+async function copySelection() {
+  if (!term) return;
+  const text = term.getSelection();
+  if (!text) {
+    ElMessage.info("终端没有选中内容");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    noteClipboardFailure("复制", e);
+  }
+}
+
+async function pasteClipboard() {
+  if (!term) return;
+  let text: string;
+  try {
+    text = await navigator.clipboard.readText();
+  } catch (e) {
+    noteClipboardFailure("粘贴", e);
+    return;
+  }
+  if (!text) {
+    ElMessage.info("剪贴板为空");
+    return;
+  }
+  // paste() 走 term.onData 通路，与键盘输入同等对待（含后端 IO 失败提示）
+  term.paste(text);
+}
+
 function onTerminalAction(event: Event) {
-  const detail = (event as CustomEvent<{ sessionId: Uuid; action: "find" | "clear" | "closeFind" }>)
+  const detail = (event as CustomEvent<{ sessionId: Uuid; action: "find" | "clear" | "closeFind" | "copy" | "paste" }>)
     .detail;
   // R2-13：window 级快捷键（Ctrl+F/Escape）由 App.vue 统一拦截后经本事件
   // 路由到当前激活终端；这里按 sessionId 过滤，非激活面板不响应。
@@ -110,6 +147,8 @@ function onTerminalAction(event: Event) {
   if (detail.action === "find") searchBarVisible.value = true;
   if (detail.action === "clear") term?.clear();
   if (detail.action === "closeFind") closeSearch();
+  if (detail.action === "copy") void copySelection();
+  if (detail.action === "paste") void pasteClipboard();
 }
 
 // ── PROB-13：sendInput/resizeTerminal 持续失败的一次性可见提示 ──

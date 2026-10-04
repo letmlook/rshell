@@ -296,6 +296,10 @@ impl CommandDispatcher {
                     .await?;
                 Ok(CommandOutcome::None)
             }
+            AppCommand::GetRemoteHomeDir { session_id } => {
+                let path = self.session_service.remote_home_dir(session_id).await?;
+                Ok(CommandOutcome::RemoteHomeDir(path))
+            }
             AppCommand::DeleteRemoteEntry { session_id, path } => {
                 self.session_service
                     .delete_remote_entry(session_id, &path)

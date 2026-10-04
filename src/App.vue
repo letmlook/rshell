@@ -127,6 +127,43 @@ async function runTransferAction(taskId: string, action: TransferAction) {
   }
 }
 
+/**
+ * 队列生命周期批量清理：逐条调用 RemoveTransfer。
+ * 逐条而非新增批量命令，是为了让部分失败可见——批量接口吞掉单条错误会让
+ * 用户以为队列已清空，实际仍有残留条目。终态守卫在服务端，
+ * 活跃任务会被拒绝并计入失败。
+ */
+async function removeTransfers(taskIds: string[]) {
+  if (taskIds.length === 0) return;
+  transferActionError.value = null;
+  const pending = new Set(transferPendingIds.value);
+  for (const id of taskIds) pending.add(id);
+  transferPendingIds.value = pending;
+
+  const failures: string[] = [];
+  try {
+    for (const id of taskIds) {
+      try {
+        await removeTransfer(id as Uuid);
+      } catch (error) {
+        failures.push(String(error));
+      }
+    }
+    await refreshTransfers();
+    if (failures.length > 0) {
+      transferActionError.value = `删除失败 ${failures.length} 个：${failures[0]}`;
+      ElNotification.error({
+        title: "队列清理未完成",
+        message: `${failures.length} 个条目未能删除（进行中的任务需先取消）。`,
+      });
+    }
+  } finally {
+    const remaining = new Set(transferPendingIds.value);
+    for (const id of taskIds) remaining.delete(id);
+    transferPendingIds.value = remaining;
+  }
+}
+
 const sidebarWidth = ref(DEFAULT_SIDEBAR_WIDTH);
 const viewportWidth = ref(
   typeof window === "undefined" ? 1280 : window.innerWidth,
@@ -303,7 +340,9 @@ async function disconnectCurrent() {
   catch (error) { ElMessage.error(`断开失败：${String(error)}`); }
 }
 
-function terminalAction(action: "find" | "clear" | "closeFind") {
+type TerminalAction = "find" | "clear" | "closeFind" | "copy" | "paste";
+
+function terminalAction(action: TerminalAction) {
   if (!activeTerminal.value) return;
   window.dispatchEvent(new CustomEvent("rshell:terminal-action", { detail: { sessionId: activeTerminal.value, action } }));
 }
@@ -311,8 +350,17 @@ function terminalAction(action: "find" | "clear" | "closeFind") {
 // R2-13：window 级快捷键只路由到当前激活终端。以前每个 TerminalPane 各自挂
 // window keydown，多面板并存时一次 Ctrl+F 会同时切换所有面板的搜索栏；
 // 现在统一在这里拦截，经 rshell:terminal-action（面板内按 sessionId 过滤）分发。
+// 复制粘贴用 Ctrl+Shift+C / Ctrl+Shift+V（Xterm.js 惯例）：裸 Ctrl+C 在终端里
+// 是 SIGINT，Ctrl+V 是 quoted-insert，都不能劫持成剪贴板操作。
 function onGlobalKeydown(e: KeyboardEvent) {
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+  const accel = e.ctrlKey || e.metaKey;
+  if (accel && e.shiftKey && e.key.toLowerCase() === "c") {
+    e.preventDefault();
+    terminalAction("copy");
+  } else if (accel && e.shiftKey && e.key.toLowerCase() === "v") {
+    e.preventDefault();
+    terminalAction("paste");
+  } else if (accel && e.key.toLowerCase() === "f") {
     e.preventDefault();
     terminalAction("find");
   } else if (e.key === "Escape") {
@@ -503,6 +551,7 @@ onBeforeUnmount(() => {
               @resume="(taskId) => runTransferAction(taskId, 'resume')"
               @cancel="(taskId) => runTransferAction(taskId, 'cancel')"
               @remove="(taskId) => runTransferAction(taskId, 'remove')"
+              @remove-many="removeTransfers"
             />
           </div>
         </div>

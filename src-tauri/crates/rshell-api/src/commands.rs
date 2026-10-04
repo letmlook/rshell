@@ -95,6 +95,10 @@ pub enum AppCommand {
         session_id: Uuid,
         path: String,
     },
+    /// 获取远端用户工作目录（登录后默认所在目录）
+    GetRemoteHomeDir {
+        session_id: Uuid,
+    },
     CreateRemoteDirectory {
         session_id: Uuid,
         path: String,

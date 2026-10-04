@@ -321,6 +321,18 @@ impl SftpClient {
         Ok(())
     }
 
+    /// 远端用户的工作目录（登录后默认所在目录）
+    ///
+    /// 用 SFTP `realpath(".")` 解析：sftp 子系统启动时的当前目录即为登录用户
+    /// 的 home，远端无需额外支持 `~` 展开。解析失败时回退到 `/`，
+    /// 保证调用方总有可用目录（与旧行为一致，不把失败暴露为空白面板）。
+    pub async fn home_dir(&self) -> Result<String, ProtocolError> {
+        match self.session.canonicalize(".").await {
+            Ok(dir) if !dir.trim().is_empty() => Ok(dir),
+            Ok(_) | Err(_) => Ok("/".to_string()),
+        }
+    }
+
     /// 删除远程文件
     pub async fn remove_file(&self, path: &str) -> Result<(), ProtocolError> {
         self.session

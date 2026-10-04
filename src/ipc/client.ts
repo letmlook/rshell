@@ -165,6 +165,9 @@ export const removeTransfer = (task_id: Uuid) => call({ RemoveTransfer: { task_i
 
 export const browseRemoteDir = (session_id: Uuid, path: string) =>
   call<{ path: string; entries: RemoteFileEntry[] }>({ BrowseRemoteDir: { session_id, path } });
+/** 远端用户工作目录（登录后默认所在目录）；后端解析失败时回退 "/" */
+export const getRemoteHomeDir = (session_id: Uuid) =>
+  call<string>({ GetRemoteHomeDir: { session_id } });
 export const createRemoteDirectory = (session_id: Uuid, path: string) =>
   call<void>({ CreateRemoteDirectory: { session_id, path } });
 export const deleteRemoteEntry = (session_id: Uuid, path: string) =>

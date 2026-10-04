@@ -1131,6 +1131,22 @@ impl SessionService {
         Ok(entries)
     }
 
+    /// 远端用户的工作目录（登录后默认所在目录）
+    pub async fn remote_home_dir(&self, session_id: Uuid) -> Result<String, CoreError> {
+        let client = self.get_ssh_client(session_id).await?;
+        let ssh = client.read().await;
+        let channel = ssh
+            .open_sftp_channel()
+            .await
+            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+        let sftp = SftpClient::new(channel)
+            .await
+            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+        sftp.home_dir()
+            .await
+            .map_err(|e| CoreError::ConnectionError(e.to_string()))
+    }
+
     pub async fn create_remote_directory(
         &self,
         session_id: Uuid,

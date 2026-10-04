@@ -402,6 +402,7 @@ const OUTCOME_RETURN_MAP: Record<string, { helper: string; typeText: string }> =
   Plugins: { helper: "listPlugins", typeText: "PluginInfo[]" },
   Themes: { helper: "listThemes", typeText: "ThemeInfo" },
   PendingTunnels: { helper: "listPendingTunnels", typeText: "PendingTunnelInfo" },
+  RemoteHomeDir: { helper: "getRemoteHomeDir", typeText: "string" },
   RemoteDir: {
     helper: "browseRemoteDir",
     typeText: "{ path: string; entries: RemoteFileEntry[] }",

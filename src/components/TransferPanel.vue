@@ -55,6 +55,8 @@ const emit = defineEmits<{
   (e: "resume", taskId: string): void;
   (e: "cancel", taskId: string): void;
   (e: "remove", taskId: string): void;
+  /** 队列生命周期批量操作：按终态分组移除条目 */
+  (e: "remove-many", taskIds: string[]): void;
 }>();
 
 const tab = ref<"transfer" | "log">("transfer");
@@ -92,6 +94,44 @@ function onRemove(taskId: string, event: Event) {
 /** 终态（完成/失败/已取消）才允许从队列移除 */
 function isRemovable(phase: TransferPhase): boolean {
   return phase === "done" || phase === "failed" || phase === "cancelled";
+}
+
+// ── 队列生命周期菜单 ──
+// 批量操作只覆盖终态条目：活跃任务的拷贝循环仍在跑，必须先逐条取消。
+type BulkAction = "clearDone" | "clearFailed" | "clearCancelled" | "clearAll";
+
+const bulkMenuOpen = ref(false);
+
+const removableIds = computed(() =>
+  merged.value.filter((row) => isRemovable(row.phase)).map((row) => row.id),
+);
+
+const bulkTargets = computed<Record<BulkAction, string[]>>(() => {
+  const byPhase = (phase: TransferPhase) =>
+    merged.value.filter((row) => row.phase === phase).map((row) => row.id);
+  return {
+    clearDone: byPhase("done"),
+    clearFailed: byPhase("failed"),
+    clearCancelled: byPhase("cancelled"),
+    clearAll: removableIds.value,
+  };
+});
+
+const BULK_ACTIONS: { action: BulkAction; label: string }[] = [
+  { action: "clearDone", label: "清除已完成" },
+  { action: "clearFailed", label: "清除失败" },
+  { action: "clearCancelled", label: "清除已取消" },
+  { action: "clearAll", label: "清除全部已结束" },
+];
+
+/** 没有可清理的终态条目时菜单整体不可用，避免空操作入口 */
+const canBulkClear = computed(() => removableIds.value.length > 0);
+
+function runBulkAction(action: BulkAction) {
+  bulkMenuOpen.value = false;
+  const ids = bulkTargets.value[action];
+  if (ids.length === 0) return;
+  emit("remove-many", ids);
 }
 
 function fmtSize(n: number): string {
@@ -156,7 +196,42 @@ function phaseClass(p: TransferPhase): string {
         </button>
       </div>
       <div class="spacer" />
-      <button class="icon-btn" :title="expanded ? '折叠' : '展开'" aria-label="折叠/展开">
+      <div class="bulk-wrap">
+        <button
+          class="icon-btn"
+          data-test="xfer-bulk-toggle"
+          aria-label="队列管理"
+          title="队列管理"
+          :aria-expanded="bulkMenuOpen"
+          :disabled="!canBulkClear"
+          @click.stop="bulkMenuOpen = !bulkMenuOpen"
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16">
+            <path d="M2 4 H14 M2 8 H14 M2 12 H14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+          </svg>
+        </button>
+        <ul
+          v-if="bulkMenuOpen"
+          class="bulk-menu"
+          data-test="xfer-bulk-menu"
+          role="menu"
+        >
+          <li
+            v-for="item in BULK_ACTIONS"
+            :key="item.action"
+            role="menuitem"
+            class="bulk-item"
+            :data-test="`xfer-bulk-${item.action}`"
+            :class="{ 'is-empty': bulkTargets[item.action].length === 0 }"
+            tabindex="0"
+            @click="runBulkAction(item.action)"
+            @keydown.enter="runBulkAction(item.action)"
+          >
+            {{ item.label }}（{{ bulkTargets[item.action].length }}）
+          </li>
+        </ul>
+      </div>
+      <button class="icon-btn" :title="expanded ? '折叠' : '展开'" aria-label="折叠/展开" @click.stop="emit('toggle')">
         <svg width="12" height="12" viewBox="0 0 16 16">
           <path
             v-if="expanded"
@@ -352,6 +427,47 @@ function phaseClass(p: TransferPhase): string {
   cursor: pointer;
 }
 .icon-btn:hover { background: var(--rs-bg-surface-hover); color: var(--rs-fg); }
+.icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.bulk-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.bulk-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  min-width: 156px;
+  background: var(--rs-bg-surface);
+  border: 1px solid var(--rs-border);
+  border-radius: var(--rs-radius-1);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 32%);
+}
+.bulk-item {
+  padding: 6px 12px;
+  font-size: var(--rs-fs-xs);
+  color: var(--rs-fg);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.bulk-item:hover,
+.bulk-item:focus-visible {
+  background: var(--rs-bg-surface-hover);
+  outline: none;
+}
+/* 该分组当前没有可清理条目：仍展示计数（说明为什么不可用），但不触发操作 */
+.bulk-item.is-empty {
+  color: var(--rs-fg-disabled);
+  cursor: not-allowed;
+}
+.bulk-item.is-empty:hover {
+  background: transparent;
+}
 
 .panel-body {
   flex: 1;

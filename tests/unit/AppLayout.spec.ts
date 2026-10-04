@@ -297,6 +297,69 @@ describe("App layout", () => {
     wrapper.unmount();
   });
 
+  // 复制粘贴走 Ctrl+Shift+C / Ctrl+Shift+V（Xterm.js 惯例）。裸 Ctrl+C 是 SIGINT、
+  // Ctrl+V 是 quoted-insert，劫持它们会破坏终端语义，因此必须原样透传给远端。
+  it("routes Ctrl+Shift+C/V to the active terminal and leaves bare Ctrl+C/V alone", async () => {
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    const seen: Array<{ sessionId: string; action: string }> = [];
+    const handler = (e: Event) => seen.push((e as CustomEvent<{ sessionId: string; action: string }>).detail);
+    window.addEventListener("rshell:terminal-action", handler);
+
+    await wrapper.findComponent({ name: "SidePanel" }).vm.$emit("select-session", "session-a");
+    await flushPromises();
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { ctrlKey: true, shiftKey: true, key: "C" }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { ctrlKey: true, shiftKey: true, key: "v" }));
+    await flushPromises();
+    expect(seen).toEqual([
+      { sessionId: "session-a", action: "copy" },
+      { sessionId: "session-a", action: "paste" },
+    ]);
+
+    // 裸 Ctrl+C / Ctrl+V 不得被当作剪贴板操作
+    seen.length = 0;
+    window.dispatchEvent(new KeyboardEvent("keydown", { ctrlKey: true, key: "c" }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { ctrlKey: true, key: "v" }));
+    await flushPromises();
+    expect(seen).toEqual([]);
+
+    window.removeEventListener("rshell:terminal-action", handler);
+    wrapper.unmount();
+  });
+
+  it("also accepts the macOS meta key for copy and paste", async () => {
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    const seen: Array<{ sessionId: string; action: string }> = [];
+    const handler = (e: Event) => seen.push((e as CustomEvent<{ sessionId: string; action: string }>).detail);
+    window.addEventListener("rshell:terminal-action", handler);
+
+    await wrapper.findComponent({ name: "SidePanel" }).vm.$emit("select-session", "session-a");
+    await flushPromises();
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { metaKey: true, shiftKey: true, key: "c" }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { metaKey: true, shiftKey: true, key: "V" }));
+    await flushPromises();
+    expect(seen.map((e) => e.action)).toEqual(["copy", "paste"]);
+
+    window.removeEventListener("rshell:terminal-action", handler);
+    wrapper.unmount();
+  });
+
+  it("does not dispatch copy/paste when no terminal is active", async () => {
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    const seen: string[] = [];
+    const handler = (e: Event) => seen.push((e as CustomEvent<{ action: string }>).detail.action);
+    window.addEventListener("rshell:terminal-action", handler);
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { ctrlKey: true, shiftKey: true, key: "c" }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { ctrlKey: true, shiftKey: true, key: "v" }));
+    await flushPromises();
+    expect(seen).toEqual([]);
+
+    window.removeEventListener("rshell:terminal-action", handler);
+    wrapper.unmount();
+  });
+
   it("opens the sidebar and changes the selected panel from toolbar intent", async () => {
     const wrapper = mount(App, { global: { stubs: childStubs } });
     const toolbar = wrapper.find('[data-testid="toolbar"]');

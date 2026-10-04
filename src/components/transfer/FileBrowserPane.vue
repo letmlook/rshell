@@ -40,6 +40,11 @@ const emit = defineEmits<{
   (e: "open-file", entry: FsEntry): void;
   (e: "selection-change", entries: FsEntry[]): void;
   (e: "request-sync", path: string): void;
+  /**
+   * 右键菜单请求。`entries` 为右键时的操作目标：点在已选行上时是整个当前选中集，
+   * 点在未选行上时是那单独一行；点在列表空白处时为空数组（只给面板级操作）。
+   */
+  (e: "row-context-menu", payload: { entries: FsEntry[]; x: number; y: number }): void;
 }>();
 
 const entries = ref<FsEntry[]>([]);
@@ -221,6 +226,31 @@ function onRowClick(entry: FsEntry) {
   toggleSelect(entry, false, false);
 }
 
+/**
+ * 右键：若点在当前选中集之外，先把选中切到该行（标准文件管理器行为），
+ * 否则菜单会作用到一批用户并未指向的文件。已选行上则保持整个多选集。
+ */
+function onRowContextMenu(entry: FsEntry, event: MouseEvent) {
+  event.preventDefault();
+  let targets: FsEntry[];
+  if (selected.value.has(entry.name)) {
+    targets = entries.value.filter((x) => selected.value.has(x.name));
+  } else {
+    selected.value = new Set([entry.name]);
+    targets = [entry];
+    emit("selection-change", targets);
+  }
+  emit("row-context-menu", { entries: targets, x: event.clientX, y: event.clientY });
+}
+
+/** 列表空白处右键：只提供面板级操作（新建目录/刷新），不带文件目标 */
+function onPaneContextMenu(event: MouseEvent) {
+  // 表格行自带处理，行内点击不冒泡到这里；这里只接空白
+  if ((event.target as HTMLElement).closest(".el-table__row")) return;
+  event.preventDefault();
+  emit("row-context-menu", { entries: [], x: event.clientX, y: event.clientY });
+}
+
 watch(
   () => [props.path, props.sessionId] as const,
   ([p, session], old) => {
@@ -273,7 +303,7 @@ watch(
     </div>
 
     <!-- 列表 -->
-    <div class="list-wrap">
+    <div class="list-wrap" @contextmenu="onPaneContextMenu">
       <p v-if="errorText" class="err">{{ errorText }}</p>
       <el-table
         :data="visibleEntries"
@@ -284,6 +314,7 @@ watch(
         class="fs-table"
         @row-dblclick="onRowDblClick"
         @row-click="(row: FsEntry) => onRowClick(row)"
+        @row-contextmenu="(row: FsEntry, _column: unknown, event: MouseEvent) => onRowContextMenu(row, event)"
       >
         <el-table-column prop="name" label="名称" min-width="220">
           <template #default="{ row }">

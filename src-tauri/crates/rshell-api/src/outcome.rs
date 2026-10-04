@@ -47,6 +47,8 @@ pub enum CommandOutcome {
         path: String,
         entries: Vec<RemoteFileEntry>,
     },
+    /// 响应 `GetRemoteHomeDir`
+    RemoteHomeDir(String),
     Transfers(Vec<TransferTaskInfo>),
     /// 响应 `ExportPublicKey`
     PublicKey(String),
@@ -71,6 +73,7 @@ impl CommandOutcome {
             Self::Themes(_) => "themes",
             Self::PendingTunnels(_) => "pending_tunnels",
             Self::RemoteDir { .. } => "remote_dir",
+            Self::RemoteHomeDir(_) => "remote_home_dir",
             Self::Transfers(_) => "transfers",
             Self::PublicKey(_) => "public_key",
             Self::Verified(_) => "verified",
@@ -92,6 +95,10 @@ mod tests {
             "quick_commands"
         );
         assert_eq!(CommandOutcome::Verified(true).kind(), "verified");
+        assert_eq!(
+            CommandOutcome::RemoteHomeDir("/home/deploy".into()).kind(),
+            "remote_home_dir"
+        );
         assert_eq!(
             CommandOutcome::Themes(crate::types::ThemeInfo {
                 current_theme: String::new(),

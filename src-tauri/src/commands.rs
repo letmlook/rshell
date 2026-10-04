@@ -330,6 +330,22 @@ pub struct RemoteDirectoryResult {
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn get_remote_home_dir(
+    session_id: Uuid,
+    state: State<'_, AppState>,
+) -> Result<String, IpcError> {
+    let outcome = state
+        .dispatcher
+        .dispatch(AppCommand::GetRemoteHomeDir { session_id })
+        .await
+        .map_err(IpcError::from)?;
+    match outcome {
+        CommandOutcome::RemoteHomeDir(path) => Ok(path),
+        other => Err(IpcError::outcome_mismatch("remote_home_dir", other.kind())),
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn create_remote_directory(
     session_id: Uuid,
     path: String,
