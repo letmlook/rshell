@@ -347,9 +347,12 @@ export type AppCommand =
   | { CreateSession: { config: SessionConfig; credential: SessionCredential | null } }
   | { UpdateSession: { id: Uuid; config: SessionConfig; credential: CredentialUpdate } }
   | { DeleteSession: { id: Uuid } }
-  // 终端
-  | { SendInput: { session_id: Uuid; data: number[] } }
-  | { ResizeTerminal: { session_id: Uuid; cols: number; rows: number } }
+  // 终端：terminal_id 缺省 = 主 pty（以 session_id 寻址）；给了就是指定那个 pty。
+  // 一个连接可以有多个 pty（多标签会话），各自独立 shell，输入/输出/尺寸按它隔离。
+  | { SendInput: { session_id: Uuid; terminal_id?: Uuid | null; data: number[] } }
+  | { ResizeTerminal: { session_id: Uuid; terminal_id?: Uuid | null; cols: number; rows: number } }
+  | { OpenTerminal: { session_id: Uuid; terminal_id: Uuid; cols: number; rows: number } }
+  | { CloseTerminal: { session_id: Uuid; terminal_id: Uuid } }
   // 切片 2.2 删除（设计 §5）：CopySelection 上移前端 xterm 自持选区
   // 传输
   | { EnqueueUpload: { local: PathBuf; remote: string; session_id: Uuid; conflict?: ConflictPolicy } }

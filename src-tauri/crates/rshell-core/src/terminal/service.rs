@@ -11,7 +11,11 @@ use std::sync::{Arc, RwLock};
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-type OutputSender = tokio::sync::mpsc::UnboundedSender<(Uuid, Vec<u8>)>;
+/// 输出泵的信道元素：`(session_id, terminal_id, data)`。
+///
+/// `terminal_id` 必须带上：一条连接可以有多个 pty（多个标签会话），
+/// 壳层按它把字节投到对应的前端通道。
+type OutputSender = tokio::sync::mpsc::UnboundedSender<(Uuid, Uuid, Vec<u8>)>;
 
 /// 终端服务 —— 仅持"已知会话 + 最近一次报告尺寸",无 alacritty 状态机。
 ///
@@ -39,7 +43,12 @@ impl TerminalService {
             .expect("output sender lock poisoned") = Some(sender);
     }
 
-    pub fn push_output(&self, session_id: Uuid, data: Vec<u8>) -> Result<(), CoreError> {
+    pub fn push_output(
+        &self,
+        session_id: Uuid,
+        terminal_id: Uuid,
+        data: Vec<u8>,
+    ) -> Result<(), CoreError> {
         let sink = self
             .output_sender
             .read()
@@ -48,7 +57,7 @@ impl TerminalService {
             CoreError::InvalidState("Terminal output sink is not configured".into())
         })?;
         sender
-            .send((session_id, data))
+            .send((session_id, terminal_id, data))
             .map_err(|_| CoreError::InvalidState("Terminal output sink is closed".into()))
     }
 
@@ -126,9 +135,14 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         service.set_output_sender(tx);
         let session_id = Uuid::new_v4();
+        let terminal_id = Uuid::new_v4();
         service
-            .push_output(session_id, vec![0, 0xff, b'\n'])
+            .push_output(session_id, terminal_id, vec![0, 0xff, b'\n'])
             .unwrap();
-        assert_eq!(rx.try_recv().unwrap(), (session_id, vec![0, 0xff, b'\n']));
+        // 输出带 terminal_id：壳层据此把字节投到对应标签的 pty
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            (session_id, terminal_id, vec![0, 0xff, b'\n'])
+        );
     }
 }

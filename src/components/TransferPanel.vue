@@ -118,6 +118,32 @@ function isRemovable(phase: TransferPhase): boolean {
   return phase === "done" || phase === "failed" || phase === "cancelled";
 }
 
+/**
+ * 某一行在当前相位下会渲染几个操作按钮。
+ * 活跃/暂停 = 暂停(继续) + 取消；终态 = 删除。
+ */
+function actionCount(phase: TransferPhase): number {
+  if (phase === "active" || phase === "paused") return 2;
+  if (isRemovable(phase)) return 1;
+  return 0;
+}
+
+const ACTION_BUTTON_WIDTH = 48;
+const ACTION_GAP = 4;
+
+/**
+ * 操作列宽度按**当前队列里最多的按钮数**算，而不是写死。
+ *
+ * 写死 170px 时，终态行只有一个「删除」按钮却占着 2 个按钮的宽度，整张表
+ * 右侧空一大块。改成按实际按钮数计算后，列宽既贴合内容，各行又仍然对齐
+ * （用全表最大值，而不是每行各自撑开——那样前面的列会错位）。
+ */
+const actionsColumnWidth = computed(() => {
+  const max = merged.value.reduce((acc, row) => Math.max(acc, actionCount(row.phase)), 0);
+  if (max === 0) return `${ACTION_BUTTON_WIDTH}px`;
+  return `${max * ACTION_BUTTON_WIDTH + (max - 1) * ACTION_GAP + 8}px`;
+});
+
 // ── 队列生命周期菜单 ──
 // 批量操作只覆盖终态条目：活跃任务的拷贝循环仍在跑，必须先逐条取消。
 type BulkAction = "clearDone" | "clearFailed" | "clearCancelled" | "clearAll";
@@ -313,6 +339,7 @@ const columns = [
     :class="{ 'is-expanded': expanded, 'is-resizing': resizing }"
     data-test="xfer-panel"
     :style="panelStyle"
+    :data-actions-width="actionsColumnWidth"
   >
     <!-- 顶边拖动条：与上方文件窗格的下边缘重合 -->
     <div
@@ -734,16 +761,17 @@ const columns = [
   display: flex;
   flex-direction: column;
 }
-/* 行与列标题共用同一套列宽；min-width 让窄面板走横向滚动而不是把列挤扁 */
+/* 行与列标题共用同一套列宽；操作列宽由 JS 按实际按钮数算好后写在 data 属性上，
+   min-width 让窄面板走横向滚动而不是把列挤扁 */
 .xfer-row {
   display: grid;
-  grid-template-columns: minmax(140px, 1.5fr) 96px 170px 80px minmax(140px, 1.4fr) 32px minmax(140px, 1.4fr) 80px 90px 170px;
+  grid-template-columns: minmax(140px, 1.5fr) 96px 170px 80px minmax(140px, 1.4fr) 32px minmax(140px, 1.4fr) 80px 90px var(--xfer-actions-w, 104px);
   align-items: center;
   gap: var(--rs-s-2);
   padding: var(--rs-s-2) var(--rs-s-3);
   border-bottom: 1px solid var(--rs-border);
   font-size: var(--rs-fs-xs);
-  min-width: 1000px;
+  min-width: 940px;
 }
 .xfer-row:last-child { border-bottom: none; }
 .xfer-row.is-header {

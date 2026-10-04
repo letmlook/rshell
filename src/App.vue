@@ -48,6 +48,7 @@ import {
 import { toTransferItem } from "./utils/transferItem";
 import { useTransferLog } from "./utils/transferLog";
 import { shortTerminalTitle } from "./utils/terminalTitle";
+import { newUuid } from "./utils/uuid";
 import { useSessionsStore } from "./stores/sessions";
 import { useHostKeyStore } from "./stores/hostKey";
 import { useThemeStore } from "./stores/theme";
@@ -209,13 +210,16 @@ const TerminalPanelView = defineComponent({
   props: { params: { type: Object, default: undefined } },
   setup(panelProps) {
     return () => {
-      const panelParams = panelProps.params as { params?: { sessionId?: Uuid } } | undefined;
+      const panelParams = panelProps.params as { params?: { sessionId?: Uuid; terminalId?: Uuid } } | undefined;
       const sessionId = panelParams?.params?.sessionId;
       if (!sessionId) return null;
+      // terminalId 决定这个标签用哪个 pty：主 pty 由连接创建，附加标签各开各的。
+      // 缺省 undefined = 主 pty。
+      const terminalId = panelParams?.params?.terminalId;
       // 连接状态从 store 现取：终端面板要跟着真实连接变化（断开/重连），
       // 不能只在挂载时读一次。render 函数里读 store 天然是响应式的。
       const connectionState = store.connectionState.get(sessionId) ?? "disconnected";
-      return h(TerminalPane, { sessionId, connectionState });
+      return h(TerminalPane, { sessionId, terminalId, connectionState });
     };
   },
 });
@@ -305,7 +309,12 @@ function ensureTerminalPanel(sessionId: Uuid, opts: { forceNew?: boolean } = {})
     id: panelId,
     component: "terminal",
     title: terminalPanelTitle(sessionId, index),
-    params: { sessionId },
+    // terminalId 决定这个标签用哪个 pty。主 pty 以 session_id 寻址（首标签），
+    // 附加标签各带一个自己的 id，挂载时后端为它单独开 pty = 独立的 shell 进程。
+    params: {
+      sessionId,
+      terminalId: index <= 1 ? sessionId : newUuid(),
+    },
   });
   retitleTerminalPanels(sessionId);
 }
@@ -434,10 +443,15 @@ function onOpenTerminal(_id: Uuid, _path: string) {
 }
 
 /**
- * 为当前会话新开一个终端窗口：复用已有连接（不重复握手），只是多挂一个
- * 独立的终端通道。会话未连接时先走 selectSession 建连再建面板。
+ * 为连接信息新开一个标签会话。
+ *
+ * 概念（见 docs/08）：左侧「连接」是连接信息（主机/端口/用户/认证），
+ * 终端标签是**独立的会话实例**——同一条连接可以同时开多个标签，
+ * 每个标签各挂自己的 attach 通道与终端状态，关闭其中一个不影响其余。
+ *
+ * 连接未建立时先握手再建标签；已连接则直接复用，不重复握手。
  */
-async function openTerminalWindow(id: Uuid) {
+async function openTabSession(id: Uuid) {
   workspace.value = "terminal";
   activeTerminal.value = id;
   store.currentId = id;
@@ -450,6 +464,21 @@ async function openTerminalWindow(id: Uuid) {
     }
   }
   ensureTerminalPanel(id, { forceNew: true });
+}
+
+/**
+ * 在**当前连接信息**下新开一个标签。
+ *
+ * 与「复制标签」的区别：复制标签用右键所在那个标签的连接，新建标签用
+ * 当前聚焦标签的连接——右键非聚焦标签时两者结果不同。
+ */
+function newTabFromActive(): void {
+  const id = activeTerminal.value;
+  if (!id) {
+    ElMessage.info("先选中一个标签会话，再新建标签。");
+    return;
+  }
+  void openTabSession(id);
 }
 
 // ── 复制会话 ──
@@ -477,30 +506,35 @@ async function duplicateSession(id: Uuid) {
     if (created && duplicateNeedsCredential(created)) {
       credentialForDuplicate.value = created;
       ElNotification.info({
-        title: "已复制会话",
-        message: `「${created.name}」连接信息与原会话相同；凭据不随配置复制，请先填写凭据再连接。`,
+        title: "已复制连接信息",
+        message: `「${created.name}」的连接信息与原条目相同；凭据不随配置复制，请先填写凭据再连接。`,
       });
     } else {
       ElNotification.info({
-        title: "已复制会话",
-        message: `「${created?.name ?? "新会话"}」连接信息与原会话相同；凭据未复制，如需要请在会话列表右键「更新凭据」。`,
+        title: "已复制连接信息",
+        message: `「${created?.name ?? "新连接"}」的连接信息与原条目相同；凭据未复制，如需要请在连接列表右键「更新凭据」。`,
       });
     }
     // 不自动选中/连接：新条目此刻没有凭据，自动连接只会换来一次注定失败的
     // 认证与一个错误弹窗。连不连由用户点击决定。
   } catch (error) {
-    ElNotification.error({ title: "复制会话失败", message: String(error) });
+    ElNotification.error({ title: "复制连接信息失败", message: String(error) });
   } finally {
     duplicatingSession.value = false;
   }
 }
 
 /**
- * 终端 tab 右键菜单。
+ * 终端标签的右键菜单。
  *
  * 用 dockview 的 `getTabContextMenuItems`：省略该选项时 dockview 根本不弹菜单，
  * 返回空数组则对该面板抑制。菜单项执行后 dockview 会自动收起菜单。
  * 「关闭标签」自己实现而不用内置 `'close'`，因为内置项文案是英文 Close。
+ *
+ * 三项都以**连接信息**为操作对象，但结果不同：
+ *   新建标签 —— 当前聚焦标签的连接，再开一个独立会话实例
+ *   复制标签 —— 右键所在标签的连接，再开一个独立会话实例
+ *   关闭标签 —— 只关这个标签，同连接的其他标签不受影响
  */
 function terminalTabContextMenuItems(params: {
   panel: { id: string; api: { close: () => void } };
@@ -508,8 +542,8 @@ function terminalTabContextMenuItems(params: {
   const info = parseTerminalPanelId(params.panel.id);
   if (!info) return [];
   return [
-    { label: "新开终端窗口", action: () => void openTerminalWindow(info.sessionId) },
-    { label: "复制会话", action: () => void duplicateSession(info.sessionId) },
+    { label: "新建标签", action: newTabFromActive },
+    { label: "复制标签", action: () => void openTabSession(info.sessionId) },
     "separator",
     { label: "关闭标签", action: () => params.panel.api.close() },
   ];
@@ -664,7 +698,7 @@ onBeforeUnmount(() => {
       :on-disconnect="disconnectCurrent"
       :on-find="() => terminalAction('find')"
       :on-clear-screen="() => terminalAction('clear')"
-      :on-new-terminal-window="() => activeTerminal && openTerminalWindow(activeTerminal)"
+      :on-new-tab="newTabFromActive"
       @change-workspace="pickWorkspace"
       @select-panel="selectPanel"
       @toggle-sidebar="toggleSidebar"
@@ -694,7 +728,7 @@ onBeforeUnmount(() => {
         @new-session="openNewSession"
         @open-sftp="onOpenSftp"
         @open-terminal="onOpenTerminal"
-        @open-terminal-window="openTerminalWindow"
+        @open-terminal-window="openTabSession"
         @duplicate-session="duplicateSession"
       />
 
@@ -713,8 +747,8 @@ onBeforeUnmount(() => {
             <div class="empty-content">
               <div class="empty-icon">⌬</div>
               <h2>RShell</h2>
-              <p>从左侧「会话」面板新建或选择一个 SSH 会话</p>
-              <el-button type="primary" @click="openNewSession">新建会话</el-button>
+              <p>从左侧「连接」面板新建或选择一个 SSH 连接</p>
+              <el-button type="primary" @click="openNewSession">新建连接</el-button>
             </div>
           </div>
         </div>
@@ -737,9 +771,9 @@ onBeforeUnmount(() => {
               <div class="empty-content">
                 <div class="empty-icon">⇄</div>
                 <h2>传输工作区</h2>
-                <p>从左侧「会话」右键 → 打开 SFTP,或先连接一个会话</p>
+                <p>从左侧「连接」右键 → 打开 SFTP，或先连接一个连接信息</p>
                 <el-button type="primary" :disabled="!activeTerminal" @click="onOpenSftp(activeTerminal!)">
-                  使用当前会话
+                  使用当前连接
                 </el-button>
               </div>
             </div>

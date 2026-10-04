@@ -49,16 +49,38 @@ pub enum AppCommand {
     },
 
     // ===== 终端命令 =====
-    /// 发送输入到终端
+    // 终端以 (session_id, terminal_id) 二元组寻址：一个连接可以有多个
+    // pty（= 多个独立标签会话），输入/尺寸/输出都按 terminal_id 区分，
+    // 否则多个标签会共用同一个 shell（输入串台、关掉一个影响其余）。
+    /// 发送输入到指定 pty
     SendInput {
         session_id: Uuid,
+        /// 目标 pty；`None` 表示该连接的主 pty（连接建立时创建的那个）
+        #[serde(default)]
+        terminal_id: Option<Uuid>,
         data: Vec<u8>,
     },
-    /// 调整终端大小
+    /// 调整指定 pty 大小
     ResizeTerminal {
         session_id: Uuid,
+        #[serde(default)]
+        terminal_id: Option<Uuid>,
         cols: u16,
         rows: u16,
+    },
+    /// 在已连接的会话上另开一个 pty（新增一个独立标签会话）
+    OpenTerminal {
+        session_id: Uuid,
+        terminal_id: Uuid,
+        #[serde(default)]
+        cols: u16,
+        #[serde(default)]
+        rows: u16,
+    },
+    /// 关闭一个 pty（标签关闭）
+    CloseTerminal {
+        session_id: Uuid,
+        terminal_id: Uuid,
     },
 
     // ===== 文件传输命令 =====

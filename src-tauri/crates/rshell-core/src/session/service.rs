@@ -444,6 +444,9 @@ impl SessionService {
                 let mut output_rx = client
                     .take_data_receiver()
                     .ok_or_else(|| CoreError::InvalidState("SSH output channel missing".into()))?;
+                // 主 pty 以 session_id 寻址（首标签不传 terminal_id）。
+                // 附加标签用各自的 terminal_id，因此输出能按 pty 分流。
+                let primary_terminal = session_id;
                 // 创建取消通道
                 let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
 
@@ -527,8 +530,8 @@ impl SessionService {
                             result = output_rx.recv() => {
                                 match result {
                                     Some(data) => {
-                                        if let Err(e) = terminal_service.push_output(session_id, data.clone()) {
-                                            warn!(session_id = %session_id, error = %e, "terminal output delivery failed");
+                                        if let Err(e) = terminal_service.push_output(session_id, primary_terminal, data.clone()) {
+                                            warn!(session_id = %session_id, terminal_id = %primary_terminal, error = %e, "terminal output delivery failed");
                                         }
 
                                         // ── 触发器匹配（原始字节 → UTF-8 → 正则） ──
@@ -720,7 +723,9 @@ impl SessionService {
                     result = connection.recv(&mut buf) => match result {
                         Ok(n) if n > 0 => {
                             let data = buf[..n].to_vec();
-                            if let Err(e) = terminal_service.push_output(session_id, data.clone()) {
+                            // Telnet/Serial 一条连接只有一个 pty，沿用 session_id 作为
+                            // terminal 键（前端首标签的 terminal_id 就是 session_id）
+                            if let Err(e) = terminal_service.push_output(session_id, session_id, data.clone()) {
                                 warn!(session_id = %session_id, error = %e, "terminal output delivery failed");
                             }
                             if let Ok(output) = std::str::from_utf8(&data) {
@@ -835,7 +840,12 @@ impl SessionService {
     }
 
     /// 发送数据到会话
-    pub async fn send_data(&self, session_id: Uuid, data: &[u8]) -> Result<(), CoreError> {
+    pub async fn send_data(
+        &self,
+        session_id: Uuid,
+        terminal_id: Option<Uuid>,
+        data: &[u8],
+    ) -> Result<(), CoreError> {
         let sender = {
             self.protocol_connections
                 .read()
@@ -864,6 +874,14 @@ impl SessionService {
                 })?
         };
         let client = client.read().await;
+        // 指定 terminal_id 就投到那个 pty；None = 主 pty（首标签）
+        if let Some(id) = terminal_id {
+            client
+                .send_data_to(id, data)
+                .await
+                .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+            return Ok(());
+        }
         client
             .send_data(data)
             .await
@@ -875,6 +893,7 @@ impl SessionService {
     pub async fn resize_terminal(
         &self,
         session_id: Uuid,
+        terminal_id: Option<Uuid>,
         cols: u32,
         rows: u32,
     ) -> Result<(), CoreError> {
@@ -905,10 +924,83 @@ impl SessionService {
                 })?
         };
         let client = client.read().await;
+        if let Some(id) = terminal_id {
+            client
+                .resize_terminal_of(id, cols, rows)
+                .await
+                .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+            return Ok(());
+        }
         client
             .resize_terminal(cols, rows)
             .await
             .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 在已连接的会话上另开一个 pty（= 新增一个独立标签会话）。
+    ///
+    /// 复用同一条 SSH 连接（不再握手、不再校验主机密钥），只新开一条
+    /// session channel + pty + shell。为它单独起一个输出读取任务，
+    /// 按 `terminal_id` 投递给壳层，因此各标签的输入/输出互不串台。
+    pub async fn open_terminal(
+        &self,
+        session_id: Uuid,
+        terminal_id: Uuid,
+        cols: u32,
+        rows: u32,
+    ) -> Result<(), CoreError> {
+        let client = {
+            let connections = self.connections.read().await;
+            connections
+                .get(&session_id)
+                .map(|c| c.client.clone())
+                .ok_or_else(|| {
+                    CoreError::NotFound(format!("Connection {} not found", session_id))
+                })?
+        };
+        let mut output_rx = {
+            let mut guard = client.write().await;
+            guard
+                .open_terminal(terminal_id, cols, rows)
+                .await
+                .map_err(|e| CoreError::ConnectionError(e.to_string()))?
+        };
+        self.terminal_service
+            .create_terminal(terminal_id, cols as u16, rows as u16)?;
+
+        let terminal_service = self.terminal_service.clone();
+        tokio::spawn(async move {
+            while let Some(data) = output_rx.recv().await {
+                if let Err(e) = terminal_service.push_output(session_id, terminal_id, data) {
+                    warn!(session_id = %session_id, terminal_id = %terminal_id, error = %e, "extra pty output delivery failed");
+                }
+            }
+            debug!(session_id = %session_id, terminal_id = %terminal_id, "extra pty output stream ended");
+        });
+        debug!(session_id = %session_id, terminal_id = %terminal_id, "extra pty opened");
+        Ok(())
+    }
+
+    /// 关闭一个 pty（标签关闭）。未知的 terminal_id 视为已关闭，幂等。
+    pub async fn close_terminal(
+        &self,
+        session_id: Uuid,
+        terminal_id: Uuid,
+    ) -> Result<(), CoreError> {
+        let client = {
+            let connections = self.connections.read().await;
+            connections
+                .get(&session_id)
+                .map(|c| c.client.clone())
+                .ok_or_else(|| {
+                    CoreError::NotFound(format!("Connection {} not found", session_id))
+                })?
+        };
+        let mut guard = client.write().await;
+        guard.close_terminal(terminal_id).await;
+        drop(guard);
+        let _ = self.terminal_service.destroy_terminal(terminal_id);
         Ok(())
     }
 
@@ -1371,8 +1463,8 @@ mod tests {
                 let svc = svc.clone();
                 tokio::spawn(async move {
                     match operation {
-                        0 => svc.send_data(id, b"x").await,
-                        1 => svc.resize_terminal(id, 90, 30).await,
+                        0 => svc.send_data(id, None, b"x").await,
+                        1 => svc.resize_terminal(id, None, 90, 30).await,
                         _ => svc.disconnect(id).await,
                     }
                 })
@@ -1419,13 +1511,13 @@ mod tests {
         let id = svc.create_session(cfg).await.unwrap();
         svc.connect(id).await.unwrap();
         assert_eq!(svc.get_state(id).await.unwrap(), ConnectionState::Connected);
-        let (_, ready) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        let (_, _, ready) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(ready, b"ready\n");
-        svc.send_data(id, b"ping").await.unwrap();
-        let (_, pong) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        svc.send_data(id, None, b"ping").await.unwrap();
+        let (_, _, pong) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -1529,6 +1621,7 @@ mod tests {
         dispatcher
             .dispatch(rshell_api::AppCommand::ResizeTerminal {
                 session_id: id,
+                terminal_id: None,
                 cols: 90,
                 rows: 30,
             })
@@ -1542,6 +1635,7 @@ mod tests {
         dispatcher
             .dispatch(rshell_api::AppCommand::ResizeTerminal {
                 session_id: id,
+                terminal_id: None,
                 cols: 100,
                 rows: 40,
             })
@@ -1670,7 +1764,10 @@ mod tests {
     #[tokio::test]
     async fn test_send_data_unknown_returns_not_found() {
         let svc = make_service();
-        let err = svc.send_data(Uuid::new_v4(), b"hi").await.unwrap_err();
+        let err = svc
+            .send_data(Uuid::new_v4(), None, b"hi")
+            .await
+            .unwrap_err();
         assert!(format!("{err}").contains("not found"));
     }
 
@@ -1678,7 +1775,7 @@ mod tests {
     async fn test_resize_terminal_unknown_returns_not_found() {
         let svc = make_service();
         let err = svc
-            .resize_terminal(Uuid::new_v4(), 80, 24)
+            .resize_terminal(Uuid::new_v4(), None, 80, 24)
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("not found"));

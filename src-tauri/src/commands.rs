@@ -139,12 +139,61 @@ pub async fn delete_session(id: Uuid, state: State<'_, AppState>) -> Result<(), 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn send_input(
     session_id: Uuid,
+    terminal_id: Option<Uuid>,
     data: Vec<u8>,
     state: State<'_, AppState>,
 ) -> Result<(), IpcError> {
     state
         .dispatcher
-        .dispatch(AppCommand::SendInput { session_id, data })
+        .dispatch(AppCommand::SendInput {
+            session_id,
+            terminal_id,
+            data,
+        })
+        .await
+        .map_err(IpcError::from)?;
+    Ok(())
+}
+
+/// open_terminal —— 在已连接的会话上另开一个 pty（= 一个独立标签会话）。
+///
+/// 复用同一条 SSH 连接（不重新握手、不再弹主机密钥），只新开 session channel
+/// + pty + shell，因此每个标签都是各自独立的 shell 进程。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn open_terminal(
+    session_id: Uuid,
+    terminal_id: Uuid,
+    cols: u16,
+    rows: u16,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::OpenTerminal {
+            session_id,
+            terminal_id,
+            cols,
+            rows,
+        })
+        .await
+        .map_err(IpcError::from)?;
+    Ok(())
+}
+
+/// close_terminal —— 关闭一个 pty（标签关闭）。断开连接时无需调用：
+/// 整条连接上的 pty 会一并关闭。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn close_terminal(
+    session_id: Uuid,
+    terminal_id: Uuid,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::CloseTerminal {
+            session_id,
+            terminal_id,
+        })
         .await
         .map_err(IpcError::from)?;
     Ok(())
@@ -153,6 +202,7 @@ pub async fn send_input(
 #[tauri::command(rename_all = "snake_case")]
 pub async fn resize_terminal(
     session_id: Uuid,
+    terminal_id: Option<Uuid>,
     cols: u16,
     rows: u16,
     state: State<'_, AppState>,
@@ -161,6 +211,7 @@ pub async fn resize_terminal(
         .dispatcher
         .dispatch(AppCommand::ResizeTerminal {
             session_id,
+            terminal_id,
             cols,
             rows,
         })
@@ -793,14 +844,21 @@ pub async fn set_terminal_color_scheme(
 // attach_terminal —— 设计 §4.1
 // 把 Channel<Vec<u8>> 注册到 TerminalChannels,flush 积压后切换为 Attached 模式。
 // 该命令**不走 dispatcher**(Channel 是壳层基础设施,不需要业务逻辑)。
+//
+// `terminal_id` 决定这份通道接收哪个 pty 的输出：每个标签一个独立 pty。
+// 首标签用 `session_id` 作为 terminal_id（主 pty 的约定键），附加标签用各自的 id。
 #[tauri::command(rename_all = "snake_case")]
 pub async fn attach_terminal(
     session_id: Uuid,
+    terminal_id: Uuid,
     on_data: Channel<Vec<u8>>,
     state: State<'_, AppState>,
 ) -> Result<(), IpcError> {
-    state.terminal_channels.attach(session_id, on_data).await;
-    info!(session_id = %session_id, "Terminal attached; backend→frontend channel established");
+    state
+        .terminal_channels
+        .attach(session_id, terminal_id, on_data)
+        .await;
+    info!(session_id = %session_id, terminal_id = %terminal_id, "Terminal attached; backend→frontend channel established");
     Ok(())
 }
 

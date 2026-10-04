@@ -16,7 +16,7 @@ const emit = defineEmits<{
 }>();
 
 const items = [
-  { id: "sessions", icon: "▤", label: "会话" },
+  { id: "sessions", icon: "▤", label: "连接" },
   { id: "files", icon: "▥", label: "文件" },
   { id: "keys", icon: "⚷", label: "密钥" },
   { id: "tools", icon: "⚒", label: "工具" },

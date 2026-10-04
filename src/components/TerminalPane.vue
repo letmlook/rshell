@@ -9,9 +9,12 @@
  * 面板自带三组能力:
  *   1. 连接状态:跟随后端 ConnectionStateChanged 渲染「已连接/连接中/已断开」。
  *      断开时禁用输入并给出可重连入口（PROB-13 的错误条仍保留给 attach 失败）。
- *   2. 剪贴板:选中即复制（可配置、持久化）+ 右键直接粘贴 + 有选区时右键菜单
+ *   2. 剪贴板:可配置的选中即复制 + 右键直接粘贴 + 有选区时右键菜单
  *      （复制/粘贴/清屏）+ Ctrl 系快捷键。
- *   3. 终端配色:工具栏下拉切换后端已安装的配色方案（SetTerminalColorScheme）。
+ *   3. 配色方案与剪贴板开关**不在面板上呈现**：它们属于设置（设置→终端），
+ *      这里只消费 `utils/terminalPrefs` 与 theme store，切换后由
+ *      `rshell:terminal-theme` 事件即时生效。终端只留状态反馈（断线条）
+ *      与操作入口（右键菜单），不堆配置控件。
  *
  * 状态来源全部是后端真实状态：连接状态取 sessions store，方案列表取
  * ListThemes 的 available_schemes，切换走真实命令。没有任何本地猜测的
@@ -29,15 +32,11 @@ import { SearchAddon } from "@xterm/addon-search";
 import { Channel } from "@tauri-apps/api/core";
 import { invoke } from "@tauri-apps/api/core";
 import { ElMessage } from "element-plus/es/components/message/index.mjs";
-import { ipcErrorMessage, sendInput, resizeTerminal } from "../ipc/client";
+import { ipcErrorMessage, closeTerminal, openTerminal, sendInput, resizeTerminal } from "../ipc/client";
 import type { Uuid } from "../ipc/types";
 import { useThemeStore } from "../stores/theme";
 import { useSessionsStore } from "../stores/sessions";
-import {
-  defaultLocalStorage,
-  loadCopyOnSelect,
-  saveCopyOnSelect,
-} from "../utils/terminalPrefs";
+import { copyOnSelect } from "../utils/terminalPrefs";
 
 const themeStore = useThemeStore();
 const sessionsStore = useSessionsStore();
@@ -45,6 +44,11 @@ const sessionsStore = useSessionsStore();
 const props = withDefaults(
   defineProps<{
     sessionId?: Uuid;
+    /**
+     * 本标签的 pty 标识。每个标签一个独立 pty（独立 shell 进程）。
+     * 缺省 = 该连接的主 pty（首标签）。
+     */
+    terminalId?: Uuid;
     /**
      * 会话连接状态,由 App.vue 从 sessions store 现取后传入。
      * 缺省按 disconnected 处理:没有真实连接就不该让用户以为能输入。
@@ -80,13 +84,10 @@ const isConnected = computed(() => props.connectionState === "connected");
 /** 连接掉线（曾经连过、现在不是 connected）才叫「断开」 */
 const isDropped = computed(() => everConnected.value && props.connectionState !== "connected");
 
-const CONNECTION_LABEL: Record<string, string> = {
-  connected: "已连接",
-  connecting: "连接中",
-  disconnected: "未连接",
-  failed: "连接失败",
-};
-const connectionLabel = computed(() => CONNECTION_LABEL[props.connectionState] ?? props.connectionState);
+/** 断线提示条用；连接状态的常驻展示在窗口底部 StatusBar，这里不重复占位 */
+const droppedLabel = computed(() =>
+  props.connectionState === "connecting" ? "重新连接中" : "已断开",
+);
 
 const reconnecting = ref(false);
 
@@ -112,19 +113,9 @@ watch(
   { immediate: false },
 );
 
-// ── 剪贴板:选中即复制 ──
-const copyOnSelect = ref(loadCopyOnSelect(defaultLocalStorage()));
+// ── 剪贴板:选中即复制（开关在 设置→终端，这里只消费）──
 const copyOnSelectTimer = ref<ReturnType<typeof setTimeout> | null>(null);
 let copyFailureNotified = false;
-
-function onCopyOnSelectToggle(next: boolean | string | number) {
-  const value = next === true || next === "true";
-  copyOnSelect.value = value;
-  // 存储失败（隐私模式/配额满）不阻断本次会话内的行为，只是不记住
-  if (!saveCopyOnSelect(defaultLocalStorage(), value)) {
-    console.warn("[TerminalPane] 选中即复制偏好未能持久化");
-  }
-}
 
 /** 复制/粘贴需要剪贴板权限；无选中内容或剪贴板不可用时必须可见提示，不静默吞掉 */
 function noteClipboardFailure(action: "复制" | "粘贴", error: unknown) {
@@ -257,28 +248,6 @@ function menuClear() {
   term?.clear();
 }
 
-// ── 终端配色方案 ──
-/** 菜单里的「重新加载」哨兵：与真实方案名（来自后端）不会冲突 */
-const RELOAD_SCHEMES = "__reload__";
-
-const schemes = computed(() => themeStore.availableSchemes);
-const currentScheme = computed(() => themeStore.currentScheme);
-
-function reportSchemeError(prefix: string) {
-  if (themeStore.error) ElMessage.error(`${prefix}：${themeStore.error}`);
-}
-
-function onSchemeChange(name: string) {
-  if (name === RELOAD_SCHEMES) {
-    // 方案列表可能刚被导入/卸载过，用户显式点「重新加载」才发 IPC
-    void themeStore.refresh().then(() => reportSchemeError("重新加载配色方案失败"));
-    return;
-  }
-  if (!name || name === themeStore.currentScheme) return;
-  // applyScheme 失败时 store 回滚并写 error，这里原样暴露，不假装切换成功
-  void themeStore.applyScheme(name).then(() => reportSchemeError("切换配色失败"));
-}
-
 function onTerminalTheme(event: Event) {
   if (term) term.options.theme = (event as CustomEvent<ITheme>).detail;
 }
@@ -373,14 +342,51 @@ function noteIoFailure(what: string, e: unknown) {
 }
 
 /**
+ * 本标签 pty 的 id。
+ *
+ * 约定：主 pty（首标签）以 `session_id` 寻址，附加标签用各自的 id。
+ * 缺省回落到 session_id，因此这个值总是可用的真实 uuid —— 后端参数是必填
+ * `Uuid`，传 null 会被 Tauri 以 invalid type 拒掉。
+ */
+const ptyId = computed<Uuid | undefined>(() => props.terminalId ?? props.sessionId);
+
+/** 是否主 pty（首标签）：主 pty 由连接建立时创建，不能再 open 也不能单独关 */
+const isMainPty = computed(() => !props.terminalId || props.terminalId === props.sessionId);
+
+/**
+ * 为这个标签申请一个**独立 pty**（独立 shell 进程）。
+ *
+ * 主 pty（首标签）由连接建立时创建，这里不用管；只有带独立 terminalId 的
+ * 附加标签需要先 open_terminal 才会存在对应的 pty。
+ * 失败时把原因挂到 attachError：不能静默 attach 到一个不存在的 pty，
+ * 那样标签会一直空白。
+ */
+async function ensurePty(cols: number, rows: number): Promise<boolean> {
+  const sid = props.sessionId;
+  const tid = ptyId.value;
+  if (!sid || !tid || isMainPty.value) return true;
+  try {
+    await openTerminal(sid, tid, cols, rows);
+    return true;
+  } catch (e) {
+    attachError.value = `无法为该标签创建独立会话：${ipcErrorMessage(e)}`;
+    console.error("[TerminalPane] open_terminal failed", e);
+    return false;
+  }
+}
+
+/**
  * attach_terminal：把字节流 Channel 注册到后端（幂等，可重试）。
  * 失败时置 attachError 供面板内错误状态条展示，成功则清除。返回是否成功。
  */
 async function attachTerminal(): Promise<boolean> {
   if (!term || !channel) return false;
+  const tid = ptyId.value;
+  if (!tid) return false;
   try {
     await invoke("attach_terminal", {
       session_id: props.sessionId,
+      terminal_id: tid,
       on_data: channel,
     });
     attachError.value = null;
@@ -392,9 +398,11 @@ async function attachTerminal(): Promise<boolean> {
   }
 }
 
-/** 错误状态条上的「重试附加」：真实重新执行 attach_terminal */
+/** 错误状态条上的「重试附加」：真实重跑「确保 pty + 注册通道」 */
 async function retryAttach() {
-  await attachTerminal();
+  if (term && (await ensurePty(term.cols, term.rows))) {
+    await attachTerminal();
+  }
 }
 
 onMounted(async () => {
@@ -423,7 +431,7 @@ onMounted(async () => {
     event.stopPropagation();
     const sid = props.sessionId;
     if (!sid) return false;
-    sendInput(sid, new TextEncoder().encode("\x08"))
+    sendInput(sid, new TextEncoder().encode("\x08"), ptyId.value ?? undefined)
       .then(() => noteIoSuccess())
       .catch((e) => noteIoFailure("send_input", e));
     return false;
@@ -464,8 +472,13 @@ onMounted(async () => {
     }
   };
 
-  // 失败时错误状态条已在面板内可见（PROB-13），不中断后续本地渲染与监听注册
-  await attachTerminal();
+  // 失败时错误状态条已在面板内可见（PROB-13），不中断后续本地渲染与监听注册。
+  // 顺序很重要：附加标签必须先在自己的 pty 上开 shell，否则 attach 到的
+  // 是不存在的 pty，标签会一直空白。
+  fit.fit();
+  if (await ensurePty(term.cols, term.rows)) {
+    await attachTerminal();
+  }
 
   // 前端 → 后端:键入数据直接转发（设计 §4.3 流程 A 末步）
   term.onData((data) => {
@@ -476,7 +489,7 @@ onMounted(async () => {
       ElMessage.warning("会话未连接，输入已忽略。请先重连会话。");
       return;
     }
-    sendInput(sid, new TextEncoder().encode(data))
+    sendInput(sid, new TextEncoder().encode(data), ptyId.value ?? undefined)
       .then(() => noteIoSuccess())
       .catch((e) => noteIoFailure("send_input", e));
   });
@@ -499,7 +512,7 @@ onMounted(async () => {
         const { cols, rows } = term;
         const sid = props.sessionId;
         if (!sid) return;
-        resizeTerminal(sid, cols, rows)
+        resizeTerminal(sid, cols, rows, ptyId.value ?? undefined)
           .then(() => noteIoSuccess())
           .catch((e) => noteIoFailure("resize_terminal", e));
       } catch {
@@ -516,8 +529,24 @@ onMounted(async () => {
   }
   // 配色方案列表不在这里拉：App.vue 挂载时已 refresh 过 theme store，
   // 方案变化由 ColorSchemeListChanged / 后端刷新驱动；用户要手动重拉时
-  // 用工具栏的「重新加载方案…」。
+  // 去「设置 → 终端」。
 });
+
+/**
+ * 标签关闭时释放自己的 pty。
+ *
+ * 只对「自己开的附加 pty」调用；主 pty 属于连接，关掉它会连带影响整条连接的
+ * 终端，断开连接时后端会一并关闭所有 pty。
+ * 失败不阻塞卸载——远端 shell 进程会随连接断开回收。
+ */
+function releasePty() {
+  const sid = props.sessionId;
+  const tid = ptyId.value;
+  if (!sid || !tid || isMainPty.value) return;
+  void closeTerminal(sid, tid).catch((e) => {
+    console.warn("[TerminalPane] close_terminal 失败，pty 将随连接断开回收", e);
+  });
+}
 
 function onDocumentMouseDown(e: MouseEvent) {
   if (!contextMenu.value) return;
@@ -541,6 +570,8 @@ onBeforeUnmount(() => {
   detachSizeObserver = null;
   window.removeEventListener("rshell:terminal-theme", onTerminalTheme);
   window.removeEventListener("rshell:terminal-action", onTerminalAction);
+  // 先放 pty 再 dispose：dispose 后 term 为 null，releasePty 不依赖它
+  releasePty();
   term?.dispose();
   term = null;
   channel = null;
@@ -560,9 +591,7 @@ onBeforeUnmount(() => {
     <!-- 断开/连接中的状态条：状态取自后端 ConnectionStateChanged，不是本地猜测 -->
     <div v-if="isDropped" class="terminal-dropped-bar" role="status" data-test="term-dropped">
       <span class="rs-status-dot rs-status-dot--failed" aria-hidden="true" />
-      <span class="dropped-text">
-        会话已{{ connectionState === "connecting" ? "重新连接中" : "断开" }}，输入已暂停。重新连接后可继续键入。
-      </span>
+      <span class="dropped-text">会话已{{ droppedLabel }}，输入已暂停。重新连接后可继续键入。</span>
       <el-button
         size="small"
         type="primary"
@@ -585,52 +614,8 @@ onBeforeUnmount(() => {
       <span class="dropped-text">正在建立连接…</span>
     </div>
 
-    <!-- 工具栏：连接状态 + 终端配色 + 选中即复制 -->
-    <div class="terminal-toolbar" data-test="term-toolbar">
-      <span class="conn-chip" :class="`is-${connectionState}`" data-test="term-conn">
-        <span class="rs-status-dot" :class="`rs-status-dot--${connectionState}`" aria-hidden="true" />
-        {{ connectionLabel }}
-      </span>
-      <el-dropdown trigger="click" @command="onSchemeChange">
-        <button class="tb-btn" data-test="term-scheme" :title="`终端配色：${currentScheme || '未选择'}`" aria-label="终端配色方案">
-          <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true">
-            <path d="M8 2 A6 6 0 1 0 14 8 H8 Z" fill="none" stroke="currentColor" stroke-width="1.2" />
-            <circle cx="5.5" cy="6" r="1" fill="currentColor" />
-            <circle cx="8" cy="4.5" r="1" fill="currentColor" />
-            <circle cx="10.5" cy="6" r="1" fill="currentColor" />
-          </svg>
-          <span class="tb-label">{{ currentScheme || "配色" }}</span>
-        </button>
-        <template #dropdown>
-          <el-dropdown-menu>
-            <el-dropdown-item
-              v-for="name in schemes"
-              :key="name"
-              :command="name"
-              :disabled="name === currentScheme"
-            >
-              {{ name }}
-            </el-dropdown-item>
-            <el-dropdown-item v-if="schemes.length === 0" disabled>
-              暂无可用配色方案
-            </el-dropdown-item>
-            <el-dropdown-item divided :command="RELOAD_SCHEMES">重新加载方案…</el-dropdown-item>
-          </el-dropdown-menu>
-        </template>
-      </el-dropdown>
-      <el-switch
-        :model-value="copyOnSelect"
-        size="small"
-        data-test="term-copy-on-select"
-        title="选中即复制"
-        aria-label="选中即复制"
-        @update:model-value="onCopyOnSelectToggle"
-      />
-      <span class="tb-label">选中即复制</span>
-    </div>
-
     <!-- 切片 2.4 搜索栏（默认隐藏） -->
-    <div v-if="searchBarVisible" class="search-bar">
+    <div v-if="searchBarVisible" class="search-bar" :class="{ 'is-offset': isDropped || connectionState === 'connecting' }">
       <el-input
         v-model="searchTerm"
         size="small"
@@ -715,51 +700,6 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
-.terminal-toolbar {
-  position: absolute;
-  top: 6px;
-  right: 12px;
-  z-index: 12;
-  display: flex;
-  align-items: center;
-  gap: var(--rs-s-2);
-  padding: 3px 6px;
-  font-size: var(--rs-fs-xs);
-  color: var(--rs-fg-muted);
-  background: var(--rs-bg-surface);
-  border: 1px solid var(--rs-border);
-  border-radius: var(--rs-radius-1);
-  opacity: 0.75;
-  transition: opacity var(--rs-dur-fast) var(--rs-easing);
-}
-.terminal-toolbar:hover { opacity: 1; }
-.tb-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  height: 20px;
-  padding: 0 4px;
-  background: transparent;
-  border: none;
-  border-radius: var(--rs-radius-1);
-  color: var(--rs-fg-muted);
-  font-family: var(--rs-font-ui);
-  font-size: var(--rs-fs-xs);
-  cursor: pointer;
-}
-.tb-btn:hover { background: var(--rs-bg-surface-hover); color: var(--rs-fg); }
-.tb-label { white-space: nowrap; }
-.conn-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  white-space: nowrap;
-}
-.conn-chip.is-connected { color: var(--rs-progress-done); }
-.conn-chip.is-failed,
-.conn-chip.is-disconnected { color: var(--rs-p-danger); }
-.conn-chip.is-connecting { color: var(--rs-fg-muted); }
-
 .search-bar {
   position: absolute;
   top: 36px;
@@ -774,6 +714,8 @@ onBeforeUnmount(() => {
   z-index: 10;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
+/* 断线条在左上角展开时把搜索栏下移，避免两者叠在一起 */
+.search-bar.is-offset { top: 68px; }
 .terminal-error-bar {
   position: absolute;
   top: 50%;

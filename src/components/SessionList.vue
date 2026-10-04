@@ -143,8 +143,8 @@ async function ctxDelete() {
   if (!target) return;
   // 应用内确认窗替代 tauri-plugin-dialog 的 confirm()：不弹操作系统窗口
   const ok = await confirmDialog({
-    title: "删除会话",
-    message: `确定删除会话「${target.name}」吗？此操作不可撤销。`,
+    title: "删除连接信息",
+    message: `确定删除连接「${target.name}」吗？此操作不可撤销。`,
     detail: `${target.host}:${target.port}`,
     confirmText: "删除",
     danger: true,
@@ -158,10 +158,10 @@ async function ctxDelete() {
 <template>
   <div class="session-tree">
     <div v-if="!props.embedded" class="tree-header">
-      <h3>会话 ({{ store.items.length }})</h3>
+      <h3>连接 ({{ store.items.length }})</h3>
       <div class="header-actions">
-        <el-tooltip content="新建会话" placement="top">
-          <button class="mini-btn" aria-label="新建会话" @click="emit('new-session')">
+        <el-tooltip content="新建连接" placement="top">
+          <button class="mini-btn" aria-label="新建连接" @click="emit('new-session')">
             <svg width="12" height="12" viewBox="0 0 16 16"><path d="M8 3 V13 M3 8 H13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
           </button>
         </el-tooltip>
@@ -180,17 +180,18 @@ async function ctxDelete() {
       class="search"
     />
     <p v-if="store.error" class="error">{{ store.error }}</p>
+    <p class="model-hint">一条连接信息可同时开多个标签会话，每个标签是独立的会话实例。</p>
     <div v-if="store.loadIssues.length" class="error" role="alert">
-      <p>部分会话加载失败。请检查会话配置和钥匙串访问权限后重试。</p>
+      <p>部分连接加载失败。请检查配置和钥匙串访问权限后重试。</p>
       <p v-for="issue in store.loadIssues" :key="issue.session_id ?? 'storage'">
-        {{ issue.session_id ?? '会话存储' }}: {{ issue.message }}
+        {{ issue.session_id ?? '连接存储' }}: {{ issue.message }}
       </p>
       <button class="ctx-item" :disabled="store.retryingLoad" @click="store.retryLoad()">重试加载</button>
     </div>
     <SessionCredentialDialog v-if="credentialSession" :session="credentialSession" @close="credentialSession = null" />
 
     <div v-if="groups.length === 0" class="empty">
-      <p>暂无会话</p>
+      <p>暂无连接</p>
     </div>
 
     <div class="tree-body">
@@ -235,13 +236,13 @@ async function ctxDelete() {
       <button v-if="contextMenu.session?.protocol === 'SSH'" class="ctx-item" @click="ctxUpdateCredential">更新凭据</button>
       <div class="ctx-sep" />
       <button v-if="contextMenu.session?.protocol === 'SSH'" class="ctx-item" @click="ctxOpenSftp">打开 SFTP</button>
-      <button class="ctx-item" @click="ctxOpenTerminal">打开终端</button>
+      <button class="ctx-item" @click="ctxOpenTerminal">打开标签</button>
       <button
         class="ctx-item"
         data-test="ctx-open-terminal-window"
         @click="ctxOpenTerminalWindow"
       >
-        新开终端窗口
+        新开标签
       </button>
       <div class="ctx-sep" />
       <button
@@ -249,9 +250,9 @@ async function ctxDelete() {
         data-test="ctx-duplicate"
         @click="ctxDuplicate"
       >
-        复制会话
+        复制连接信息
       </button>
-      <button class="ctx-item ctx-danger" @click="ctxDelete">删除</button>
+      <button class="ctx-item ctx-danger" @click="ctxDelete">删除连接</button>
     </div>
   </div>
 </template>
@@ -307,6 +308,12 @@ h3 {
   background: var(--rs-bg-surface);
 }
 .empty { color: var(--rs-fg-disabled); font-size: var(--rs-fs-xs); padding: var(--rs-s-2); }
+.model-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--rs-fg-disabled);
+}
 
 .tree-body {
   flex: 1;

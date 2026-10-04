@@ -55,8 +55,11 @@ struct CoreScriptHost {
 
 impl ScriptHost for CoreScriptHost {
     fn send_text(&self, session_id: Uuid, text: &str) -> Result<(), CoreError> {
-        tokio::runtime::Handle::current()
-            .block_on(self.sessions.send_data(session_id, text.as_bytes()))
+        tokio::runtime::Handle::current().block_on(self.sessions.send_data(
+            session_id,
+            None,
+            text.as_bytes(),
+        ))
     }
 
     fn list_sessions(&self) -> Result<Vec<Uuid>, CoreError> {
@@ -69,7 +72,7 @@ impl ScriptHost for CoreScriptHost {
 
     fn execute_quick_command(&self, command_id: Uuid, session_id: Uuid) -> Result<(), CoreError> {
         let data = self.quick_commands.get_command_text(command_id)?;
-        tokio::runtime::Handle::current().block_on(self.sessions.send_data(session_id, &data))
+        tokio::runtime::Handle::current().block_on(self.sessions.send_data(session_id, None, &data))
     }
 }
 
@@ -220,8 +223,16 @@ impl CommandDispatcher {
             }
 
             // ===== 终端命令 =====
-            AppCommand::SendInput { session_id, data } => {
-                self.session_service.send_data(session_id, &data).await?;
+            // terminal_id 缺省 = 主 pty（连接建立时创建的首标签）；给了就是
+            // 指定那个 pty，输出/输入/尺寸都按它隔离。
+            AppCommand::SendInput {
+                session_id,
+                terminal_id,
+                data,
+            } => {
+                self.session_service
+                    .send_data(session_id, terminal_id, &data)
+                    .await?;
                 if self.sync_input_service.is_sync_active()? {
                     self.sync_input_service
                         .send_to_synced_sessions(&data, &self.session_service)
@@ -231,18 +242,41 @@ impl CommandDispatcher {
             }
             AppCommand::ResizeTerminal {
                 session_id,
+                terminal_id,
                 cols,
                 rows,
             } => {
-                self.terminal_service.resize(session_id, cols, rows)?;
+                // 尺寸登记键用 terminal_id 优先：多标签时不能都记到 session_id 上
+                let key = terminal_id.unwrap_or(session_id);
+                self.terminal_service.resize(key, cols, rows)?;
                 if matches!(
                     self.session_service.get_state(session_id).await,
                     Ok(rshell_api::types::ConnectionState::Connected)
                 ) {
                     self.session_service
-                        .resize_terminal(session_id, cols as u32, rows as u32)
+                        .resize_terminal(session_id, terminal_id, cols as u32, rows as u32)
                         .await?;
                 }
+                Ok(CommandOutcome::None)
+            }
+            AppCommand::OpenTerminal {
+                session_id,
+                terminal_id,
+                cols,
+                rows,
+            } => {
+                self.session_service
+                    .open_terminal(session_id, terminal_id, cols as u32, rows as u32)
+                    .await?;
+                Ok(CommandOutcome::None)
+            }
+            AppCommand::CloseTerminal {
+                session_id,
+                terminal_id,
+            } => {
+                self.session_service
+                    .close_terminal(session_id, terminal_id)
+                    .await?;
                 Ok(CommandOutcome::None)
             }
 
@@ -628,7 +662,9 @@ impl CommandDispatcher {
         let data = self.quick_command_service.get_command_text(command_id)?;
 
         for session_id in target_sessions {
-            self.session_service.send_data(*session_id, &data).await?;
+            self.session_service
+                .send_data(*session_id, None, &data)
+                .await?;
         }
 
         info!(command_id = %command_id, targets = target_sessions.len(), "Quick command executed");

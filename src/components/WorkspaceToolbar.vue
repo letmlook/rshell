@@ -28,8 +28,8 @@ const props = defineProps<{
   onDisconnect?: () => void;
   onFind?: () => void;
   onClearScreen?: () => void;
-  /** Terminal：为当前会话新开一个终端窗口 */
-  onNewTerminalWindow?: () => void;
+  /** Terminal：在当前连接信息下新开一个标签会话 */
+  onNewTab?: () => void;
   /** Transfer 工具栏 */
   onSyncToggle?: () => void;
   onUpload?: () => void;
@@ -55,7 +55,7 @@ const emit = defineEmits<{
 }>();
 
 const contextItems: Array<{ id: PanelKind; label: string; icon: string }> = [
-  { id: "sessions", label: "会话", icon: "▤" },
+  { id: "sessions", label: "连接", icon: "▤" },
   { id: "files", label: "文件", icon: "▥" },
   { id: "keys", label: "密钥", icon: "⚷" },
   { id: "tools", label: "工具", icon: "⚒" },
@@ -143,7 +143,7 @@ function pickWorkspace(w: WorkspaceKind) {
 
     <!-- 2. 通用按钮 -->
     <div class="cluster">
-      <button class="tb-btn" title="新建会话 (Ctrl+N)" aria-label="新建会话" @click="onNewSession">
+      <button class="tb-btn" title="新建连接 (Ctrl+N)" aria-label="新建连接" @click="onNewSession">
         <svg width="14" height="14" viewBox="0 0 16 16">
           <path d="M8 3 V13 M3 8 H13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
         </svg>
@@ -164,11 +164,11 @@ function pickWorkspace(w: WorkspaceKind) {
         </button>
         <button
           class="tb-btn"
-          title="新开终端窗口"
-          aria-label="新开终端窗口"
+          title="新开标签"
+          aria-label="新开标签"
           data-testid="new-terminal-window"
           :disabled="!terminalAvailable"
-          @click="onNewTerminalWindow"
+          @click="onNewTab"
         >
           <svg width="14" height="14" viewBox="0 0 16 16">
             <rect x="1.5" y="2.5" width="9" height="11" rx="1" fill="none" stroke="currentColor" stroke-width="1.2" />

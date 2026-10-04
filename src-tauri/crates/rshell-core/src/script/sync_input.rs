@@ -77,7 +77,7 @@ impl SyncInputService {
         };
 
         for session_id in &sessions {
-            if let Err(e) = session_service.send_data(*session_id, data).await {
+            if let Err(e) = session_service.send_data(*session_id, None, data).await {
                 debug!(session_id = %session_id, error = %e, "Failed to send to synced session");
             }
         }

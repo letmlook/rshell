@@ -1,4 +1,4 @@
-﻿import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { defineComponent, onMounted } from "vue";
 import { flushPromises, mount } from "@vue/test-utils";
 import App from "../../src/App.vue";
@@ -174,7 +174,7 @@ describe("App layout", () => {
       id: "terminal-session-42",
       component: "terminal",
       title: "session-",
-      params: { sessionId: "session-42" },
+      params: { sessionId: "session-42", terminalId: "session-42" },
     });
     wrapper.unmount();
   });
@@ -192,7 +192,7 @@ describe("App layout", () => {
     await flushPromises();
     expect(dockviewApiMocks.addPanel).toHaveBeenCalledTimes(2);
     expect(dockviewApiMocks.addPanel).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "terminal-session-b", params: { sessionId: "session-b" } }),
+      expect.objectContaining({ id: "terminal-session-b", params: { sessionId: "session-b", terminalId: "session-b" } }),
     );
     expect(dockviewApiMocks.panelMap.get("terminal-session-a")?.api.setActive).toHaveBeenCalledOnce();
     // 会话改名后重新激活：标题必须同步刷新，不能停留在旧名
@@ -219,7 +219,7 @@ describe("App layout", () => {
 
     expect(dockviewApiMocks.addPanel).toHaveBeenCalledTimes(2);
     expect(dockviewApiMocks.addPanel).toHaveBeenLastCalledWith(
-      expect.objectContaining({ id: "terminal-session-42~2", params: { sessionId: "session-42" } }),
+      expect.objectContaining({ id: "terminal-session-42~2", params: expect.objectContaining({ sessionId: "session-42" }) }),
     );
     // 附加窗口的编号来自「已打开窗口的顺序」，不写死成 2
     const second = dockviewApiMocks.addPanel.mock.calls[1][0] as unknown as { title: string };
@@ -261,9 +261,10 @@ describe("App layout", () => {
     wrapper.unmount();
   });
 
-  // 终端 tab 右键：同一份连接信息下既能「新开终端窗口」也能「复制会话」。
+  // 终端标签右键：三项都以连接信息为操作对象，但结果不同——
+  // 新建标签用当前聚焦标签的连接，复制标签用右键所在标签的连接，关闭只关这一个。
   // 菜单由 dockview 的 getTabContextMenuItems 提供（省略该选项 dockview 不弹菜单）。
-  it("offers 新开终端窗口 / 复制会话 on the terminal tab context menu", async () => {
+  it("offers 新建标签 / 复制标签 / 关闭标签 on the terminal tab context menu", async () => {
     dockviewApiMocks.panelMap.clear();
     dockviewApiMocks.addPanel.mockClear();
     if (!sessionsStoreMock.store) throw new Error("sessions store mock missing");
@@ -285,21 +286,25 @@ describe("App layout", () => {
     const panel = dockviewApiMocks.panelMap.get("terminal-session-42")!;
     const items = getItems!({ panel }) as Array<{ label?: string; action?: () => void } | string>;
     const labels = items.filter((i) => typeof i === "object").map((i) => (i as { label: string }).label);
-    expect(labels).toEqual(["新开终端窗口", "复制会话", "关闭标签"]);
+    expect(labels).toEqual(["新建标签", "复制标签", "关闭标签"]);
 
-    // 「新开终端窗口」：为同一会话再建一个面板，而不是激活原面板
-    const newWindow = items[0] as { action: () => void };
-    newWindow.action();
+    // 「新建标签」：为当前聚焦的连接再建一个面板，而不是激活原面板
+    const newTab = items[0] as { action: () => void };
+    newTab.action();
     await flushPromises();
     expect(dockviewApiMocks.addPanel).toHaveBeenLastCalledWith(
       expect.objectContaining({ id: "terminal-session-42~2" }),
     );
 
-    // 「复制会话」：走 store 的真实复制（凭据不复制由 App.vue 负责提示）
-    const duplicate = items[1] as { action: () => void };
-    duplicate.action();
+    // 「复制标签」：同样只是多开一个独立标签会话，不复制连接信息本身
+    const copyTab = items[1] as { action: () => void };
+    copyTab.action();
     await flushPromises();
-    expect(sessionsStoreMock.store.duplicate).toHaveBeenCalledWith("session-42");
+    expect(dockviewApiMocks.addPanel).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "terminal-session-42~3" }),
+    );
+    // 标签操作不碰连接信息条目（复制连接信息是左侧列表里的独立动作）
+    expect(sessionsStoreMock.store.duplicate).not.toHaveBeenCalled();
 
     // 「关闭标签」：仍能关掉面板（没有因为换掉内置项而丢失关闭能力）
     const close = items[3] as { action: () => void };
@@ -384,7 +389,7 @@ describe("App layout", () => {
       id: "terminal-session-a",
       component: "terminal",
       title: "session-",
-      params: { sessionId: "session-a" },
+      params: { sessionId: "session-a", terminalId: "session-a" },
     });
     expect(dockviewApiMocks.panelMap.get("terminal-session-a")).toBeDefined();
     wrapper.unmount();

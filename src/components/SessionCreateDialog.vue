@@ -90,7 +90,7 @@ function onUpdateVisible(v: boolean) {
 <template>
   <el-dialog
     :model-value="props.visible"
-    title="新建会话"
+    title="新建连接"
     width="480px"
     @update:model-value="onUpdateVisible"
     @close="close"

@@ -130,12 +130,22 @@ export const disconnectSession = (session_id: Uuid) =>
   call({ DisconnectSession: { session_id } });
 
 // ===== 终端 =====
+// terminal_id 决定操作落在哪个 pty：每个标签一个独立 pty（独立 shell）。
+// 传 undefined = 该连接的主 pty（连接建立时创建的首标签）。
 
-export const sendInput = (session_id: Uuid, data: Uint8Array | number[]) =>
-  call({ SendInput: { session_id, data: Array.from(data) } });
+export const sendInput = (session_id: Uuid, data: Uint8Array | number[], terminal_id?: Uuid) =>
+  call({ SendInput: { session_id, terminal_id: terminal_id ?? null, data: Array.from(data) } });
 
-export const resizeTerminal = (session_id: Uuid, cols: number, rows: number) =>
-  call({ ResizeTerminal: { session_id, cols, rows } });
+export const resizeTerminal = (session_id: Uuid, cols: number, rows: number, terminal_id?: Uuid) =>
+  call({ ResizeTerminal: { session_id, terminal_id: terminal_id ?? null, cols, rows } });
+
+/** 在已连接的会话上另开一个 pty（= 一个独立标签会话） */
+export const openTerminal = (session_id: Uuid, terminal_id: Uuid, cols: number, rows: number) =>
+  call({ OpenTerminal: { session_id, terminal_id, cols, rows } });
+
+/** 关闭一个 pty（标签关闭）；断开连接时无需调用 */
+export const closeTerminal = (session_id: Uuid, terminal_id: Uuid) =>
+  call({ CloseTerminal: { session_id, terminal_id } });
 
 // 切片 2.2 删除（设计 §5）：CopySelection 上移到前端 ——
 // xterm.js 自持选区,后端不再发 ClipboardCopy 事件,前端用 navigator.clipboard

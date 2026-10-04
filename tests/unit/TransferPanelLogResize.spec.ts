@@ -63,6 +63,30 @@ describe("TransferPanel 日志页", () => {
   });
 });
 
+describe("TransferPanel 操作列宽度", () => {
+  const onlyTerminal = [{ ...sampleItems[0], phase: "done" as const, progress: 1, speed: 0 }];
+  const withActive = [...sampleItems, { id: "t-done", name: "d", phase: "done" as const, progress: 1, size: 1, local: "/a", remote: "/b", speed: 0 }];
+
+  /** 从 data 属性读出实际下发的操作列宽度 */
+  const actionsWidth = (wrapper: ReturnType<typeof mountPanel>) =>
+    wrapper.get('[data-test="xfer-panel"]').attributes("data-actions-width");
+
+  it("全是终态（每行只有一个「删除」）时列宽按 1 个按钮算", () => {
+    const wrapper = mountPanel({ items: onlyTerminal });
+    expect(actionsWidth(wrapper)).toBe("56px");
+  });
+
+  it("存在活跃任务（两个按钮）时列宽按 2 个按钮算", () => {
+    const wrapper = mountPanel({ items: withActive });
+    expect(actionsWidth(wrapper)).toBe("108px");
+  });
+
+  it("队列为空时给出单按钮宽度的下限，不塌成 0", () => {
+    const wrapper = mountPanel({ items: [] });
+    expect(actionsWidth(wrapper)).toBe("48px");
+  });
+});
+
 describe("TransferPanel 顶部边缘拖动高度", () => {
   it("向上拖动把面板变高并回写 update:height", async () => {
     const wrapper = mountPanel({ height: 220 });

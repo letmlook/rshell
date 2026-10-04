@@ -2,29 +2,41 @@
 //!
 //! 基于 russh 实现 SSH 连接、认证、数据收发和终端大小调整。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// 每个 pty 的输出目的地，按 russh 通道号索引。
+///
+/// 一条 SSH 连接可以开多个 session channel（= 多个 pty = 多个独立标签会话），
+/// 因此不能再用「一个 channel id + 一个 sender」：那样第二个 pty 的数据会被
+/// 丢弃，或把第一个 pty 的去向顶掉。
 #[derive(Default)]
 struct ShellOutput {
-    channel: Option<u32>,
-    sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    /// russh 通道号 → 该 pty 的输出发送端
+    routes: HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 impl ShellOutput {
+    /// 为一个新开的 pty 登记输出去向。
+    fn register(&mut self, channel: u32, sender: mpsc::UnboundedSender<Vec<u8>>) {
+        self.routes.insert(channel, sender);
+    }
+
+    /// 收到某通道的数据：只投给该通道对应的 pty。
     fn data(&self, channel: u32, data: &[u8]) {
-        if self.channel == Some(channel) {
-            if let Some(sender) = &self.sender {
-                let _ = sender.send(data.to_vec());
-            }
+        if let Some(sender) = self.routes.get(&channel) {
+            let _ = sender.send(data.to_vec());
         }
     }
 
+    /// 关闭某个 pty（`Some(channel)`）或整条连接上的全部 pty（`None`）。
     fn close(&mut self, channel: Option<u32>) {
-        if channel.is_none() || channel == self.channel {
-            self.sender.take();
-            self.channel = None;
+        match channel {
+            Some(id) => {
+                self.routes.remove(&id);
+            }
+            None => self.routes.clear(),
         }
     }
 }
@@ -80,15 +92,62 @@ async fn open_nodelay_socket(addr: &str) -> Result<tokio::net::TcpStream, Protoc
     Ok(socket)
 }
 
+/// 一个 pty 的句柄：请求发送端（Send/Resize/Close）+ 它对应的 russh 通道号。
+struct TerminalHandle {
+    sender: mpsc::Sender<ShellRequest>,
+    channel: u32,
+}
+
+/// 在已建立的连接上开一个 session channel，请求 PTY 与 shell。
+///
+/// 抽成自由函数是为了让 `spawn_shell_channel` 能把连接句柄**临时取出**再传入
+/// （`russh::client::Handle` 不是 `Clone`，而借用 `self.handle` 会与后续对
+/// `self` 其他字段的访问冲突）。
+async fn open_pty_channel(
+    handle: &mut russh::client::Handle<SshHandler>,
+    cols: u32,
+    rows: u32,
+) -> Result<russh::Channel<russh::client::Msg>, ProtocolError> {
+    // russh 0.48 的 request_pty/request_shell 走 &self，无需可变借用
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
+
+    channel
+        .request_pty(
+            false,            // want_reply
+            "xterm-256color", // term
+            cols,             // col_width
+            rows,             // row_height
+            0,                // pix_width
+            0,                // pix_height
+            &[],              // terminal_modes
+        )
+        .await
+        .map_err(|e| ProtocolError::ProtocolError(format!("PTY request failed: {}", e)))?;
+
+    channel
+        .request_shell(false)
+        .await
+        .map_err(|e| ProtocolError::ProtocolError(format!("Shell request failed: {}", e)))?;
+
+    Ok(channel)
+}
+
 /// SSH 客户端
 pub struct SshClient {
     config: SessionConfig,
     auth: Option<ResolvedAuthMethod>,
     /// 连接句柄
     handle: Option<russh::client::Handle<SshHandler>>,
-    /// 当前会话通道
+    /// 主 pty（连接时创建）的请求发送端；保留单值是为了兼容既有 Connection 契约
     channel: Option<mpsc::Sender<ShellRequest>>,
-    /// 接收数据的通道
+    /// 主 pty 的通道号
+    channel_id: Option<u32>,
+    /// 全部 pty：terminal_id → 句柄。同一连接上的多个标签各自一个 pty
+    terminals: HashMap<Uuid, TerminalHandle>,
+    /// 接收数据的通道（主 pty；额外 pty 的接收端交给调用方）
     data_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
     /// `Connection::recv` 尚未消费完的上一条消息余量。
     /// `recv_data()` 返回的是一条完整消息，若调用方 `buf` 装不下，
@@ -511,6 +570,8 @@ impl SshClient {
             auth: Some(auth),
             handle: None,
             channel: None,
+            channel_id: None,
+            terminals: HashMap::new(),
             data_rx: None,
             recv_pending: VecDeque::new(),
             shell_output: Arc::new(Mutex::new(ShellOutput::default())),
@@ -538,12 +599,8 @@ impl SshClient {
             self.config.host, self.config.port
         );
 
-        // 创建数据通道
-        let (data_tx, data_rx) = mpsc::unbounded_channel();
-        self.shell_output = Arc::new(Mutex::new(ShellOutput {
-            channel: None,
-            sender: Some(data_tx),
-        }));
+        // 输出不再在这里预建唯一通道：每个 pty 在 spawn_shell_channel 时按
+        // russh 通道号单独登记到 ShellOutput（一条连接可以挂多个 pty）。
 
         // 创建 SSH 配置：空闲 keepalive 每 15s 探测一次，服务端应答会重置
         // 探测计数，空闲会话长期存活；死链由 keepalive_max（默认 3）在约
@@ -574,7 +631,6 @@ impl SshClient {
             .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
 
         self.handle = Some(handle);
-        self.data_rx = Some(data_rx);
 
         info!("SSH TCP connection established");
 
@@ -677,40 +733,77 @@ impl SshClient {
         Ok(())
     }
 
-    /// 打开会话通道并请求 PTY
+    /// 主 pty 的 terminal_id。
+    ///
+    /// 约定：**主 pty 以会话 id 寻址**。前端首标签不做额外生成，直接把
+    /// `session_id` 当 terminal_id 传下来（壳层的输出路由、核心层的
+    /// `send_data`/`resize` 全用这个键）。若这里改成随机 uuid，输入会因为
+    /// `terminals` 查不到句柄而被静默丢弃——输出正常、键盘无反应。
+    fn primary_terminal_id(&self) -> Uuid {
+        self.config.id
+    }
+
+    /// 打开会话通道并请求 PTY（主 pty，连接建立时创建）
     async fn open_session(&mut self) -> Result<(), ProtocolError> {
-        let handle = self
+        let primary = self.primary_terminal_id();
+        let (handle, rx) = self.spawn_shell_channel(primary, 80, 24).await?;
+        // 主 pty 的请求端另外记一份，供既有 Connection 契约（send_data/resize）使用
+        self.channel = Some(handle.sender.clone());
+        self.channel_id = Some(handle.channel);
+        self.terminals.insert(primary, handle);
+        self.data_rx = Some(rx);
+        Ok(())
+    }
+
+    /// 在**已建立的连接**上再开一个 pty（独立 session channel + 独立 shell）。
+    ///
+    /// 同一个 `terminal_id` 重复调用会报错而不是开出第二个 pty——否则同一个
+    /// 标签会多挂一个用户看不见的 shell。
+    pub async fn open_terminal(
+        &mut self,
+        terminal_id: Uuid,
+        cols: u32,
+        rows: u32,
+    ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>, ProtocolError> {
+        if self.terminals.contains_key(&terminal_id) {
+            return Err(ProtocolError::ProtocolError(format!(
+                "terminal {terminal_id} already exists on this connection"
+            )));
+        }
+        let (handle, rx) = self.spawn_shell_channel(terminal_id, cols, rows).await?;
+        debug!(terminal_id = %terminal_id, channel = handle.channel, "extra pty opened");
+        self.terminals.insert(terminal_id, handle);
+        Ok(rx)
+    }
+
+    /// 建立一个 pty：开 session channel、请求 PTY 与 shell，起 actor 独占该 channel，
+    /// 并把输出登记到 `ShellOutput`。返回 `(句柄, 输出接收端)`。
+    ///
+    /// `terminal_id` 由调用方给定：主 pty 传会话 id，附加 pty 传各自的 id。
+    /// 这里**不能**自己生成随机 id——那样前端传来的 terminal_id 就查不到句柄。
+    async fn spawn_shell_channel(
+        &mut self,
+        terminal_id: Uuid,
+        cols: u32,
+        rows: u32,
+    ) -> Result<(TerminalHandle, mpsc::UnboundedReceiver<Vec<u8>>), ProtocolError> {
+        debug!(terminal_id = %terminal_id, cols, rows, "opening pty session channel");
+        // russh 的 Handle 不是 Clone，而 `self.handle.as_ref()` 的借用会与后面
+        // 对 self 其他字段的访问冲突。改成「临时取出 → 建通道 → 无论成败都放回」。
+        let mut handle = self
             .handle
-            .as_ref()
+            .take()
             .ok_or_else(|| ProtocolError::ConnectionFailed("Not connected".to_string()))?;
+        let opened = open_pty_channel(&mut handle, cols, rows).await;
+        self.handle = Some(handle);
+        let mut channel = opened?;
+        let channel_id: u32 = channel.id().into();
 
-        // 打开会话通道
-        let mut channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
-
-        self.shell_output.lock().unwrap().channel = Some(channel.id().into());
-
-        // 请求 PTY（默认 80x24）
-        channel
-            .request_pty(
-                false,            // want_reply
-                "xterm-256color", // term
-                80,               // col_width
-                24,               // row_height
-                0,                // pix_width
-                0,                // pix_height
-                &[],              // terminal_modes
-            )
-            .await
-            .map_err(|e| ProtocolError::ProtocolError(format!("PTY request failed: {}", e)))?;
-
-        // 请求 shell
-        channel
-            .request_shell(false)
-            .await
-            .map_err(|e| ProtocolError::ProtocolError(format!("Shell request failed: {}", e)))?;
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        self.shell_output
+            .lock()
+            .unwrap()
+            .register(channel_id, out_tx);
 
         let (tx, mut requests) = mpsc::channel(32);
         let output = self.shell_output.clone();
@@ -744,21 +837,85 @@ impl SshClient {
                 }
             }
             drop(requests);
-            output.lock().unwrap().close(None);
+            output.lock().unwrap().close(Some(channel_id));
         });
-        self.channel = Some(tx);
 
-        Ok(())
+        Ok((
+            TerminalHandle {
+                sender: tx,
+                channel: channel_id,
+            },
+            out_rx,
+        ))
+    }
+
+    /// 关闭一个 pty（标签关闭）。未知 id 视为已关闭，幂等。
+    pub async fn close_terminal(&mut self, terminal_id: Uuid) {
+        if let Some(handle) = self.terminals.remove(&terminal_id) {
+            let (reply, received) = oneshot::channel();
+            if handle.sender.send(ShellRequest::Close(reply)).await.is_ok() {
+                let _ = received.await;
+            }
+        }
+    }
+
+    /// 向指定 pty 发送输入。
+    pub async fn send_data_to(&self, terminal_id: Uuid, data: &[u8]) -> Result<(), ProtocolError> {
+        let handle = self.terminals.get(&terminal_id).ok_or_else(|| {
+            ProtocolError::ProtocolError(format!(
+                "terminal {terminal_id} not found on this connection"
+            ))
+        })?;
+        let (reply, received) = oneshot::channel();
+        handle
+            .sender
+            .send(ShellRequest::Send(data.to_vec(), reply))
+            .await
+            .map_err(|_| ProtocolError::ConnectionClosed)?;
+        received
+            .await
+            .map_err(|_| ProtocolError::ConnectionClosed)?
+    }
+
+    /// 调整指定 pty 的窗口尺寸。
+    pub async fn resize_terminal_of(
+        &self,
+        terminal_id: Uuid,
+        cols: u32,
+        rows: u32,
+    ) -> Result<(), ProtocolError> {
+        let handle = self.terminals.get(&terminal_id).ok_or_else(|| {
+            ProtocolError::ProtocolError(format!(
+                "terminal {terminal_id} not found on this connection"
+            ))
+        })?;
+        let (reply, received) = oneshot::channel();
+        handle
+            .sender
+            .send(ShellRequest::Resize(cols, rows, reply))
+            .await
+            .map_err(|_| ProtocolError::ConnectionClosed)?;
+        received
+            .await
+            .map_err(|_| ProtocolError::ConnectionClosed)?
+    }
+
+    /// 该连接上已登记的 pty 数量（诊断/测试用）。
+    pub fn terminal_count(&self) -> usize {
+        self.terminals.len()
     }
 
     /// 断开连接
     pub async fn disconnect_ssh(&mut self) -> Result<(), ProtocolError> {
-        if let Some(channel) = self.channel.take() {
-            let (reply, received) = oneshot::channel();
-            if channel.send(ShellRequest::Close(reply)).await.is_ok() {
-                let _ = received.await;
-            }
+        // 先关掉全部 pty：只关主 pty 会让额外标签的 actor 任务继续挂在
+        // 通道上，直到 TCP 断开才结束。
+        let ids: Vec<Uuid> = self.terminals.keys().copied().collect();
+        for id in ids {
+            self.close_terminal(id).await;
         }
+        self.terminals.clear();
+        self.channel = None;
+        self.channel_id = None;
 
         if let Some(handle) = self.handle.take() {
             let _ = handle
@@ -775,7 +932,9 @@ impl SshClient {
         Ok(())
     }
 
-    /// 发送数据到远程 shell
+    /// 发送数据到**主 pty**（`Connection::send` 契约）。
+    ///
+    /// 多标签走 [`Self::send_data_to`]：每个标签一个 pty，输入互不串台。
     pub async fn send_data(&self, data: &[u8]) -> Result<(), ProtocolError> {
         let channel = self
             .channel
@@ -1440,10 +1599,8 @@ mod tests {
     #[tokio::test]
     async fn shell_output_excludes_other_channels_and_ends_on_shell_eof() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut output = ShellOutput {
-            channel: Some(7),
-            sender: Some(tx),
-        };
+        let mut output = ShellOutput::default();
+        output.register(7, tx);
         output.data(9, b"sftp payload");
         output.data(7, b"shell");
         output.close(Some(9));
@@ -1458,10 +1615,8 @@ mod tests {
     #[tokio::test]
     async fn transport_disconnect_ends_shell_output() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut output = ShellOutput {
-            channel: Some(7),
-            sender: Some(tx),
-        };
+        let mut output = ShellOutput::default();
+        output.register(7, tx);
         output.close(None);
         assert_eq!(rx.recv().await, None);
     }
@@ -1478,12 +1633,9 @@ mod tests {
             format!("[example.test]:2222 {}\n", key.to_openssh().unwrap()),
         )
         .unwrap();
-        let (data_tx, _) = mpsc::unbounded_channel();
+        // 输出目的地按 pty 登记（ShellOutput::register），这里无需预建通道
         let handler = SshHandler {
-            shell_output: Arc::new(Mutex::new(ShellOutput {
-                channel: None,
-                sender: Some(data_tx),
-            })),
+            shell_output: Arc::new(Mutex::new(ShellOutput::default())),
             host: "example.test".into(),
             port: 2222,
             known_hosts_paths: vec![path],
@@ -1521,12 +1673,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("known_hosts");
         std::fs::write(&path, format!("::1 {}\n", key.to_openssh().unwrap())).unwrap();
-        let (data_tx, _) = mpsc::unbounded_channel();
+        // 输出目的地按 pty 登记（ShellOutput::register），这里无需预建通道
         let handler = SshHandler {
-            shell_output: Arc::new(Mutex::new(ShellOutput {
-                channel: None,
-                sender: Some(data_tx),
-            })),
+            shell_output: Arc::new(Mutex::new(ShellOutput::default())),
             host: "::1".into(),
             port: 22,
             known_hosts_paths: vec![path],
@@ -1555,12 +1704,9 @@ mod tests {
         .unwrap();
 
         fn handler_with(paths: Vec<PathBuf>) -> SshHandler {
-            let (data_tx, _) = mpsc::unbounded_channel();
+            // 输出目的地按 pty 登记（ShellOutput::register），这里无需预建通道
             SshHandler {
-                shell_output: Arc::new(Mutex::new(ShellOutput {
-                    channel: None,
-                    sender: Some(data_tx),
-                })),
+                shell_output: Arc::new(Mutex::new(ShellOutput::default())),
                 host: "example.test".into(),
                 port: 2222,
                 known_hosts_paths: paths,
@@ -1614,5 +1760,40 @@ mod tests {
         );
         assert!(client.handle.is_none());
         assert!(client.channel.is_none());
+    }
+
+    /// 回归：主 pty 必须以**会话 id** 注册。
+    ///
+    /// 前端首标签把 `session_id` 当 terminal_id 传下来（壳层输出路由、
+    /// 核心层 send_data/resize 都用这个键）。若协议层给主 pty 生成随机
+    /// uuid，`terminals.get(&session_id)` 就查不到句柄 —— 表现为
+    /// **输出正常但键盘完全无反应**（输入被静默丢弃）。
+    #[test]
+    fn primary_terminal_is_addressed_by_session_id() {
+        let session_id = Uuid::new_v4();
+        let client = SshClient::new(
+            SessionConfig {
+                id: session_id,
+                name: "test".to_string(),
+                folder_id: None,
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                protocol: rshell_api::types::Protocol::SSH,
+                auth_method: AuthMethod::Password {
+                    username: "root".to_string(),
+                    has_password: true,
+                },
+                serial_config: None,
+            },
+            ResolvedAuthMethod::Password {
+                username: "root".into(),
+                password: "test".into(),
+            },
+        );
+        assert_eq!(
+            client.primary_terminal_id(),
+            session_id,
+            "主 pty 的 terminal_id 必须等于 session_id，否则首标签输入会被丢弃",
+        );
     }
 }

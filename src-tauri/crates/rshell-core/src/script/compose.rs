@@ -62,7 +62,7 @@ impl ComposeService {
         let data = content.as_bytes().to_vec();
         let mut failed: Vec<(Uuid, CoreError)> = Vec::new();
         for session_id in &target_sessions {
-            if let Err(e) = session_service.send_data(*session_id, &data).await {
+            if let Err(e) = session_service.send_data(*session_id, None, &data).await {
                 warn!(session_id = %session_id, error = %e, "Failed to send compose text to session");
                 failed.push((*session_id, e));
                 // 继续发送到其他会话

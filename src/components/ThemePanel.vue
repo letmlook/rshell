@@ -2,8 +2,8 @@
 /**
  * ThemePanel —— 切片 3
  *
- * 选择应用主题 + 终端配色方案。前端管展开态/排序列/过滤词（设计 §5）；
- * 使用后端返回的真实主题色和终端配色，前端只负责 CSS/xterm 映射。
+ * 选择应用主题（CSS 变量）。终端配色方案与「选中即复制」等终端配置在
+ * 「设置 → 终端」面板，同一区域里只留一处入口，避免两个面板各改一半。
  */
 import { onMounted } from "vue";
 import { useThemeStore } from "../stores/theme";
@@ -32,17 +32,7 @@ onMounted(async () => {
         />
       </el-select>
     </section>
-    <section>
-      <label>终端配色方案</label>
-      <el-select :model-value="store.currentScheme" @change="store.applyScheme" :loading="store.loading">
-        <el-option
-          v-for="name in store.availableSchemes"
-          :key="name"
-          :label="name"
-          :value="name"
-        />
-      </el-select>
-    </section>
+    <p class="hint">终端配色与剪贴板行为在「设置 → 终端」。</p>
   </aside>
 </template>
 
@@ -63,6 +53,11 @@ onMounted(async () => {
   font-size: 12px;
   color: var(--el-text-color-secondary);
   margin-bottom: 4px;
+}
+.hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
 }
 .error {
   color: var(--el-color-danger);

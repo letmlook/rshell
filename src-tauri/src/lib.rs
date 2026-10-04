@@ -72,8 +72,11 @@ pub fn run() {
             terminal_service.set_output_sender(output_tx);
             let channels_for_output = terminal_channels.clone();
             tauri::async_runtime::spawn(async move {
-                while let Some((session_id, data)) = output_rx.recv().await {
-                    channels_for_output.push(session_id, &data).await;
+                // 按 (session, terminal) 路由：每个标签一个独立 pty，字节不串台
+                while let Some((session_id, terminal_id, data)) = output_rx.recv().await {
+                    channels_for_output
+                        .push(session_id, terminal_id, &data)
+                        .await;
                 }
             });
             let trigger_engine = Arc::new(TriggerEngine::with_path(
@@ -162,6 +165,8 @@ pub fn run() {
             commands::connect_session,
             commands::disconnect_session,
             commands::send_input,
+            commands::open_terminal,
+            commands::close_terminal,
             commands::resize_terminal,
             commands::attach_terminal,
             commands::decide_host_key,

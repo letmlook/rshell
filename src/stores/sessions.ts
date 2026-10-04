@@ -18,6 +18,7 @@ import {
   updateSession,
 } from "../ipc/client";
 import { subscribeAppEvents } from "../ipc/events";
+import { newUuid } from "../utils/uuid";
 
 type ConnectionStateValue = "disconnected" | "connecting" | "connected" | "failed";
 
@@ -85,16 +86,7 @@ export const useSessionsStore = defineStore("sessions", () => {
    * 且会和真实会话撞上。
    */
   function newSessionId(): Uuid {
-    const source = globalThis.crypto;
-    if (typeof source?.randomUUID === "function") return source.randomUUID() as Uuid;
-    if (typeof source?.getRandomValues !== "function") {
-      throw new Error("无法生成会话 ID：当前环境缺少安全随机源");
-    }
-    const bytes = source.getRandomValues(new Uint8Array(16));
-    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
-    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10x
-    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}` as Uuid;
+    return newUuid() as Uuid;
   }
 
   /** 在已用名称后追加序号，保证复制出来的会话名不撞车 */

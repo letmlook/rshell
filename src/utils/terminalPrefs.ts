@@ -5,7 +5,11 @@
  * 与 lastLocalDir 同理，走 IPC 往返只会让首屏多一次阻塞等待。
  * 存储不可用（隐私模式、配额满、WebView 禁用）时降级为「进程内有效」，
  * 绝不抛错打断终端。
+ *
+ * 响应式导出而非只读函数：设置面板改开关时，已经打开的终端要**立即**
+ * 生效，不必等面板重挂。只在读取时查一次 localStorage 的写法做不到这点。
  */
+import { ref } from "vue";
 
 export const COPY_ON_SELECT_KEY = "rshell.terminal.copyOnSelect.v1";
 
@@ -46,4 +50,16 @@ export function saveCopyOnSelect(
 /** localStorage 可能不存在（SSR / 测试环境），统一走这个取值口 */
 export function defaultLocalStorage(): Pick<Storage, "getItem" | "setItem"> | null {
   return typeof localStorage === "undefined" ? null : localStorage;
+}
+
+/**
+ * 当前生效的「选中即复制」。设置面板写它，终端面板 watch 它。
+ * 模块级单例：与 dialog/transferLog 同一套取舍，跨组件共享一份偏好。
+ */
+export const copyOnSelect = ref(loadCopyOnSelect(defaultLocalStorage()));
+
+/** 改开关：更新内存态并落盘；落盘失败只说明「不记住」，不影响本次运行 */
+export function setCopyOnSelect(value: boolean): boolean {
+  copyOnSelect.value = value;
+  return saveCopyOnSelect(defaultLocalStorage(), value);
 }

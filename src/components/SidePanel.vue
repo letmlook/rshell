@@ -18,6 +18,7 @@ import {
   resizeSidebarWithKey,
 } from "../utils/workspaceLayout";
 import ThemePanel from "./ThemePanel.vue";
+import TerminalSettingsPanel from "./TerminalSettingsPanel.vue";
 import SessionList from "./SessionList.vue";
 import KeyManagerPanel from "./KeyManagerPanel.vue";
 import QuickCommandPanel from "./QuickCommandPanel.vue";
@@ -26,7 +27,7 @@ import TunnelPanel from "./TunnelPanel.vue";
 import PluginPanel from "./PluginPanel.vue";
 
 export type ToolSubview = "quick-commands" | "triggers" | "tunnels";
-export type SettingsSubview = "theme" | "plugins";
+export type SettingsSubview = "theme" | "terminal" | "plugins";
 
 const props = withDefaults(
   defineProps<{
@@ -59,11 +60,11 @@ const emit = defineEmits<{
 }>();
 
 const titles: Record<string, string> = {
-  sessions: "会话",
+  sessions: "连接",
   files: "文件浏览",
   keys: "SSH 密钥",
   tools: "快速命令与触发器",
-  settings: "主题与插件",
+  settings: "设置",
 };
 
 const activeToolSubview = ref<ToolSubview>("quick-commands");
@@ -127,6 +128,7 @@ function resetWidth() {
     </nav>
     <nav v-else-if="active === 'settings'" class="subview-tabs" aria-label="设置面板">
       <button data-testid="settings-theme" :class="{ active: activeSettingsSubview === 'theme' }" @click="activeSettingsSubview = 'theme'">主题</button>
+      <button data-testid="settings-terminal" :class="{ active: activeSettingsSubview === 'terminal' }" @click="activeSettingsSubview = 'terminal'">终端</button>
       <button data-testid="settings-plugins" :class="{ active: activeSettingsSubview === 'plugins' }" @click="activeSettingsSubview = 'plugins'">插件</button>
     </nav>
 
@@ -161,6 +163,10 @@ function resetWidth() {
       />
       <ThemePanel
         v-else-if="active === 'settings' && activeSettingsSubview === 'theme'"
+        embedded
+      />
+      <TerminalSettingsPanel
+        v-else-if="active === 'settings' && activeSettingsSubview === 'terminal'"
         embedded
       />
       <PluginPanel

@@ -96,17 +96,36 @@ defineExpose({
     <!-- 左:logo + 主菜单 -->
     <div class="titlebar-left" data-tauri-drag-region="false">
       <div class="logo">
-        <span class="logo-mark">⌬</span>
+        <!-- 与 src-tauri/icons 同款标记（由 scripts/gen-icons.mjs 光栅化）：
+             圆角底 + 终端提示符 ">" + 光标块。之前这里是文字字形 ⌬，不是 logo 图。 -->
+        <svg class="logo-mark" width="18" height="18" viewBox="0 0 64 64" aria-hidden="true">
+          <defs>
+            <linearGradient id="rshell-logo-gradient" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#4f8ef7" />
+              <stop offset="1" stop-color="#1d4ed8" />
+            </linearGradient>
+          </defs>
+          <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#rshell-logo-gradient)" />
+          <path
+            d="M23 21 L38 32 L23 43"
+            fill="none"
+            stroke="#f8fafc"
+            stroke-width="7"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+          <rect x="41" y="38" width="7" height="12" rx="1.5" fill="#f8fafc" />
+        </svg>
         <span class="logo-text">RShell</span>
       </div>
       <nav class="menus">
         <!-- 会话菜单 -->
         <el-dropdown trigger="click">
-          <span class="menu-item">会话</span>
+          <span class="menu-item">连接</span>
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item @click="emit('new-session')">
-                <span class="mi-icon">＋</span>新建会话
+                <span class="mi-icon">＋</span>新建连接
               </el-dropdown-item>
               <el-dropdown-item @click="store.refresh()">
                 <span class="mi-icon">↻</span>刷新列表
@@ -278,9 +297,8 @@ defineExpose({
   cursor: default;
 }
 .logo-mark {
-  font-size: 18px;
-  color: var(--el-color-primary);
-  line-height: 36px;
+  display: block;
+  flex-shrink: 0;
 }
 .logo-text {
   letter-spacing: 0.5px;
