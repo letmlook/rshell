@@ -98,6 +98,20 @@ function isEntryGone(e: unknown): boolean {
   return msg.includes("enoent") || msg.includes("no such file") || msg.includes("os error 2");
 }
 
+/**
+ * Tauri 的 fs scope 拒绝时，后端原文会指向 capability 文件（"maybe it is not
+ * allowed on the scope for `allow-read-dir` permission in your capability file"），
+ * 这在「目录是用户自己选的」场景下是误导——真实原因是进程重启后运行时 scope
+ * 为空。改写成用户可行动的说法，但不吞掉失败：仍然展示是哪个目录出的问题。
+ */
+function describeLoadError(e: unknown, path: string): string {
+  const raw = String(e);
+  if (/forbidden path|not allowed on the scope|scope/i.test(raw)) {
+    return `无权读取 ${path}：该目录尚未授权。请点击上方「本地：… · 更换」重新选择。`;
+  }
+  return raw;
+}
+
 async function load(path: string, pushHistory = true) {
   loading.value = true;
   errorText.value = null;
@@ -146,7 +160,7 @@ async function load(path: string, pushHistory = true) {
       historyIndex.value = history.value.length - 1;
     }
   } catch (e) {
-    errorText.value = String(e);
+    errorText.value = describeLoadError(e, path);
     entries.value = [];
   } finally {
     loading.value = false;

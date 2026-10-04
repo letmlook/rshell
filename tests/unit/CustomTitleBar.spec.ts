@@ -128,9 +128,15 @@ afterEach(() => { while (cleanups.length) cleanups.pop()!(); });
 function installNativeDrag() {
   const source = readFileSync(join(tauriRoot!, "src/window/scripts/drag.js"), "utf8");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"))["core:window"];
-  const permissions = capability.permissions.flatMap(permission => permission === "core:window:default"
+  // capability.permissions 里同时存在字符串权限与对象型 scope 条目
+  // （如 `{"identifier":"fs:scope","allow":["**"]}`）；这里只关心 core:window
+  // 的字符串权限，先滤掉非字符串项以免把对象当字符串处理。
+  const windowPermissions = capability.permissions.filter(
+    (permission): permission is string => typeof permission === "string" && permission.startsWith("core:window:"),
+  );
+  const permissions = windowPermissions.flatMap(permission => permission === "core:window:default"
     ? manifest.default_permission.permissions as string[]
-    : permission.startsWith("core:window:") ? [permission.slice("core:window:".length)] : []);
+    : [permission.slice("core:window:".length)]);
   const allowed = new Set<string>(permissions.flatMap(permission => manifest.permissions[permission]?.commands.allow ?? []));
   const commands: string[] = [];
   const denied: string[] = [];

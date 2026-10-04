@@ -90,7 +90,6 @@ async function chooseLocalRoot() {
   saveLastLocalDir(typeof localStorage === "undefined" ? null : localStorage, result);
   emit("local-path", result);
 }
-
 /**
  * 远端默认目录：未显式指定 remotePath 时用登录用户的工作目录，
  * 而不是文件系统根 `/`（根目录对普通用户没有意义，也容易被误当作可写区）。
@@ -108,9 +107,10 @@ async function resolveRemoteHome() {
   }
 }
 
-onMounted(() => {
-  // 恢复上次打开的本地目录；记录已失效（目录被删/改名）时由 FileBrowserPane
-  // 的错误行显示真实原因，用户可点「更换」重新选择，不静默清空。
+onMounted(async () => {
+  // 恢复上次打开的本地目录。capability 声明了全局 fs scope（`fs:scope` allow
+  // `**`），任意目录都可读，无需再逐个授权；目录若已失效，错误由
+  // FileBrowserPane 的错误行显示真实原因，用户可点「更换」重新选择。
   const remembered = loadLastLocalDir(typeof localStorage === "undefined" ? null : localStorage);
   if (remembered && !localRoot.value) {
     localRoot.value = remembered;

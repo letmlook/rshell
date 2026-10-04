@@ -17,8 +17,16 @@
     "core:window:allow-is-maximized",
     "core:webview:default",
     "core:app:default",
-    "fs:allow-read-dir",
-    "fs:allow-stat",
+
+    "fs:read-all",
+    "fs:write-all",
+    {
+      "identifier": "fs:scope",
+      "allow": ["**"]
+    },
+    "fs:deny-webview-data-windows",
+    "fs:deny-webview-data-linux",
+
     "dialog:allow-open",
     "dialog:allow-message"
   ]

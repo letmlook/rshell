@@ -29,6 +29,14 @@ SSH 密钥管理面板提供生成、导入、删除与列表展示，当前仅�
 
 本地目录记忆上次打开位置：存 `localStorage`（纯 UI 偏好，无跨进程/跨设备一致性要求），仅接受绝对路径并归一化尾部分隔符，存储不可用时降级为「不记忆」且不抛错。记忆的目录若已失效，错误由面板错误行显示真实原因，用户可点「更换」重新选择，不静默清空。
 
+### 本地文件系统权限（全局读写）
+
+Tauri 的 fs scope 分「命令权限」与「路径 scope」两层。此前 capability 只声明了 `fs:allow-read-dir` / `fs:allow-stat` 且**没有任何路径 scope**，而 scope 是运行时状态：`tauri-plugin-dialog` 只在用户点选目录时自动 `allow_directory`，进程重启后即为空。后果是「上次打开的目录」从 localStorage 恢复时没有经过对话框，读取被拒（`forbidden path: ...`，该提示仅在 debug 构建出现，release 返回 `PathForbidden`）。
+
+按产品决定改为**默认全局可读可写**：capability 声明 `fs:read-all` + `fs:write-all`，并加一条 `{ "identifier": "fs:scope", "allow": ["**"] }` 覆盖全部路径。`deny` 优先于 `allow`（tauri 先判 `is_forbidden`），因此同时保留 `fs:deny-webview-data-windows` / `-linux`，WebView 自身数据目录仍不可读写。
+
+风险边界（如实记录）：授予的是应用自身 WebView 的权限，`fs:write-all` 包含 `mkdir`/`create`/`copy_file`/`remove`/`rename`/`truncate`/`write*`，即 WebView 可创建、覆盖、**删除和重命名**进程权限范围内的任意文件。本应用以自己的进程权限运行，该范围与 Xftp/WinSCP 等同类工具一致。`tests/unit/capabilityScope.spec.ts` 锁定三项：存在 `**` scope、读写权限未被收窄、WebView 数据目录仍在 deny 列表。
+
 终端复制粘贴快捷键为 `Ctrl+Shift+C` / `Ctrl+Shift+V`（macOS 另接受 `Cmd`），经既有的 `rshell:terminal-action` 路由到当前激活终端。裸 `Ctrl+C`（SIGINT）与 `Ctrl+V`（quoted-insert）不劫持，原样透传给远端。无选中内容或剪贴板为空时给出可见提示，剪贴板不可用时提示失败原因，不静默吞掉。
 
 SFTP 下载方向改为并发区间读取。根因是 `russh-sftp` 的 `File::poll_read` 只有一个在途 READ 槽，串行读取的吞吐上限为 `CHUNK_SIZE / RTT`；上传方向用 `write_nowait` 本就支持 `max_concurrent_writes` 路并发，因此下载长期明显慢于上传。现按 64 KiB 切分连续不重叠区间，最多 8 个 READ 同时在途，写入侧仍严格按 offset 升序串行，落盘内容与串行版本逐字节一致；小于 128 KiB 的文件退回串行以省掉多句柄开销。并发区间共用一个**远端句柄池**（整个传输只开 8 次句柄）——逐区间 `open` 会把 OPEN/CLOSE 放大到每 64 KiB 一对，1 GiB 文件就是 16384 次 OPEN + 16384 次 CLOSE，协议消息数是数据量的 3 倍；池空时退回现开一个，保证任务被中止丢句柄后读取不会永久阻塞。区间划分的连续/不重叠/完整覆盖由纯函数 `plan_ranges` 的测试锁定，句柄池的借还不泄漏/不超发/并发互异另有测试，错序完成、进度单调性、取消中止与源变短报错均有测试覆盖。**真实服务器上的实际吞吐提升倍数未验证**，局域网与跨网的对比数据待补。
