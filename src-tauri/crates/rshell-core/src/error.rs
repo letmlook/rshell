@@ -23,4 +23,10 @@ pub enum CoreError {
     /// 写磁盘失败必须阻断 create/update/delete,避免出现"内存有但磁盘无"的分裂状态。
     #[error("Storage error: {0}")]
     StorageError(String),
+    /// 传输目标已存在且策略为 Fail：前端据此弹出「覆盖 / 重命名 / 取消」对话框。
+    ///
+    /// 单独成变体而非复用 `InvalidState`，是为了让 IPC 的 `kind` 成为稳定的
+    /// 机器可读判别串——前端按 `kind == "target_exists"` 分支，不解析 message。
+    #[error("Transfer target already exists: {0}")]
+    TargetExists(String),
 }

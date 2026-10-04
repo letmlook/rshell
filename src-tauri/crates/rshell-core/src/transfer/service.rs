@@ -8,7 +8,7 @@ use crate::event_bus::EventBus;
 use crate::session::service::validate_remote_mutation_path;
 use crate::session::service::SshClientHandle;
 use rshell_api::types::{
-    TransferDirection as ApiTransferDirection, TransferTaskInfo,
+    ConflictPolicy, TransferDirection as ApiTransferDirection, TransferTaskInfo,
     TransferTaskState as ApiTransferTaskState,
 };
 use rshell_api::AppEvent;
@@ -88,6 +88,9 @@ pub struct TransferTask {
     pub speed_bps: f64,
     /// 进入终态的时间：终态任务限量清理时据此保留最近 `MAX_FINISHED_TASKS` 条
     pub finished_at: Option<std::time::Instant>,
+    /// 目标已存在时的策略。上传在 SFTP `create` 之前强制执行（防竞态覆盖），
+    /// 下载在入队时用本地文件系统检查（无需额外往返）。
+    pub conflict: ConflictPolicy,
 }
 
 impl TransferTask {
@@ -227,6 +230,93 @@ impl Drop for TransferCleanupGuard {
     }
 }
 
+/// 冲突标记前缀：写入 `error_message`，前端据此在队列行上提供「覆盖/重命名」。
+/// 固定字符串而非整句文案解析——文案会随语言/版本变化。
+pub const TRANSFER_CONFLICT_PREFIX: &str = "target_exists: ";
+
+/// 传输错误里若含冲突标记则取出目标路径
+fn conflict_target(error: &str) -> Option<String> {
+    error
+        .strip_prefix(TRANSFER_CONFLICT_PREFIX)
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// 把协议层错误转成可展示的文案；冲突统一加上标记前缀。
+///
+/// `ProtocolError::TransferConflict(path)` 的 Display 形如
+/// `Transfer target already exists: /path`，这里剥出裸路径供前端定位。
+fn describe_transfer_error(e: &str) -> String {
+    match e.strip_prefix("Transfer target already exists: ") {
+        Some(path) if !path.is_empty() => format!("{TRANSFER_CONFLICT_PREFIX}{path}"),
+        _ => e.to_string(),
+    }
+}
+
+/// 由「所在目录 + 新文件名」拼出目标路径。
+///
+/// 拒绝含分隔符、`.`/`..`、空白的名字——否则「重命名」会成为任意路径写入的
+/// 旁路，绕过 `validate_remote_mutation_path` 的越界检查。
+pub fn sibling_path(base: &str, name: &str) -> Result<String, CoreError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.trim().is_empty()
+    {
+        return Err(CoreError::InvalidState(format!("Unsafe file name: {name}")));
+    }
+    let dir = match base.rfind('/') {
+        // 命中 0 表示 "/name"，父目录就是根
+        Some(0) => "/".to_string(),
+        Some(i) => base[..i].to_string(),
+        None => {
+            return Err(CoreError::InvalidState(format!(
+                "Base path has no parent: {base}"
+            )))
+        }
+    };
+    if dir == "/" {
+        Ok(format!("/{name}"))
+    } else {
+        Ok(format!("{dir}/{name}"))
+    }
+}
+
+/// 本地下载目标解析：语义与远端版一致。
+///
+/// `Overwrite` 直接沿用原路径——`tokio::fs::File::create` 本身会截断既有文件。
+pub fn resolve_local_target(
+    target: &std::path::Path,
+    conflict: &ConflictPolicy,
+) -> Result<PathBuf, CoreError> {
+    if !target.exists() || matches!(conflict, ConflictPolicy::Overwrite) {
+        return Ok(target.to_path_buf());
+    }
+    match conflict {
+        ConflictPolicy::Overwrite => Ok(target.to_path_buf()),
+        ConflictPolicy::Fail => Err(CoreError::TargetExists(format!(
+            "本地已存在同名文件：{}",
+            target.display()
+        ))),
+        ConflictPolicy::Rename(name) => {
+            if name.is_empty() || name == "." || name == ".." {
+                return Err(CoreError::InvalidState(format!("Unsafe file name: {name}")));
+            }
+            let renamed = target.with_file_name(name);
+            if renamed.exists() {
+                return Err(CoreError::TargetExists(format!(
+                    "重命名目标也已存在：{}",
+                    renamed.display()
+                )));
+            }
+            Ok(renamed)
+        }
+    }
+}
+
 /// 文件传输服务
 pub struct TransferService {
     /// 传输任务队列
@@ -260,12 +350,33 @@ impl TransferService {
         *p = Some(provider);
     }
 
+    /// 上传目标解析：只做纯路径计算，**不做存在性探测**。
+    ///
+    /// 探测需要开 SFTP 通道，会消耗 SSH provider 并打乱「provider 被调用时任务
+    /// 已在表内且可控」这一已被 R2-01/R2-02 测试锁定的时序。改为由前端用已加载的
+    /// 目录列表检测（体验即时），后端在 SFTP `create` 时强制（防 TOCTOU 竞态）。
+    fn resolve_upload_target(remote: &str, conflict: &ConflictPolicy) -> Result<String, CoreError> {
+        match conflict {
+            ConflictPolicy::Overwrite => Ok(remote.to_string()),
+            ConflictPolicy::Fail => Ok(remote.to_string()),
+            ConflictPolicy::Rename(name) => {
+                let renamed = sibling_path(remote, name)?;
+                validate_remote_mutation_path(&renamed)?;
+                Ok(renamed)
+            }
+        }
+    }
+
     /// 添加上传任务并启动传输
+    ///
+    /// `conflict` 决定目标已存在时的行为。策略在**入队时**强制执行：即使前端
+    /// 未先做存在性检查（TOCTOU），也不会出现静默覆盖。
     pub async fn enqueue_upload(
         &self,
         local: PathBuf,
         remote: String,
         session_id: Uuid,
+        conflict: ConflictPolicy,
     ) -> Result<Uuid, CoreError> {
         validate_remote_mutation_path(&remote)?;
         if !local.is_absolute()
@@ -278,6 +389,7 @@ impl TransferService {
                 "Upload source must be an existing regular local file".into(),
             ));
         }
+        let remote = Self::resolve_upload_target(&remote, &conflict)?;
         let task_id = Uuid::new_v4();
 
         let task = TransferTask {
@@ -295,6 +407,7 @@ impl TransferService {
             last_bytes: 0,
             speed_bps: 0.0,
             finished_at: None,
+            conflict: conflict.clone(),
         };
 
         {
@@ -312,16 +425,19 @@ impl TransferService {
     }
 
     /// 添加下载任务并启动传输
+    ///
+    /// `conflict` 决定本地目标已存在时的行为，语义同 [`Self::enqueue_upload`]。
     pub async fn enqueue_download(
         &self,
         remote: String,
         local: PathBuf,
         session_id: Uuid,
+        conflict: ConflictPolicy,
     ) -> Result<Uuid, CoreError> {
         validate_remote_mutation_path(&remote)?;
-        if !local.is_absolute() || local.file_name().is_none() || local.exists() {
+        if !local.is_absolute() || local.file_name().is_none() {
             return Err(CoreError::InvalidState(
-                "Download target must be a new absolute local file".into(),
+                "Download target must be an absolute local file".into(),
             ));
         }
         if !local.parent().is_some_and(|p| p.is_dir()) {
@@ -329,6 +445,7 @@ impl TransferService {
                 "Download target directory does not exist".into(),
             ));
         }
+        let local = resolve_local_target(&local, &conflict)?;
         let task_id = Uuid::new_v4();
 
         let task = TransferTask {
@@ -346,6 +463,7 @@ impl TransferService {
             last_bytes: 0,
             speed_bps: 0.0,
             finished_at: None,
+            conflict: conflict.clone(),
         };
 
         {
@@ -509,6 +627,7 @@ impl TransferService {
                         sftp.upload(
                             &task.local_path,
                             &task.remote_path,
+                            matches!(task.conflict, ConflictPolicy::Overwrite),
                             &mut control_rx,
                             &mut progress,
                         )
@@ -588,11 +707,21 @@ impl TransferService {
                         event_bus.publish(AppEvent::TransferQueueChanged);
                     } else {
                         t.state = TransferTaskState::Failed;
-                        t.error_message = Some(e.clone());
                         t.finished_at = Some(std::time::Instant::now());
+                        // 冲突用固定前缀标记，前端据此在队列行上提供「覆盖/重命名」
+                        // 入口（重新入队时带上对应策略）。不用解析整句错误文案。
+                        if let Some(path) = conflict_target(&describe_transfer_error(&e)) {
+                            t.error_message = Some(format!("{TRANSFER_CONFLICT_PREFIX}{path}"));
+                            event_bus.publish(AppEvent::TransferConflict {
+                                task_id,
+                                path: path.clone(),
+                            });
+                        } else {
+                            t.error_message = Some(e.clone());
+                        }
                         event_bus.publish(AppEvent::TransferFailed {
                             task_id,
-                            error: e.clone(),
+                            error: t.error_message.clone().unwrap_or_default(),
                         });
                         event_bus.publish(AppEvent::TransferQueueChanged);
                         warn!(task_id = %task_id, error = %e, "Transfer failed");
@@ -874,6 +1003,7 @@ mod tests {
                 PathBuf::from("/definitely/missing/rshell-file"),
                 "/remote/file".into(),
                 Uuid::new_v4(),
+                ConflictPolicy::Fail,
             )
             .await
             .unwrap_err();
@@ -882,22 +1012,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_download_rejects_root_and_existing_target() {
+    async fn enqueue_download_rejects_root_and_reports_existing_target() {
         let service = make_service();
         let folder = tempfile::tempdir().unwrap();
         let target = folder.path().join("file");
         assert!(matches!(
             service
-                .enqueue_download("/".into(), target.clone(), Uuid::new_v4())
+                .enqueue_download(
+                    "/".into(),
+                    target.clone(),
+                    Uuid::new_v4(),
+                    ConflictPolicy::Fail
+                )
                 .await,
             Err(CoreError::InvalidState(_))
         ));
         std::fs::write(&target, b"keep").unwrap();
+        // 目标已存在时不再是无差别 InvalidState，而是专门的 TargetExists：
+        // 前端据此弹「覆盖 / 重命名 / 取消」，不会静默覆盖既有文件。
         assert!(matches!(
             service
-                .enqueue_download("/remote/file".into(), target.clone(), Uuid::new_v4())
+                .enqueue_download(
+                    "/remote/file".into(),
+                    target.clone(),
+                    Uuid::new_v4(),
+                    ConflictPolicy::Fail
+                )
                 .await,
-            Err(CoreError::InvalidState(_))
+            Err(CoreError::TargetExists(_))
         ));
         assert_eq!(std::fs::read(target).unwrap(), b"keep");
         assert!(service.list_tasks().await.is_empty());
@@ -919,6 +1061,7 @@ mod tests {
             last_bytes: 0,
             speed_bps: 0.0,
             finished_at: None,
+            conflict: ConflictPolicy::Fail,
         }
     }
 
@@ -1014,6 +1157,66 @@ mod tests {
             !seen.lock().unwrap().is_empty(),
             "移除条目后必须广播 TransferQueueChanged 让前端刷新"
         );
+    }
+
+    // ── 覆盖冲突策略 ──
+    #[test]
+    fn sibling_path_keeps_directory_and_rejects_escaping_names() {
+        assert_eq!(
+            sibling_path("/home/u/a.txt", "b.txt").unwrap(),
+            "/home/u/b.txt"
+        );
+        assert_eq!(sibling_path("/a.txt", "b.txt").unwrap(), "/b.txt");
+        // 名字含分隔符必须被拒——否则「重命名」会成为任意路径写入的旁路
+        for bad in ["", ".", "..", "a/b", "a\\b", "   ", "a\0b"] {
+            assert!(
+                sibling_path("/home/u/a.txt", bad).is_err(),
+                "name={bad:?} 应被拒绝"
+            );
+        }
+        // 没有父目录的裸名无法推导目录
+        assert!(sibling_path("bare.txt", "b.txt").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_local_target_reports_existing_and_honours_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("a.txt");
+        std::fs::write(&existing, b"old").unwrap();
+
+        // Fail：已存在即报错，供前端弹覆盖/重命名对话框
+        let err = resolve_local_target(&existing, &ConflictPolicy::Fail).unwrap_err();
+        assert!(matches!(err, CoreError::TargetExists(_)), "实际: {err:?}");
+
+        // Overwrite：沿用原路径（后续 File::create 会截断）
+        assert_eq!(
+            resolve_local_target(&existing, &ConflictPolicy::Overwrite).unwrap(),
+            existing
+        );
+
+        // Rename：产出同目录下的新名，且必须尚不存在
+        let renamed =
+            resolve_local_target(&existing, &ConflictPolicy::Rename("b.txt".into())).unwrap();
+        assert_eq!(renamed, dir.path().join("b.txt"));
+        // 新名也被占用时必须报错，否则「重命名」退化为又一次静默覆盖
+        std::fs::write(&renamed, b"x").unwrap();
+        assert!(matches!(
+            resolve_local_target(&existing, &ConflictPolicy::Rename("b.txt".into())).unwrap_err(),
+            CoreError::TargetExists(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_local_target_passes_through_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("new.txt");
+        for policy in [
+            ConflictPolicy::Fail,
+            ConflictPolicy::Overwrite,
+            ConflictPolicy::Rename("other.txt".into()),
+        ] {
+            assert_eq!(resolve_local_target(&fresh, &policy).unwrap(), fresh);
+        }
     }
 
     #[tokio::test]
@@ -1608,6 +1811,7 @@ mod tests {
             last_bytes: 0,
             speed_bps: 0.0,
             finished_at: None,
+            conflict: ConflictPolicy::Fail,
         };
         assert!((task.progress() - 0.5).abs() < f64::EPSILON);
 
@@ -1627,6 +1831,7 @@ mod tests {
             last_bytes: 0,
             speed_bps: 0.0,
             finished_at: None,
+            conflict: ConflictPolicy::Fail,
         };
         assert_eq!(zero.progress(), 0.0);
     }
@@ -1859,8 +2064,13 @@ mod tests {
         let enqueue = {
             let svc = svc.clone();
             tokio::spawn(async move {
-                svc.enqueue_upload(local, "/remote/file".into(), Uuid::new_v4())
-                    .await
+                svc.enqueue_upload(
+                    local,
+                    "/remote/file".into(),
+                    Uuid::new_v4(),
+                    ConflictPolicy::Fail,
+                )
+                .await
             })
         };
         // provider 已被调用 ⇒ 任务已置 Transferring、正卡在 await 窗口内

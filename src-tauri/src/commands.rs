@@ -18,8 +18,8 @@
 //! - `send_input` / `resize_terminal` / `attach_terminal`
 
 use rshell_api::types::{
-    ComposeTarget, CredentialUpdate, PluginInfo, RemoteFileEntry, SessionConfig, SessionCredential,
-    SessionLoadIssue, TerminalColorScheme, TransferTaskInfo,
+    ComposeTarget, ConflictPolicy, CredentialUpdate, PluginInfo, RemoteFileEntry, SessionConfig,
+    SessionCredential, SessionLoadIssue, TerminalColorScheme, TransferTaskInfo,
 };
 use rshell_api::{AppCommand, CommandOutcome};
 use tauri::ipc::Channel;
@@ -233,6 +233,7 @@ pub async fn enqueue_upload(
     local: String,
     remote: String,
     session_id: Uuid,
+    conflict: Option<ConflictPolicy>,
     state: State<'_, AppState>,
 ) -> Result<(), IpcError> {
     state
@@ -241,6 +242,7 @@ pub async fn enqueue_upload(
             local: std::path::PathBuf::from(local),
             remote,
             session_id,
+            conflict: conflict.unwrap_or_default(),
         })
         .await
         .map_err(IpcError::from)?;
@@ -252,6 +254,7 @@ pub async fn enqueue_download(
     remote: String,
     local: String,
     session_id: Uuid,
+    conflict: Option<ConflictPolicy>,
     state: State<'_, AppState>,
 ) -> Result<(), IpcError> {
     state
@@ -260,6 +263,7 @@ pub async fn enqueue_download(
             remote,
             local: std::path::PathBuf::from(local),
             session_id,
+            conflict: conflict.unwrap_or_default(),
         })
         .await
         .map_err(IpcError::from)?;

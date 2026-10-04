@@ -132,7 +132,9 @@ async fn bench_sftp_upload_and_download() {
     let (_ctl_tx, mut ctl_rx) = watch::channel(TransferControl::Run);
     let up_start = Instant::now();
     let uploaded = sftp
-        .upload(&local_src, &remote_path, &mut ctl_rx, &mut |_, _| {})
+        // conflict_overwrite = false：基准路径下远端不应有同名文件，
+        // 若有则报冲突而不是悄悄覆盖——这正是要测的语义。
+        .upload(&local_src, &remote_path, false, &mut ctl_rx, &mut |_, _| {})
         .await
         .expect("上传失败");
     let up_secs = up_start.elapsed().as_secs_f64();

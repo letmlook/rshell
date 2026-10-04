@@ -6,6 +6,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppCommand,
+  ConflictPolicy,
   ConnectionState,
   PathBuf,
   PortForwardRule,
@@ -151,11 +152,11 @@ export interface ThemeInfo {
 
 // ===== 文件传输 =====
 
-export const enqueueUpload = (local: PathBuf, remote: string, session_id: Uuid) =>
-  call({ EnqueueUpload: { local, remote, session_id } });
+export const enqueueUpload = (local: PathBuf, remote: string, session_id: Uuid, conflict?: ConflictPolicy) =>
+  call({ EnqueueUpload: { local, remote, session_id, conflict: conflict ?? "Fail" } });
 
-export const enqueueDownload = (remote: string, local: PathBuf, session_id: Uuid) =>
-  call({ EnqueueDownload: { remote, local, session_id } });
+export const enqueueDownload = (remote: string, local: PathBuf, session_id: Uuid, conflict?: ConflictPolicy) =>
+  call({ EnqueueDownload: { remote, local, session_id, conflict: conflict ?? "Fail" } });
 
 export const pauseTransfer = (task_id: Uuid) => call({ PauseTransfer: { task_id } });
 export const resumeTransfer = (task_id: Uuid) => call({ ResumeTransfer: { task_id } });

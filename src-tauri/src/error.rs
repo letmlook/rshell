@@ -24,6 +24,8 @@ pub enum IpcErrorKind {
     OutcomeMismatch,
     Internal,
     Storage,
+    /// 传输目标已存在；前端弹覆盖/重命名对话框后用对应策略重试。
+    TargetExists,
 }
 
 impl IpcErrorKind {
@@ -38,6 +40,7 @@ impl IpcErrorKind {
             Self::OutcomeMismatch => "outcome_mismatch",
             Self::Internal => "internal",
             Self::Storage => "storage",
+            Self::TargetExists => "target_exists",
         }
     }
 }
@@ -86,6 +89,7 @@ impl From<CoreError> for IpcError {
             }
             CoreError::ConnectionError(_) => (IpcErrorKind::Connection, err.to_string()),
             CoreError::StorageError(_) => (IpcErrorKind::Storage, err.to_string()),
+            CoreError::TargetExists(_) => (IpcErrorKind::TargetExists, err.to_string()),
             CoreError::InvalidState(_) => (IpcErrorKind::Internal, err.to_string()),
             CoreError::ServiceError(_) | CoreError::Internal(_) => {
                 (IpcErrorKind::Internal, err.to_string())

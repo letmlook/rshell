@@ -240,6 +240,7 @@ impl SftpClient {
         &self,
         local: &PathBuf,
         remote: &str,
+        conflict_overwrite: bool,
         control: &mut watch::Receiver<TransferControl>,
         mut progress: F,
     ) -> Result<u64, ProtocolError>
@@ -247,6 +248,12 @@ impl SftpClient {
         F: FnMut(u64, u64),
     {
         info!(local = %local.display(), remote = %remote, "Uploading file");
+
+        // 覆盖策略：先探测再 create。若在 create 之后才判断，Truncate 标志
+        // 已经把既有文件清空了——那时报冲突也来不及。
+        if !conflict_overwrite && self.exists(remote).await {
+            return Err(ProtocolError::TransferConflict(remote.to_string()));
+        }
 
         let total = tokio::fs::metadata(local)
             .await
@@ -424,6 +431,14 @@ impl SftpClient {
             Ok(dir) if !dir.trim().is_empty() => Ok(dir),
             Ok(_) | Err(_) => Ok("/".to_string()),
         }
+    }
+
+    /// 远端路径是否已存在。用于传输前的覆盖冲突判定。
+    ///
+    /// 只区分「存在 / 不存在」：stat 的其他失败（权限、无权限进入父目录等）
+    /// 一律当作**存在**，宁可让用户在对话框里看到「已存在」也不静默覆盖。
+    pub async fn exists(&self, path: &str) -> bool {
+        self.session.metadata(path).await.is_ok()
     }
 
     /// 删除远程文件

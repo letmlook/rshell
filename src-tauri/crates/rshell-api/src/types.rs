@@ -116,6 +116,29 @@ pub enum FileType {
     Other,
 }
 
+/// 传输目标已存在时的处理策略。
+///
+/// `Fail` 是安全默认：入队即返回 `CoreError::TargetExists`，前端弹出
+/// 「覆盖 / 重命名 / 取消」对话框，再用用户选定的策略重试一次。
+/// 后端在**入队时**强制执行该策略，因此前端先查后传存在 TOCTOU 竞态也不会
+/// 绕过保护——不允许出现「界面问过了就静默覆盖」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictPolicy {
+    /// 目标已存在即报错
+    Fail,
+    /// 覆盖已有目标
+    Overwrite,
+    /// 改用指定的新文件名（仅文件名，不含分隔符），原文件名保留
+    Rename(String),
+}
+
+impl Default for ConflictPolicy {
+    /// 省略 `conflict` 字段时按 `Fail` 处理：安全默认，不静默覆盖。
+    fn default() -> Self {
+        Self::Fail
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferTaskInfo {
     pub id: Uuid,

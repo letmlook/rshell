@@ -31,6 +31,8 @@ const props = defineProps<{
   sessionId?: Uuid;
   path: string;
   rootPath?: string;
+  /** 本地模式：已授权的根目录，用于在路径栏上显示「更换」入口 */
+  rootLabel?: string;
   /** 是否参与同步浏览(被反向 navigate) */
   externallyNavigated?: boolean;
 }>();
@@ -40,6 +42,8 @@ const emit = defineEmits<{
   (e: "open-file", entry: FsEntry): void;
   (e: "selection-change", entries: FsEntry[]): void;
   (e: "request-sync", path: string): void;
+  /** 请求打开本地目录选择器（仅本地模式） */
+  (e: "choose-root"): void;
   /**
    * 右键菜单请求。`entries` 为右键时的操作目标：点在已选行上时是整个当前选中集，
    * 点在未选行上时是那单独一行；点在列表空白处时为空数组（只给面板级操作）。
@@ -59,9 +63,36 @@ const canBack = computed(() => historyIndex.value > 0);
 const canForward = computed(() => historyIndex.value < history.value.length - 1);
 const visibleEntries = computed(() => entries.value.filter((entry) => entry.name.toLowerCase().includes(search.value.toLowerCase())));
 
+/** 根目录是否已授权（本地模式）。未授权时路径栏显示「选择文件夹」入口 */
+const hasRoot = computed(() => props.mode !== "local" || !!props.rootPath);
+
+const parentPath = computed<string | null>(() => {
+  if (props.mode === "local" && props.rootPath && props.path === props.rootPath) return null;
+  // 本地可能是 Windows 路径（D:\data），远端是 POSIX（/home/x）——两种分隔符都要认
+  const idx = Math.max(props.path.lastIndexOf("/"), props.path.lastIndexOf("\\"));
+  if (idx < 0) return null;
+  if (idx === 0) return props.path.startsWith("\\") ? "\\" : "/";
+  return props.path.slice(0, idx);
+});
+
+/**
+ * 面包屑分段。返回每段的显示文本与「点击后导航到的绝对路径」。
+ *
+ * 本地 Windows 路径要保留盘符（`D:`），不能按 `/` 简单 split——否则
+ * `D:\data` 会被显示成一个不可点的整段。
+ */
 const breadcrumb = computed(() => {
-  const parts = props.path.split(/[\\/]/).filter(Boolean);
-  return parts;
+  const isWin = props.path.includes("\\") || /^[A-Za-z]:/.test(props.path);
+  const sep = isWin ? "\\" : "/";
+  const parts = props.path.split(sep).filter(Boolean);
+  if (isWin && /^[A-Za-z]:$/.test(parts[0] ?? "")) {
+    const drive = parts.shift() as string;
+    return [{ label: `${drive}${sep}`, path: `${drive}${sep}` }, ...parts.map((seg, i) => ({
+      label: seg,
+      path: `${drive}${sep}${parts.slice(0, i + 1).join(sep)}`,
+    }))];
+  }
+  return parts.map((seg, i) => ({ label: seg, path: `/${parts.slice(0, i + 1).join("/")}` }));
 });
 
 function fmtSize(n: number): string {
@@ -198,11 +229,8 @@ function goForward() {
 }
 
 function goUp() {
-  if (props.mode === "local" && props.rootPath && props.path === props.rootPath) return;
-  const parts = props.path.split("/").filter(Boolean);
-  parts.pop();
-  const parent = "/" + parts.join("/");
-  if (props.mode === "local" && props.rootPath && parent !== props.rootPath && !parent.startsWith(`${props.rootPath}/`)) return;
+  const parent = parentPath.value;
+  if (!parent) return;
   navigateTo(parent);
 }
 
@@ -291,7 +319,13 @@ watch(
       <button class="path-btn" :disabled="!canForward" title="前进" @click="goForward">
         <svg width="12" height="12" viewBox="0 0 16 16"><path d="M6 3 L11 8 L6 13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
-      <button class="path-btn" title="上级目录" @click="goUp">
+      <button
+        class="path-btn"
+        :disabled="!parentPath"
+        title="上级目录"
+        data-test="fs-up"
+        @click="goUp"
+      >
         <svg width="12" height="12" viewBox="0 0 16 16"><path d="M3 8 H13 M8 3 V13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
       </button>
       <div class="breadcrumb" :title="path">
@@ -299,13 +333,26 @@ watch(
           v-for="(seg, i) in breadcrumb"
           :key="i"
           class="seg"
-          @click="navigateTo('/' + breadcrumb.slice(0, i + 1).join('/'))"
+          :data-test="`fs-crumb-${i}`"
+          @click="navigateTo(seg.path)"
         >
-          {{ seg }}
+          {{ seg.label }}
         </span>
       </div>
       <button class="path-btn" title="刷新" @click="load(path, false)">
         <svg width="12" height="12" viewBox="0 0 16 16"><path d="M13 8 A5 5 0 1 1 11.5 4.2 M11.5 2.5 V5 H9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      </button>
+      <button
+        v-if="mode === 'local'"
+        class="path-btn choose-btn"
+        data-test="fs-choose-root"
+        :title="hasRoot ? '更换本地目录' : '选择本地目录'"
+        :aria-label="hasRoot ? '更换本地目录' : '选择本地目录'"
+        @click="emit('choose-root')"
+      >
+        <svg width="12" height="12" viewBox="0 0 16 16">
+          <path d="M1.5 12.5 V4 H6 L7.5 5.5 H14.5 V12.5 Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+        </svg>
       </button>
       <el-input
         v-model="search"
@@ -405,6 +452,10 @@ watch(
   color: var(--rs-fg);
 }
 .path-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* 「选择/更换本地目录」入口：与刷新同级，置于搜索框左侧 */
+.choose-btn { color: var(--rs-accent); }
+.choose-btn:hover:not(:disabled) { color: var(--rs-accent); }
 
 .breadcrumb {
   flex: 1;

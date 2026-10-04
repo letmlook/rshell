@@ -16,7 +16,7 @@ import { open, confirm } from "@tauri-apps/plugin-dialog";
 import { ElMessage } from "element-plus/es/components/message/index.mjs";
 import { ElMessageBox } from "element-plus/es/components/message-box/index.mjs";
 import FileBrowserPane, { type FsEntry } from "./FileBrowserPane.vue";
-import type { Uuid } from "../../ipc/types";
+import type { ConflictPolicy, Uuid } from "../../ipc/types";
 import {
   enqueueUpload,
   enqueueDownload,
@@ -68,6 +68,61 @@ watch(() => props.remotePath, (v) => {
 const validFile = (entries: FsEntry[]) => entries.length === 1 && !entries[0].is_dir && safeName(entries[0].name);
 /** 可传输文件集合：全部为普通文件且名称安全（支持多选批量传输） */
 const transferable = (entries: FsEntry[]) => entries.filter((e) => !e.is_dir && safeName(e.name));
+
+/**
+ * 目标已存在时询问用户：覆盖 / 重命名 / 取消。
+ *
+ * 判定依据是 IPC 错误的 `kind === "target_exists"`（后端在**入队时**强制策略），
+ * 不解析 message。用户在对话框里点「覆盖」之前，不会有任何写入发生。
+ *
+ * 先用 confirm 承载「覆盖 / 取消」；若用户选择取消分支，则再问一次新文件名
+ * （取消改名 = 整体放弃）。对话框关闭与取消是两种语义，故用
+ * distinguishCancelAndClose 区分。
+ */
+async function askConflict(targetLabel: string): Promise<ConflictPolicy | null> {
+  let action: "confirm" | "cancel" | "close";
+  try {
+    await ElMessageBox.confirm(`${targetLabel} 已存在同名文件。要如何处理？`, "目标已存在", {
+      type: "warning",
+      confirmButtonText: "覆盖",
+      cancelButtonText: "重命名…",
+      distinguishCancelAndClose: true,
+    });
+    return "Overwrite";
+  } catch (err) {
+    action = err as "cancel" | "close";
+  }
+  if (action === "close") return null;
+  try {
+    const { value } = await ElMessageBox.prompt("请输入新的文件名", "重命名", {
+      inputValidator: (v: string) =>
+        !!v.trim() && !/[\\/]/.test(v) && v !== "." && v !== ".."
+          ? true
+          : "请输入不含 \\ / 的文件名，且不能是 . 或 ..",
+    });
+    return { Rename: value.trim() };
+  } catch {
+    return null;
+  }
+}
+
+/** 按冲突策略调用入队；遇到 target_exists 弹一次对话框并按用户选择重试一次 */
+async function enqueueWithConflict(
+  targetLabel: string,
+  run: (policy: ConflictPolicy) => Promise<unknown>,
+): Promise<boolean> {
+  try {
+    await run("Fail");
+    return true;
+  } catch (error) {
+    const kind = (error as { kind?: string })?.kind;
+    if (kind !== "target_exists") throw error;
+    const policy = await askConflict(targetLabel);
+    if (!policy) return false;
+    await run(policy);
+    return true;
+  }
+}
 const capabilities = computed(() => ({
   upload: !!props.sessionId && !!props.connected && !!localRoot.value && transferable(selectedLocal.value).length > 0,
   download: !!props.sessionId && !!props.connected && !!localRoot.value && transferable(selectedRemote.value).length > 0,
@@ -166,18 +221,18 @@ async function upload() {
   if (files.length === 0) return;
   // 批量：逐个入队。单条失败不阻断其余文件，失败条目在面板顶部汇总提示。
   const failures: string[] = [];
+  let queued = 0;
   for (const file of files) {
     try {
-      await enqueueUpload(
-        joinPath(internalLocalPath.value, file.name),
-        joinPath(internalRemotePath.value, file.name),
-        props.sessionId,
+      const remote = joinPath(internalRemotePath.value, file.name);
+      const ok = await enqueueWithConflict(`远端 ${remote}`, (policy) =>
+        enqueueUpload(joinPath(internalLocalPath.value, file.name), remote, props.sessionId!, policy),
       );
+      if (ok) queued += 1;
     } catch (error) {
       failures.push(`${file.name}：${String(error)}`);
     }
   }
-  const queued = files.length - failures.length;
   if (queued > 0) emit("upload-queued", queued);
   if (failures.length > 0) {
     ElMessage.error(`上传失败 ${failures.length} 个：${failures.join("；")}`);
@@ -189,18 +244,18 @@ async function download() {
   const files = transferable(selectedRemote.value);
   if (files.length === 0) return;
   const failures: string[] = [];
+  let queued = 0;
   for (const file of files) {
     try {
-      await enqueueDownload(
-        joinPath(internalRemotePath.value, file.name),
-        joinPath(internalLocalPath.value, file.name),
-        props.sessionId,
+      const local = joinPath(internalLocalPath.value, file.name);
+      const ok = await enqueueWithConflict(`本地 ${local}`, (policy) =>
+        enqueueDownload(joinPath(internalRemotePath.value, file.name), local, props.sessionId!, policy),
       );
+      if (ok) queued += 1;
     } catch (error) {
       failures.push(`${file.name}：${String(error)}`);
     }
   }
-  const queued = files.length - failures.length;
   if (queued > 0) emit("download-queued", queued);
   if (failures.length > 0) {
     ElMessage.error(`下载失败 ${failures.length} 个：${failures.join("；")}`);
@@ -319,13 +374,13 @@ const rightWidth = computed(() => `${100 - splitPct.value}%`);
     @mouseleave="endSplitDrag"
   >
     <div class="pane-slot" :style="{ width: leftWidth }">
-      <button v-if="!localRoot" class="choose-root" @click="chooseLocalRoot">选择本地文件夹</button>
-      <button v-else class="choose-root" @click="chooseLocalRoot">本地：{{ localRoot }} · 更换</button>
       <FileBrowserPane
         ref="localPane"
         mode="local"
         :path="internalLocalPath"
         :root-path="localRoot"
+        :root-label="localRoot"
+        @choose-root="chooseLocalRoot"
         @navigate="onLocalNavigate"
         @request-sync="onLocalSyncRequest"
         @selection-change="(s) => selectedLocal = s"

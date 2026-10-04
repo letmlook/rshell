@@ -19,6 +19,15 @@ export type Uuid = string;
 export type PathBuf = string;
 export type Timestamp = string; // ISO 8601 字符串
 
+/**
+ * 传输目标已存在时的处理策略，与后端 `ConflictPolicy` 对应。
+ *
+ * `Fail` 为安全默认：后端在入队时发现同名文件即返回 `target_exists` 错误，
+ * 前端据此弹「覆盖 / 重命名 / 取消」对话框，再用选定策略重试。
+ * 省略该字段等价于 `Fail`。
+ */
+export type ConflictPolicy = "Fail" | "Overwrite" | { Rename: string };
+
 // ===== 会话相关 =====
 
 export interface SessionConfig {
@@ -343,8 +352,8 @@ export type AppCommand =
   | { ResizeTerminal: { session_id: Uuid; cols: number; rows: number } }
   // 切片 2.2 删除（设计 §5）：CopySelection 上移前端 xterm 自持选区
   // 传输
-  | { EnqueueUpload: { local: PathBuf; remote: string; session_id: Uuid } }
-  | { EnqueueDownload: { remote: string; local: PathBuf; session_id: Uuid } }
+  | { EnqueueUpload: { local: PathBuf; remote: string; session_id: Uuid; conflict?: ConflictPolicy } }
+  | { EnqueueDownload: { remote: string; local: PathBuf; session_id: Uuid; conflict?: ConflictPolicy } }
   | { PauseTransfer: { task_id: Uuid } }
   | { ResumeTransfer: { task_id: Uuid } }
   | { CancelTransfer: { task_id: Uuid } }
@@ -448,6 +457,7 @@ export type AppEvent =
     }
   | { TransferCompleted: { task_id: Uuid } }
   | { TransferFailed: { task_id: Uuid; error: string } }
+  | { TransferConflict: { task_id: Uuid; path: string } }
   | "TransferQueueChanged"
   // R2-10（2026-10）：TransferTaskAdded / TransferTaskCompleted / TransferTaskFailed
   // 因后端 0 发布点删除（前端监听 TransferProgress/TransferCompleted/TransferFailed）

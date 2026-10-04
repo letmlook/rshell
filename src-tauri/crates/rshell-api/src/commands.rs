@@ -67,12 +67,18 @@ pub enum AppCommand {
         local: std::path::PathBuf,
         remote: String,
         session_id: Uuid,
+        /// 目标已存在时的策略；省略按 `Fail` 处理
+        #[serde(default)]
+        conflict: crate::types::ConflictPolicy,
     },
     /// 添加下载任务
     EnqueueDownload {
         remote: String,
         local: std::path::PathBuf,
         session_id: Uuid,
+        /// 目标已存在时的策略；省略按 `Fail` 处理
+        #[serde(default)]
+        conflict: crate::types::ConflictPolicy,
     },
     /// 暂停传输
     PauseTransfer {

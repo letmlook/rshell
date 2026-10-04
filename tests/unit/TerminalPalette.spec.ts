@@ -4,17 +4,23 @@ import { createPinia, setActivePinia } from "pinia";
 import TerminalPane from "../../src/components/TerminalPane.vue";
 import { useThemeStore } from "../../src/stores/theme";
 
-const { terminalOptions } = vi.hoisted(() => ({ terminalOptions: [] as Array<{ theme: unknown }> }));
+const { terminalOptions, keyHandlers, sendInputMock } = vi.hoisted(() => ({
+  terminalOptions: [] as Array<{ theme: unknown }>,
+  // 记录 attachCustomKeyEventHandler 收到的回调，供退格键位测试直接调用
+  keyHandlers: [] as Array<(e: KeyboardEvent) => boolean>,
+  sendInputMock: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock("@xterm/xterm", () => ({ Terminal: class {
   cols = 80; rows = 24;
   constructor(public options: { theme: unknown }) { terminalOptions.push(options); }
   loadAddon() {} open() {} onData() {} dispose() {} write() {}
+  attachCustomKeyEventHandler(cb: (e: KeyboardEvent) => boolean) { keyHandlers.push(cb); }
 } }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
 vi.mock("@xterm/addon-search", () => ({ SearchAddon: class { clearDecorations() {} } }));
 vi.mock("@xterm/addon-webgl", () => ({ WebglAddon: class { onContextLoss() {} } }));
 vi.mock("@tauri-apps/api/core", () => ({ Channel: class {}, invoke: vi.fn().mockResolvedValue(undefined) }));
-vi.mock("../../src/ipc/client", () => ({ sendInput: vi.fn(), resizeTerminal: vi.fn(), listThemes: vi.fn(), setAppTheme: vi.fn(), setTerminalColorScheme: vi.fn() }));
+vi.mock("../../src/ipc/client", () => ({ sendInput: sendInputMock, resizeTerminal: vi.fn(), listThemes: vi.fn(), setAppTheme: vi.fn(), setTerminalColorScheme: vi.fn() }));
 vi.mock("../../src/ipc/events", () => ({ subscribeAppEvents: vi.fn() }));
 
 afterEach(() => vi.unstubAllGlobals());
@@ -70,3 +76,33 @@ it("applies routed find/closeFind only to the matching session and ignores raw w
   pane1.unmount();
   pane2.unmount();
 });
+
+  // 退格必须送 \x08 (BS)：xterm.js 默认送 \x7f (DEL)，而远端 shell 的行规程
+  // 多以 \x08 作 erase 字符，收到 \x7f 时屏幕字符不消失（用户报「backspace 无效」）。
+  it("sends BS for Backspace and leaves other keys to xterm", async () => {
+    keyHandlers.length = 0;
+    sendInputMock.mockClear();
+    const wrapper = mount(TerminalPane, { props: { sessionId: "session-1" } });
+    await flushPromises();
+
+    const handler = keyHandlers.at(-1);
+    expect(handler).toBeTypeOf("function");
+
+    const ev = new KeyboardEvent("keydown", { key: "Backspace", cancelable: true });
+    const handled = handler!(ev);
+    expect(handled).toBe(false);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(sendInputMock).toHaveBeenCalledOnce();
+    const bytes = sendInputMock.mock.calls[0][1] as Uint8Array;
+    expect(Array.from(bytes)).toEqual([0x08]);
+
+    // 普通字符键交回 xterm 自行处理
+    const other = new KeyboardEvent("keydown", { key: "a", cancelable: true });
+    expect(handler!(other)).toBe(true);
+    // Ctrl+Backspace 保留 xterm 默认（部分 shell 用 \x7f 删前一个词）
+    const ctrlBack = new KeyboardEvent("keydown", { key: "Backspace", ctrlKey: true, cancelable: true });
+    expect(handler!(ctrlBack)).toBe(true);
+    expect(sendInputMock).toHaveBeenCalledOnce();
+
+    wrapper.unmount();
+  });

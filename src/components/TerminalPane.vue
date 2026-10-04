@@ -210,6 +210,25 @@ onMounted(async () => {
     theme: themeStore.terminalTheme ?? readXtermThemeFromCssVars(),
   });
 
+  // Backspace 映射：xterm.js 默认回车送 \x7f (DEL)。多数远端 shell 的行规程以
+  // \x08 (BS) 作为 erase 字符，收到 \x7f 时屏幕字符不消失——表现为「按退格没反应」。
+  // 这里拦截该键并经与键盘输入相同的 sendInput 通路直送 \x08。
+  // Ctrl+Backspace 保留 xterm 默认的 \x7f（部分 shell 用它删除前一个词）。
+  term.attachCustomKeyEventHandler((event) => {
+    if (event.type !== "keydown") return true;
+    if (event.key !== "Backspace" || event.ctrlKey || event.metaKey || event.altKey) {
+      return true;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const sid = props.sessionId;
+    if (!sid) return false;
+    sendInput(sid, new TextEncoder().encode("\x08"))
+      .then(() => noteIoSuccess())
+      .catch((e) => noteIoFailure("send_input", e));
+    return false;
+  });
+
   fit = new FitAddon();
   term.loadAddon(fit);
 

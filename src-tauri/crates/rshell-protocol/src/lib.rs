@@ -26,6 +26,10 @@ pub enum ProtocolError {
     Timeout,
     #[error("Transfer cancelled")]
     TransferCancelled,
+    /// 目标已存在且策略为「发现冲突即失败」。在**创建/截断之前**抛出，
+    /// 保证既有文件不被破坏。
+    #[error("Transfer target already exists: {0}")]
+    TransferConflict(String),
 }
 
 /// 连接 trait（所有协议的统一抽象）

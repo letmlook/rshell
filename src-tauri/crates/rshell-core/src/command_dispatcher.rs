@@ -251,9 +251,10 @@ impl CommandDispatcher {
                 local,
                 remote,
                 session_id,
+                conflict,
             } => {
                 self.transfer_service
-                    .enqueue_upload(local, remote, session_id)
+                    .enqueue_upload(local, remote, session_id, conflict)
                     .await?;
                 Ok(CommandOutcome::None)
             }
@@ -261,9 +262,10 @@ impl CommandDispatcher {
                 remote,
                 local,
                 session_id,
+                conflict,
             } => {
                 self.transfer_service
-                    .enqueue_download(remote, local, session_id)
+                    .enqueue_download(remote, local, session_id, conflict)
                     .await?;
                 Ok(CommandOutcome::None)
             }

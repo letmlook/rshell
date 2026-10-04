@@ -68,7 +68,7 @@ describe("TransferWorkspace", () => {
     await flushPromises();
     await (wrapper.vm as unknown as { upload(): Promise<void> }).upload();
     expect(enqueueUpload).toHaveBeenCalledOnce();
-    expect(enqueueUpload).toHaveBeenCalledWith("/Users/test/files/a.txt", "/a.txt", "session-1");
+    expect(enqueueUpload).toHaveBeenCalledWith("/Users/test/files/a.txt", "/a.txt", "session-1", "Fail");
   });
 
   it("does not delete before confirmation or when a directory is selected", async () => {
@@ -98,8 +98,8 @@ describe("TransferWorkspace 批量传输", () => {
     await flushPromises();
     await (wrapper.vm as unknown as { upload(): Promise<void> }).upload();
     expect(enqueueUpload).toHaveBeenCalledTimes(2);
-    expect(enqueueUpload).toHaveBeenCalledWith("/Users/test/files/a.txt", "/a.txt", "session-1");
-    expect(enqueueUpload).toHaveBeenCalledWith("/Users/test/files/b.txt", "/b.txt", "session-1");
+    expect(enqueueUpload).toHaveBeenCalledWith("/Users/test/files/a.txt", "/a.txt", "session-1", "Fail");
+    expect(enqueueUpload).toHaveBeenCalledWith("/Users/test/files/b.txt", "/b.txt", "session-1", "Fail");
   });
 
   // 目录没有可传输的内容，且不安全名称（. / .. / 含分隔符）必须被剔除，
@@ -115,7 +115,7 @@ describe("TransferWorkspace 批量传输", () => {
     await flushPromises();
     await (wrapper.vm as unknown as { upload(): Promise<void> }).upload();
     expect(enqueueUpload).toHaveBeenCalledOnce();
-    expect(enqueueUpload).toHaveBeenCalledWith("/Users/test/files/ok.txt", "/ok.txt", "session-1");
+    expect(enqueueUpload).toHaveBeenCalledWith("/Users/test/files/ok.txt", "/ok.txt", "session-1", "Fail");
   });
 
   it("keeps queueing the rest when one file fails", async () => {
@@ -143,7 +143,7 @@ describe("TransferWorkspace 批量传输", () => {
     await flushPromises();
     await (wrapper.vm as unknown as { download(): Promise<void> }).download();
     expect(enqueueDownload).toHaveBeenCalledTimes(2);
-    expect(enqueueDownload).toHaveBeenCalledWith("/a.txt", "/Users/test/files/a.txt", "session-1");
+    expect(enqueueDownload).toHaveBeenCalledWith("/a.txt", "/Users/test/files/a.txt", "session-1", "Fail");
   });
 });
 

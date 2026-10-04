@@ -46,6 +46,8 @@ pub enum AppEvent {
     TransferCompleted { task_id: Uuid },
     /// 传输失败
     TransferFailed { task_id: Uuid, error: String },
+    /// 传输因目标同名而中止：既有文件未被改动，前端据此提供「覆盖 / 重命名」
+    TransferConflict { task_id: Uuid, path: String },
     /// 传输队列改变
     TransferQueueChanged,
     // R2-10（2026-10）：`TransferTaskAdded` / `TransferTaskCompleted` /
