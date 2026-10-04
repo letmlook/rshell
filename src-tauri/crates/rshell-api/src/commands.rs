@@ -86,6 +86,10 @@ pub enum AppCommand {
     CancelTransfer {
         task_id: Uuid,
     },
+    /// 从传输队列移除条目（仅终态任务；不删除已传输文件）
+    RemoveTransfer {
+        task_id: Uuid,
+    },
     /// 浏览远程目录
     BrowseRemoteDir {
         session_id: Uuid,

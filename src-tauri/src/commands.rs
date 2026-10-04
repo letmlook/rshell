@@ -297,6 +297,16 @@ pub async fn cancel_transfer(task_id: Uuid, state: State<'_, AppState>) -> Resul
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn remove_transfer(task_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::RemoveTransfer { task_id })
+        .await
+        .map_err(IpcError::from)?;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn browse_remote_dir(
     session_id: Uuid,
     path: String,

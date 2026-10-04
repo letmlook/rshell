@@ -175,6 +175,7 @@ pub fn run() {
             commands::pause_transfer,
             commands::resume_transfer,
             commands::cancel_transfer,
+            commands::remove_transfer,
             commands::browse_remote_dir,
             commands::create_remote_directory,
             commands::delete_remote_entry,

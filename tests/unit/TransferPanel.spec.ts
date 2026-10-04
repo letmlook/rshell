@@ -74,3 +74,71 @@ describe("TransferPanel pause/resume controls", () => {
     expect(wrapper.find('[data-test="xfer-action-error"]').text()).toContain("暂停失败");
   });
 });
+
+describe("TransferPanel cancel/remove controls", () => {
+  const cancelledItem: TransferItem = {
+    id: "t-cancelled", name: "cancelled", phase: "cancelled",
+    progress: 0.3, size: 100, local: "/a", remote: "/b", speed: 0,
+  };
+
+  it("shows 取消 for active and paused tasks only", () => {
+    const wrapper = mountPanel();
+    const cancels = wrapper.findAll('[data-test="xfer-cancel"]');
+    expect(cancels).toHaveLength(2);
+    expect(cancels.map((b) => b.attributes("data-task-id")).sort()).toEqual(["t-active", "t-paused"]);
+    for (const id of ["t-done", "t-failed"]) {
+      expect(wrapper.find(`[data-row-id="${id}"] [data-test="xfer-cancel"]`).exists()).toBe(false);
+    }
+  });
+
+  it("shows 删除 only for terminal tasks (done/failed/cancelled)", () => {
+    const wrapper = mountPanel({ items: [...sampleItems, cancelledItem] });
+    const removes = wrapper.findAll('[data-test="xfer-remove"]');
+    expect(removes.map((b) => b.attributes("data-task-id")).sort())
+      .toEqual(["t-cancelled", "t-done", "t-failed"]);
+    // 活跃任务仍由 CancelTransfer 收尾，不提供直接移除
+    for (const id of ["t-active", "t-paused"]) {
+      expect(wrapper.find(`[data-row-id="${id}"] [data-test="xfer-remove"]`).exists()).toBe(false);
+    }
+  });
+
+  it("emits cancel(taskId) from the active row", async () => {
+    const wrapper = mountPanel();
+    await wrapper.find('[data-row-id="t-active"] [data-test="xfer-cancel"]').trigger("click");
+    expect(wrapper.emitted("cancel")).toEqual([["t-active"]]);
+    expect(wrapper.emitted("remove")).toBeUndefined();
+  });
+
+  it("emits remove(taskId) from a terminal row", async () => {
+    const wrapper = mountPanel();
+    await wrapper.find('[data-row-id="t-failed"] [data-test="xfer-remove"]').trigger("click");
+    expect(wrapper.emitted("remove")).toEqual([["t-failed"]]);
+    expect(wrapper.emitted("cancel")).toBeUndefined();
+  });
+
+  it("disables 取消/删除 while that task's action is pending", () => {
+    const wrapper = mountPanel({
+      items: [...sampleItems, cancelledItem],
+      pendingTaskIds: new Set(["t-active", "t-done"]),
+    });
+    const activeCancel = wrapper.find('[data-row-id="t-active"] [data-test="xfer-cancel"]')
+      .element as HTMLButtonElement;
+    const doneRemove = wrapper.find('[data-row-id="t-done"] [data-test="xfer-remove"]')
+      .element as HTMLButtonElement;
+    const pausedCancel = wrapper.find('[data-row-id="t-paused"] [data-test="xfer-cancel"]')
+      .element as HTMLButtonElement;
+    expect(activeCancel.disabled).toBe(true);
+    expect(doneRemove.disabled).toBe(true);
+    expect(pausedCancel.disabled).toBe(false);
+  });
+
+  it("ignores remove clicks while pending and reports the failure banner", async () => {
+    const wrapper = mountPanel({
+      pendingTaskIds: new Set(["t-done"]),
+      actionError: "删除失败：Invalid state",
+    });
+    await wrapper.find('[data-row-id="t-done"] [data-test="xfer-remove"]').trigger("click");
+    expect(wrapper.emitted("remove")).toBeUndefined();
+    expect(wrapper.find('[data-test="xfer-action-error"]').text()).toContain("删除失败");
+  });
+});

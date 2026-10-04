@@ -35,7 +35,7 @@ import WorkspaceToolbar, {
   type PanelKind,
 } from "./components/WorkspaceToolbar.vue";
 import TransferPanel, { type TransferItem } from "./components/TransferPanel.vue";
-import { listTransfers, pauseTransfer, resumeTransfer } from "./ipc/client";
+import { listTransfers, pauseTransfer, resumeTransfer, cancelTransfer, removeTransfer } from "./ipc/client";
 import { subscribeAppEvents } from "./ipc/events";
 import {
   DEFAULT_SIDEBAR_WIDTH,
@@ -43,6 +43,7 @@ import {
   maxSidebarWidthForViewport,
 } from "./utils/workspaceLayout";
 import { toTransferItem } from "./utils/transferItem";
+import { shortTerminalTitle } from "./utils/terminalTitle";
 import { useSessionsStore } from "./stores/sessions";
 import { useHostKeyStore } from "./stores/hostKey";
 import { useThemeStore } from "./stores/theme";
@@ -69,10 +70,16 @@ const transferCapabilities = ref({ upload: false, download: false, createFolder:
 const transferItems = ref<TransferItem[]>([]);
 /** 队列读取/订阅失败的提示；非空时 TransferPanel 就地展示（区别于"确实没有任务"） */
 const transferLoadError = ref<string | null>(null);
-/** 最近一次 pause/resume 调用的错误；面板顶部红条展示，不静默 */
+/** 最近一次 pause/resume/cancel/remove 调用的错误；面板顶部红条展示，不静默 */
 const transferActionError = ref<string | null>(null);
-/** 当前正在调用 pauseTransfer/resumeTransfer 的任务 ID，用于禁用按钮 */
+/** 当前正在调用传输控制命令的任务 ID，用于禁用按钮 */
 const transferPendingIds = ref(new Set<string>());
+/**
+ * 传输队列行可触发的控制动作。
+ * - pause/resume/cancel 操作传输循环
+ * - remove 只把终态条目移出队列，不删除已传输文件
+ */
+type TransferAction = "pause" | "resume" | "cancel" | "remove";
 let unlistenTransfers: (() => void) | null = null;
 let mounted = false;
 
@@ -87,11 +94,11 @@ async function refreshTransfers() {
   }
 }
 
-function actionLabel(action: "pause" | "resume") {
-  return action === "pause" ? "暂停" : "继续";
+function actionLabel(action: TransferAction) {
+  return { pause: "暂停", resume: "继续", cancel: "取消", remove: "删除" }[action];
 }
 
-async function runTransferAction(taskId: string, action: "pause" | "resume") {
+async function runTransferAction(taskId: string, action: TransferAction) {
   if (transferPendingIds.value.has(taskId)) return;
   transferActionError.value = null;
   const next = new Set(transferPendingIds.value);
@@ -100,8 +107,12 @@ async function runTransferAction(taskId: string, action: "pause" | "resume") {
   try {
     if (action === "pause") {
       await pauseTransfer(taskId as Uuid);
-    } else {
+    } else if (action === "resume") {
       await resumeTransfer(taskId as Uuid);
+    } else if (action === "cancel") {
+      await cancelTransfer(taskId as Uuid);
+    } else {
+      await removeTransfer(taskId as Uuid);
     }
     // 后端事件或队列刷新决定最终 phase；这里不写乐观状态。
     await refreshTransfers();
@@ -154,14 +165,19 @@ let dockviewApi: DockviewApi | null = null;
 function ensureTerminalPanel(sessionId: Uuid) {
   if (!dockviewApi) return;
   const panelId = `terminal-${sessionId}`;
+  // 不传 title 时 dockview 会把面板 id 当标签（`terminal-<uuid>`，45 字符），
+  // 这里显式给短标题；已存在的面板同步改名，避免会话重命名后标签仍是旧名。
+  const title = shortTerminalTitle(store.items.find((s) => s.id === sessionId)?.name, sessionId);
   const existing = dockviewApi.getPanel(panelId);
   if (existing) {
+    existing.api.setTitle(title);
     existing.api.setActive();
     return;
   }
   dockviewApi.addPanel({
     id: panelId,
     component: "terminal",
+    title,
     params: { sessionId },
   });
 }
@@ -485,6 +501,8 @@ onBeforeUnmount(() => {
               @toggle="transferPanelExpanded = !transferPanelExpanded"
               @pause="(taskId) => runTransferAction(taskId, 'pause')"
               @resume="(taskId) => runTransferAction(taskId, 'resume')"
+              @cancel="(taskId) => runTransferAction(taskId, 'cancel')"
+              @remove="(taskId) => runTransferAction(taskId, 'remove')"
             />
           </div>
         </div>

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+﻿import { describe, expect, it, vi } from "vitest";
 import { defineComponent, onMounted } from "vue";
 import { flushPromises, mount } from "@vue/test-utils";
 import App from "../../src/App.vue";
@@ -7,11 +7,13 @@ import { listTransfers, pauseTransfer, resumeTransfer } from "../../src/ipc/clie
 import TransferPanel from "../../src/components/TransferPanel.vue";
 import ElementPlus from "element-plus";
 
-const { listTransfersMock, pauseTransferMock, resumeTransferMock, sessionsStoreMock } = vi.hoisted(() => ({
+const { listTransfersMock, pauseTransferMock, resumeTransferMock, cancelTransferMock, removeTransferMock, sessionsStoreMock } = vi.hoisted(() => ({
   listTransfersMock: vi.fn().mockResolvedValue([]),
   pauseTransferMock: vi.fn().mockResolvedValue(undefined),
   resumeTransferMock: vi.fn().mockResolvedValue(undefined),
-  sessionsStoreMock: { store: null as { items: Array<{ id: string }>; [key: string]: unknown } | null },
+  cancelTransferMock: vi.fn().mockResolvedValue(undefined),
+  removeTransferMock: vi.fn().mockResolvedValue(undefined),
+  sessionsStoreMock: { store: null as { items: Array<{ id: string; name?: string }>; [key: string]: unknown } | null },
 }));
 
 // PROB-02：dockview-vue 真实实现不渲染插槽，面板只能经 ready 事件给出的
@@ -20,10 +22,17 @@ const { listTransfersMock, pauseTransferMock, resumeTransferMock, sessionsStoreM
 const { dockviewApiMocks } = vi.hoisted(() => {
   const panelMap = new Map<
     string,
-    { id: string; api: { setActive: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> } }
+    {
+      id: string;
+      api: {
+        setActive: ReturnType<typeof vi.fn>;
+        setTitle: ReturnType<typeof vi.fn>;
+        close: ReturnType<typeof vi.fn>;
+      };
+    }
   >();
   const addPanel = vi.fn((options: { id: string }) => {
-    const panel = { id: options.id, api: { setActive: vi.fn(), close: vi.fn() } };
+    const panel = { id: options.id, api: { setActive: vi.fn(), setTitle: vi.fn(), close: vi.fn() } };
     panelMap.set(options.id, panel);
     return panel;
   });
@@ -68,6 +77,8 @@ vi.mock("../../src/ipc/client", () => ({
   listTransfers: listTransfersMock,
   pauseTransfer: pauseTransferMock,
   resumeTransfer: resumeTransferMock,
+  cancelTransfer: cancelTransferMock,
+  removeTransfer: removeTransferMock,
 }));
 vi.mock("../../src/ipc/events", () => ({ subscribeAppEvents: vi.fn().mockResolvedValue(vi.fn()) }));
 
@@ -154,9 +165,11 @@ describe("App layout", () => {
     // 面板只能由 addPanel 创建 —— 桩或 App.vue 回归插槽方案时本断言失败。
     expect(wrapper.find('[data-testid="terminal-pane"]').exists()).toBe(false);
     expect(dockviewApiMocks.addPanel).toHaveBeenCalledTimes(1);
+    // 回归：不传 title 时 dockview 用面板 id 当标签（`terminal-<uuid>`，45 字符）
     expect(dockviewApiMocks.addPanel).toHaveBeenCalledWith({
       id: "terminal-session-42",
       component: "terminal",
+      title: "session-",
       params: { sessionId: "session-42" },
     });
     wrapper.unmount();
@@ -178,6 +191,28 @@ describe("App layout", () => {
       expect.objectContaining({ id: "terminal-session-b", params: { sessionId: "session-b" } }),
     );
     expect(dockviewApiMocks.panelMap.get("terminal-session-a")?.api.setActive).toHaveBeenCalledOnce();
+    // 会话改名后重新激活：标题必须同步刷新，不能停留在旧名
+    expect(dockviewApiMocks.panelMap.get("terminal-session-a")?.api.setTitle).toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  // 终端标签用短格式：会话名优先，其次短 id。
+  // 回归点是 addPanel 漏传 title —— dockview 会用 `terminal-<uuid>` 当标签。
+  it("titles the terminal panel with the short session name instead of the panel id", async () => {
+    dockviewApiMocks.panelMap.clear();
+    dockviewApiMocks.addPanel.mockClear();
+    if (!sessionsStoreMock.store) throw new Error("sessions store mock missing");
+    sessionsStoreMock.store.items = [{ id: "session-42", name: "prod-web-01" }];
+
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    await wrapper.findComponent({ name: "SidePanel" }).vm.$emit("select-session", "session-42");
+    await flushPromises();
+
+    expect(dockviewApiMocks.addPanel).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "terminal-session-42", title: "prod-web-01" }),
+    );
+    const title = dockviewApiMocks.addPanel.mock.calls[0][0] as unknown as { title: string };
+    expect(title.title).not.toContain("session-42");
     wrapper.unmount();
   });
 
@@ -204,6 +239,7 @@ describe("App layout", () => {
     expect(dockviewApiMocks.addPanel).toHaveBeenLastCalledWith({
       id: "terminal-session-a",
       component: "terminal",
+      title: "session-",
       params: { sessionId: "session-a" },
     });
     expect(dockviewApiMocks.panelMap.get("terminal-session-a")).toBeDefined();

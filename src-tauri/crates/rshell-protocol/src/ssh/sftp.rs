@@ -7,13 +7,28 @@
 
 use crate::ProtocolError;
 use rshell_api::types::{FilePermissions, FileType, RemoteFileEntry};
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tracing::{debug, info};
 
 /// 单次读写分块大小（64 KiB）
 const CHUNK_SIZE: usize = 64 * 1024;
+
+/// 下载方向的在途 READ 并发度。
+///
+/// SFTP 的 READ 是请求/响应协议：russh-sftp 的 `File::poll_read` 只有一个
+/// `f_read` 槽（client/fs/file.rs），一次只发一个 READ 并等待响应，因此串行
+/// 读取的吞吐上限是 `CHUNK_SIZE / RTT`——局域网 RTT 再低也会被这一个往返卡住。
+/// 上传方向相反，`poll_write` 用 `write_nowait` 支持 `max_concurrent_writes`
+/// 路并发，所以上传明显快于下载。
+///
+/// 这里把下载改成多个在途 READ 并发，与上传的并发度对齐。
+const DOWNLOAD_CONCURRENCY: usize = 8;
+
+/// 下载并发度低于该值时退回串行拷贝：省掉多句柄/多任务的固定开销。
+const DOWNLOAD_PIPELINE_MIN_BYTES: u64 = (CHUNK_SIZE * 2) as u64;
 
 /// 传输控制信号
 ///
@@ -32,8 +47,12 @@ pub enum TransferControl {
 /// SFTP 客户端
 ///
 /// 封装 russh_sftp::client::SftpSession，提供高层文件操作接口。
+///
+/// `SftpSession` 自身不是 `Clone`，但全部方法都取 `&self`；用 `Arc` 共享，
+/// 让并发区间下载的多个任务能同时在同一条 SFTP 会话上发 READ
+/// （russh-sftp 按请求 id 多路复用，并发请求是协议层支持的）。
 pub struct SftpClient {
-    session: russh_sftp::client::SftpSession,
+    session: std::sync::Arc<russh_sftp::client::SftpSession>,
 }
 
 impl SftpClient {
@@ -48,7 +67,9 @@ impl SftpClient {
             .map_err(|e| ProtocolError::ProtocolError(format!("SFTP init failed: {}", e)))?;
 
         info!("SFTP session initialized");
-        Ok(Self { session })
+        Ok(Self {
+            session: std::sync::Arc::new(session),
+        })
     }
 
     /// 列出远程目录内容
@@ -154,6 +175,11 @@ impl SftpClient {
     /// 下载远程文件到本地（分块写入，边传边回调进度）
     ///
     /// `control` 的语义与 [`Self::upload`] 相同。
+    ///
+    /// 大文件走并发区间读取（见 [`copy_pipelined`]）：每个区间用独立句柄
+    /// `seek` 到区间起点后 `read_exact`，最多 [`DOWNLOAD_CONCURRENCY`] 个
+    /// READ 同时在途；写入侧仍严格按 offset 升序串行，落盘内容与串行版本一致。
+    /// 小文件退回串行，避免多句柄的固定开销。
     pub async fn download<F>(
         &self,
         remote: &str,
@@ -175,10 +201,6 @@ impl SftpClient {
             })?
             .len();
 
-        let mut source = self.session.open(remote).await.map_err(|e| {
-            ProtocolError::ProtocolError(format!("Failed to open remote file: {}", e))
-        })?;
-
         // 确保本地目录存在
         if let Some(parent) = local.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -189,15 +211,55 @@ impl SftpClient {
             ProtocolError::ProtocolError(format!("Failed to create local file: {}", e))
         })?;
 
-        let copied = copy_with_progress(
-            &mut source,
-            &mut target,
-            total,
-            CHUNK_SIZE,
-            control,
-            &mut progress,
-        )
-        .await?;
+        let copied = if total >= DOWNLOAD_PIPELINE_MIN_BYTES {
+            let session = self.session.clone();
+            let remote = remote.to_string();
+            copy_pipelined(
+                total,
+                move |offset, len| {
+                    let session = session.clone();
+                    let remote = remote.clone();
+                    async move {
+                        let mut file = session.open(remote).await.map_err(|e| {
+                            ProtocolError::ProtocolError(format!(
+                                "Failed to open remote file for range: {e}"
+                            ))
+                        })?;
+                        file.seek(std::io::SeekFrom::Start(offset))
+                            .await
+                            .map_err(|e| {
+                                ProtocolError::ProtocolError(format!(
+                                    "Failed to seek remote file to {offset}: {e}"
+                                ))
+                            })?;
+                        let mut buf = vec![0u8; len];
+                        file.read_exact(&mut buf).await.map_err(|e| {
+                            ProtocolError::ProtocolError(format!(
+                                "range read failed at {offset} (+{len}): {e}"
+                            ))
+                        })?;
+                        Ok(buf)
+                    }
+                },
+                &mut target,
+                control,
+                &mut progress,
+            )
+            .await?
+        } else {
+            let mut source = self.session.open(remote).await.map_err(|e| {
+                ProtocolError::ProtocolError(format!("Failed to open remote file: {}", e))
+            })?;
+            copy_with_progress(
+                &mut source,
+                &mut target,
+                total,
+                CHUNK_SIZE,
+                control,
+                &mut progress,
+            )
+            .await?
+        };
 
         info!(remote = %remote, bytes = copied, "Download completed");
         Ok(copied)
@@ -357,6 +419,119 @@ where
     Ok(done)
 }
 
+/// 把 `total` 字节切成连续不重叠的区间 `(offset, len)`，按 offset 升序。
+///
+/// 纯函数：分块正确性直接决定落盘内容是否损坏，必须独立可测。
+/// `total == 0` 返回空区间；`chunk == 0` 视为 1，避免死循环。
+fn plan_ranges(total: u64, chunk: usize) -> Vec<(u64, usize)> {
+    let step = chunk.max(1) as u64;
+    let mut ranges = Vec::with_capacity(total.div_ceil(step) as usize);
+    let mut offset = 0u64;
+    while offset < total {
+        let len = step.min(total - offset);
+        ranges.push((offset, len as usize));
+        offset += len;
+    }
+    ranges
+}
+
+/// 按区间顺序（offset 升序）并发生成区间内容，再**严格按序**写给 `writer`。
+///
+/// `fetch(offset, len)` 由调用方提供，负责发出单个区间的远端读取，返回恰好
+/// `len` 字节。并发只发生在读取侧；写入侧按序串行，因此：
+/// - 落盘内容与区间划分一致，与完成顺序无关；
+/// - `done` 单调递增，进度回调语义与串行版本一致。
+///
+/// 暂停/取消在派发新区间前和每次写入前各检查一次，与串行版本同款语义。
+async fn copy_pipelined<F, Fut, W, P>(
+    total: u64,
+    fetch: F,
+    writer: &mut W,
+    control: &mut watch::Receiver<TransferControl>,
+    progress: &mut P,
+) -> Result<u64, ProtocolError>
+where
+    F: Fn(u64, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, ProtocolError>> + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+    P: FnMut(u64, u64),
+{
+    let ranges = plan_ranges(total, CHUNK_SIZE);
+    progress(0, total);
+
+    let mut done: u64 = 0;
+    let mut pending: VecDeque<tokio::task::JoinHandle<Result<Vec<u8>, ProtocolError>>> =
+        VecDeque::new();
+    let mut next = 0usize;
+
+    // 提前中止时（暂停以外的取消/错误）必须停掉在途任务，
+    // 否则它们会继续占用 SFTP 请求槽并可能写入已废弃的缓冲。
+    let abort_all =
+        |pending: &mut VecDeque<tokio::task::JoinHandle<Result<Vec<u8>, ProtocolError>>>| {
+            for handle in pending.drain(..) {
+                handle.abort();
+            }
+        };
+
+    loop {
+        // 派发阶段：把在途数补到并发上限。
+        while next < ranges.len() && pending.len() < DOWNLOAD_CONCURRENCY {
+            wait_for_run(control).await?;
+            let (offset, len) = ranges[next];
+            next += 1;
+            pending.push_back(tokio::spawn(fetch(offset, len)));
+        }
+
+        if pending.is_empty() {
+            break;
+        }
+
+        // 写入阶段：始终取队首（最早派发 = offset 最小），保证按序落盘。
+        let handle = pending.pop_front().expect("pending is non-empty");
+        let buf = match handle.await {
+            Ok(result) => result,
+            Err(join_error) => {
+                abort_all(&mut pending);
+                return Err(ProtocolError::ProtocolError(format!(
+                    "range read task failed during copy: {join_error}"
+                )));
+            }
+        };
+        let buf = match buf {
+            Ok(buf) => buf,
+            Err(err) => {
+                abort_all(&mut pending);
+                return Err(err);
+            }
+        };
+
+        // 到写点才检查控制信号：暂停时字节停止增长。
+        if let Err(err) = wait_for_run(control).await {
+            abort_all(&mut pending);
+            return Err(err);
+        }
+
+        writer
+            .write_all(&buf)
+            .await
+            .map_err(|e| ProtocolError::ProtocolError(format!("write failed during copy: {e}")))?;
+        done += buf.len() as u64;
+        progress(done, total);
+    }
+
+    writer
+        .flush()
+        .await
+        .map_err(|e| ProtocolError::ProtocolError(format!("flush failed during copy: {e}")))?;
+
+    if total > 0 && done != total {
+        return Err(ProtocolError::ProtocolError(format!(
+            "source changed during transfer: expected {total} bytes, copied {done}"
+        )));
+    }
+    Ok(done)
+}
+
 /// 分块前的控制检查：`Cancel` 立即中止；`Pause` 挂起等待下一信号；
 /// 控制通道关闭（发送端已随任务清理）视同取消。
 ///
@@ -383,6 +558,257 @@ mod tests {
 
     /// 记录进度帧的共享 sink
     type ProgressLog = Arc<Mutex<Vec<(u64, u64)>>>;
+
+    /// 区间划分必须是连续、不重叠、完整覆盖 [0, total) 的升序切片，
+    /// 否则并发下载会把内容写错位置——这是整个并发化里唯一会损坏文件的点。
+    #[test]
+    fn plan_ranges_covers_total_without_gaps_or_overlap() {
+        for &(total, chunk) in &[
+            (0u64, 64usize),
+            (1, 64),
+            (63, 64),
+            (64, 64),
+            (65, 64),
+            (300, 64),
+            (CHUNK_SIZE as u64, CHUNK_SIZE),
+            (CHUNK_SIZE as u64 * 3 + 17, CHUNK_SIZE),
+        ] {
+            let ranges = plan_ranges(total, chunk);
+            let sum: u64 = ranges.iter().map(|(_, len)| *len as u64).sum();
+            assert_eq!(
+                sum, total,
+                "total={total} chunk={chunk} 区间长度之和必须等于总量"
+            );
+
+            let mut cursor = 0u64;
+            for (offset, len) in &ranges {
+                assert_eq!(*offset, cursor, "区间必须首尾相接，total={total}");
+                assert!(*len > 0, "区间长度必须为正，total={total}");
+                assert!(*len <= chunk.max(1), "区间长度不得超过分块大小");
+                cursor += *len as u64;
+            }
+        }
+    }
+
+    #[test]
+    fn plan_ranges_uses_full_chunks_except_the_last() {
+        let chunk = 64usize;
+        let ranges = plan_ranges(300, chunk);
+        assert_eq!(ranges.len(), 5);
+        for (offset, len) in &ranges[..4] {
+            assert_eq!(*len, chunk, "非末区间必须是满块");
+            assert_eq!(
+                *offset,
+                ranges.iter().position(|r| r == &(*offset, *len)).unwrap() as u64 * chunk as u64
+            );
+        }
+        assert_eq!(ranges[4], (256, 44), "末区间承载余数");
+    }
+
+    /// 并发下载：完成顺序打乱也不能影响落盘内容——写入必须按 offset 升序。
+    #[tokio::test]
+    async fn pipelined_copy_writes_ranges_in_offset_order() {
+        let total = 5 * CHUNK_SIZE as u64 + 11;
+        // 源数据：每个字节等于其 offset，便于校验错位
+        let source: Arc<Vec<u8>> =
+            Arc::new((0..total).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let expected = source.as_slice().to_vec();
+
+        // 故意让后面的区间先返回，验证写入顺序不依赖完成顺序
+        let fetch = move |offset: u64, len: usize| {
+            let source = source.clone();
+            async move {
+                // 反向延迟：offset 越大越先完成
+                let rank = (total - offset) / CHUNK_SIZE as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(rank * 3)).await;
+                Ok(source[offset as usize..offset as usize + len].to_vec())
+            }
+        };
+
+        let mut sink: Vec<u8> = Vec::new();
+        let (_, mut control) = watch::channel(TransferControl::Run);
+        let copied = copy_pipelined(total, fetch, &mut sink, &mut control, &mut |_, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(copied, total);
+        assert_eq!(sink.len() as u64, total, "落盘长度必须等于总量");
+        assert_eq!(
+            sink,
+            expected.as_slice(),
+            "并发完成顺序被打乱时，落盘内容仍须与源逐字节一致"
+        );
+    }
+
+    /// 进度必须单调递增：并发读取下 done 只能按写入顺序累加。
+    #[tokio::test]
+    async fn pipelined_copy_reports_monotonic_progress() {
+        let total = 4 * CHUNK_SIZE as u64;
+        let source: Arc<Vec<u8>> = Arc::new(vec![3u8; total as usize]);
+        let fetch = move |offset: u64, len: usize| {
+            let source = source.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis((total - offset) % 7)).await;
+                Ok(source[offset as usize..offset as usize + len].to_vec())
+            }
+        };
+
+        let log: ProgressLog = Arc::new(Mutex::new(Vec::new()));
+        let progress_log = log.clone();
+        let mut sink: Vec<u8> = Vec::new();
+        let (_, mut control) = watch::channel(TransferControl::Run);
+        copy_pipelined(total, fetch, &mut sink, &mut control, &mut move |d, t| {
+            progress_log.lock().unwrap().push((d, t))
+        })
+        .await
+        .unwrap();
+
+        let frames = log.lock().unwrap().clone();
+        assert_eq!(frames.first().unwrap(), &(0, total), "首帧必须是 0/total");
+        assert_eq!(frames.last().unwrap().0, total, "末帧必须达到 total");
+        assert!(
+            frames.windows(2).all(|w| w[0].0 < w[1].0),
+            "进度必须严格递增: {frames:?}"
+        );
+        assert!(
+            frames.windows(2).all(|w| w[0].1 == w[1].1),
+            "total 在各帧间不得变化: {frames:?}"
+        );
+    }
+
+    /// 达到并发上限才派发更多区间；观测到的最大在途数应等于并发度。
+    #[tokio::test]
+    async fn pipelined_copy_keeps_multiple_ranges_in_flight() {
+        let ranges_total = 64usize;
+        let total = (ranges_total * CHUNK_SIZE) as u64;
+        let in_flight = Arc::new(Mutex::new(0usize));
+        let peak = Arc::new(Mutex::new(0usize));
+        let source: Arc<Vec<u8>> = Arc::new(vec![1u8; total as usize]);
+
+        let fetch = {
+            let in_flight = in_flight.clone();
+            let peak = peak.clone();
+            let source = source.clone();
+            move |offset: u64, len: usize| {
+                let in_flight = in_flight.clone();
+                let peak = peak.clone();
+                let source = source.clone();
+                async move {
+                    let now = {
+                        let mut g = in_flight.lock().unwrap();
+                        *g += 1;
+                        *g
+                    };
+                    {
+                        let mut observed = peak.lock().unwrap();
+                        if now > *observed {
+                            *observed = now;
+                        }
+                    }
+
+                    // 每个区间都挂起一段时间：只有真正并发才会堆到上限
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    *in_flight.lock().unwrap() -= 1;
+                    Ok(source[offset as usize..offset as usize + len].to_vec())
+                }
+            }
+        };
+
+        let mut sink: Vec<u8> = Vec::new();
+        let (_, mut control) = watch::channel(TransferControl::Run);
+        let copied = copy_pipelined(total, fetch, &mut sink, &mut control, &mut |_, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(copied, total);
+        assert_eq!(sink.len(), total as usize);
+        let observed_peak = *peak.lock().unwrap();
+        assert!(
+            observed_peak > 1,
+            "串行读取不会提升吞吐；实际峰值在途数 = {observed_peak}，说明仍是串行"
+        );
+        assert!(
+            observed_peak <= DOWNLOAD_CONCURRENCY,
+            "在途区间数不得超过并发上限，实际 {observed_peak}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipelined_copy_propagates_fetch_error_and_aborts_inflight() {
+        let total = 16 * CHUNK_SIZE as u64;
+        let fetch = |offset: u64, _len: usize| async move {
+            if offset >= 4 * CHUNK_SIZE as u64 {
+                Err(ProtocolError::ProtocolError(format!("boom at {offset}")))
+            } else {
+                Ok(vec![0u8; CHUNK_SIZE])
+            }
+        };
+
+        let mut sink: Vec<u8> = Vec::new();
+        let (_, mut control) = watch::channel(TransferControl::Run);
+        let err = copy_pipelined(total, fetch, &mut sink, &mut control, &mut |_, _| {})
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{err:?}").contains("boom at"),
+            "应透传区间读取错误，实际: {err:?}"
+        );
+    }
+
+    /// 取消必须立刻中止并保持 TransferCancelled 终态语义。
+    #[tokio::test]
+    async fn pipelined_copy_cancels_without_completing() {
+        let total = 64 * CHUNK_SIZE as u64;
+        let source: Arc<Vec<u8>> = Arc::new(vec![5u8; total as usize]);
+        let (control_tx, mut control) = watch::channel(TransferControl::Run);
+
+        let fetch = move |offset: u64, len: usize| {
+            let source = source.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Ok(source[offset as usize..offset as usize + len].to_vec())
+            }
+        };
+
+        let mut sink: Vec<u8> = Vec::new();
+        let copy = tokio::spawn(async move {
+            copy_pipelined(total, fetch, &mut sink, &mut control, &mut |_, _| {}).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        control_tx.send(TransferControl::Cancel).unwrap();
+
+        let result = copy.await.unwrap();
+        assert!(
+            matches!(result, Err(ProtocolError::TransferCancelled)),
+            "取消必须返回 TransferCancelled，实际: {result:?}"
+        );
+    }
+
+    /// 源在传输期间变短时报错，不留下被截断却当成功的文件。
+    #[tokio::test]
+    async fn pipelined_copy_rejects_short_source() {
+        let total = 8 * CHUNK_SIZE as u64;
+        let fetch = |offset: u64, len: usize| async move {
+            if offset == 0 {
+                Ok(vec![0u8; len])
+            } else {
+                // 假装远端只剩一半
+                Err(ProtocolError::ProtocolError(format!(
+                    "range read failed at {offset} (+{len})"
+                )))
+            }
+        };
+
+        let mut sink: Vec<u8> = Vec::new();
+        let (_, mut control) = watch::channel(TransferControl::Run);
+        assert!(
+            copy_pipelined(total, fetch, &mut sink, &mut control, &mut |_, _| {})
+                .await
+                .is_err()
+        );
+    }
 
     /// 等待拷贝循环推进到至少 `min_done` 字节
     async fn wait_for_progress(log: &ProgressLog, min_done: u64) {

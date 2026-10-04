@@ -421,7 +421,6 @@ const OUTCOME_WHITELIST = new Set([
  * 任一 helper 接线后必须从此处移除。
  */
 const HELPER_WHITELIST = new Set([
-  "cancelTransfer", // CancelTransfer 命令已注册，传输队列界面仅接线 pause/resume（docs/08）
   "restoreTunnel", // 隧道磁盘恢复尚未接入 UI
   "suspendTunnel", // 隧道挂起/恢复尚未接入 UI
   "resumeTunnel",

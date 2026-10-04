@@ -11,9 +11,12 @@
  *
  * 数据来自后端真实传输队列快照。
  *
- * 暂停/恢复控制:
- *   - 仅对 `active` 任务渲染"暂停"按钮,仅对 `paused` 任务渲染"继续"按钮。
- *   - 按钮调用期间由调用方控制,本组件只发出 pause(taskId) / resume(taskId) 事件。
+ * 暂停/恢复/取消/删除控制:
+ *   - 仅对 `active` 任务渲染"暂停",仅对 `paused` 任务渲染"继续"。
+ *   - `active`/`paused` 渲染"取消":调用 CancelTransfer 置终态 Cancelled。
+ *   - 仅终态(done/failed/cancelled)渲染"删除":调用 RemoveTransfer 移除队列条目。
+ *     移除只作用于队列列表,不会删除已传输的本地/远端文件。
+ *   - 按钮调用期间由调用方控制,本组件只发出 pause/resume/cancel/remove 事件。
  *   - 进行中(`pendingTaskIds`)的按钮自动禁用,避免重复点击。
  *   - 失败提示由调用方写入 `actionError`,本组件原样展示,不做乐观更新。
  */
@@ -50,6 +53,8 @@ const emit = defineEmits<{
   (e: "toggle"): void;
   (e: "pause", taskId: string): void;
   (e: "resume", taskId: string): void;
+  (e: "cancel", taskId: string): void;
+  (e: "remove", taskId: string): void;
 }>();
 
 const tab = ref<"transfer" | "log">("transfer");
@@ -70,6 +75,23 @@ function onResume(taskId: string, event: Event) {
   event.stopPropagation();
   if (isPending(taskId)) return;
   emit("resume", taskId);
+}
+
+function onCancel(taskId: string, event: Event) {
+  event.stopPropagation();
+  if (isPending(taskId)) return;
+  emit("cancel", taskId);
+}
+
+function onRemove(taskId: string, event: Event) {
+  event.stopPropagation();
+  if (isPending(taskId)) return;
+  emit("remove", taskId);
+}
+
+/** 终态（完成/失败/已取消）才允许从队列移除 */
+function isRemovable(phase: TransferPhase): boolean {
+  return phase === "done" || phase === "failed" || phase === "cancelled";
 }
 
 function fmtSize(n: number): string {
@@ -223,6 +245,30 @@ function phaseClass(p: TransferPhase): string {
             >
               继续
             </button>
+            <button
+              v-if="row.phase === 'active' || row.phase === 'paused'"
+              type="button"
+              class="xfer-action"
+              data-test="xfer-cancel"
+              :data-task-id="row.id"
+              aria-label="取消传输"
+              :disabled="isPending(row.id)"
+              @click="onCancel(row.id, $event)"
+            >
+              取消
+            </button>
+            <button
+              v-if="isRemovable(row.phase)"
+              type="button"
+              class="xfer-action is-danger"
+              data-test="xfer-remove"
+              :data-task-id="row.id"
+              aria-label="从队列删除"
+              :disabled="isPending(row.id)"
+              @click="onRemove(row.id, $event)"
+            >
+              删除
+            </button>
           </div>
         </li>
       </ul>
@@ -336,7 +382,7 @@ function phaseClass(p: TransferPhase): string {
 }
 .xfer-row {
   display: grid;
-  grid-template-columns: minmax(140px, 1.5fr) 96px 170px 80px minmax(140px, 1.4fr) 32px minmax(140px, 1.4fr) 80px 90px 120px;
+  grid-template-columns: minmax(140px, 1.5fr) 96px 170px 80px minmax(140px, 1.4fr) 32px minmax(140px, 1.4fr) 80px 90px 170px;
   align-items: center;
   gap: var(--rs-s-2);
   padding: var(--rs-s-2) var(--rs-s-3);
@@ -402,6 +448,7 @@ function phaseClass(p: TransferPhase): string {
 .xfer-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 4px;
 }
 .xfer-action {
   background: var(--rs-bg-surface);
@@ -419,5 +466,15 @@ function phaseClass(p: TransferPhase): string {
 .xfer-action:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+/* 删除只影响队列条目，但与「取消」区分开，避免误点 */
+.xfer-action.is-danger {
+  color: var(--el-color-danger);
+  border-color: var(--el-color-danger);
+}
+.xfer-action.is-danger:hover:not(:disabled) {
+  background: var(--el-color-danger);
+  border-color: var(--el-color-danger);
+  color: #fff;
 }
 </style>

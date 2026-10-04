@@ -107,3 +107,17 @@ SSH 密码和密钥口令使用 macOS 钥匙串服务 `com.letmlook.rshell.crede
 第二轮体检的逐项修复记录见 [docs/11](11-known-issues-round2.md)：传输启动窗口的取消/暂停竞态与终态守卫（含修复中新立并已修复的 R2-21：mark_failed/mark_completed 终态守卫）、传输任务 panic 兜底清理、后端错误在前端的可读转换、终端面板关闭后重建与会话删除后的面板清理、搜索快捷键按激活终端路由、触发器删除确认、隧道面板事件订阅、RSA 生成位数、known_hosts 裸 IPv6 匹配、SOCKS5 分段握手、触发器正则预编译、xtask dev 入口、IPC 契约对账测试扩展、KeyManager 密钥能力边界文档，以及本记录按轮次分节。
 
 本轮验证口径为快速检查：`cargo fmt --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 0 告警；`cargo test` rshell-core 168 项、rshell-protocol 38 项、rshell-api 6 项通过；`npm run typecheck` 通过，`npm test` 110 项（23 文件）通过，文档契约检查通过；每项修复另附针对性单测或变异验证（见 docs/11 各条）。全量 `verify.sh` 本轮未运行，留待统一收口，不在此记为已执行。真实 SSH/SFTP 服务器、物理串口与签名公证仍未验证，上方验收清单状态不变。
+
+## 2026-10-04：传输速度、队列删除与终端短标签
+
+用户实机反馈三项问题，均已定位到具体代码并修复。
+
+**SFTP 下载慢**：根因不是应用侧限速——`copy_with_progress` 无 sleep，200ms 节流只在进度广播路径上、不在拷贝热路径。真实原因是 `russh-sftp` 的 `File::poll_read` 只有一个 `f_read` 槽，串行下载吞吐上限为 `CHUNK_SIZE / RTT`；上传用 `write_nowait` 支持 `max_concurrent_writes = 8` 路并发，故下载长期慢于上传。改为按 64 KiB 切分连续不重叠区间、最多 8 个 READ 在途，写入侧仍严格按 offset 升序串行。`SftpClient` 的 `SftpSession` 改为 `Arc` 共享以支持同会话并发 READ（russh-sftp 按请求 id 多路复用）。小于 128 KiB 退回串行。
+
+**传输队列无删除**：原先只有 `PauseTransfer`/`ResumeTransfer` 的界面入口，`CancelTransfer` 命令已注册但无界面入口，且后端根本没有「从队列移除」的 API。新增 `RemoveTransfer` 命令与服务方法，只允许移除终态任务，活跃/暂停任务返回 `InvalidState`，未知条目按幂等处理。
+
+**终端标签过长**：`ensureTerminalPanel` 调 `addPanel` 时未传 `title`，dockview 回退到 `options.id`，渲染成 45 字符的 `terminal-<uuid>`。改为显式传短标题。
+
+本轮验证：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings` 0 告警、`cargo test --workspace`、`npm run typecheck`、`npm test` 127 项（24 文件）通过，文档契约检查通过。新增测试：Rust 6 项区间划分/按序落盘/进度单调/在途并发上限/取消中止/源变短，以及 `remove_transfer` 5 项终态守卫；前端 `shortTerminalTitle` 10 项、TransferPanel 取消/删除 6 项。
+
+**未验证项**：真实 SSH/SFTP 服务器上的实际吞吐提升倍数、局域网与跨网对比数据，以及新的下载路径在真实服务器上的端到端落盘正确性，均无实机证据。区间正确性仅有基于假源的单元测试覆盖。物理串口与签名公证状态不变。

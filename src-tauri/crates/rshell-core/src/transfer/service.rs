@@ -623,6 +623,39 @@ impl TransferService {
         }
     }
 
+    /// 移除传输任务条目（仅从队列列表消失，不触碰已传输的文件）
+    ///
+    /// 只允许移除**终态**（Completed/Failed/Cancelled）任务：活跃任务的拷贝
+    /// 循环仍在跑并持有控制通道，提前移除会让 `apply_progress` 写不回任务表、
+    /// 让控制通道条目泄漏。非终态调用返回 `CoreError::InvalidState`，前端
+    /// 必须先取消再移除。
+    ///
+    /// 该操作只删内存中的队列条目，不删除本地或远端已传输的文件。
+    pub async fn remove_transfer(&self, task_id: Uuid) -> Result<(), CoreError> {
+        let mut tasks = self.tasks.write().await;
+
+        match tasks.get(&task_id) {
+            Some(task) if !task.state.is_terminal() => {
+                return Err(CoreError::InvalidState(format!(
+                    "transfer {task_id} is still {:?}; cancel it before removing",
+                    task.state
+                )));
+            }
+            Some(_) => {}
+            None => {
+                // 幂等：条目可能已被 prune_finished_tasks 限量清理移除。
+                // 重复移除不视为错误，避免前端与后台清理竞态时弹错误。
+                warn!(task_id = %task_id, "Remove requested for unknown transfer task");
+                return Ok(());
+            }
+        }
+
+        tasks.remove(&task_id);
+        info!(task_id = %task_id, "Transfer task removed from queue");
+        self.event_bus.publish(AppEvent::TransferQueueChanged);
+        Ok(())
+    }
+
     /// 暂停传输任务
     ///
     /// 置 Paused 并通过控制通道通知传输循环在下一分块前挂起；
@@ -887,6 +920,100 @@ mod tests {
             speed_bps: 0.0,
             finished_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn remove_transfer_deletes_terminal_task_from_queue() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+        {
+            let mut tasks = svc.tasks.write().await;
+            let mut task = make_task(id, TransferTaskState::Completed);
+            task.finished_at = Some(std::time::Instant::now());
+            tasks.insert(id, task);
+        }
+
+        svc.remove_transfer(id).await.unwrap();
+
+        assert!(
+            svc.list_tasks().await.is_empty(),
+            "终态任务移除后不得再出现在队列"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_transfer_rejects_non_terminal_task() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Transferring));
+        }
+
+        let err = svc.remove_transfer(id).await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidState(_)),
+            "活跃任务不得被直接移除，须先取消"
+        );
+        assert!(
+            svc.get_task(id).await.is_some(),
+            "被拒绝的移除不得影响任务表"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_transfer_rejects_paused_task() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+        {
+            let mut tasks = svc.tasks.write().await;
+            tasks.insert(id, make_task(id, TransferTaskState::Paused));
+        }
+
+        assert!(matches!(
+            svc.remove_transfer(id).await.unwrap_err(),
+            CoreError::InvalidState(_)
+        ));
+        assert!(svc.get_task(id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn remove_transfer_is_idempotent_for_unknown_task() {
+        let svc = make_service();
+        // 未知/已被限量清理移除的条目重复移除不应报错，
+        // 否则前端与 prune_finished_tasks 竞态时会弹出无意义错误。
+        svc.remove_transfer(Uuid::new_v4()).await.unwrap();
+        svc.remove_transfer(Uuid::new_v4()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_transfer_publishes_queue_change() {
+        let event_bus = Arc::new(EventBus::new());
+        let svc = TransferService::new(event_bus.clone());
+        let id = Uuid::new_v4();
+        {
+            let mut tasks = svc.tasks.write().await;
+            let mut task = make_task(id, TransferTaskState::Cancelled);
+            task.finished_at = Some(std::time::Instant::now());
+            tasks.insert(id, task);
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        event_bus.subscribe(move |event| {
+            if let AppEvent::TransferQueueChanged = event {
+                sink.lock().unwrap().push(());
+            }
+        });
+
+        svc.remove_transfer(id).await.unwrap();
+        // 事件总线异步投递，留出调度时间
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "移除条目后必须广播 TransferQueueChanged 让前端刷新"
+        );
     }
 
     #[tokio::test]

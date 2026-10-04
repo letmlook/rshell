@@ -348,6 +348,7 @@ export type AppCommand =
   | { PauseTransfer: { task_id: Uuid } }
   | { ResumeTransfer: { task_id: Uuid } }
   | { CancelTransfer: { task_id: Uuid } }
+  | { RemoveTransfer: { task_id: Uuid } }
   | { BrowseRemoteDir: { session_id: Uuid; path: string } }
   | { CreateRemoteDirectory: { session_id: Uuid; path: string } }
   | { DeleteRemoteEntry: { session_id: Uuid; path: string } }

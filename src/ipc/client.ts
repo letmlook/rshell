@@ -160,6 +160,8 @@ export const enqueueDownload = (remote: string, local: PathBuf, session_id: Uuid
 export const pauseTransfer = (task_id: Uuid) => call({ PauseTransfer: { task_id } });
 export const resumeTransfer = (task_id: Uuid) => call({ ResumeTransfer: { task_id } });
 export const cancelTransfer = (task_id: Uuid) => call({ CancelTransfer: { task_id } });
+/** 从队列移除终态条目；不删除已传输文件。仅终态任务可移除 */
+export const removeTransfer = (task_id: Uuid) => call({ RemoveTransfer: { task_id } });
 
 export const browseRemoteDir = (session_id: Uuid, path: string) =>
   call<{ path: string; entries: RemoteFileEntry[] }>({ BrowseRemoteDir: { session_id, path } });

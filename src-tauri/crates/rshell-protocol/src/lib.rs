@@ -29,6 +29,10 @@ pub enum ProtocolError {
 }
 
 /// 连接 trait（所有协议的统一抽象）
+// async_trait 宏为每个 async 方法生成的 #[must_use] 与返回值
+// Pin<Box<dyn Future>> 自带的 #[must_use] 重复，触发 clippy::double_must_use。
+// 该 lint 报在宏展开上，只能在此处定点豁免。
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait Connection: Send + Sync {
     /// 连接到远程主机

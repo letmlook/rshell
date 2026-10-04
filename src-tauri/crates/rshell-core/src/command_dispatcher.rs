@@ -279,6 +279,10 @@ impl CommandDispatcher {
                 self.transfer_service.cancel_transfer(task_id).await?;
                 Ok(CommandOutcome::None)
             }
+            AppCommand::RemoveTransfer { task_id } => {
+                self.transfer_service.remove_transfer(task_id).await?;
+                Ok(CommandOutcome::None)
+            }
             AppCommand::BrowseRemoteDir { session_id, path } => {
                 let entries = self
                     .session_service
