@@ -28,6 +28,8 @@ const props = defineProps<{
   onDisconnect?: () => void;
   onFind?: () => void;
   onClearScreen?: () => void;
+  /** Terminal：为当前会话新开一个终端窗口 */
+  onNewTerminalWindow?: () => void;
   /** Transfer 工具栏 */
   onSyncToggle?: () => void;
   onUpload?: () => void;
@@ -158,6 +160,19 @@ function pickWorkspace(w: WorkspaceKind) {
             <path d="M11 3.5 L14 8 L11 12.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
             <path d="M14 8 H4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
             <path d="M2 12 V4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+          </svg>
+        </button>
+        <button
+          class="tb-btn"
+          title="新开终端窗口"
+          aria-label="新开终端窗口"
+          data-testid="new-terminal-window"
+          :disabled="!terminalAvailable"
+          @click="onNewTerminalWindow"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16">
+            <rect x="1.5" y="2.5" width="9" height="11" rx="1" fill="none" stroke="currentColor" stroke-width="1.2" />
+            <path d="M13 6.5 V12.5 M10 9.5 H16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
           </svg>
         </button>
         <button class="tb-btn" title="断开" aria-label="断开" :disabled="connectionState !== 'connected'" @click="onDisconnect">

@@ -6,14 +6,13 @@
  * "只出 SshKeyInfo, 私钥永不过 IPC"。
  *
  * 后端 list_keys 返回的元数据(id/name/fingerprint/public_key_blob/...)
- * 展示在这里;用户点击"导入"通过 tauri-plugin-dialog 选本地文件。
+ * 展示在这里;用户点击"导入"通过应用内路径选择器选本地文件。
  *
  * 能力边界(docs/08「核心接口与界面边界」)：密钥管理仅为托管存储——
  * 此处生成/导入的私钥没有「关联到会话」入口、不参与会话认证；会话公钥
  * 认证使用会话自身配置的外部私钥文件路径。界面提示与该边界一致。
  */
 import { onMounted, ref } from "vue";
-import { confirm, open } from "@tauri-apps/plugin-dialog";
 import {
   listKeys,
   generateSshKey,
@@ -21,6 +20,16 @@ import {
   deleteSshKey,
 } from "../ipc/client";
 import type { SshKeyType, Uuid } from "../ipc/types";
+import { confirmDialog } from "../utils/dialog";
+import { pickLocalPath } from "../utils/pathPicker";
+
+/**
+ * 只把「像私钥」的条目列进选择器，减少选到明显无关文件后的失败。
+ * 这里是启发式过滤，不替代后端导入时的真实解析校验——选错仍会得到后端错误。
+ */
+function isLikelyKeyFile(name: string): boolean {
+  return /\.(pem|key|ppk|pub|openssh)$/i.test(name) || !/\./.test(name);
+}
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
 
@@ -70,13 +79,15 @@ async function refresh() {
 }
 
 async function importKey() {
-  const path = await open({
-    multiple: false,
-    filters: [{ name: "SSH key", extensions: ["", "pem", "key", "pub"] }],
+  // 应用内路径选择器替代 tauri-plugin-dialog 的 open()：不弹操作系统窗口
+  const path = await pickLocalPath({
+    mode: "file",
+    title: "选择私钥文件",
+    accept: isLikelyKeyFile,
   });
   if (!path) return;
   importPassphrase.value = "";
-  importState.value = { path: path as string };
+  importState.value = { path };
 }
 
 async function confirmImport() {
@@ -119,10 +130,12 @@ async function generate() {
 
 async function remove(id: Uuid) {
   const name = keys.value.find(key => key.id === id)?.name ?? id;
-  // wry/WKWebView 不实现 window.confirm, 必须走 plugin-dialog 原生确认框
-  const ok = await confirm(`删除 SSH 密钥“${name}”？此操作无法撤销。`, {
-    title: "删除密钥",
-    kind: "warning",
+  // 应用内确认窗替代 plugin-dialog 的 confirm()：不弹操作系统窗口
+  const ok = await confirmDialog({
+    title: "删除 SSH 密钥",
+    message: `删除密钥「${name}」？此操作无法撤销。`,
+    confirmText: "删除",
+    danger: true,
   });
   if (!ok) return;
   try {

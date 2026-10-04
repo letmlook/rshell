@@ -19,17 +19,20 @@
  */
 import { defineComponent, h, onBeforeUnmount, onMounted, ref, markRaw, computed, watch } from "vue";
 import { DockviewVue } from "dockview-vue";
-import type { DockviewApi, DockviewReadyEvent } from "dockview-vue";
+import type { ContextMenuItem, DockviewApi, DockviewReadyEvent } from "dockview-vue";
 import { ElMessage } from "element-plus/es/components/message/index.mjs";
 import { ElNotification } from "element-plus/es/components/notification/index.mjs";
 import "dockview-vue/dist/styles/dockview.css";
 import TerminalPane from "./components/TerminalPane.vue";
 import TransferWorkspace from "./components/transfer/TransferWorkspace.vue";
 import SessionCreateDialog from "./components/SessionCreateDialog.vue";
+import SessionCredentialDialog from "./components/SessionCredentialDialog.vue";
 import HostKeyMismatchDialog from "./components/HostKeyMismatchDialog.vue";
 import CustomTitleBar from "./components/CustomTitleBar.vue";
 import SidePanel, { type ToolSubview, type SettingsSubview } from "./components/SidePanel.vue";
 import StatusBar from "./components/StatusBar.vue";
+import DialogHost from "./components/dialogs/DialogHost.vue";
+import PathPickerHost from "./components/dialogs/PathPickerHost.vue";
 import WorkspaceToolbar, {
   type WorkspaceKind,
   type PanelKind,
@@ -43,11 +46,12 @@ import {
   maxSidebarWidthForViewport,
 } from "./utils/workspaceLayout";
 import { toTransferItem } from "./utils/transferItem";
+import { useTransferLog } from "./utils/transferLog";
 import { shortTerminalTitle } from "./utils/terminalTitle";
 import { useSessionsStore } from "./stores/sessions";
 import { useHostKeyStore } from "./stores/hostKey";
 import { useThemeStore } from "./stores/theme";
-import type { Uuid } from "./ipc/types";
+import type { Uuid, SessionConfig } from "./ipc/types";
 
 const store = useSessionsStore();
 const hostKeyStore = useHostKeyStore();
@@ -75,6 +79,13 @@ const transferActionError = ref<string | null>(null);
 /** 当前正在调用传输控制命令的任务 ID，用于禁用按钮 */
 const transferPendingIds = ref(new Set<string>());
 /**
+ * 传输面板「日志」tab 的数据源：真实事件流（入队 / 控制命令 / 冲突 / 失败 /
+ * 完成），写入方是本文件与 TransferWorkspace，渲染方是 TransferPanel。
+ * undefined 表示还没拖过，TransferPanel 用默认高度。
+ */
+const { entries: transferLogEntries, droppedCount: transferDroppedLogs, append: appendTransferLog, clear: clearTransferLogs } = useTransferLog();
+const transferPanelHeight = ref<number | undefined>(undefined);
+/**
  * 传输队列行可触发的控制动作。
  * - pause/resume/cancel 操作传输循环
  * - remove 只把终态条目移出队列，不删除已传输文件
@@ -90,12 +101,18 @@ async function refreshTransfers() {
   } catch (error) {
     // 不能静默：面板必须能区分「读取失败」与「确实没有任务」
     transferLoadError.value = String(error);
+    appendTransferLog("error", "传输队列读取失败", String(error));
     console.error("无法读取传输队列", error);
   }
 }
 
 function actionLabel(action: TransferAction) {
   return { pause: "暂停", resume: "继续", cancel: "取消", remove: "删除" }[action];
+}
+
+/** 任务名用于日志文案：优先用队列里的名字，查不到（已移出队列）就退回 ID */
+function transferName(taskId: string): string {
+  return transferItems.value.find((row) => row.id === taskId)?.name ?? taskId;
 }
 
 async function runTransferAction(taskId: string, action: TransferAction) {
@@ -116,8 +133,13 @@ async function runTransferAction(taskId: string, action: TransferAction) {
     }
     // 后端事件或队列刷新决定最终 phase；这里不写乐观状态。
     await refreshTransfers();
+    appendTransferLog(
+      action === "remove" ? "info" : "success",
+      `${actionLabel(action)}：${transferName(taskId)}`,
+    );
   } catch (error) {
     transferActionError.value = `${actionLabel(action)}失败：${String(error)}`;
+    appendTransferLog("error", `${actionLabel(action)}失败：${transferName(taskId)}`, String(error));
     ElNotification.error({ title: `${actionLabel(action)}传输失败`, message: String(error) });
     console.error(`${actionLabel(action)}传输失败`, error);
   } finally {
@@ -152,10 +174,13 @@ async function removeTransfers(taskIds: string[]) {
     await refreshTransfers();
     if (failures.length > 0) {
       transferActionError.value = `删除失败 ${failures.length} 个：${failures[0]}`;
+      appendTransferLog("error", `批量删除未完成：${failures.length} 个条目未删除`, failures.join("；"));
       ElNotification.error({
         title: "队列清理未完成",
         message: `${failures.length} 个条目未能删除（进行中的任务需先取消）。`,
       });
+    } else {
+      appendTransferLog("success", `已从队列移除 ${taskIds.length} 个已结束条目`);
     }
   } finally {
     const remaining = new Set(transferPendingIds.value);
@@ -186,7 +211,11 @@ const TerminalPanelView = defineComponent({
     return () => {
       const panelParams = panelProps.params as { params?: { sessionId?: Uuid } } | undefined;
       const sessionId = panelParams?.params?.sessionId;
-      return sessionId ? h(TerminalPane, { sessionId }) : null;
+      if (!sessionId) return null;
+      // 连接状态从 store 现取：终端面板要跟着真实连接变化（断开/重连），
+      // 不能只在挂载时读一次。render 函数里读 store 天然是响应式的。
+      const connectionState = store.connectionState.get(sessionId) ?? "disconnected";
+      return h(TerminalPane, { sessionId, connectionState });
     };
   },
 });
@@ -198,30 +227,105 @@ const components = markRaw({ terminal: TerminalPanelView as never });
 /** dockview 容器 ready 后的 api；终端面板只能经该 api 创建 */
 let dockviewApi: DockviewApi | null = null;
 
-/** 确保会话的终端面板存在：已创建则激活原面板，否则 addPanel 新建 */
-function ensureTerminalPanel(sessionId: Uuid) {
+const TERMINAL_PANEL_PREFIX = "terminal-";
+/** 同会话多开窗口时面板 id 的序号分隔符；UUID 只有十六进制与连字符，不会撞上 */
+const PANEL_INDEX_SEPARATOR = "~";
+
+/** 面板 id ⇄ 会话：第 1 个窗口不带后缀，第 n 个带 `~n` */
+function terminalPanelId(sessionId: Uuid, index: number): string {
+  return index <= 1
+    ? `${TERMINAL_PANEL_PREFIX}${sessionId}`
+    : `${TERMINAL_PANEL_PREFIX}${sessionId}${PANEL_INDEX_SEPARATOR}${index}`;
+}
+
+function parseTerminalPanelId(panelId: string): { sessionId: Uuid; index: number } | null {
+  if (!panelId.startsWith(TERMINAL_PANEL_PREFIX)) return null;
+  const rest = panelId.slice(TERMINAL_PANEL_PREFIX.length);
+  const sep = rest.indexOf(PANEL_INDEX_SEPARATOR);
+  if (sep < 0) return { sessionId: rest as Uuid, index: 1 };
+  const sessionId = rest.slice(0, sep) as Uuid;
+  const index = Number.parseInt(rest.slice(sep + 1), 10);
+  if (!sessionId || !Number.isInteger(index) || index < 1) return null;
+  return { sessionId, index };
+}
+
+function terminalPanelTitle(sessionId: Uuid, position: number): string {
+  const name = store.items.find((s) => s.id === sessionId)?.name;
+  const base = shortTerminalTitle(name, sessionId);
+  return position <= 1 ? base : `${base} #${position}`;
+}
+
+/** 新窗口序号 = 现存最大序号 + 1；用最大值而非个数，避免中间窗口被关掉后撞 id */
+function nextTerminalPanelIndex(sessionId: Uuid): number {
+  let max = 0;
+  for (const panel of dockviewApi?.panels ?? []) {
+    const info = parseTerminalPanelId(panel.id);
+    if (info && info.sessionId === sessionId) max = Math.max(max, info.index);
+  }
+  return max + 1;
+}
+
+/**
+ * 按创建顺序给某会话的窗口重新编号：主窗口不带后缀，附加窗口显示 `#2`、
+ * `#3`… 关掉中间一个窗口后编号自动补齐，不会出现 `#2 #4` 这种跳号。
+ */
+function retitleTerminalPanels(sessionId: Uuid) {
   if (!dockviewApi) return;
-  const panelId = `terminal-${sessionId}`;
-  // 不传 title 时 dockview 会把面板 id 当标签（`terminal-<uuid>`，45 字符），
-  // 这里显式给短标题；已存在的面板同步改名，避免会话重命名后标签仍是旧名。
-  const title = shortTerminalTitle(store.items.find((s) => s.id === sessionId)?.name, sessionId);
-  const existing = dockviewApi.getPanel(panelId);
-  if (existing) {
-    existing.api.setTitle(title);
-    existing.api.setActive();
+  const owned = dockviewApi.panels
+    .map((panel) => ({ panel, info: parseTerminalPanelId(panel.id) }))
+    .filter((entry) => !!entry.info && entry.info!.sessionId === sessionId)
+    .sort((a, b) => a.info!.index - b.info!.index);
+  owned.forEach((entry, i) => entry.panel.api.setTitle(terminalPanelTitle(sessionId, i + 1)));
+}
+
+/**
+ * 确保该会话有终端面板。`forceNew` 为真时**总是**新开一个窗口——
+ * 同一份连接信息可以同时开多个 shell，各窗口是各自独立的 attach 通道。
+ */
+function ensureTerminalPanel(sessionId: Uuid, opts: { forceNew?: boolean } = {}) {
+  if (!dockviewApi) return;
+  if (!opts.forceNew) {
+    const main = dockviewApi.getPanel(terminalPanelId(sessionId, 1));
+    if (main) {
+      main.api.setTitle(terminalPanelTitle(sessionId, 1));
+      main.api.setActive();
+      retitleTerminalPanels(sessionId);
+      return;
+    }
+  }
+  const index = nextTerminalPanelIndex(sessionId);
+  const panelId = terminalPanelId(sessionId, index);
+  // 序号取自现存最大值，理论上不会撞；真撞上就复用而不是 addPanel 报错
+  const clash = dockviewApi.getPanel(panelId);
+  if (clash) {
+    clash.api.setActive();
     return;
   }
   dockviewApi.addPanel({
     id: panelId,
     component: "terminal",
-    title,
+    title: terminalPanelTitle(sessionId, index),
     params: { sessionId },
   });
+  retitleTerminalPanels(sessionId);
 }
 
 function onDockviewReady(event: DockviewReadyEvent) {
   dockviewApi = event.api;
   if (activeTerminal.value) ensureTerminalPanel(activeTerminal.value);
+  // 聚焦窗口决定工具栏的连接/断开作用在哪条会话上：同一会话的多个窗口
+  // 共享连接状态，但跨会话必须跟着焦点走。
+  event.api.onDidActivePanelChange(({ panel }) => {
+    if (!panel) return;
+    const info = parseTerminalPanelId(panel.id);
+    if (!info) return;
+    activeTerminal.value = info.sessionId;
+    store.currentId = info.sessionId;
+  });
+  event.api.onDidRemovePanel(({ id }) => {
+    const info = parseTerminalPanelId(id);
+    if (info) retitleTerminalPanels(info.sessionId);
+  });
 }
 
 // 容器 v-if 卸载时 DockviewVue 已 dispose 其 api，清引用防误用
@@ -242,9 +346,10 @@ function closeOrphanTerminalPanels() {
   if (!dockviewApi) return;
   const alive = new Set(store.items.map((session) => session.id));
   for (const panel of dockviewApi.panels) {
-    if (!panel.id.startsWith("terminal-")) continue;
-    const sessionId = panel.id.slice("terminal-".length);
-    if (!alive.has(sessionId)) dockviewApi.getPanel(panel.id)?.api.close();
+    const info = parseTerminalPanelId(panel.id);
+    if (!info) continue;
+    if (!alive.has(info.sessionId)) dockviewApi.getPanel(panel.id)?.api.close();
+    else retitleTerminalPanels(info.sessionId);
   }
 }
 
@@ -328,6 +433,88 @@ function onOpenTerminal(_id: Uuid, _path: string) {
   void selectSession(_id);
 }
 
+/**
+ * 为当前会话新开一个终端窗口：复用已有连接（不重复握手），只是多挂一个
+ * 独立的终端通道。会话未连接时先走 selectSession 建连再建面板。
+ */
+async function openTerminalWindow(id: Uuid) {
+  workspace.value = "terminal";
+  activeTerminal.value = id;
+  store.currentId = id;
+  if (store.connectionState.get(id) !== "connected" && store.connectionState.get(id) !== "connecting") {
+    try {
+      await store.connect(id);
+    } catch (e) {
+      ElMessage.error(`连接失败：${String(e)}`);
+      return;
+    }
+  }
+  ensureTerminalPanel(id, { forceNew: true });
+}
+
+// ── 复制会话 ──
+// 流程放在 App.vue 而不是 SessionList：入口有两个（左侧会话列表右键、终端
+// tab 右键），而 SessionList 是按侧栏当前面板条件挂载的（切到「文件/工具」
+// 就卸载），挂在那儿监听 tab 触发的复制会静默失灵。
+/** 复制后需要补录凭据的会话；非空时渲染凭据对话框 */
+const credentialForDuplicate = ref<SessionConfig | null>(null);
+const duplicatingSession = ref(false);
+
+/** 口令类认证且新条目还没有凭据时，才需要立刻补录 */
+function duplicateNeedsCredential(session: SessionConfig): boolean {
+  const auth = session.auth_method;
+  if ("Password" in auth) return !auth.Password.has_password;
+  if ("KeyboardInteractive" in auth) return !auth.KeyboardInteractive.has_password;
+  return false;
+}
+
+async function duplicateSession(id: Uuid) {
+  if (duplicatingSession.value) return;
+  duplicatingSession.value = true;
+  try {
+    const newId = await store.duplicate(id);
+    const created = store.items.find((item) => item.id === newId) ?? null;
+    if (created && duplicateNeedsCredential(created)) {
+      credentialForDuplicate.value = created;
+      ElNotification.info({
+        title: "已复制会话",
+        message: `「${created.name}」连接信息与原会话相同；凭据不随配置复制，请先填写凭据再连接。`,
+      });
+    } else {
+      ElNotification.info({
+        title: "已复制会话",
+        message: `「${created?.name ?? "新会话"}」连接信息与原会话相同；凭据未复制，如需要请在会话列表右键「更新凭据」。`,
+      });
+    }
+    // 不自动选中/连接：新条目此刻没有凭据，自动连接只会换来一次注定失败的
+    // 认证与一个错误弹窗。连不连由用户点击决定。
+  } catch (error) {
+    ElNotification.error({ title: "复制会话失败", message: String(error) });
+  } finally {
+    duplicatingSession.value = false;
+  }
+}
+
+/**
+ * 终端 tab 右键菜单。
+ *
+ * 用 dockview 的 `getTabContextMenuItems`：省略该选项时 dockview 根本不弹菜单，
+ * 返回空数组则对该面板抑制。菜单项执行后 dockview 会自动收起菜单。
+ * 「关闭标签」自己实现而不用内置 `'close'`，因为内置项文案是英文 Close。
+ */
+function terminalTabContextMenuItems(params: {
+  panel: { id: string; api: { close: () => void } };
+}): ContextMenuItem[] {
+  const info = parseTerminalPanelId(params.panel.id);
+  if (!info) return [];
+  return [
+    { label: "新开终端窗口", action: () => void openTerminalWindow(info.sessionId) },
+    { label: "复制会话", action: () => void duplicateSession(info.sessionId) },
+    "separator",
+    { label: "关闭标签", action: () => params.panel.api.close() },
+  ];
+}
+
 async function connectCurrent() {
   if (!store.currentId) return;
   try { await store.connect(store.currentId); }
@@ -395,6 +582,17 @@ onMounted(async () => {
       if (event === "TransferQueueChanged" || (typeof event === "object" && event !== null && (
         "TransferCompleted" in event || "TransferFailed" in event || "TransferProgress" in event
       ))) void refreshTransfers();
+      // 终态与冲突进日志。TransferProgress 不进：每次采样都写一条会把日志刷爆，
+      // 进度本来就由队列列表实时呈现。
+      if (typeof event !== "string" && "TransferCompleted" in event) {
+        appendTransferLog("success", `传输完成：${transferName(event.TransferCompleted.task_id)}`);
+      }
+      if (typeof event !== "string" && "TransferFailed" in event) {
+        appendTransferLog("error", `传输失败：${transferName(event.TransferFailed.task_id)}`, event.TransferFailed.error);
+      }
+      if (typeof event !== "string" && "TransferConflict" in event) {
+        appendTransferLog("warn", `目标已存在：${event.TransferConflict.path}`);
+      }
       if (typeof event !== "string" && "TriggerFired" in event && event.TriggerFired.action_summary.startsWith("notify: ")) {
         ElNotification({ title: "触发器通知", message: event.TriggerFired.action_summary.slice(8) });
       }
@@ -413,6 +611,7 @@ onMounted(async () => {
   } catch (error) {
     console.error("无法订阅传输队列", error);
     transferLoadError.value = String(error);
+    appendTransferLog("error", "传输事件订阅失败", String(error));
     ElNotification.error({
       title: "传输事件订阅失败",
       message: "传输进度与结果将不再自动刷新，请重启应用。",
@@ -465,6 +664,7 @@ onBeforeUnmount(() => {
       :on-disconnect="disconnectCurrent"
       :on-find="() => terminalAction('find')"
       :on-clear-screen="() => terminalAction('clear')"
+      :on-new-terminal-window="() => activeTerminal && openTerminalWindow(activeTerminal)"
       @change-workspace="pickWorkspace"
       @select-panel="selectPanel"
       @toggle-sidebar="toggleSidebar"
@@ -494,6 +694,8 @@ onBeforeUnmount(() => {
         @new-session="openNewSession"
         @open-sftp="onOpenSftp"
         @open-terminal="onOpenTerminal"
+        @open-terminal-window="openTerminalWindow"
+        @duplicate-session="duplicateSession"
       />
 
       <main class="main-area">
@@ -502,6 +704,7 @@ onBeforeUnmount(() => {
           <DockviewVue
             v-if="activeTerminal"
             :components="components"
+            :get-tab-context-menu-items="terminalTabContextMenuItems"
             style="width: 100%; height: 100%"
             @ready="onDockviewReady"
             @vue:unmounted="onDockviewUnmounted"
@@ -546,12 +749,17 @@ onBeforeUnmount(() => {
               :error="transferLoadError"
               :action-error="transferActionError"
               :pending-task-ids="transferPendingIds"
+              :height="transferPanelHeight"
+              :logs="transferLogEntries"
+              :dropped-logs="transferDroppedLogs"
               @toggle="transferPanelExpanded = !transferPanelExpanded"
               @pause="(taskId) => runTransferAction(taskId, 'pause')"
               @resume="(taskId) => runTransferAction(taskId, 'resume')"
               @cancel="(taskId) => runTransferAction(taskId, 'cancel')"
               @remove="(taskId) => runTransferAction(taskId, 'remove')"
               @remove-many="removeTransfers"
+              @update:height="transferPanelHeight = $event"
+              @clear-log="clearTransferLogs"
             />
           </div>
         </div>
@@ -565,7 +773,17 @@ onBeforeUnmount(() => {
       @close="dialogVisible = false"
       @created="(id) => selectSession(id)"
     />
+    <!-- 复制会话后为新条目补录凭据（凭据不随配置复制） -->
+    <SessionCredentialDialog
+      v-if="credentialForDuplicate"
+      :session="credentialForDuplicate"
+      @close="credentialForDuplicate = null"
+    />
     <HostKeyMismatchDialog />
+    <!-- 全局自定义弹窗：确认/输入窗体与本地路径选择器都在应用内渲染，
+         不再出现 Element Plus 的 MessageBox 或操作系统原生窗口 -->
+    <DialogHost />
+    <PathPickerHost />
   </div>
 </template>
 

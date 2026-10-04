@@ -12,16 +12,20 @@
  * 按 'group' 字段聚合成树,后端将来接入分组 API 后只需替换 buildTree。
  */
 import { computed, ref } from "vue";
-import { confirm } from "@tauri-apps/plugin-dialog";
 import { useSessionsStore } from "../stores/sessions";
 import type { Uuid } from "../ipc/types";
 import type { SessionConfig } from "../ipc/types";
 import SessionCredentialDialog from "./SessionCredentialDialog.vue";
+import { confirmDialog } from "../utils/dialog";
 
 const emit = defineEmits<{
   (e: "select", id: Uuid): void;
   (e: "open-sftp", id: Uuid): void;
   (e: "open-terminal", id: Uuid, path: string): void;
+  /** 为同一会话新开一个终端窗口（不抢占已有面板） */
+  (e: "open-terminal-window", id: Uuid): void;
+  /** 复制会话：用同一份连接信息建新条目 */
+  (e: "duplicate-session", id: Uuid): void;
   (e: "new-session"): void;
 }>();
 
@@ -111,6 +115,11 @@ function ctxOpenTerminal() {
   if (!contextMenu.value.session) return;
   emit("open-terminal", contextMenu.value.session.id, "~");
 }
+/** 新开窗口：同连接信息可以同时开多个 shell，不复用已存在的终端面板 */
+function ctxOpenTerminalWindow() {
+  if (!contextMenu.value.session) return;
+  emit("open-terminal-window", contextMenu.value.session.id);
+}
 function ctxDisconnect() {
   if (!contextMenu.value.session) return;
   store.disconnect(contextMenu.value.session.id).catch(console.warn);
@@ -119,17 +128,30 @@ function ctxUpdateCredential() {
   credentialSession.value = contextMenu.value.session;
   contextMenu.value.visible = false;
 }
+
+/** 口令类认证且新条目还没有凭据时，才需要立刻补录 */
+// 复制流程由 App.vue 持有（入口有左侧列表与终端 tab 两处，而本组件按侧栏
+// 当前面板条件挂载），这里只负责发出意图。
+function ctxDuplicate() {
+  const target = contextMenu.value.session;
+  if (!target) return;
+  contextMenu.value.visible = false;
+  emit("duplicate-session", target.id);
+}
 async function ctxDelete() {
   const target = contextMenu.value.session;
   if (!target) return;
-  // wry/WKWebView 不实现 JS confirm(), 必须走 plugin-dialog 原生确认框
-  const ok = await confirm(`确定删除会话 ${target.name} ?`, {
+  // 应用内确认窗替代 tauri-plugin-dialog 的 confirm()：不弹操作系统窗口
+  const ok = await confirmDialog({
     title: "删除会话",
-    kind: "warning",
+    message: `确定删除会话「${target.name}」吗？此操作不可撤销。`,
+    detail: `${target.host}:${target.port}`,
+    confirmText: "删除",
+    danger: true,
   });
-  if (ok) {
-    store.delete?.(target.id).catch(console.warn);
-  }
+  if (!ok) return;
+  // 失败原因由 sessions store 写入 store.error，列表顶部已有展示位
+  await store.delete?.(target.id).catch(console.warn);
 }
 </script>
 
@@ -214,7 +236,21 @@ async function ctxDelete() {
       <div class="ctx-sep" />
       <button v-if="contextMenu.session?.protocol === 'SSH'" class="ctx-item" @click="ctxOpenSftp">打开 SFTP</button>
       <button class="ctx-item" @click="ctxOpenTerminal">打开终端</button>
+      <button
+        class="ctx-item"
+        data-test="ctx-open-terminal-window"
+        @click="ctxOpenTerminalWindow"
+      >
+        新开终端窗口
+      </button>
       <div class="ctx-sep" />
+      <button
+        class="ctx-item"
+        data-test="ctx-duplicate"
+        @click="ctxDuplicate"
+      >
+        复制会话
+      </button>
       <button class="ctx-item ctx-danger" @click="ctxDelete">删除</button>
     </div>
   </div>
@@ -261,6 +297,14 @@ h3 {
   color: var(--rs-p-danger);
   font-size: var(--rs-fs-xs);
   margin: 0;
+}
+.notice {
+  color: var(--rs-fg-muted);
+  font-size: var(--rs-fs-xs);
+  margin: 0;
+  padding: 4px var(--rs-s-2);
+  border-left: 2px solid var(--rs-accent);
+  background: var(--rs-bg-surface);
 }
 .empty { color: var(--rs-fg-disabled); font-size: var(--rs-fs-xs); padding: var(--rs-s-2); }
 

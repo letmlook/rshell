@@ -1,20 +1,37 @@
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import TerminalPane from "../../src/components/TerminalPane.vue";
 import { useThemeStore } from "../../src/stores/theme";
 
-const { terminalOptions, keyHandlers, sendInputMock } = vi.hoisted(() => ({
+const { terminalOptions, keyHandlers, sendInputMock, selectionHandlers, terminalInstances, pasteMock } = vi.hoisted(() => ({
   terminalOptions: [] as Array<{ theme: unknown }>,
   // 记录 attachCustomKeyEventHandler 收到的回调，供退格键位测试直接调用
   keyHandlers: [] as Array<(e: KeyboardEvent) => boolean>,
   sendInputMock: vi.fn().mockResolvedValue(undefined),
+  // 记录 onSelectionChange 回调，供「选中即复制」测试直接触发
+  selectionHandlers: [] as Array<() => void>,
+  // 记录 Terminal 实例，测试可改 selection 模拟「有选区/无选区」
+  terminalInstances: [] as Array<{ selection: string }>,
+  pasteMock: vi.fn(),
 }));
+// TerminalPane 真实用到的方法必须在替身上存在：缺一个就会在 mounted 抛错，
+// 连带 window 事件监听注册不上，表现为「搜索栏不弹」这类假故障。
 vi.mock("@xterm/xterm", () => ({ Terminal: class {
   cols = 80; rows = 24;
-  constructor(public options: { theme: unknown }) { terminalOptions.push(options); }
+  selection = "";
+  options: { theme: unknown; disableStdin: boolean } = { theme: undefined, disableStdin: false };
+  constructor(options: { theme: unknown }) {
+    this.options.theme = options.theme;
+    terminalOptions.push(options);
+    terminalInstances.push(this);
+  }
   loadAddon() {} open() {} onData() {} dispose() {} write() {}
   attachCustomKeyEventHandler(cb: (e: KeyboardEvent) => boolean) { keyHandlers.push(cb); }
+  onSelectionChange(cb: () => void) { selectionHandlers.push(cb); }
+  getSelection() { return this.selection; }
+  clear() { this.selection = ""; }
+  paste(text: string) { pasteMock(text); }
 } }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
 vi.mock("@xterm/addon-search", () => ({ SearchAddon: class { clearDecorations() {} } }));
@@ -75,6 +92,65 @@ it("applies routed find/closeFind only to the matching session and ignores raw w
 
   pane1.unmount();
   pane2.unmount();
+});
+
+// 右键语义（Xshell 习惯）：没有选区时右键**直接粘贴**；有选区时语义歧义
+// （复制选中内容 vs 粘贴），才弹菜单让用户选。
+describe("TerminalPane 右键粘贴", () => {
+  function stubClipboard(text: string) {
+    const readText = vi.fn(async () => text);
+    Object.defineProperty(globalThis.navigator, "clipboard", {
+      value: { readText, writeText: vi.fn(async () => {}) },
+      configurable: true,
+    });
+    return readText;
+  }
+
+  beforeEach(() => {
+    terminalInstances.length = 0;
+    pasteMock.mockClear();
+  });
+
+  it("无选区时右键直接粘贴剪贴板内容，且不弹菜单", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    stubClipboard("ls -al");
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const wrapper = mount(TerminalPane, {
+      props: { sessionId: "session-1", connectionState: "connected" },
+      global: { plugins: [pinia] },
+    });
+    await flushPromises();
+    terminalInstances.at(-1)!.selection = "";
+
+    await wrapper.get('[data-test="term-canvas"]').trigger("contextmenu", { clientX: 20, clientY: 30 });
+    await flushPromises();
+
+    expect(pasteMock).toHaveBeenCalledWith("ls -al");
+    expect(wrapper.find('[data-test="term-context-menu"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("有选区时右键弹菜单，不直接粘贴（避免覆盖掉刚选中的内容）", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    stubClipboard("rm -rf /");
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const wrapper = mount(TerminalPane, {
+      props: { sessionId: "session-1", connectionState: "connected" },
+      global: { plugins: [pinia] },
+    });
+    await flushPromises();
+    terminalInstances.at(-1)!.selection = "/var/log";
+
+    await wrapper.get('[data-test="term-canvas"]').trigger("contextmenu", { clientX: 20, clientY: 30 });
+    await flushPromises();
+
+    expect(pasteMock).not.toHaveBeenCalled();
+    const menu = wrapper.get('[data-test="term-context-menu"]');
+    expect(menu.find('[data-test="term-menu-copy"]').attributes("disabled")).toBeUndefined();
+    wrapper.unmount();
+  });
 });
 
   // 退格必须送 \x08 (BS)：xterm.js 默认送 \x7f (DEL)，而远端 shell 的行规程

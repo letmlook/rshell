@@ -4,7 +4,7 @@ import { defineComponent } from "vue";
 import TransferWorkspace from "../../src/components/transfer/TransferWorkspace.vue";
 import FileBrowserPane from "../../src/components/transfer/FileBrowserPane.vue";
 import { enqueueUpload, enqueueDownload, deleteRemoteEntry, getRemoteHomeDir } from "../../src/ipc/client";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { confirmDialog } from "../../src/utils/dialog";
 
 vi.mock("../../src/ipc/client", () => ({
   enqueueUpload: vi.fn().mockResolvedValue(undefined),
@@ -12,11 +12,17 @@ vi.mock("../../src/ipc/client", () => ({
   createRemoteDirectory: vi.fn().mockResolvedValue(undefined),
   deleteRemoteEntry: vi.fn().mockResolvedValue(undefined),
   getRemoteHomeDir: vi.fn().mockResolvedValue("/"),
+  browseRemoteDir: vi.fn().mockResolvedValue({ entries: [] }),
 }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({
-  open: vi.fn(),
-  confirm: vi.fn().mockResolvedValue(false),
+// 冲突预检要读本地目标目录；默认给空目录（= 无同名冲突）
+vi.mock("@tauri-apps/plugin-fs", () => ({ readDir: vi.fn().mockResolvedValue([]) }));
+// 确认/输入/选路径都走应用内弹窗服务，不再有 tauri-plugin-dialog
+vi.mock("../../src/utils/dialog", () => ({
+  confirmDialog: vi.fn().mockResolvedValue(false),
+  openDialog: vi.fn().mockResolvedValue(null),
+  promptDialog: vi.fn().mockResolvedValue(null),
 }));
+vi.mock("../../src/utils/pathPicker", () => ({ pickLocalPath: vi.fn().mockResolvedValue(null) }));
 vi.mock("element-plus", () => ({
   ElMessage: { error: vi.fn() },
   ElMessageBox: { prompt: vi.fn() },
@@ -77,11 +83,11 @@ describe("TransferWorkspace", () => {
     remote.vm.$emit("selection-change", [{ name: "folder", is_dir: true, size: 0, modified: "" }]);
     await flushPromises();
     await (wrapper.vm as unknown as { deleteSelected(): Promise<void> }).deleteSelected();
-    expect(confirm).not.toHaveBeenCalled();
+    expect(confirmDialog).not.toHaveBeenCalled();
     remote.vm.$emit("selection-change", [{ name: "a.txt", is_dir: false, size: 1, modified: "" }]);
     await flushPromises();
     await (wrapper.vm as unknown as { deleteSelected(): Promise<void> }).deleteSelected();
-    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirmDialog).toHaveBeenCalledOnce();
     expect(deleteRemoteEntry).not.toHaveBeenCalled();
   });
 });

@@ -6,10 +6,11 @@ import { deleteTrigger, listTriggers } from "../../src/ipc/client";
 
 // R2-14：触发器删除是持久数据删除，必须先弹确认、取消则不删除
 //（此前是唯一没有确认流的删除入口；对照 SessionList/KeyManagerPanel/QuickCommandPanel）。
-const { confirmMock, subscribeAppEventsMock, handlers: eventHandlers } = vi.hoisted(() => {
+// 删除确认走应用内自定义弹窗（utils/dialog），不再用 ElMessageBox。
+const { confirmDialogMock, subscribeAppEventsMock, handlers: eventHandlers } = vi.hoisted(() => {
   const handlers: Array<(event: unknown) => void> = [];
   return {
-    confirmMock: vi.fn(),
+    confirmDialogMock: vi.fn(),
     subscribeAppEventsMock: vi.fn((handler: (event: unknown) => void) => {
       handlers.push(handler);
       return Promise.resolve(() => {
@@ -28,9 +29,7 @@ vi.mock("../../src/ipc/client", () => ({
   deleteTrigger: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("../../src/ipc/events", () => ({ subscribeAppEvents: subscribeAppEventsMock }));
-vi.mock("element-plus/es/components/message-box/index.mjs", () => ({
-  ElMessageBox: { confirm: confirmMock },
-}));
+vi.mock("../../src/utils/dialog", () => ({ confirmDialog: confirmDialogMock }));
 
 const trigger = {
   id: "trigger-1",
@@ -58,18 +57,18 @@ async function clickDelete() {
 
 describe("TriggerEditor 删除确认（R2-14）", () => {
   beforeEach(() => {
-    confirmMock.mockReset();
+    confirmDialogMock.mockReset();
     vi.mocked(deleteTrigger).mockReset().mockResolvedValue(undefined);
     vi.mocked(listTriggers).mockReset().mockResolvedValue([trigger]);
     eventHandlers.length = 0;
   });
 
   it("删除前弹出确认，取消则不删除", async () => {
-    confirmMock.mockRejectedValueOnce("cancel"); // 用户点取消
+    confirmDialogMock.mockResolvedValueOnce(false); // 用户点取消
     const wrapper = await clickDelete();
 
-    expect(confirmMock).toHaveBeenCalledTimes(1);
-    expect(String(confirmMock.mock.calls[0][0])).toContain("prompt-regex");
+    expect(confirmDialogMock).toHaveBeenCalledTimes(1);
+    expect(String(confirmDialogMock.mock.calls[0][0].message)).toContain("prompt-regex");
     expect(vi.mocked(deleteTrigger)).not.toHaveBeenCalled();
     // 取消路径不产生错误提示
     expect(wrapper.text()).not.toContain("删除失败");
@@ -77,10 +76,10 @@ describe("TriggerEditor 删除确认（R2-14）", () => {
   });
 
   it("确认后调用 deleteTrigger 并刷新列表", async () => {
-    confirmMock.mockResolvedValueOnce(undefined); // 用户确认
+    confirmDialogMock.mockResolvedValueOnce(true); // 用户确认
     const wrapper = await clickDelete();
 
-    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(confirmDialogMock).toHaveBeenCalledTimes(1);
     expect(vi.mocked(deleteTrigger)).toHaveBeenCalledWith("trigger-1");
     expect(vi.mocked(listTriggers).mock.calls.length).toBeGreaterThanOrEqual(2);
     wrapper.unmount();

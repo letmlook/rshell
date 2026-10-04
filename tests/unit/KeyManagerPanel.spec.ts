@@ -4,10 +4,14 @@ import ElementPlus from "element-plus";
 import KeyManagerPanel from "../../src/components/KeyManagerPanel.vue";
 import { deleteSshKey, importPrivateKey } from "../../src/ipc/client";
 
-// wry/WKWebView 不实现 window.confirm/prompt(恒 false/null),
-// 组件已改用 @tauri-apps/plugin-dialog + el-dialog, 这里 mock 模块而非全局函数
-const { open, confirm } = vi.hoisted(() => ({ open: vi.fn(), confirm: vi.fn() }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open, confirm }));
+// 选文件走应用内路径选择器（utils/pathPicker），删除确认走 utils/dialog，
+// 都不再经过 tauri-plugin-dialog 的原生窗口。
+const { pickLocalPath, confirmDialog } = vi.hoisted(() => ({
+  pickLocalPath: vi.fn(),
+  confirmDialog: vi.fn(),
+}));
+vi.mock("../../src/utils/pathPicker", () => ({ pickLocalPath }));
+vi.mock("../../src/utils/dialog", () => ({ confirmDialog }));
 vi.mock("../../src/ipc/client", () => ({
   listKeys: vi.fn().mockResolvedValue([{ id: "key-1", name: "work", key_type: "ED25519", fingerprint: "SHA256:test", has_passphrase: false }]),
   generateSshKey: vi.fn(), importPrivateKey: vi.fn(), deleteSshKey: vi.fn(),
@@ -25,7 +29,7 @@ const importButton = (wrapper: Wrapper) =>
   wrapper.findAll("button").find(button => button.text() === "导入");
 
 async function openImportDialog(wrapper: Wrapper) {
-  open.mockResolvedValue("/tmp/id_ed25519");
+  pickLocalPath.mockResolvedValue("/tmp/id_ed25519");
   await importButton(wrapper)!.trigger("click");
   await flushPromises();
 }
@@ -64,11 +68,11 @@ describe("embedded key manager", () => {
     const wrapper = mountPanel();
     await flushPromises();
     const button = wrapper.findAll("button").find(button => button.text() === "删除")!;
-    confirm.mockResolvedValue(false);
+    confirmDialog.mockResolvedValue(false);
     await button.trigger("click");
     await flushPromises();
     expect(deleteSshKey).not.toHaveBeenCalled();
-    confirm.mockResolvedValue(true);
+    confirmDialog.mockResolvedValue(true);
     await button.trigger("click");
     await flushPromises();
     expect(deleteSshKey).toHaveBeenCalledWith("key-1");

@@ -12,12 +12,12 @@
  * 分隔条可拖动改变窗格比例。
  */
 import { computed, onMounted, ref, watch } from "vue";
-import { open, confirm } from "@tauri-apps/plugin-dialog";
+import { readDir } from "@tauri-apps/plugin-fs";
 import { ElMessage } from "element-plus/es/components/message/index.mjs";
-import { ElMessageBox } from "element-plus/es/components/message-box/index.mjs";
 import FileBrowserPane, { type FsEntry } from "./FileBrowserPane.vue";
 import type { ConflictPolicy, Uuid } from "../../ipc/types";
 import {
+  browseRemoteDir,
   enqueueUpload,
   enqueueDownload,
   createRemoteDirectory,
@@ -25,6 +25,9 @@ import {
   getRemoteHomeDir,
 } from "../../ipc/client";
 import { loadLastLocalDir, saveLastLocalDir } from "../../utils/lastLocalDir";
+import { appendTransferLog } from "../../utils/transferLog";
+import { confirmDialog, openDialog, promptDialog } from "../../utils/dialog";
+import { pickLocalPath } from "../../utils/pathPicker";
 
 const props = defineProps<{
   sessionId?: Uuid;
@@ -70,37 +73,63 @@ const validFile = (entries: FsEntry[]) => entries.length === 1 && !entries[0].is
 const transferable = (entries: FsEntry[]) => entries.filter((e) => !e.is_dir && safeName(e.name));
 
 /**
- * 目标已存在时询问用户：覆盖 / 重命名 / 取消。
+ * 目标已存在时的处理选择。
  *
- * 判定依据是 IPC 错误的 `kind === "target_exists"`（后端在**入队时**强制策略），
- * 不解析 message。用户在对话框里点「覆盖」之前，不会有任何写入发生。
- *
- * 先用 confirm 承载「覆盖 / 取消」；若用户选择取消分支，则再问一次新文件名
- * （取消改名 = 整体放弃）。对话框关闭与取消是两种语义，故用
- * distinguishCancelAndClose 区分。
+ * 走应用内自定义窗体（utils/dialog），不再用 ElMessageBox：
+ * 「覆盖」是破坏性操作，用 danger 样式；「重命名…」再串一个输入窗，
+ * 取消输入等同跳过该文件。
  */
-async function askConflict(targetLabel: string): Promise<ConflictPolicy | null> {
-  let action: "confirm" | "cancel" | "close";
+type ConflictChoice =
+  | { action: "overwrite" }
+  | { action: "rename"; name: string }
+  | { action: "skip" };
+
+async function askConflict(targetLabel: string, currentName: string): Promise<ConflictChoice> {
+  const choice = await openDialog({
+    title: "目标已存在同名文件",
+    message: `${targetLabel} 已存在同名文件，要如何处理？`,
+    detail: targetLabel,
+    buttons: [
+      { label: "跳过", value: "skip", variant: "ghost" },
+      { label: "重命名…", value: "rename", variant: "ghost" },
+      { label: "覆盖", value: "overwrite", variant: "danger" },
+    ],
+  });
+  if (choice === "overwrite") return { action: "overwrite" };
+  if (choice !== "rename") return { action: "skip" };
+  const name = await promptDialog({
+    title: "重命名后传输",
+    message: `为「${currentName}」输入新的文件名。`,
+    defaultValue: currentName,
+    confirmText: "传输",
+    validate: (value) => {
+      const trimmed = value.trim();
+      if (!trimmed) return "文件名不能为空";
+      if (/[\\/]/.test(trimmed)) return "文件名不能包含 \\ 或 /";
+      if (trimmed === "." || trimmed === "..") return "文件名不能是 . 或 ..";
+      return null;
+    },
+  });
+  return name ? { action: "rename", name: name.trim() } : { action: "skip" };
+}
+
+/**
+ * 目标目录里已存在的文件名集合。
+ *
+ * 入队前先读一次目录，右键上传/下载时同名文件能**当场**弹处理窗，
+ * 不必等后端拒绝一次再问。读不到（权限/断线）返回 null：不假装"不存在"，
+ * 交给入队时的 target_exists 兜底。
+ */
+async function existingNames(dir: string, remote: boolean): Promise<Set<string> | null> {
+  if (!dir) return null;
   try {
-    await ElMessageBox.confirm(`${targetLabel} 已存在同名文件。要如何处理？`, "目标已存在", {
-      type: "warning",
-      confirmButtonText: "覆盖",
-      cancelButtonText: "重命名…",
-      distinguishCancelAndClose: true,
-    });
-    return "Overwrite";
-  } catch (err) {
-    action = err as "cancel" | "close";
-  }
-  if (action === "close") return null;
-  try {
-    const { value } = await ElMessageBox.prompt("请输入新的文件名", "重命名", {
-      inputValidator: (v: string) =>
-        !!v.trim() && !/[\\/]/.test(v) && v !== "." && v !== ".."
-          ? true
-          : "请输入不含 \\ / 的文件名，且不能是 . 或 ..",
-    });
-    return { Rename: value.trim() };
+    if (remote) {
+      if (!props.sessionId) return null;
+      const result = await browseRemoteDir(props.sessionId, dir);
+      return new Set(result.entries.map((entry) => entry.name));
+    }
+    const items = await readDir(dir);
+    return new Set(items.map((item) => item.name));
   } catch {
     return null;
   }
@@ -117,9 +146,10 @@ async function enqueueWithConflict(
   } catch (error) {
     const kind = (error as { kind?: string })?.kind;
     if (kind !== "target_exists") throw error;
-    const policy = await askConflict(targetLabel);
-    if (!policy) return false;
-    await run(policy);
+    const name = targetLabel.split("/").pop() ?? targetLabel;
+    const choice = await askConflict(targetLabel, name);
+    if (choice.action === "skip") return false;
+    await run(choice.action === "overwrite" ? "Overwrite" : { Rename: choice.name });
     return true;
   }
 }
@@ -137,8 +167,14 @@ function safeName(name: string) { return !!name && name !== "." && name !== ".."
 function joinPath(base: string, name: string) { return `${base.replace(/\/$/, "")}/${name}`; }
 
 async function chooseLocalRoot() {
-  const result = await open({ directory: true, multiple: false, recursive: true, title: "选择本地文件夹" });
-  if (typeof result !== "string") return;
+  // 应用内选择器替代 tauri-plugin-dialog 的 open()：不再弹操作系统窗口
+  const result = await pickLocalPath({
+    mode: "directory",
+    title: "选择本地文件夹",
+    initialPath: internalLocalPath.value || localRoot.value || undefined,
+    allowCreateDirectory: true,
+  });
+  if (!result) return;
   localRoot.value = result;
   internalLocalPath.value = result;
   // 记住本次选择，供下次进入工作区时直接恢复
@@ -220,11 +256,23 @@ async function upload() {
   const files = transferable(selectedLocal.value);
   if (files.length === 0) return;
   // 批量：逐个入队。单条失败不阻断其余文件，失败条目在面板顶部汇总提示。
+  // 入队前先读一次远端目录：同名文件当场问覆盖/重命名/跳过，
+  // 而不是先让后端拒绝一次再问（少一次往返，也不会先失败再解释）。
+  const existing = await existingNames(internalRemotePath.value, true);
   const failures: string[] = [];
   let queued = 0;
   for (const file of files) {
     try {
       const remote = joinPath(internalRemotePath.value, file.name);
+      if (existing?.has(file.name)) {
+        const choice = await askConflict(`远端 ${remote}`, file.name);
+        if (choice.action === "skip") continue;
+        const policy: ConflictPolicy = choice.action === "overwrite" ? "Overwrite" : { Rename: choice.name };
+        const target = choice.action === "rename" ? joinPath(internalRemotePath.value, choice.name) : remote;
+        await enqueueUpload(joinPath(internalLocalPath.value, file.name), target, props.sessionId!, policy);
+        queued += 1;
+        continue;
+      }
       const ok = await enqueueWithConflict(`远端 ${remote}`, (policy) =>
         enqueueUpload(joinPath(internalLocalPath.value, file.name), remote, props.sessionId!, policy),
       );
@@ -233,8 +281,12 @@ async function upload() {
       failures.push(`${file.name}：${String(error)}`);
     }
   }
-  if (queued > 0) emit("upload-queued", queued);
+  if (queued > 0) {
+    emit("upload-queued", queued);
+    appendTransferLog("success", `上传入队 ${queued} 个文件 → ${internalRemotePath.value}`);
+  }
   if (failures.length > 0) {
+    appendTransferLog("error", `上传入队失败 ${failures.length} 个`, failures.join("；"));
     ElMessage.error(`上传失败 ${failures.length} 个：${failures.join("；")}`);
   }
 }
@@ -243,11 +295,22 @@ async function download() {
   if (!capabilities.value.download || !props.sessionId) return;
   const files = transferable(selectedRemote.value);
   if (files.length === 0) return;
+  // 同上传：先读本地目标目录，同名文件当场问覆盖/重命名/跳过
+  const existing = await existingNames(internalLocalPath.value, false);
   const failures: string[] = [];
   let queued = 0;
   for (const file of files) {
     try {
       const local = joinPath(internalLocalPath.value, file.name);
+      if (existing?.has(file.name)) {
+        const choice = await askConflict(`本地 ${local}`, file.name);
+        if (choice.action === "skip") continue;
+        const policy: ConflictPolicy = choice.action === "overwrite" ? "Overwrite" : { Rename: choice.name };
+        const target = choice.action === "rename" ? joinPath(internalLocalPath.value, choice.name) : local;
+        await enqueueDownload(joinPath(internalRemotePath.value, file.name), target, props.sessionId!, policy);
+        queued += 1;
+        continue;
+      }
       const ok = await enqueueWithConflict(`本地 ${local}`, (policy) =>
         enqueueDownload(joinPath(internalRemotePath.value, file.name), local, props.sessionId!, policy),
       );
@@ -256,31 +319,58 @@ async function download() {
       failures.push(`${file.name}：${String(error)}`);
     }
   }
-  if (queued > 0) emit("download-queued", queued);
+  if (queued > 0) {
+    emit("download-queued", queued);
+    appendTransferLog("success", `下载入队 ${queued} 个文件 → ${internalLocalPath.value}`);
+  }
   if (failures.length > 0) {
+    appendTransferLog("error", `下载入队失败 ${failures.length} 个`, failures.join("；"));
     ElMessage.error(`下载失败 ${failures.length} 个：${failures.join("；")}`);
   }
 }
 
 async function createFolder() {
   if (!capabilities.value.createFolder || !props.sessionId) return;
+  const value = await promptDialog({
+    title: "新建远程文件夹",
+    message: `将在 ${internalRemotePath.value} 下创建。`,
+    placeholder: "文件夹名称",
+    confirmText: "创建",
+    validate: (input) => (safeName(input.trim()) ? null : "请输入不含 \\ / 的名称，且不能是 . 或 .."),
+  });
+  if (!value) return;
+  const target = joinPath(internalRemotePath.value, value.trim());
   try {
-    const { value } = await ElMessageBox.prompt("文件夹名称", "新建远程文件夹");
-    if (!safeName(value)) { ElMessage.error("无效的文件夹名称"); return; }
-    await createRemoteDirectory(props.sessionId, joinPath(internalRemotePath.value, value));
+    await createRemoteDirectory(props.sessionId, target);
+    appendTransferLog("success", `新建远程文件夹：${target}`);
     await remotePane.value?.refresh();
-  } catch (error) { if (error !== "cancel" && error !== "close") ElMessage.error(`创建失败：${String(error)}`); }
+  } catch (error) {
+    appendTransferLog("error", "新建远程文件夹失败", String(error));
+    ElMessage.error(`创建失败：${String(error)}`);
+  }
 }
 
 async function deleteSelected() {
   if (!capabilities.value.delete || !props.sessionId) return;
   const file = selectedRemote.value[0];
-  if (!await confirm(`确定删除远程文件「${file.name}」吗？`, { title: "删除文件", kind: "warning" })) return;
+  const target = joinPath(internalRemotePath.value, file.name);
+  const ok = await confirmDialog({
+    title: "删除远程文件",
+    message: `确定删除远程文件「${file.name}」吗？此操作不可撤销。`,
+    detail: target,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!ok) return;
   try {
-    await deleteRemoteEntry(props.sessionId, joinPath(internalRemotePath.value, file.name));
+    await deleteRemoteEntry(props.sessionId, target);
+    appendTransferLog("success", `已删除远程文件：${target}`);
     selectedRemote.value = [];
     await remotePane.value?.refresh();
-  } catch (error) { ElMessage.error(`删除失败：${String(error)}`); }
+  } catch (error) {
+    appendTransferLog("error", `删除远程文件失败：${target}`, String(error));
+    ElMessage.error(`删除失败：${String(error)}`);
+  }
 }
 
 async function refresh() { await Promise.all([localPane.value?.refresh(), remotePane.value?.refresh()]); }

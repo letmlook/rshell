@@ -10,9 +10,10 @@
  *
  * 本地目录由已授权的 Tauri fs 读取;远程目录由 SFTP IPC 读取。
  */
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { readDir, stat } from "@tauri-apps/plugin-fs";
 import { browseRemoteDir } from "../../ipc/client";
+import PathBar from "./PathBar.vue";
 import type { Uuid, FilePermissions } from "../../ipc/types";
 
 export interface FsEntry {
@@ -63,6 +64,41 @@ const canBack = computed(() => historyIndex.value > 0);
 const canForward = computed(() => historyIndex.value < history.value.length - 1);
 const visibleEntries = computed(() => entries.value.filter((entry) => entry.name.toLowerCase().includes(search.value.toLowerCase())));
 
+/**
+ * 列表容器的实测高度，喂给 el-table 的 height。
+ *
+ * 之前只有外层 `.list-wrap { overflow: auto }`，表头随内容一起滚走，且
+ * 纵向滚动条挂在面板外层——双窗格里几乎分不清是列表还是面板在滚。
+ * 交给 el-table 自己管高度后：表头固定、纵向滚动条贴着表格，
+ * 横向滚动条也出现在表格底部（列宽总和大于面板宽度时才出现）。
+ *
+ * 未测到高度（jsdom / 隐藏容器）时传 undefined，el-table 退化为自适应高度，
+ * 不会因为 0 高度把整个面板压没。
+ */
+const listWrapRef = ref<HTMLElement | null>(null);
+const tableHeight = ref<number | undefined>(undefined);
+let listObserver: ResizeObserver | null = null;
+
+function measureList() {
+  const el = listWrapRef.value;
+  if (!el) return;
+  const h = el.clientHeight;
+  tableHeight.value = h > 0 ? h : undefined;
+}
+
+onMounted(() => {
+  measureList();
+  // ResizeObserver 在 jsdom 里不存在，缺省时保持自适应高度即可
+  if (typeof ResizeObserver === "undefined" || !listWrapRef.value) return;
+  listObserver = new ResizeObserver(() => measureList());
+  listObserver.observe(listWrapRef.value);
+});
+
+onBeforeUnmount(() => {
+  listObserver?.disconnect();
+  listObserver = null;
+});
+
 /** 根目录是否已授权（本地模式）。未授权时路径栏显示「选择文件夹」入口 */
 const hasRoot = computed(() => props.mode !== "local" || !!props.rootPath);
 
@@ -73,26 +109,6 @@ const parentPath = computed<string | null>(() => {
   if (idx < 0) return null;
   if (idx === 0) return props.path.startsWith("\\") ? "\\" : "/";
   return props.path.slice(0, idx);
-});
-
-/**
- * 面包屑分段。返回每段的显示文本与「点击后导航到的绝对路径」。
- *
- * 本地 Windows 路径要保留盘符（`D:`），不能按 `/` 简单 split——否则
- * `D:\data` 会被显示成一个不可点的整段。
- */
-const breadcrumb = computed(() => {
-  const isWin = props.path.includes("\\") || /^[A-Za-z]:/.test(props.path);
-  const sep = isWin ? "\\" : "/";
-  const parts = props.path.split(sep).filter(Boolean);
-  if (isWin && /^[A-Za-z]:$/.test(parts[0] ?? "")) {
-    const drive = parts.shift() as string;
-    return [{ label: `${drive}${sep}`, path: `${drive}${sep}` }, ...parts.map((seg, i) => ({
-      label: seg,
-      path: `${drive}${sep}${parts.slice(0, i + 1).join(sep)}`,
-    }))];
-  }
-  return parts.map((seg, i) => ({ label: seg, path: `/${parts.slice(0, i + 1).join("/")}` }));
 });
 
 function fmtSize(n: number): string {
@@ -328,17 +344,13 @@ watch(
       >
         <svg width="12" height="12" viewBox="0 0 16 16"><path d="M3 8 H13 M8 3 V13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
       </button>
-      <div class="breadcrumb" :title="path">
-        <span
-          v-for="(seg, i) in breadcrumb"
-          :key="i"
-          class="seg"
-          :data-test="`fs-crumb-${i}`"
-          @click="navigateTo(seg.path)"
-        >
-          {{ seg.label }}
-        </span>
-      </div>
+      <PathBar
+        :mode="mode"
+        :session-id="sessionId"
+        :path="path"
+        :root-path="rootPath"
+        @navigate="navigateTo"
+      />
       <button class="path-btn" title="刷新" @click="load(path, false)">
         <svg width="12" height="12" viewBox="0 0 16 16"><path d="M13 8 A5 5 0 1 1 11.5 4.2 M11.5 2.5 V5 H9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
@@ -364,12 +376,13 @@ watch(
     </div>
 
     <!-- 列表 -->
-    <div class="list-wrap" @contextmenu="onPaneContextMenu">
+    <div ref="listWrapRef" class="list-wrap" @contextmenu="onPaneContextMenu">
       <p v-if="errorText" class="err">{{ errorText }}</p>
       <el-table
         :data="visibleEntries"
         :loading="loading"
         :show-header="true"
+        :height="tableHeight"
         size="small"
         :empty-text="mode === 'local' && !path ? '先选择本地文件夹' : '空目录'"
         class="fs-table"
@@ -457,38 +470,19 @@ watch(
 .choose-btn { color: var(--rs-accent); }
 .choose-btn:hover:not(:disabled) { color: var(--rs-accent); }
 
-.breadcrumb {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 0;
-  font-family: var(--rs-font-mono);
-  font-size: var(--rs-fs-xs);
-  color: var(--rs-fg-muted);
-  overflow-x: auto;
-  white-space: nowrap;
-  scrollbar-width: thin;
-}
-.seg {
-  cursor: pointer;
-  padding: 0 4px;
-}
-.seg:hover { color: var(--rs-fg); }
-.seg + .seg::before {
-  content: "/";
-  margin-right: 4px;
-  opacity: 0.5;
-}
-
+/* 面包屑 / 输入框 / 目录树的样式都在 PathBar 里，这里只留搜索框 */
 .search {
   width: 120px;
   flex-shrink: 0;
 }
 
+/* 滚动交给 el-table 自己（表头固定 + 表格底部横向滚动条），
+   外层只负责占满剩余高度，不参与滚动 */
 .list-wrap {
   flex: 1;
-  overflow: auto;
+  overflow: hidden;
   min-height: 0;
+  position: relative;
 }
 .fs-table {
   --el-table-bg-color: var(--rs-bg-panel);
@@ -496,6 +490,17 @@ watch(
   --el-table-row-hover-bg-color: var(--rs-row-hover);
   --el-table-border-color: var(--rs-border);
   width: 100%;
+}
+/* 横向滚动条贴在表格底部：滚动条槽与主题一致，避免默认浅色条割裂面板 */
+.fs-table :deep(.el-scrollbar__bar.is-horizontal) {
+  height: 8px;
+}
+.fs-table :deep(.el-scrollbar__bar.is-horizontal .el-scrollbar__thumb) {
+  background-color: var(--rs-fg-disabled);
+  opacity: 0.8;
+}
+.fs-table :deep(.el-scrollbar__bar.is-vertical) {
+  width: 8px;
 }
 .fs-table :deep(.el-table__row) {
   cursor: default;

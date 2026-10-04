@@ -5,11 +5,11 @@
  * 快速命令列表 + 执行（弹输入框 → 选目标会话 → 调 execute_quick_command）。
  */
 import { onBeforeUnmount, onMounted, ref } from "vue";
-import { ElMessageBox } from "element-plus/es/components/message-box/index.mjs";
 import { createQuickCommand, deleteQuickCommand, listQuickCommands, executeQuickCommand } from "../ipc/client";
 import { subscribeAppEvents } from "../ipc/events";
 import { useSessionsStore } from "../stores/sessions";
 import type { QuickCommand, Uuid } from "../ipc/types";
+import { confirmDialog } from "../utils/dialog";
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
 
@@ -71,12 +71,18 @@ async function create() {
 }
 
 async function remove(cmd: QuickCommand) {
+  const ok = await confirmDialog({
+    title: "删除快速命令",
+    message: `删除快速命令「${cmd.name}」？此操作不可撤销。`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!ok) return;
   try {
-    await ElMessageBox.confirm(`删除快速命令“${cmd.name}”？`, "确认删除", { type: "warning" });
     await deleteQuickCommand(cmd.id);
     await refresh();
   } catch (e) {
-    if (e !== "cancel" && e !== "close") error.value = String(e);
+    error.value = String(e);
   }
 }
 

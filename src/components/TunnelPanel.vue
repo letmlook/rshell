@@ -5,10 +5,10 @@
  * 本地端口转发与动态 SOCKS5 隧道管理。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import { ElMessageBox } from "element-plus/es/components/message-box/index.mjs";
 import { listTunnels, listPendingTunnels, createTunnel, closeTunnel } from "../ipc/client";
 import { subscribeAppEvents } from "../ipc/events";
 import type { Uuid, PortForwardRule, ActiveTunnelInfo } from "../ipc/types";
+import { confirmDialog } from "../utils/dialog";
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
 
@@ -86,15 +86,13 @@ async function add() {
   // PROB-23：非回环监听会把端口转发 / 无认证 SOCKS5 代理暴露给局域网，
   // 必须经用户确认并携带 allow_non_loopback 标志，否则后端拒绝创建。
   if (nonLoopbackBind.value) {
-    try {
-      await ElMessageBox.confirm(
-        `监听地址 “${bind.host}” 不是回环地址：隧道将暴露给局域网，同网段任何主机都能使用该 SSH 连接转发（SOCKS5 代理无认证）。确认继续？`,
-        "将暴露给局域网",
-        { type: "warning", confirmButtonText: "确认暴露并创建", cancelButtonText: "取消" },
-      );
-    } catch {
-      return; // 用户取消：不创建
-    }
+    const exposed = await confirmDialog({
+      title: "将暴露给局域网",
+      message: `监听地址「${bind.host}」不是回环地址：隧道将暴露给局域网，同网段任何主机都能使用该 SSH 连接转发（SOCKS5 代理无认证）。确认继续？`,
+      confirmText: "确认暴露并创建",
+      danger: true,
+    });
+    if (!exposed) return; // 用户取消：不创建
     rule.allow_non_loopback = true;
   }
   try {

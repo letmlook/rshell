@@ -1,15 +1,14 @@
 <script setup lang="ts">
 /**
- * TransferPanel —— v2 重设计
+ * TransferPanel —— Xftp 底部传输/日志面板
  *
- * Xftp 底部传输面板:
  *   - 折叠态:28px 高的 [传输|日志] tab bar
- *   - 展开态:全宽列表面板,字段:名称·状态·进度条·大小·本地路径 ←→ 远程路径·速度·估计剩余·经过时间·暂停/恢复
+ *   - 展开态:全宽列表面板,字段:名称·状态·进度条·大小·本地路径 ←→ 远程路径·速度·剩余·操作
+ *   - 顶部边缘可拖动改高度(见 startResize),双击边缘恢复默认高度
  *
- * 进度条颜色映射到 --rs-progress-*
- * 状态点复用签名元素
- *
- * 数据来自后端真实传输队列快照。
+ * 进度条颜色映射到 --rs-progress-*;状态点复用签名元素。
+ * 数据来自后端真实传输队列快照(utils/transferItem.ts 映射),日志来自
+ * utils/transferLog.ts 的真实事件流——两者都不允许假数据兜底。
  *
  * 暂停/恢复/取消/删除控制:
  *   - 仅对 `active` 任务渲染"暂停",仅对 `paused` 任务渲染"继续"。
@@ -20,7 +19,8 @@
  *   - 进行中(`pendingTaskIds`)的按钮自动禁用,避免重复点击。
  *   - 失败提示由调用方写入 `actionError`,本组件原样展示,不做乐观更新。
  */
-import { computed, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { formatTransferLogTime, type TransferLogEntry, type TransferLogLevel } from "../utils/transferLog";
 
 export type TransferPhase = "queued" | "active" | "paused" | "failed" | "done" | "cancelled";
 
@@ -36,17 +36,28 @@ export interface TransferItem {
   error?: string | null;
 }
 
+/** 展开态默认高度;与 tokens.css 的 --rs-transfer-panel-h-expanded 保持一致 */
+const DEFAULT_EXPANDED_HEIGHT = 220;
+/** 拖动下限:再小就读不到「名称 + 操作」两列 */
+const MIN_EXPANDED_HEIGHT = 120;
+/** 拖动上限时给上方文件窗格保留的高度,避免把窗格压到看不见 */
+const MIN_FILES_PANE_HEIGHT = 140;
+
 const props = defineProps<{
   expanded: boolean;
   items: TransferItem[];
   /** 队列读取失败时的提示；非空时优先于空状态展示 */
   error?: string | null;
-  /** 队列高度,折叠后不占空间 */
+  /** 展开态高度(px)；不传时用 DEFAULT_EXPANDED_HEIGHT。拖动后由父组件回写 */
   height?: number;
   /** 暂停/恢复调用中的任务 ID；用于禁用对应按钮 */
   pendingTaskIds?: ReadonlySet<string>;
   /** 上一次 pause/resume 调用的错误；非空时在面板顶部展示一行 */
   actionError?: string | null;
+  /** 日志页数据（真实事件流，非占位文案） */
+  logs?: TransferLogEntry[];
+  /** 因超出环形缓冲容量而被丢弃的更早日志条数 */
+  droppedLogs?: number;
 }>();
 
 const emit = defineEmits<{
@@ -57,11 +68,22 @@ const emit = defineEmits<{
   (e: "remove", taskId: string): void;
   /** 队列生命周期批量操作：按终态分组移除条目 */
   (e: "remove-many", taskIds: string[]): void;
+  /** 拖动边缘后回写展开态高度 */
+  (e: "update:height", px: number): void;
+  /** 请求清空日志 */
+  (e: "clear-log"): void;
 }>();
 
 const tab = ref<"transfer" | "log">("transfer");
 
 const merged = computed<TransferItem[]>(() => props.items);
+const logEntries = computed<TransferLogEntry[]>(() => props.logs ?? []);
+
+const effectiveHeight = computed(() => Math.max(MIN_EXPANDED_HEIGHT, props.height ?? DEFAULT_EXPANDED_HEIGHT));
+
+const panelStyle = computed(() =>
+  props.expanded ? { height: `${effectiveHeight.value}px` } : {},
+);
 
 function isPending(taskId: string): boolean {
   return props.pendingTaskIds?.has(taskId) ?? false;
@@ -174,15 +196,146 @@ function phaseClass(p: TransferPhase): string {
     cancelled: "rs-status-dot--disconnected",
   }[p];
 }
+
+// ── 日志 ──
+const LOG_LEVEL_LABEL: Record<TransferLogLevel, string> = {
+  info: "信息",
+  success: "完成",
+  warn: "警告",
+  error: "失败",
+};
+
+const logBodyRef = ref<HTMLElement | null>(null);
+/** 用户是否贴在底部：手动上滚查看历史后不再被新日志拽回底部 */
+const stickToBottom = ref(true);
+
+function onLogScroll() {
+  const el = logBodyRef.value;
+  if (!el) return;
+  stickToBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+}
+
+function scrollLogToBottom() {
+  const el = logBodyRef.value;
+  if (!el) return;
+  el.scrollTop = el.scrollHeight;
+}
+
+watch(
+  () => [logEntries.value.length, tab.value, props.expanded] as const,
+  async () => {
+    if (tab.value !== "log" || !props.expanded || !stickToBottom.value) return;
+    await nextTick();
+    scrollLogToBottom();
+  },
+);
+
+function onLogTabActivated() {
+  tab.value = "log";
+  stickToBottom.value = true;
+  void nextTick().then(scrollLogToBottom);
+}
+
+// ── 拖动高度 ──
+// 拖动条位于面板顶边，与文件窗格的下边缘重合：往下拖 = 面板变矮。
+// 监听挂在 window 上，鼠标在面板外释放也要收尾，否则会粘住光标。
+const resizing = ref(false);
+const rootEl = ref<HTMLElement | null>(null);
+let resizeStartY = 0;
+let resizeStartHeight = 0;
+
+function maxResizableHeight(): number {
+  const parent = rootEl.value?.parentElement as HTMLElement | null;
+  const parentHeight = parent?.clientHeight ?? 0;
+  if (parentHeight <= 0) {
+    return typeof window === "undefined" ? DEFAULT_EXPANDED_HEIGHT : Math.round(window.innerHeight * 0.8);
+  }
+  return Math.max(MIN_EXPANDED_HEIGHT, parentHeight - MIN_FILES_PANE_HEIGHT);
+}
+
+function clampHeight(px: number): number {
+  return Math.round(Math.max(MIN_EXPANDED_HEIGHT, Math.min(maxResizableHeight(), px)));
+}
+
+function onResizeMove(e: MouseEvent) {
+  if (!resizing.value) return;
+  // 向上拖（clientY 变小）面板应变高
+  const next = clampHeight(resizeStartHeight - (e.clientY - resizeStartY));
+  emit("update:height", next);
+}
+
+function endResize() {
+  if (!resizing.value) return;
+  resizing.value = false;
+  window.removeEventListener("mousemove", onResizeMove);
+  window.removeEventListener("mouseup", endResize);
+}
+
+function startResize(e: MouseEvent) {
+  if (!props.expanded) return;
+  e.preventDefault();
+  resizing.value = true;
+  resizeStartY = e.clientY;
+  resizeStartHeight = effectiveHeight.value;
+  window.addEventListener("mousemove", onResizeMove);
+  window.addEventListener("mouseup", endResize);
+}
+
+/** 双击拖动条 = 恢复默认高度；给手滑的用户一个不需要精确拖拽的退路 */
+function resetHeight() {
+  emit("update:height", DEFAULT_EXPANDED_HEIGHT);
+}
+
+onBeforeUnmount(() => {
+  if (typeof window === "undefined") return;
+  window.removeEventListener("mousemove", onResizeMove);
+  window.removeEventListener("mouseup", endResize);
+});
+
+const columns = [
+  "名称",
+  "状态",
+  "进度",
+  "大小",
+  "本地路径",
+  "",
+  "远程路径",
+  "速度",
+  "剩余",
+  "操作",
+];
 </script>
 
 <template>
-  <section class="transfer-panel" :class="{ 'is-expanded': expanded }">
+  <section
+    ref="rootEl"
+    class="transfer-panel"
+    :class="{ 'is-expanded': expanded, 'is-resizing': resizing }"
+    data-test="xfer-panel"
+    :style="panelStyle"
+  >
+    <!-- 顶边拖动条：与上方文件窗格的下边缘重合 -->
+    <div
+      v-if="expanded"
+      class="resize-grip"
+      data-test="xfer-resize"
+      role="separator"
+      aria-orientation="horizontal"
+      :aria-valuenow="effectiveHeight"
+      aria-valuemin="120"
+      title="拖动调整高度，双击恢复默认"
+      @mousedown="startResize"
+      @dblclick="resetHeight"
+    >
+      <span class="resize-grip-bar" />
+    </div>
+
     <header class="panel-bar" @click="emit('toggle')">
       <div class="tabs">
         <button
           class="tab"
           :class="{ 'is-active': tab === 'transfer' }"
+          data-test="xfer-tab-transfer"
           @click.stop="tab = 'transfer'"
         >
           传输 ({{ merged.length }})
@@ -190,12 +343,22 @@ function phaseClass(p: TransferPhase): string {
         <button
           class="tab"
           :class="{ 'is-active': tab === 'log' }"
-          @click.stop="tab = 'log'"
+          data-test="xfer-tab-log"
+          @click.stop="onLogTabActivated"
         >
-          日志
+          日志{{ logEntries.length ? ` (${logEntries.length})` : "" }}
         </button>
       </div>
       <div class="spacer" />
+      <button
+        v-if="tab === 'log' && logEntries.length > 0"
+        class="text-btn"
+        data-test="xfer-log-clear"
+        title="清空日志"
+        @click.stop="emit('clear-log')"
+      >
+        清空
+      </button>
       <div class="bulk-wrap">
         <button
           class="icon-btn"
@@ -262,100 +425,141 @@ function phaseClass(p: TransferPhase): string {
     </p>
     <div v-if="expanded && tab === 'transfer'" class="panel-body">
       <div v-if="merged.length === 0" class="empty-state">暂无传输任务</div>
-      <ul v-else class="xfer-list" role="list">
-        <li
-          v-for="row in merged"
-          :key="row.id"
-          class="xfer-row"
-          :data-row-id="row.id"
-        >
-          <div class="xfer-col xfer-name" :title="row.name">{{ row.name }}</div>
-          <div class="xfer-col xfer-phase">
-            <span class="phase">
-              <span class="rs-status-dot" :class="phaseClass(row.phase)" />
-              {{ phaseLabel(row.phase) }}
-            </span>
+      <template v-else>
+        <!-- 列标题行：随内容横向滚动，纵向滚动时吸顶 -->
+        <div class="xfer-row is-header" aria-hidden="true">
+          <div
+            v-for="(col, i) in columns"
+            :key="i"
+            class="xfer-col xfer-h"
+            :class="{ 'is-blank': !col }"
+          >
+            {{ col }}
           </div>
-          <div class="xfer-col xfer-progress">
-            <div class="progress">
-              <div
-                class="progress-fill"
-                :class="`is-${row.phase}`"
-                :style="{ width: `${Math.round(row.progress * 100)}%` }"
-              />
+        </div>
+        <ul class="xfer-list" role="list" data-test="xfer-list">
+          <li
+            v-for="row in merged"
+            :key="row.id"
+            class="xfer-row"
+            :data-row-id="row.id"
+          >
+            <div class="xfer-col xfer-name" :title="row.name">{{ row.name }}</div>
+            <div class="xfer-col xfer-phase">
+              <span class="phase">
+                <span class="rs-status-dot" :class="phaseClass(row.phase)" />
+                {{ phaseLabel(row.phase) }}
+              </span>
             </div>
-            <span class="progress-label">{{ Math.round(row.progress * 100) }}%</span>
-          </div>
-          <div class="xfer-col xfer-size">{{ fmtSize(row.size) }}</div>
-          <div class="xfer-col xfer-path"><code class="path" :title="row.local">{{ row.local }}</code></div>
-          <div class="xfer-col xfer-arrow">↔</div>
-          <div class="xfer-col xfer-path"><code class="path" :title="row.remote">{{ row.remote }}</code></div>
-          <div class="xfer-col xfer-speed">{{ fmtSpeed(row.speed) }}</div>
-          <div class="xfer-col xfer-remaining">{{ fmtRemaining(row) }}</div>
-          <div class="xfer-col xfer-error" v-if="row.phase === 'failed'" role="alert">
-            {{ row.error || '传输失败，请检查连接和文件权限后重试。' }}
-          </div>
-          <div class="xfer-col xfer-actions">
-            <button
-              v-if="row.phase === 'active'"
-              type="button"
-              class="xfer-action"
-              data-test="xfer-pause"
-              :data-task-id="row.id"
-              aria-label="暂停传输"
-              :disabled="isPending(row.id)"
-              @click="onPause(row.id, $event)"
-            >
-              暂停
-            </button>
-            <button
-              v-if="row.phase === 'paused'"
-              type="button"
-              class="xfer-action"
-              data-test="xfer-resume"
-              :data-task-id="row.id"
-              aria-label="继续传输"
-              :disabled="isPending(row.id)"
-              @click="onResume(row.id, $event)"
-            >
-              继续
-            </button>
-            <button
-              v-if="row.phase === 'active' || row.phase === 'paused'"
-              type="button"
-              class="xfer-action"
-              data-test="xfer-cancel"
-              :data-task-id="row.id"
-              aria-label="取消传输"
-              :disabled="isPending(row.id)"
-              @click="onCancel(row.id, $event)"
-            >
-              取消
-            </button>
-            <button
-              v-if="isRemovable(row.phase)"
-              type="button"
-              class="xfer-action is-danger"
-              data-test="xfer-remove"
-              :data-task-id="row.id"
-              aria-label="从队列删除"
-              :disabled="isPending(row.id)"
-              @click="onRemove(row.id, $event)"
-            >
-              删除
-            </button>
-          </div>
+            <div class="xfer-col xfer-progress">
+              <div class="progress">
+                <div
+                  class="progress-fill"
+                  :class="`is-${row.phase}`"
+                  :style="{ width: `${Math.round(row.progress * 100)}%` }"
+                />
+              </div>
+              <span class="progress-label">{{ Math.round(row.progress * 100) }}%</span>
+            </div>
+            <div class="xfer-col xfer-size">{{ fmtSize(row.size) }}</div>
+            <div class="xfer-col xfer-path"><code class="path" :title="row.local">{{ row.local }}</code></div>
+            <div class="xfer-col xfer-arrow">↔</div>
+            <div class="xfer-col xfer-path"><code class="path" :title="row.remote">{{ row.remote }}</code></div>
+            <div class="xfer-col xfer-speed">{{ fmtSpeed(row.speed) }}</div>
+            <div class="xfer-col xfer-remaining">{{ fmtRemaining(row) }}</div>
+            <div class="xfer-col xfer-error" v-if="row.phase === 'failed'" role="alert">
+              {{ row.error || '传输失败，请检查连接和文件权限后重试。' }}
+            </div>
+            <div class="xfer-col xfer-actions">
+              <button
+                v-if="row.phase === 'active'"
+                type="button"
+                class="xfer-action"
+                data-test="xfer-pause"
+                :data-task-id="row.id"
+                aria-label="暂停传输"
+                :disabled="isPending(row.id)"
+                @click="onPause(row.id, $event)"
+              >
+                暂停
+              </button>
+              <button
+                v-if="row.phase === 'paused'"
+                type="button"
+                class="xfer-action"
+                data-test="xfer-resume"
+                :data-task-id="row.id"
+                aria-label="继续传输"
+                :disabled="isPending(row.id)"
+                @click="onResume(row.id, $event)"
+              >
+                继续
+              </button>
+              <button
+                v-if="row.phase === 'active' || row.phase === 'paused'"
+                type="button"
+                class="xfer-action"
+                data-test="xfer-cancel"
+                :data-task-id="row.id"
+                aria-label="取消传输"
+                :disabled="isPending(row.id)"
+                @click="onCancel(row.id, $event)"
+              >
+                取消
+              </button>
+              <button
+                v-if="isRemovable(row.phase)"
+                type="button"
+                class="xfer-action is-danger"
+                data-test="xfer-remove"
+                :data-task-id="row.id"
+                aria-label="从队列删除"
+                :disabled="isPending(row.id)"
+                @click="onRemove(row.id, $event)"
+              >
+                删除
+              </button>
+            </div>
+          </li>
+        </ul>
+      </template>
+    </div>
+    <div
+      v-else-if="expanded && tab === 'log'"
+      ref="logBodyRef"
+      class="panel-body log"
+      data-test="xfer-log-body"
+      @scroll="onLogScroll"
+    >
+      <p v-if="droppedLogs" class="log-dropped" data-test="xfer-log-dropped">
+        更早还有 {{ droppedLogs }} 条记录已超出缓冲被丢弃。
+      </p>
+      <p v-if="logEntries.length === 0" class="log-empty" data-test="xfer-log-empty">
+        暂无日志记录。传输入队、暂停/取消、目标冲突与失败都会记在这里。
+      </p>
+      <ul v-else class="log-list" data-test="xfer-log-list">
+        <li
+          v-for="entry in logEntries"
+          :key="entry.seq"
+          class="log-row"
+          :class="`is-${entry.level}`"
+          :data-test="`xfer-log-${entry.seq}`"
+        >
+          <span class="log-time">{{ formatTransferLogTime(entry.time) }}</span>
+          <span class="log-level">{{ LOG_LEVEL_LABEL[entry.level] }}</span>
+          <span class="log-msg">
+            {{ entry.message }}
+            <span v-if="entry.detail" class="log-detail">— {{ entry.detail }}</span>
+          </span>
         </li>
       </ul>
-    </div>
-    <div v-else-if="expanded && tab === 'log'" class="panel-body log">
-      <p class="log-line">传输错误会显示在任务状态中。</p>
     </div>
   </section>
 </template>
 
 <style scoped>
 .transfer-panel {
+  position: relative;
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
@@ -365,9 +569,38 @@ function phaseClass(p: TransferPhase): string {
   transition: height var(--rs-dur-mid) var(--rs-easing);
   overflow: hidden;
 }
-.transfer-panel.is-expanded {
-  height: var(--rs-transfer-panel-h-expanded);
+/* 拖动时关掉高度过渡，否则高度会追着鼠标跑，手感发飘 */
+.transfer-panel.is-resizing {
+  transition: none;
+  user-select: none;
+  cursor: row-resize;
 }
+
+.resize-grip {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 7px;
+  cursor: row-resize;
+  z-index: 5;
+}
+.resize-grip-bar {
+  position: absolute;
+  top: 3px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 40px;
+  height: 1px;
+  background: var(--rs-border);
+  opacity: 0;
+  transition: opacity var(--rs-dur-fast) var(--rs-easing);
+}
+.resize-grip:hover .resize-grip-bar {
+  opacity: 1;
+  background: var(--rs-accent);
+}
+
 .panel-load-error {
   margin: 6px 10px 0;
   padding: 6px 8px;
@@ -413,6 +646,19 @@ function phaseClass(p: TransferPhase): string {
 }
 
 .spacer { flex: 1; }
+
+.text-btn {
+  background: transparent;
+  border: 1px solid var(--rs-border);
+  border-radius: var(--rs-radius-1);
+  color: var(--rs-fg-muted);
+  font-family: var(--rs-font-ui);
+  font-size: var(--rs-fs-xs);
+  padding: 2px 8px;
+  margin-right: var(--rs-s-1);
+  cursor: pointer;
+}
+.text-btn:hover { color: var(--rs-fg); border-color: var(--rs-accent); }
 
 .icon-btn {
   width: 24px;
@@ -474,14 +720,6 @@ function phaseClass(p: TransferPhase): string {
   overflow: auto;
   min-height: 0;
 }
-.panel-body.log {
-  padding: var(--rs-s-2) var(--rs-s-3);
-  font-size: var(--rs-fs-xs);
-  font-family: var(--rs-font-mono);
-  color: var(--rs-fg-muted);
-}
-.log-line { margin: 2px 0; }
-.log-time { color: var(--rs-fg-disabled); margin-right: var(--rs-s-2); }
 
 .empty-state {
   padding: var(--rs-s-3);
@@ -496,6 +734,7 @@ function phaseClass(p: TransferPhase): string {
   display: flex;
   flex-direction: column;
 }
+/* 行与列标题共用同一套列宽；min-width 让窄面板走横向滚动而不是把列挤扁 */
 .xfer-row {
   display: grid;
   grid-template-columns: minmax(140px, 1.5fr) 96px 170px 80px minmax(140px, 1.4fr) 32px minmax(140px, 1.4fr) 80px 90px 170px;
@@ -504,8 +743,21 @@ function phaseClass(p: TransferPhase): string {
   padding: var(--rs-s-2) var(--rs-s-3);
   border-bottom: 1px solid var(--rs-border);
   font-size: var(--rs-fs-xs);
+  min-width: 1000px;
 }
 .xfer-row:last-child { border-bottom: none; }
+.xfer-row.is-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  background: var(--rs-bg-surface);
+  color: var(--rs-fg-muted);
+  font-size: var(--rs-fs-xs);
+  border-bottom: 1px solid var(--rs-border);
+}
+.xfer-h.is-blank { min-width: 0; }
 .xfer-col {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -592,5 +844,57 @@ function phaseClass(p: TransferPhase): string {
   background: var(--el-color-danger);
   border-color: var(--el-color-danger);
   color: #fff;
+}
+
+/* ── 日志页 ── */
+.panel-body.log {
+  padding: var(--rs-s-1) 0;
+  font-size: var(--rs-fs-xs);
+  font-family: var(--rs-font-mono);
+  color: var(--rs-fg-muted);
+}
+.log-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.log-row {
+  display: grid;
+  grid-template-columns: 64px 48px minmax(0, 1fr);
+  gap: var(--rs-s-2);
+  align-items: baseline;
+  padding: 2px var(--rs-s-3);
+}
+.log-row:hover { background: var(--rs-row-hover); }
+.log-time { color: var(--rs-fg-disabled); }
+.log-level {
+  font-size: var(--rs-fs-xs);
+  text-align: center;
+  border-radius: 2px;
+  border: 1px solid var(--rs-border);
+  color: var(--rs-fg-muted);
+}
+.log-row.is-success .log-level { color: var(--rs-progress-done); border-color: var(--rs-progress-done); }
+.log-row.is-warn .log-level { color: var(--rs-progress-paused); border-color: var(--rs-progress-paused); }
+.log-row.is-error .log-level { color: var(--rs-p-danger); border-color: var(--rs-p-danger); }
+.log-msg {
+  color: var(--rs-fg);
+  font-family: var(--rs-font-ui);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.log-detail {
+  color: var(--rs-fg-muted);
+  font-family: var(--rs-font-mono);
+}
+.log-empty,
+.log-dropped {
+  margin: 0;
+  padding: var(--rs-s-2) var(--rs-s-3);
+  font-family: var(--rs-font-ui);
+}
+.log-dropped {
+  color: var(--rs-fg-disabled);
+  border-bottom: 1px dashed var(--rs-border);
 }
 </style>

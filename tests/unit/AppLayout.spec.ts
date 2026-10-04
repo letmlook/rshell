@@ -13,7 +13,7 @@ const { listTransfersMock, pauseTransferMock, resumeTransferMock, cancelTransfer
   resumeTransferMock: vi.fn().mockResolvedValue(undefined),
   cancelTransferMock: vi.fn().mockResolvedValue(undefined),
   removeTransferMock: vi.fn().mockResolvedValue(undefined),
-  sessionsStoreMock: { store: null as { items: Array<{ id: string; name?: string }>; [key: string]: unknown } | null },
+  sessionsStoreMock: { store: null as { items: Array<{ id: string; name?: string }>; connectionState: Map<string, string>; duplicate: ReturnType<typeof vi.fn>; connect: ReturnType<typeof vi.fn>; [key: string]: unknown } | null },
 }));
 
 // PROB-02：dockview-vue 真实实现不渲染插槽，面板只能经 ready 事件给出的
@@ -44,6 +44,9 @@ const { dockviewApiMocks } = vi.hoisted(() => {
       },
       addPanel,
       getPanel: vi.fn((id: string) => panelMap.get(id)),
+      // 焦点/关闭事件：App.vue 用它们同步当前会话与多开窗口的标题编号
+      onDidActivePanelChange: vi.fn(),
+      onDidRemovePanel: vi.fn(),
     },
   };
 });
@@ -63,6 +66,7 @@ vi.mock("../../src/stores/sessions", async () => {
     disposeEvents: vi.fn(),
     connect: vi.fn(async () => {}),
     delete: vi.fn(async () => {}),
+    duplicate: vi.fn(async () => "new-session-id"),
   });
   sessionsStoreMock.store = store;
   return { useSessionsStore: () => store };
@@ -86,7 +90,7 @@ describe("App layout", () => {
   // dockview 容器桩：经 ready 事件给出与真实库一致的 api 契约（见文件头部 PROB-02 注释）
   const dockviewStub = defineComponent({
     name: "DockviewVue",
-    props: ["components"],
+    props: ["components", "getTabContextMenuItems"],
     emits: ["ready"],
     template: "<div data-testid='dockview' />",
     setup(_, { emit }) {
@@ -198,6 +202,146 @@ describe("App layout", () => {
 
   // 终端标签用短格式：会话名优先，其次短 id。
   // 回归点是 addPanel 漏传 title —— dockview 会用 `terminal-<uuid>` 当标签。
+  // 同一份连接信息可以同时开多个终端窗口：第二个窗口必须是**新面板**
+  // （id 带 ~2 序号、标题带 #2），而不是把已有窗口激活掉。
+  it("opens an extra terminal window for the same session instead of reusing the panel", async () => {
+    dockviewApiMocks.panelMap.clear();
+    dockviewApiMocks.addPanel.mockClear();
+    if (!sessionsStoreMock.store) throw new Error("sessions store mock missing");
+    sessionsStoreMock.store.items = [{ id: "session-42", name: "prod-web-01" }];
+
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    const sidePanel = wrapper.findComponent({ name: "SidePanel" });
+    await sidePanel.vm.$emit("select-session", "session-42");
+    await flushPromises();
+    await sidePanel.vm.$emit("open-terminal-window", "session-42");
+    await flushPromises();
+
+    expect(dockviewApiMocks.addPanel).toHaveBeenCalledTimes(2);
+    expect(dockviewApiMocks.addPanel).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "terminal-session-42~2", params: { sessionId: "session-42" } }),
+    );
+    // 附加窗口的编号来自「已打开窗口的顺序」，不写死成 2
+    const second = dockviewApiMocks.addPanel.mock.calls[1][0] as unknown as { title: string };
+    expect(second.title).toBe("prod-web-01 #2");
+    // 主窗口仍在，不被新窗口顶掉
+    expect(dockviewApiMocks.panelMap.has("terminal-session-42")).toBe(true);
+    wrapper.unmount();
+  });
+
+  // 关闭中间窗口后编号补齐，不能留下 #2 #4 这种跳号标签
+  it("renumbers the remaining windows after one of them closes", async () => {
+    dockviewApiMocks.panelMap.clear();
+    dockviewApiMocks.addPanel.mockClear();
+    if (!sessionsStoreMock.store) throw new Error("sessions store mock missing");
+    sessionsStoreMock.store.items = [{ id: "session-42", name: "prod-web-01" }];
+
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    const sidePanel = wrapper.findComponent({ name: "SidePanel" });
+    await sidePanel.vm.$emit("select-session", "session-42");
+    await flushPromises();
+    await sidePanel.vm.$emit("open-terminal-window", "session-42");
+    await sidePanel.vm.$emit("open-terminal-window", "session-42");
+    await flushPromises();
+    expect(dockviewApiMocks.addPanel).toHaveBeenCalledTimes(3);
+    expect(dockviewApiMocks.addPanel).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "terminal-session-42~3" }),
+    );
+
+    // 用户关掉 #2（dockview 会回调 onDidRemovePanel）
+    dockviewApiMocks.panelMap.delete("terminal-session-42~2");
+    const removeHandler = dockviewApiMocks.onDidRemovePanel.mock.calls.at(-1)?.[0] as
+      | ((event: { id: string }) => void)
+      | undefined;
+    expect(typeof removeHandler).toBe("function");
+    removeHandler?.({ id: "terminal-session-42~2" });
+
+    const remaining = dockviewApiMocks.panelMap.get("terminal-session-42~3");
+    expect(remaining?.api.setTitle).toHaveBeenLastCalledWith("prod-web-01 #2");
+    wrapper.unmount();
+  });
+
+  // 终端 tab 右键：同一份连接信息下既能「新开终端窗口」也能「复制会话」。
+  // 菜单由 dockview 的 getTabContextMenuItems 提供（省略该选项 dockview 不弹菜单）。
+  it("offers 新开终端窗口 / 复制会话 on the terminal tab context menu", async () => {
+    dockviewApiMocks.panelMap.clear();
+    dockviewApiMocks.addPanel.mockClear();
+    if (!sessionsStoreMock.store) throw new Error("sessions store mock missing");
+    sessionsStoreMock.store.items = [{ id: "session-42", name: "dev-ubuntu" }];
+    sessionsStoreMock.store.duplicate.mockClear();
+    sessionsStoreMock.store.connectionState.set("session-42", "connected");
+
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    const sidePanel = wrapper.findComponent({ name: "SidePanel" });
+    await sidePanel.vm.$emit("select-session", "session-42");
+    await flushPromises();
+
+    const dockview = wrapper.findComponent({ name: "DockviewVue" });
+    const getItems = dockview.props("getTabContextMenuItems") as
+      | ((params: { panel: { id: string; api: { close: ReturnType<typeof vi.fn> } } }) => unknown[])
+      | undefined;
+    expect(typeof getItems).toBe("function");
+
+    const panel = dockviewApiMocks.panelMap.get("terminal-session-42")!;
+    const items = getItems!({ panel }) as Array<{ label?: string; action?: () => void } | string>;
+    const labels = items.filter((i) => typeof i === "object").map((i) => (i as { label: string }).label);
+    expect(labels).toEqual(["新开终端窗口", "复制会话", "关闭标签"]);
+
+    // 「新开终端窗口」：为同一会话再建一个面板，而不是激活原面板
+    const newWindow = items[0] as { action: () => void };
+    newWindow.action();
+    await flushPromises();
+    expect(dockviewApiMocks.addPanel).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "terminal-session-42~2" }),
+    );
+
+    // 「复制会话」：走 store 的真实复制（凭据不复制由 App.vue 负责提示）
+    const duplicate = items[1] as { action: () => void };
+    duplicate.action();
+    await flushPromises();
+    expect(sessionsStoreMock.store.duplicate).toHaveBeenCalledWith("session-42");
+
+    // 「关闭标签」：仍能关掉面板（没有因为换掉内置项而丢失关闭能力）
+    const close = items[3] as { action: () => void };
+    close.action();
+    expect(panel.api.close).toHaveBeenCalled();
+
+    wrapper.unmount();
+  });
+
+  it("suppresses the tab context menu for panels that are not terminal sessions", async () => {
+    dockviewApiMocks.panelMap.clear();
+    if (!sessionsStoreMock.store) throw new Error("sessions store mock missing");
+    sessionsStoreMock.store.items = [{ id: "session-42", name: "dev-ubuntu" }];
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    await wrapper.findComponent({ name: "SidePanel" }).vm.$emit("select-session", "session-42");
+    await flushPromises();
+
+    const getItems = wrapper.findComponent({ name: "DockviewVue" }).props("getTabContextMenuItems") as
+      | ((params: { panel: { id: string } }) => unknown[])
+      | undefined;
+    expect(getItems!({ panel: { id: "some-other-panel" } })).toEqual([]);
+    wrapper.unmount();
+  });
+
+  it("duplicates the session from the sidebar without auto-connecting it", async () => {
+    dockviewApiMocks.panelMap.clear();
+    dockviewApiMocks.addPanel.mockClear();
+    if (!sessionsStoreMock.store) throw new Error("sessions store mock missing");
+    sessionsStoreMock.store.items = [{ id: "session-42", name: "dev-ubuntu" }];
+    sessionsStoreMock.store.duplicate.mockClear();
+    sessionsStoreMock.store.connect.mockClear();
+
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    await wrapper.findComponent({ name: "SidePanel" }).vm.$emit("duplicate-session", "session-42");
+    await flushPromises();
+
+    expect(sessionsStoreMock.store.duplicate).toHaveBeenCalledWith("session-42");
+    // 复制不自动连接：新条目没有凭据，自动连只会换来一次注定失败的认证
+    expect(sessionsStoreMock.store.connect).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
   it("titles the terminal panel with the short session name instead of the panel id", async () => {
     dockviewApiMocks.panelMap.clear();
     dockviewApiMocks.addPanel.mockClear();

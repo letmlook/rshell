@@ -53,6 +53,8 @@ const emit = defineEmits<{
   (e: "select-session", id: string): void;
   (e: "open-sftp", id: string): void;
   (e: "open-terminal", id: string, path: string): void;
+  (e: "open-terminal-window", id: string): void;
+  (e: "duplicate-session", id: string): void;
   (e: "new-session"): void;
 }>();
 
@@ -136,6 +138,8 @@ function resetWidth() {
         @select="(id) => emit('select-session', id)"
         @open-sftp="(id) => emit('open-sftp', id)"
         @open-terminal="(id, p) => emit('open-terminal', id, p)"
+        @open-terminal-window="(id) => emit('open-terminal-window', id)"
+        @duplicate-session="(id) => emit('duplicate-session', id)"
       />
       <div v-else-if="active === 'files'" class="placeholder">
         <p>文件浏览位于传输工作区</p>
