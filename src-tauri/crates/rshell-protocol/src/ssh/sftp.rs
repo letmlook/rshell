@@ -9,6 +9,7 @@ use crate::ProtocolError;
 use rshell_api::types::{FilePermissions, FileType, RemoteFileEntry};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tracing::{debug, info};
@@ -29,6 +30,109 @@ const DOWNLOAD_CONCURRENCY: usize = 8;
 
 /// 下载并发度低于该值时退回串行拷贝：省掉多句柄/多任务的固定开销。
 const DOWNLOAD_PIPELINE_MIN_BYTES: u64 = (CHUNK_SIZE * 2) as u64;
+
+/// 通用句柄池：把「借出/归还」与具体 I/O 解耦，便于脱离 SFTP 服务器单测。
+///
+/// 容量上限保证池不会因为归还次数多于借出次数而无限增长（借出后任务被中止、
+/// 又走了一次兜底新建时会出现归还多于借出）。
+struct HandlePool<T> {
+    idle: tokio::sync::Mutex<Vec<T>>,
+    capacity: usize,
+}
+
+impl<T> HandlePool<T> {
+    fn with_handles(handles: Vec<T>) -> Self {
+        let capacity = handles.len();
+        Self {
+            idle: tokio::sync::Mutex::new(handles),
+            capacity,
+        }
+    }
+
+    /// 借一个句柄；池空返回 None，由调用方决定是兜底新建还是报错
+    async fn acquire(&self) -> Option<T> {
+        self.idle.lock().await.pop()
+    }
+
+    /// 归还句柄；超出容量时直接丢弃（句柄只是缓存，Drop 会关闭它）
+    async fn release(&self, handle: T) {
+        let mut idle = self.idle.lock().await;
+        if idle.len() < self.capacity {
+            idle.push(handle);
+        }
+    }
+
+    /// 仅测试用：断言池内空闲句柄数，生产路径不读这个计数
+    #[cfg(test)]
+    async fn idle_count(&self) -> usize {
+        self.idle.lock().await.len()
+    }
+}
+/// 远端文件句柄池：并发区间读取共用固定数量的已打开句柄。
+///
+/// 逐区间 `session.open()` 会把 OPEN/CLOSE 放大到「每 64 KiB 一对」——1 GiB
+/// 文件就是 16384 次 OPEN + 16384 次 CLOSE，每次一个往返，协议消息数是数据的
+/// 3 倍，远端还要反复建/销句柄。池化后整个传输只开 `capacity` 次。
+///
+/// 池空时（并发数被调高，或某个任务被中止时连同句柄一起丢弃）退回现开一个，
+/// 保证读取不会因为句柄泄漏而永久阻塞。
+#[derive(Clone)]
+struct RemoteHandlePool {
+    session: Arc<russh_sftp::client::SftpSession>,
+    path: Arc<str>,
+    handles: Arc<HandlePool<russh_sftp::client::fs::File>>,
+}
+
+impl RemoteHandlePool {
+    async fn open(
+        session: Arc<russh_sftp::client::SftpSession>,
+        path: &str,
+        capacity: usize,
+    ) -> Result<Self, ProtocolError> {
+        let mut handles = Vec::with_capacity(capacity);
+        for _ in 0..capacity.max(1) {
+            handles.push(session.open(path).await.map_err(|e| {
+                ProtocolError::ProtocolError(format!("Failed to open remote file: {e}"))
+            })?);
+        }
+        Ok(Self {
+            session,
+            path: Arc::from(path),
+            handles: Arc::new(HandlePool::with_handles(handles)),
+        })
+    }
+
+    /// 借一个句柄读指定区间，读完（无论成功失败）归还。
+    async fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>, ProtocolError> {
+        let mut file = match self.handles.acquire().await {
+            Some(file) => file,
+            None => self.session.open(self.path.as_ref()).await.map_err(|e| {
+                ProtocolError::ProtocolError(format!(
+                    "Failed to open remote file for range at {offset}: {e}"
+                ))
+            })?,
+        };
+
+        let result = async {
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|e| {
+                    ProtocolError::ProtocolError(format!(
+                        "Failed to seek remote file to {offset}: {e}"
+                    ))
+                })?;
+            let mut buf = vec![0u8; len];
+            file.read_exact(&mut buf).await.map_err(|e| {
+                ProtocolError::ProtocolError(format!("range read failed at {offset} (+{len}): {e}"))
+            })?;
+            Ok(buf)
+        }
+        .await;
+
+        self.handles.release(file).await;
+        result
+    }
+}
 
 /// 传输控制信号
 ///
@@ -52,7 +156,7 @@ pub enum TransferControl {
 /// 让并发区间下载的多个任务能同时在同一条 SFTP 会话上发 READ
 /// （russh-sftp 按请求 id 多路复用，并发请求是协议层支持的）。
 pub struct SftpClient {
-    session: std::sync::Arc<russh_sftp::client::SftpSession>,
+    session: Arc<russh_sftp::client::SftpSession>,
 }
 
 impl SftpClient {
@@ -68,7 +172,7 @@ impl SftpClient {
 
         info!("SFTP session initialized");
         Ok(Self {
-            session: std::sync::Arc::new(session),
+            session: Arc::new(session),
         })
     }
 
@@ -212,34 +316,23 @@ impl SftpClient {
         })?;
 
         let copied = if total >= DOWNLOAD_PIPELINE_MIN_BYTES {
-            let session = self.session.clone();
-            let remote = remote.to_string();
+            // 句柄池：并发区间共用固定数量的远端句柄。
+            //
+            // 每个区间各开一个句柄看似无害，实则把 OPEN/CLOSE 放大到「每 64 KiB
+            // 一对」——1 GiB 文件就是 16384 次 OPEN + 16384 次 CLOSE，每次一个
+            // 往返，协议消息数是数据的 3 倍，远端还要反复建/销句柄。池化后整个
+            // 传输只开 DOWNLOAD_CONCURRENCY 次。
+            let pool = RemoteHandlePool::open(
+                self.session.clone(),
+                remote,
+                DOWNLOAD_CONCURRENCY.min(plan_ranges(total, CHUNK_SIZE).len()),
+            )
+            .await?;
             copy_pipelined(
                 total,
                 move |offset, len| {
-                    let session = session.clone();
-                    let remote = remote.clone();
-                    async move {
-                        let mut file = session.open(remote).await.map_err(|e| {
-                            ProtocolError::ProtocolError(format!(
-                                "Failed to open remote file for range: {e}"
-                            ))
-                        })?;
-                        file.seek(std::io::SeekFrom::Start(offset))
-                            .await
-                            .map_err(|e| {
-                                ProtocolError::ProtocolError(format!(
-                                    "Failed to seek remote file to {offset}: {e}"
-                                ))
-                            })?;
-                        let mut buf = vec![0u8; len];
-                        file.read_exact(&mut buf).await.map_err(|e| {
-                            ProtocolError::ProtocolError(format!(
-                                "range read failed at {offset} (+{len}): {e}"
-                            ))
-                        })?;
-                        Ok(buf)
-                    }
+                    let pool = pool.clone();
+                    async move { pool.read_range(offset, len).await }
                 },
                 &mut target,
                 control,
@@ -570,6 +663,100 @@ mod tests {
 
     /// 记录进度帧的共享 sink
     type ProgressLog = Arc<Mutex<Vec<(u64, u64)>>>;
+
+    // ── 句柄池 ──
+    // 回归点是逐区间 session.open()：1 GiB 文件会变成 16384 次 OPEN +
+    // 16384 次 CLOSE。这里锁定「N 个区间只用 N 个句柄」这一性质。
+    #[tokio::test]
+    async fn handle_pool_serves_many_borrows_from_a_fixed_set() {
+        let pool = HandlePool::with_handles((0..DOWNLOAD_CONCURRENCY as u32).collect::<Vec<u32>>());
+        assert_eq!(pool.idle_count().await, DOWNLOAD_CONCURRENCY);
+
+        // 模拟 copy_pipelined 的真实节奏：在途数不超过池大小，分波次借还，
+        // 区间总数远多于句柄数——这正是「固定句柄数服务大量区间」的场景
+        let waves = 8usize;
+        for _ in 0..waves {
+            let mut in_flight = Vec::new();
+            for _ in 0..DOWNLOAD_CONCURRENCY {
+                in_flight.push(pool.acquire().await.expect("池应能借出句柄"));
+            }
+            assert_eq!(pool.idle_count().await, 0, "全部借出后池必须为空");
+            for handle in in_flight {
+                pool.release(handle).await;
+            }
+            assert_eq!(
+                pool.idle_count().await,
+                DOWNLOAD_CONCURRENCY,
+                "归还后池必须回到满状态：句柄不得泄漏，也不得凭空多出"
+            );
+        }
+    }
+
+    // 在途数超过池容量时 acquire 必须返回 None，交给调用方兜底新建，
+    // 而不是重复交出同一句柄（那会让两个区间读到同一位置）
+    #[tokio::test]
+    async fn handle_pool_refuses_to_over_lend() {
+        let pool = HandlePool::with_handles(vec![1u32]);
+        assert_eq!(pool.acquire().await, Some(1u32));
+        assert!(pool.acquire().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_pool_reports_empty_so_the_caller_can_fall_back() {
+        let pool = HandlePool::with_handles(vec![7u32]);
+        assert!(pool.acquire().await.is_some());
+        // 池空时必须返回 None，调用方据此走「现开一个」的兜底，
+        // 而不是拿到重复句柄导致两个区间读同一位置
+        assert!(pool.acquire().await.is_none());
+        pool.release(7u32).await;
+        assert_eq!(pool.acquire().await, Some(7u32));
+    }
+
+    // 归还多于借出（任务被中止后又走兜底新建）时池不能无限增长
+    #[tokio::test]
+    async fn handle_pool_never_grows_beyond_capacity() {
+        let pool = HandlePool::with_handles(vec![1u32, 2u32]);
+        for extra in 100u32..110 {
+            pool.release(extra).await;
+        }
+        assert_eq!(
+            pool.idle_count().await,
+            2,
+            "池容量是上限，多余归还必须被丢弃"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_pool_hands_out_distinct_handles_under_concurrency() {
+        let pool = Arc::new(HandlePool::with_handles(
+            (0..DOWNLOAD_CONCURRENCY as u32).collect::<Vec<u32>>(),
+        ));
+        let mut tasks = Vec::new();
+        for _ in 0..DOWNLOAD_CONCURRENCY {
+            let pool = pool.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut seen = Vec::new();
+                for _ in 0..8 {
+                    if let Some(h) = pool.acquire().await {
+                        seen.push(h);
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        pool.release(h).await;
+                    }
+                }
+                seen
+            }));
+        }
+        let mut all = Vec::new();
+        for t in tasks {
+            all.extend(t.await.unwrap());
+        }
+        let unique: std::collections::HashSet<u32> = all.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            DOWNLOAD_CONCURRENCY,
+            "同时在途的句柄必须互不相同"
+        );
+    }
 
     /// 区间划分必须是连续、不重叠、完整覆盖 [0, total) 的升序切片，
     /// 否则并发下载会把内容写错位置——这是整个并发化里唯一会损坏文件的点。

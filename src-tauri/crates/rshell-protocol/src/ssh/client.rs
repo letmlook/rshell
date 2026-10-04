@@ -56,6 +56,25 @@ fn transport_config(keepalive_interval: std::time::Duration) -> russh::client::C
     }
 }
 
+/// 建立到 `addr` 的 SSH 传输 socket，并关闭 Nagle 算法。
+///
+/// 不用 `russh::client::connect`：它内部直接 `TcpStream::connect`，从不设
+/// `TCP_NODELAY`，且 `russh::client::Config` 没有对应开关。Nagle 会把小写入攒起来
+/// 等对端确认，而对端 TCP 的延迟 ACK 又在攒数据等满一个包——两者在局域网上叠加
+/// 出数百毫秒级停顿。SFTP 是高频小包协议，正好踩中，实测吞吐被压到个位数 MB/s
+/// （同为局域网的 Xshell 可达数十 MB/s）。Xshell 这类原生客户端都关闭了 Nagle。
+///
+/// 单独抽出以便对真实 socket 断言 nodelay，而不是只测注释。
+async fn open_nodelay_socket(addr: &str) -> Result<tokio::net::TcpStream, ProtocolError> {
+    let socket = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
+    socket
+        .set_nodelay(true)
+        .map_err(|e| ProtocolError::ConnectionFailed(format!("failed to set TCP_NODELAY: {e}")))?;
+    Ok(socket)
+}
+
 /// SSH 客户端
 pub struct SshClient {
     config: SessionConfig,
@@ -542,9 +561,10 @@ impl SshClient {
             host_key_sink,
         };
 
-        // 连接到服务器
+        // 连接到服务器。自行建 socket 以关闭 Nagle（见 open_nodelay_socket）。
         let addr = format!("{}:{}", self.config.host, self.config.port);
-        let handle = russh::client::connect(ssh_config, &addr, handler)
+        let socket = open_nodelay_socket(&addr).await?;
+        let handle = russh::client::connect_stream(ssh_config, socket, handler)
             .await
             .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
 
@@ -908,6 +928,45 @@ impl Connection for SshClient {
 mod tests {
     use super::*;
     use rshell_api::types::AuthMethod;
+
+    // 回归：曾用 russh::client::connect，它从不设 TCP_NODELAY。Nagle 与对端延迟
+    // ACK 在局域网上叠加出数百毫秒停顿，把 SFTP 吞吐压到个位数 MB/s。这里对真实
+    // socket 断言 nodelay 已生效，防止改回 russh 的封装。
+    #[tokio::test]
+    async fn transport_socket_disables_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let socket = open_nodelay_socket(&format!("127.0.0.1:{port}"))
+            .await
+            .expect("socket 应建立成功");
+
+        assert!(
+            socket.nodelay().unwrap(),
+            "SSH 传输 socket 必须关闭 Nagle：Nagle 与延迟 ACK 叠加会让 SFTP \
+             吞吐掉到个位数 MB/s，而同链路的专业客户端可达数十 MB/s"
+        );
+    }
+
+    // 端口无人监听时必须返回可读错误，不能静默成功
+    #[tokio::test]
+    async fn transport_socket_reports_unreachable_peer() {
+        // 绑定后立即 drop，得到一个几乎确定没有监听者的端口
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let err = open_nodelay_socket(&format!("127.0.0.1:{port}"))
+            .await
+            .expect_err("无监听者时必须失败");
+        assert!(
+            matches!(err, ProtocolError::ConnectionFailed(_)),
+            "实际错误: {err:?}"
+        );
+    }
 
     #[test]
     fn transport_config_keeps_alive_and_drops_no_idle_sessions() {

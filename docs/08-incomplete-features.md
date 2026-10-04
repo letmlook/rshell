@@ -31,7 +31,17 @@ SSH 密钥管理面板提供生成、导入、删除与列表展示，当前仅�
 
 终端复制粘贴快捷键为 `Ctrl+Shift+C` / `Ctrl+Shift+V`（macOS 另接受 `Cmd`），经既有的 `rshell:terminal-action` 路由到当前激活终端。裸 `Ctrl+C`（SIGINT）与 `Ctrl+V`（quoted-insert）不劫持，原样透传给远端。无选中内容或剪贴板为空时给出可见提示，剪贴板不可用时提示失败原因，不静默吞掉。
 
-SFTP 下载方向改为并发区间读取。根因是 `russh-sftp` 的 `File::poll_read` 只有一个在途 READ 槽，串行读取的吞吐上限为 `CHUNK_SIZE / RTT`；上传方向用 `write_nowait` 本就支持 `max_concurrent_writes` 路并发，因此下载长期明显慢于上传。现按 64 KiB 切分连续不重叠区间，最多 8 个 READ 同时在途，写入侧仍严格按 offset 升序串行，落盘内容与串行版本逐字节一致；小于 128 KiB 的文件退回串行以省掉多句柄开销。区间划分的连续/不重叠/完整覆盖由纯函数 `plan_ranges` 的测试锁定，错序完成、进度单调性、取消中止与源变短报错均有测试覆盖。**真实服务器上的实际吞吐提升倍数未验证**，局域网与跨网的对比数据待补。
+SFTP 下载方向改为并发区间读取。根因是 `russh-sftp` 的 `File::poll_read` 只有一个在途 READ 槽，串行读取的吞吐上限为 `CHUNK_SIZE / RTT`；上传方向用 `write_nowait` 本就支持 `max_concurrent_writes` 路并发，因此下载长期明显慢于上传。现按 64 KiB 切分连续不重叠区间，最多 8 个 READ 同时在途，写入侧仍严格按 offset 升序串行，落盘内容与串行版本逐字节一致；小于 128 KiB 的文件退回串行以省掉多句柄开销。并发区间共用一个**远端句柄池**（整个传输只开 8 次句柄）——逐区间 `open` 会把 OPEN/CLOSE 放大到每 64 KiB 一对，1 GiB 文件就是 16384 次 OPEN + 16384 次 CLOSE，协议消息数是数据量的 3 倍；池空时退回现开一个，保证任务被中止丢句柄后读取不会永久阻塞。区间划分的连续/不重叠/完整覆盖由纯函数 `plan_ranges` 的测试锁定，句柄池的借还不泄漏/不超发/并发互异另有测试，错序完成、进度单调性、取消中止与源变短报错均有测试覆盖。**真实服务器上的实际吞吐提升倍数未验证**，局域网与跨网的对比数据待补。
+
+### 传输吞吐
+
+实测局域网下曾只有约 2 MB/s，而同链路的 Xshell 可达约 50 MB/s。已定位并修复三处：
+
+1. **SSH 传输 socket 未关闭 Nagle（主因）**。`russh::client::connect` 内部直接 `TcpStream::connect`，从不设 `TCP_NODELAY`，且 `russh::client::Config` 没有对应开关。Nagle 把小写入攒起来等对端确认，而对端 TCP 的延迟 ACK 又在攒数据等满一个包，两者叠加出数百毫秒级停顿。SFTP 是高频小包协议，正好踩中。现由 `open_nodelay_socket` 自行建连并关闭 Nagle，再走 `russh::client::connect_stream`；测试对真实 socket 断言 `nodelay()` 为真，防止改回 russh 的封装。
+2. **下载只有 1 个在途 READ**（见上）。改为最多 8 路并发区间读取。
+3. **逐区间开关句柄**（见上）。改为远端句柄池，整个传输只开 8 次。
+
+**修复后的实际吞吐倍数仍未验证**，需在真实服务器上与 Xshell 对比后再据实记录；本节不把 50 MB/s 标为已达成。
 
 ## 不在本轮范围
 
