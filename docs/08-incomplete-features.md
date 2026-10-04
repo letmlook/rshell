@@ -43,13 +43,26 @@ SFTP 下载方向改为并发区间读取。根因是 `russh-sftp` 的 `File::po
 
 ### 传输吞吐
 
-实测局域网下曾只有约 2 MB/s，而同链路的 Xshell 可达约 50 MB/s。已定位并修复三处：
+**根因：`tauri:dev` 产出的是 debug 构建，russh 的加密与缓冲处理在 debug 下慢一个数量级。** 这不是应用逻辑的限速，也不是 SFTP 层的并发问题。
 
-1. **SSH 传输 socket 未关闭 Nagle（主因）**。`russh::client::connect` 内部直接 `TcpStream::connect`，从不设 `TCP_NODELAY`，且 `russh::client::Config` 没有对应开关。Nagle 把小写入攒起来等对端确认，而对端 TCP 的延迟 ACK 又在攒数据等满一个包，两者叠加出数百毫秒级停顿。SFTP 是高频小包协议，正好踩中。现由 `open_nodelay_socket` 自行建连并关闭 Nagle，再走 `russh::client::connect_stream`；测试对真实 socket 断言 `nodelay()` 为真，防止改回 russh 的封装。
-2. **下载只有 1 个在途 READ**（见上）。改为最多 8 路并发区间读取。
-3. **逐区间开关句柄**（见上）。改为远端句柄池，整个传输只开 8 次。
+在 `192.168.85.129`（Ubuntu，磁盘 689 MB/s，RTT < 1 ms）上实测（凭据从环境变量传入，基准见 `crates/rshell-protocol/tests/sftp_bench.rs`）：
 
-**修复后的实际吞吐倍数仍未验证**，需在真实服务器上与 Xshell 对比后再据实记录；本节不把 50 MB/s 标为已达成。
+| 场景 | 上传 | 下载 |
+|---|---|---|
+| debug 构建 | 2.54 MB/s | 2.44 MB/s |
+| **release 构建** | **63.84 MB/s** | **45.22 MB/s** |
+
+同链路 OpenSSH `scp` 上传对照为 31.88 MB/s。release 下上传已超过该对照，下载达到用户用 Xshell 观测到的同一量级。
+
+**评估传输性能必须用 release 构建**（`npm run tauri:build` 或 `cargo build --release`），用 `tauri:dev` 测得的数字没有参考价值。
+
+排查过程中用实验逐项排除了：SSH 通道窗口（2 MiB ↔ 16 MiB 无差别）、单包大小（32 KiB ↔ 65535 无差别）、密码套件（ChaCha20-Poly1305 / AES-256-GCM / AES-256-CTR 均 2.4～2.8 MB/s）、Nagle、服务端磁盘与网络。放大窗口与包长的改动已撤回——实测零收益且 65535 偏离 RFC 4253 建议的 ≤32768，会牺牲互操作性。
+
+以下两项改动保留，它们本身是正确且有测试覆盖的，只是**并非速度问题的成因**：
+
+- **下载并发区间读取**：`russh-sftp` 的 `File::poll_read` 只有一个在途 READ 槽，串行读取吞吐上限为 `CHUNK_SIZE / RTT`（上传方向则由 `write_nowait` 支持 8 路并发）。现按 64 KiB 切分连续不重叠区间、最多 8 个 READ 在途，写入侧严格按 offset 升序串行，落盘内容与串行版本逐字节一致；小于 128 KiB 退回串行。
+- **远端句柄池**：逐区间 `open` 会把 OPEN/CLOSE 放大到每 64 KiB 一对（1 GiB 文件即 16384 次 OPEN + 16384 次 CLOSE）。现整个传输只开 `DOWNLOAD_CONCURRENCY` 次；池空时退回现开一个。
+- **关闭 Nagle**：`russh::client::connect` 从不设 `TCP_NODELAY` 且 `Config` 无此开关，改为自行建连后 `set_nodelay(true)`。对交互式协议是正确做法，与 OpenSSH 一致；实测对吞吐无实质影响。
 
 ## 不在本轮范围
 

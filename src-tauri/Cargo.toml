@@ -15,6 +15,18 @@ members = [
 ]
 resolver = "2"
 
+# 依赖（含 russh 的加密与缓冲热路径）以 opt-level 3 编译。
+#
+# 背景：`tauri dev` 产出 debug 构建，russh 的逐字节加密、缓冲拷贝、SFTP 包组装
+# 全部未优化，实测把 SFTP 吞吐压低一个数量级——同一台局域网服务器上 debug 为
+# 2.5 MB/s，release 为 64 MB/s（同机 OpenSSH scp 对照 31.9 MB/s）。这不是应用
+# 逻辑的限速，而是构建配置问题。
+#
+# 这里只提升**依赖**的优化级别，工作区自身 crate 仍为 dev（保留调试符号与
+# 快速增量编译），因此 `tauri dev` 的迭代体验不变，传输性能却接近 release。
+[profile.dev.package."*"]
+opt-level = 3
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

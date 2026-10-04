@@ -121,3 +121,31 @@ SSH 密码和密钥口令使用 macOS 钥匙串服务 `com.letmlook.rshell.crede
 本轮验证：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings` 0 告警、`cargo test --workspace`、`npm run typecheck`、`npm test` 127 项（24 文件）通过，文档契约检查通过。新增测试：Rust 6 项区间划分/按序落盘/进度单调/在途并发上限/取消中止/源变短，以及 `remove_transfer` 5 项终态守卫；前端 `shortTerminalTitle` 10 项、TransferPanel 取消/删除 6 项。
 
 **未验证项**：真实 SSH/SFTP 服务器上的实际吞吐提升倍数、局域网与跨网对比数据，以及新的下载路径在真实服务器上的端到端落盘正确性，均无实机证据。区间正确性仅有基于假源的单元测试覆盖。物理串口与签名公证状态不变。
+
+## 2026-10-04：传输吞吐实测与根因更正（含前两轮结论的更正）
+
+本节更正同日更早记录中「Nagle 是主因」「下载并发是关键」的判断——那两条基于代码推理，未经实测，**已被实测推翻**。
+
+**实测环境**：`192.168.85.129`（Ubuntu 22.04，磁盘 689 MB/s，RTT < 1 ms），基准代码 `crates/rshell-protocol/tests/sftp_bench.rs`（凭据只从 `RSHELL_BENCH_*` 环境变量读取，`#[ignore]`，不进 CI；同目录 `transport_bench.rs` 用于隔离 SSH 传输层与 SFTP 层）。
+
+**结果**：
+
+| 场景 | 上传 | 下载 |
+|---|---|---|
+| debug 构建 | 2.54 MB/s | 2.44 MB/s |
+| **release 构建** | **68.10 MB/s**（256 MiB） | **40.63 MB/s**（256 MiB） |
+| 同机 OpenSSH `scp` 上传对照 | 31.88 MB/s | — |
+
+release 下上传超过 OpenSSH 对照，下载与用户用 Xshell 观测到的量级一致。基准同时校验下载内容与源逐字节一致。
+
+**根因：`tauri dev` 产出 debug 构建**，russh 的逐字节加密、缓冲拷贝与 SFTP 包组装全部未优化，吞吐因此低一个数量级。这不是应用逻辑的限速。
+
+**逐项排除（均为实测）**：SSH 通道窗口 2 MiB ↔ 16 MiB 无差别；单包大小 32 KiB ↔ 65535 无差别；密码套件 ChaCha20-Poly1305 / AES-256-GCM / AES-256-CTR 均落在 2.4～2.8 MB/s；原生 SSH 传输层（绕过 SFTP 的 exec 通道）为 2.76 MB/s，与 SFTP 同量级，说明瓶颈在 SFTP 之下的共享层；底层 socket 读取约 187 次/秒、平均 16,295 字节/次。
+
+**据此撤回**：放大窗口与包长的改动（实测零收益，且 65535 偏离 RFC 4253 建议的 ≤32768，牺牲互操作性）。
+
+**保留但需正名**：下载 8 路并发区间读取、远端句柄池、关闭 Nagle——三者本身正确且有测试覆盖，但**都不是速度问题的成因**。
+
+**新增构建配置**：`[profile.dev.package."*"] opt-level = 3`，只提升依赖的优化级别，工作区自身 crate 仍为 dev，使 `tauri dev` 在保留调试符号与快速增量编译的前提下获得接近 release 的传输性能。
+
+**未验证**：跨网（非局域网）链路的表现、macOS 上的对应数字（该项目以 macOS 为验收平台，本次仅在 Windows + 局域网实测）。

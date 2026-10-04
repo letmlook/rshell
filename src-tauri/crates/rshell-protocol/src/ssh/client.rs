@@ -49,6 +49,11 @@ use crate::{Connection, ProtocolError};
 const SSH_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// 构建 russh 传输层配置：启用空闲 keepalive，不设 inactivity_timeout。
+///
+/// 窗口与包长保持 russh 默认值（2 MiB / 32 KiB）。曾试过放大到 16 MiB /
+/// 65535，实测吞吐**完全没有变化**（2.65～2.78 MB/s，与默认一致），
+/// 而 65535 偏离 RFC 4253 建议的 ≤32768，会牺牲对老实现的互操作性，
+/// 故撤回。真正的吞吐瓶颈不是这两个参数，见 docs/08「传输吞吐」。
 fn transport_config(keepalive_interval: std::time::Duration) -> russh::client::Config {
     russh::client::Config {
         keepalive_interval: Some(keepalive_interval),
