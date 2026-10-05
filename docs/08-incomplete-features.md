@@ -22,6 +22,7 @@
 
 - 应用图标：圆角蓝底 + 终端提示符「>」的标记，由 `scripts/gen-icons.mjs` 用纯 Node（内置 zlib）光栅化生成 PNG(16…1024) / ICO / ICNS，`npm run icons` 可复现。此前 `src-tauri/icons/*.png` 是**占位图**（32×32 仅 104 字节、纯色/全透明），因此 dev 与打包后的窗口、任务栏、exe 都不显示图标；标题栏的 logo 也曾是文字字形 `⌬`，现为与图标同款的内联 SVG。
   **改了图标必须让 tauri 的 build script 重跑**：图标是编译期资源，`tauri_build::build()` 把它们写进 OUT_DIR 生成的 Rust 源码，但 cargo 只按 `build.rs` 自身指纹决定是否重跑该脚本——只改 `src-tauri/icons/*.png` 不会触发它，增量构建的 exe 与安装包**仍带旧图标**（实测：图标已是真图、exe 也重新链接，抠出来仍是纯色方块）。`npm run icons` 末尾会自动 `touch src-tauri/build.rs`；已经手动改过图标文件时执行 `touch src-tauri/build.rs`（或 `cargo clean -p rshell`）再构建。验证方式：Windows 上用 `[System.Drawing.Icon]::ExtractAssociatedIcon(exe).ToBitmap().Save(...)` 抠出内嵌图标直接看，不必靠肉眼判断任务栏。
+  **安装器自身的图标要单独配**：`bundle.icon` 只决定应用本体与图标资源，**不会**自动给安装器指定图标——不配 `bundle.windows.nsis.installerIcon` 时生成的 NSIS `installer.nsi` 里是 `!define INSTALLERICON ""`，setup.exe 会用 makensis 的默认图标（经典 NSIS 箭头圆标），看起来与软件无关。MSI 侧无需额外配置：WiX 的 `main.wxs` 已把 `ProductIcon` 指向 `resources\icon.ico`。另注：`tauri.conf.json` 不接受注释键（schema `additionalProperties: false`，写 `"//": "..."` 会被直接拒掉），这类说明只能记在文档里。
 
 - SSH/Telnet/Serial 会话保存、恢复、连接、断开和终端 I/O。
 - 终端搜索、清屏、尺寸同步、发送与状态更新。
