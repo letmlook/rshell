@@ -555,6 +555,58 @@ fn plan_ranges(total: u64, chunk: usize) -> Vec<(u64, usize)> {
     ranges
 }
 
+/// 在途区间任务的 RAII 中止守卫（R3-08）。
+///
+/// 丢弃 `VecDeque<JoinHandle>` 并**不会**中止任务：`JoinHandle` 被 drop 时
+/// 任务转为游离态继续在 runtime 上跑，于是最多 `DOWNLOAD_CONCURRENCY` 个
+/// 脱离管理的任务会继续发 64 KiB 的 SFTP READ，占住池化句柄与远端文件句柄，
+/// 和后续传输抢同一批槽位。
+///
+/// 因此清理必须绑定在「离开作用域」上，而不是散落在各个错误分支里：
+/// `copy_pipelined` 里任何提前返回（含 `wait_for_run` 的 `?` 取消检查、
+/// 本地写失败的 `?`）都会触发 `Drop`，在途任务一定被 abort。
+struct AbortOnDrop<T> {
+    handles: VecDeque<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new() -> Self {
+        Self {
+            handles: VecDeque::new(),
+        }
+    }
+
+    fn push_back(&mut self, handle: tokio::task::JoinHandle<T>) {
+        self.handles.push_back(handle);
+    }
+
+    /// 取队首（最早派发 = offset 最小），保证按序落盘。
+    fn pop_front(&mut self) -> Option<tokio::task::JoinHandle<T>> {
+        self.handles.pop_front()
+    }
+
+    fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
+    /// 取出并 abort 全部在途任务。
+    fn abort_all(&mut self) {
+        for handle in self.handles.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
 /// 按区间顺序（offset 升序）并发生成区间内容，再**严格按序**写给 `writer`。
 ///
 /// `fetch(offset, len)` 由调用方提供，负责发出单个区间的远端读取，返回恰好
@@ -580,18 +632,10 @@ where
     progress(0, total);
 
     let mut done: u64 = 0;
-    let mut pending: VecDeque<tokio::task::JoinHandle<Result<Vec<u8>, ProtocolError>>> =
-        VecDeque::new();
+    // R3-08：在途任务由守卫托管，任何提前返回都会在 `Drop` 里 abort 掉它们
+    // （原来只在三个错误分支上显式清理，取消检查与本地写失败的 `?` 会漏掉）。
+    let mut pending = AbortOnDrop::<Result<Vec<u8>, ProtocolError>>::new();
     let mut next = 0usize;
-
-    // 提前中止时（暂停以外的取消/错误）必须停掉在途任务，
-    // 否则它们会继续占用 SFTP 请求槽并可能写入已废弃的缓冲。
-    let abort_all =
-        |pending: &mut VecDeque<tokio::task::JoinHandle<Result<Vec<u8>, ProtocolError>>>| {
-            for handle in pending.drain(..) {
-                handle.abort();
-            }
-        };
 
     loop {
         // 派发阶段：把在途数补到并发上限。
@@ -611,7 +655,7 @@ where
         let buf = match handle.await {
             Ok(result) => result,
             Err(join_error) => {
-                abort_all(&mut pending);
+                // 在途任务由 `pending` 的 Drop 中止（R3-08）
                 return Err(ProtocolError::ProtocolError(format!(
                     "range read task failed during copy: {join_error}"
                 )));
@@ -619,17 +663,11 @@ where
         };
         let buf = match buf {
             Ok(buf) => buf,
-            Err(err) => {
-                abort_all(&mut pending);
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
 
         // 到写点才检查控制信号：暂停时字节停止增长。
-        if let Err(err) = wait_for_run(control).await {
-            abort_all(&mut pending);
-            return Err(err);
-        }
+        wait_for_run(control).await?;
 
         writer
             .write_all(&buf)
@@ -674,6 +712,7 @@ async fn wait_for_run(control: &mut watch::Receiver<TransferControl>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::{Arc, Mutex};
 
     /// 记录进度帧的共享 sink
@@ -997,6 +1036,185 @@ mod tests {
         assert!(
             matches!(result, Err(ProtocolError::TransferCancelled)),
             "取消必须返回 TransferCancelled，实际: {result:?}"
+        );
+    }
+
+    // ── R3-08：在途区间任务必须被中止 ──
+    // 泄漏的两条路径都不经过 `handle.await` 的错误分支：`wait_for_run` 的
+    // `?`（取消）和本地 `write_all` 的 `?`。它们过去只 drop 掉
+    // `VecDeque<JoinHandle>`，任务转为游离态继续发 READ、继续占句柄。
+    //
+    // 观测方式：fetch future 持有一个 Drop 计数器，任务被 abort 时随 future
+    // 一起析构 → 计数增长。据此断言「已派发数 == 被中止数」，不依赖时序。
+    struct DropCount(Arc<Mutex<usize>>);
+
+    impl Drop for DropCount {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() += 1;
+        }
+    }
+
+    /// abort 只置取消标志，future 的析构发生在下一次调度。这里有界地让出执行权
+    /// 直到计数收敛，不依赖任何固定 sleep 时长；无中止时它会跑满循环后返回现值。
+    async fn wait_for_drops(dropped: &Arc<Mutex<usize>>, expected: usize) -> usize {
+        for _ in 0..10_000 {
+            let now = *dropped.lock().unwrap();
+            if now >= expected {
+                return now;
+            }
+            tokio::task::yield_now().await;
+        }
+        *dropped.lock().unwrap()
+    }
+
+    /// 第一次 `poll_write` 就失败的本地 writer（磁盘满 / 目录被删）。
+    struct FailingWriter;
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("no space left on device")))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// fetch future 的类型：按 offset 分支需要装箱
+    type RangeFetch =
+        std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, ProtocolError>> + Send>>;
+
+    /// 队首区间立刻返回，其余区间永不自行完成（只有 abort 能结束它们）。
+    fn head_only_fetch(
+        started: Arc<Mutex<usize>>,
+        dropped: Arc<Mutex<usize>>,
+    ) -> impl Fn(u64, usize) -> RangeFetch {
+        move |offset: u64, len: usize| {
+            let started = started.clone();
+            let dropped = dropped.clone();
+            Box::pin(async move {
+                *started.lock().unwrap() += 1;
+                let _live = DropCount(dropped);
+                if offset == 0 {
+                    Ok(vec![0u8; len])
+                } else {
+                    std::future::pending::<()>().await;
+                    unreachable!("只有 abort 能让挂起的区间任务结束")
+                }
+            })
+        }
+    }
+
+    /// R3-08 回归：取消发生在 `pending` 非空时（派发阶段的 `wait_for_run`），
+    /// 在途区间任务必须全部被 abort。
+    #[tokio::test]
+    async fn pipelined_copy_aborts_inflight_ranges_on_cancel() {
+        let total = 16 * CHUNK_SIZE as u64;
+        let started: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let dropped: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let head_ready = Arc::new(tokio::sync::Notify::new());
+        let (control_tx, mut control) = watch::channel(TransferControl::Run);
+
+        let fetch = {
+            let started = started.clone();
+            let dropped = dropped.clone();
+            let head_ready = head_ready.clone();
+            move |offset: u64, len: usize| {
+                let started = started.clone();
+                let dropped = dropped.clone();
+                let head_ready = head_ready.clone();
+                Box::pin(async move {
+                    *started.lock().unwrap() += 1;
+                    let _live = DropCount(dropped);
+                    if offset == 0 {
+                        // 队首区间等测试放行，好让拷贝循环走到派发阶段的取消检查
+                        head_ready.notified().await;
+                        Ok(vec![0u8; len])
+                    } else {
+                        std::future::pending::<()>().await;
+                        unreachable!("只有 abort 能让挂起的区间任务结束")
+                    }
+                }) as std::pin::Pin<Box<dyn Future<Output = _> + Send>>
+            }
+        };
+
+        let mut sink: Vec<u8> = Vec::new();
+        let copy = tokio::spawn(async move {
+            copy_pipelined(total, fetch, &mut sink, &mut control, &mut |_, _| {}).await
+        });
+
+        // 等到在途数打满：此刻 pending 非空，取消只能从派发阶段的 `?` 退出
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while *started.lock().unwrap() < DOWNLOAD_CONCURRENCY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("在途区间数迟迟未打满");
+        let started_count = *started.lock().unwrap();
+        assert_eq!(started_count, DOWNLOAD_CONCURRENCY);
+
+        control_tx.send(TransferControl::Cancel).unwrap();
+        // 放行队首区间，让循环推进到下一轮的取消检查
+        head_ready.notify_one();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), copy)
+            .await
+            .expect("取消后拷贝必须收尾")
+            .unwrap();
+        assert!(
+            matches!(result, Err(ProtocolError::TransferCancelled)),
+            "取消必须返回 TransferCancelled，实际: {result:?}"
+        );
+
+        let dropped_count = wait_for_drops(&dropped, started_count).await;
+        assert_eq!(
+            dropped_count, started_count,
+            "取消后不得有在途区间任务存活：已派发 {started_count} 个，仅 {dropped_count} 个被中止"
+        );
+    }
+
+    /// R3-08 回归：本地写失败的 `?` 提前返回时，在途区间任务必须全部被 abort。
+    #[tokio::test]
+    async fn pipelined_copy_aborts_inflight_ranges_on_write_error() {
+        let total = 16 * CHUNK_SIZE as u64;
+        let started: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let dropped: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let fetch = head_only_fetch(started.clone(), dropped.clone());
+
+        let (_, mut control) = watch::channel(TransferControl::Run);
+        let mut writer = FailingWriter;
+        let err = copy_pipelined(total, fetch, &mut writer, &mut control, &mut |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("write failed during copy"),
+            "应透传本地写错误，实际: {err:?}"
+        );
+
+        let started_count = *started.lock().unwrap();
+        assert_eq!(
+            started_count, DOWNLOAD_CONCURRENCY,
+            "写失败前应已派发满并发度的区间"
+        );
+        let dropped_count = wait_for_drops(&dropped, started_count).await;
+        assert_eq!(
+            dropped_count, started_count,
+            "写失败后不得有在途区间任务存活：已派发 {started_count} 个，仅 {dropped_count} 个被中止"
         );
     }
 

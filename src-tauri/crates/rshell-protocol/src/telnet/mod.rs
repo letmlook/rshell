@@ -6,7 +6,7 @@
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{Connection, ProtocolError};
 
@@ -51,6 +51,19 @@ enum TelnetState {
     Connected,
     Negotiating,
 }
+
+/// 跨 TCP 分片暂存的字节上限（未解析完的 Telnet 序列）。
+///
+/// 威胁模型（R3-07）：恶意或故障的 Telnet 设备、或注入字节的中间设备，
+/// 只发 `IAC SB <opt>` 而永不发 `IAC SE`。未闭合的子协商会被整段留存在
+/// `pending_bytes` 里，并由每次 `recv` 重新扫描、重新暂存：
+/// 1. 其后的全部终端输出被吞掉——终端看起来卡死，只能断开会话；
+/// 2. `pending_bytes` 随对端持续发送无界增长（可远程触发的内存耗尽）；
+/// 3. 单次调用重扫整个累积缓冲，累计 CPU 随流量二次增长。
+///
+/// 64 KiB 远大于任何合法子协商（NAWS 载荷 6 字节、TSEND 终端类型 < 128 字节），
+/// 因此超过上限即可判定为协议违规：清空暂存并上报可诊断错误，而不是继续吞。
+const MAX_PENDING_BYTES: usize = 64 * 1024;
 
 /// Telnet 连接
 pub struct TelnetConnection {
@@ -188,6 +201,29 @@ impl TelnetConnection {
         Ok(response)
     }
 
+    /// 把尚未解析完的字节留到下一次调用处理（跨 TCP 分片）。
+    ///
+    /// R3-07：留存量必须有硬上限。没有上限时，对端只要发一个不带 `IAC SE` 的
+    /// `IAC SB` 就能让留存量随流量无界增长，同时把后续所有输出吞掉。
+    /// 因此越界即判定为协议违规：`warn!` 留痕 + 清空暂存 + 返回可诊断的
+    /// `ProtocolError`，让运维看到违规，而不是表现为「终端静默卡死」。
+    fn stash_pending(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
+        let retained = self.pending_bytes.len() + bytes.len();
+        if retained > MAX_PENDING_BYTES {
+            warn!(
+                retained,
+                limit = MAX_PENDING_BYTES,
+                "Telnet: unterminated sequence exceeded the pending buffer limit, dropped"
+            );
+            self.pending_bytes.clear();
+            return Err(ProtocolError::ProtocolError(format!(
+                "unterminated Telnet subnegotiation retained {retained} bytes, over limit {MAX_PENDING_BYTES}"
+            )));
+        }
+        self.pending_bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
     /// 处理接收到的数据，过滤 Telnet 命令
     async fn process_data(&mut self, data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
         let mut combined = std::mem::take(&mut self.pending_bytes);
@@ -201,7 +237,7 @@ impl TelnetConnection {
             if data[i] == TelnetCommand::IAC as u8 {
                 let command_start = i;
                 if i + 1 >= data.len() {
-                    self.pending_bytes.extend_from_slice(&data[command_start..]);
+                    self.stash_pending(&data[command_start..])?;
                     break;
                 }
 
@@ -216,7 +252,7 @@ impl TelnetConnection {
                             let resp = self.handle_command(TelnetCommand::DO, opt).await?;
                             response.extend(resp);
                         } else {
-                            self.pending_bytes.extend_from_slice(&data[command_start..]);
+                            self.stash_pending(&data[command_start..])?;
                         }
                     }
                     x if x == TelnetCommand::DONT as u8 => {
@@ -226,7 +262,7 @@ impl TelnetConnection {
                             let resp = self.handle_command(TelnetCommand::DONT, opt).await?;
                             response.extend(resp);
                         } else {
-                            self.pending_bytes.extend_from_slice(&data[command_start..]);
+                            self.stash_pending(&data[command_start..])?;
                         }
                     }
                     x if x == TelnetCommand::WILL as u8 => {
@@ -236,7 +272,7 @@ impl TelnetConnection {
                             let resp = self.handle_command(TelnetCommand::WILL, opt).await?;
                             response.extend(resp);
                         } else {
-                            self.pending_bytes.extend_from_slice(&data[command_start..]);
+                            self.stash_pending(&data[command_start..])?;
                         }
                     }
                     x if x == TelnetCommand::WONT as u8 => {
@@ -246,15 +282,18 @@ impl TelnetConnection {
                             let resp = self.handle_command(TelnetCommand::WONT, opt).await?;
                             response.extend(resp);
                         } else {
-                            self.pending_bytes.extend_from_slice(&data[command_start..]);
+                            self.stash_pending(&data[command_start..])?;
                         }
                     }
                     x if x == TelnetCommand::SB as u8 => {
-                        // 跳过子协商直到 SE
+                        // 跳过子协商直到 SE。
+                        // R3-07：扫描窗口必须有界——未闭合的子协商会让缓冲
+                        // 一直累积，无界扫描等于每次调用都重扫全部历史数据。
+                        let scan_end = data.len().min(i.saturating_add(MAX_PENDING_BYTES));
                         let mut completed = false;
-                        while i < data.len() {
+                        while i < scan_end {
                             if data[i] == TelnetCommand::IAC as u8
-                                && i + 1 < data.len()
+                                && i + 1 < scan_end
                                 && data[i + 1] == TelnetCommand::SE as u8
                             {
                                 i += 2;
@@ -264,7 +303,20 @@ impl TelnetConnection {
                             i += 1;
                         }
                         if !completed {
-                            self.pending_bytes.extend_from_slice(&data[command_start..]);
+                            if scan_end < data.len() {
+                                // 上限内仍未闭合：远端可触发的无界增长，判违规
+                                warn!(
+                                    limit = MAX_PENDING_BYTES,
+                                    buffered = data.len(),
+                                    "Telnet: subnegotiation without IAC SE exceeded the scan window"
+                                );
+                                self.pending_bytes.clear();
+                                return Err(ProtocolError::ProtocolError(format!(
+                                    "unterminated Telnet subnegotiation exceeded {MAX_PENDING_BYTES} bytes without IAC SE"
+                                )));
+                            }
+                            // 合法但跨分片：暂存等待后续片段
+                            self.stash_pending(&data[command_start..])?;
                         }
                     }
                     x if x == TelnetCommand::IAC as u8 => {
@@ -469,6 +521,78 @@ mod tests {
             b"A"
         );
         assert!(connection.pending_bytes.is_empty());
+    }
+
+    /// R3-07 回归：对端只发 `IAC SB <opt>` 而不发 `IAC SE` 时，暂存缓冲
+    /// 必须停在上限内，并且必须上报错误——不能静默吞掉后续输出。
+    #[tokio::test]
+    async fn unterminated_subnegotiation_is_capped_and_reported() {
+        let mut connection = TelnetConnection::new("example", 23);
+
+        // 每次都是「IAC SB NAWS + 8 KiB 填充」，对端持续喂数据且永不闭合
+        let mut reported = None;
+        for _ in 0..64 {
+            let mut chunk = vec![255, 250, 31];
+            chunk.extend(std::iter::repeat_n(b'x', 8 * 1024));
+            match connection.process_data(&chunk).await {
+                Ok(output) => {
+                    assert!(
+                        output.is_empty(),
+                        "未闭合子协商之后本就没有可交付的输出，实际: {output:?}"
+                    );
+                    assert!(
+                        connection.pending_bytes.len() <= MAX_PENDING_BYTES,
+                        "暂存量越界: {} > {MAX_PENDING_BYTES}",
+                        connection.pending_bytes.len()
+                    );
+                }
+                Err(err) => {
+                    reported = Some(err);
+                    break;
+                }
+            }
+        }
+
+        let err = reported.expect("未闭合子协商超出上限时必须上报错误，而不是无限吞输出");
+        assert!(
+            format!("{err:?}").contains("subnegotiation"),
+            "错误必须可诊断，实际: {err:?}"
+        );
+        assert!(
+            connection.pending_bytes.is_empty(),
+            "判违规后必须清空暂存缓冲，实际仍有 {} 字节",
+            connection.pending_bytes.len()
+        );
+    }
+
+    /// 合法子协商（NAWS：IAC SB NAWS <cols> <rows> IAC SE）仍必须被完整消费，
+    /// 不得报错，其后的输出照常交付。
+    #[tokio::test]
+    async fn terminated_subnegotiation_is_consumed_and_output_flows() {
+        let mut connection = TelnetConnection::new("example", 23);
+        let mut chunk = vec![255u8, 250, 31, 0, 80, 0, 24, 255, 240];
+        chunk.extend_from_slice(b"prompt$ ");
+        assert_eq!(connection.process_data(&chunk).await.unwrap(), b"prompt$ ");
+        assert!(connection.pending_bytes.is_empty());
+    }
+
+    /// 合法子协商跨 TCP 分片到达：前半片暂存、后半片补上 IAC SE，
+    /// 不应被当成未闭合违规。
+    #[tokio::test]
+    async fn subnegotiation_split_across_chunks_is_not_treated_as_unterminated() {
+        let mut connection = TelnetConnection::new("example", 23);
+        assert!(connection
+            .process_data(&[255, 250, 31, 0, 80])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(connection
+            .process_data(&[0, 24, 255, 240])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(connection.pending_bytes.is_empty());
+        assert_eq!(connection.process_data(b"ok").await.unwrap(), b"ok");
     }
 
     #[test]

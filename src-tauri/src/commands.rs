@@ -196,6 +196,15 @@ pub async fn close_terminal(
         })
         .await
         .map_err(IpcError::from)?;
+    // R3-11：命令成功后摘掉该 (session, terminal) 的 sink 条目。
+    // 此前只有会话删除回调会清理（见 lib.rs 的 set_on_session_deleted），
+    // 于是每关一个标签就残留最多 256 KiB 积压，直到整个会话被删除。
+    // 放在壳层是因为 TerminalChannels 属于 Tauri 状态，core 的 SessionService
+    // 看不到它——与 CLAUDE.md「Tauri 层只做路由」一致。
+    state
+        .terminal_channels
+        .detach_terminal(session_id, terminal_id)
+        .await;
     Ok(())
 }
 

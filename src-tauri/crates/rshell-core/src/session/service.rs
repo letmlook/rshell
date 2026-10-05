@@ -26,6 +26,13 @@ use uuid::Uuid;
 /// 活动连接的 SSH 客户端句柄别名（与 SshClient 内部使用了同样的 tokio RwLock）
 pub type SshClientHandle = Arc<tokio::sync::RwLock<SshClient>>;
 
+/// R3-01：持有 `SshClient` 写锁执行 `disconnect_ssh()` 的时间上限。
+///
+/// 断开流程要 await 远端；一旦它挂住，写锁就把整个会话锁死（新标签、关闭标签、
+/// 删除会话、重连、send_input 全部排队），用户只能重启应用。协议层已不再逐个
+/// 等待 pty 应答，这里是防止其它未知阻塞点的最后一道兜底。
+const DISCONNECT_SSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn validate_session_config(config: &SessionConfig) -> Result<(), CoreError> {
     match config.protocol {
         Protocol::SSH | Protocol::Telnet => {
@@ -828,10 +835,26 @@ impl SessionService {
         if let Some(conn) = active {
             // 发送取消信号
             let _ = conn._cancel_tx.send(()).await;
-            // 断开 SSH 连接
+            // 断开 SSH 连接。
+            //
+            // R3-01：这里持 `SshClient` **写锁**跨越 `disconnect_ssh()`，而后者
+            // 会 await 远端。只要断开流程有可能挂住，写锁就永远不释放，新标签、
+            // 关闭标签、删除会话、重连与每一次 send_input 会被一起卡死。
+            // 协议层已不再逐个等待 pty 应答，这里再加一道兜底上限：最坏情况下
+            // 只是放弃优雅关闭，锁仍会按时释放。
             let mut client = conn.client.write().await;
-            if let Err(e) = client.disconnect_ssh().await {
-                warn!(session_id = %session_id, error = %e, "Error disconnecting SSH");
+            match tokio::time::timeout(DISCONNECT_SSH_TIMEOUT, client.disconnect_ssh()).await {
+                Ok(Err(e)) => {
+                    warn!(session_id = %session_id, error = %e, "Error disconnecting SSH");
+                }
+                Ok(Ok(())) => {}
+                Err(_) => {
+                    warn!(
+                        session_id = %session_id,
+                        "disconnect_ssh exceeded {:?}; releasing the client lock anyway",
+                        DISCONNECT_SSH_TIMEOUT
+                    );
+                }
             }
         }
 

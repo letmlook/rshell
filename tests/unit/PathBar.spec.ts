@@ -66,6 +66,73 @@ describe("PathBar 自定义路径输入", () => {
     expect(wrapper.get('[data-test="fs-path-error"]').text()).toContain("超出已授权的根目录");
   });
 
+  // R3-10：原实现只做前缀字符串比较，`/home/user/../etc` 仍以 `/home/user/`
+  // 开头而被放行，落盘目录随之越出用户选定的根。
+  it.each([
+    ["/home/user/../etc", false],
+    ["/home/user/../../etc", false],
+    ["/home/user2", false],
+  ])("本地模式拒绝穿越/同前缀兄弟目录 %s", async (target, accepted) => {
+    const wrapper = mount(PathBar, {
+      props: { mode: "local", path: "/home/user", rootPath: "/home/user" },
+      global: { stubs },
+    });
+    await wrapper.get('[data-test="fs-path-edit"]').trigger("click");
+    const input = wrapper.get('[data-test="fs-path-input"]');
+    await input.setValue(target);
+    await input.trigger("keyup.enter");
+
+    if (accepted) {
+      expect(wrapper.emitted("navigate")?.[0]).toEqual([target]);
+    } else {
+      expect(wrapper.emitted("navigate")).toBeUndefined();
+      expect(wrapper.get('[data-test="fs-path-error"]').text()).toContain("超出已授权的根目录 /home/user");
+    }
+  });
+
+  it.each(["/home/user/docs", "/home/user/./docs"])("本地模式放行根内路径 %s", async (target) => {
+    const wrapper = mount(PathBar, {
+      props: { mode: "local", path: "/home/user", rootPath: "/home/user" },
+      global: { stubs },
+    });
+    await wrapper.get('[data-test="fs-path-edit"]').trigger("click");
+    const input = wrapper.get('[data-test="fs-path-input"]');
+    await input.setValue(target);
+    await input.trigger("keyup.enter");
+
+    expect(wrapper.emitted("navigate")?.[0]).toEqual([target]);
+  });
+
+  // 同一个 Windows 根在两个入口都必须放行：旧实现下 navigateTo 只判 `/`，
+  // 会把手输进来的 `C:\data\docs` 又挡回去。
+  it.each(["C:\\data\\docs", "C:\\data/./docs"])("Windows 根内的 %s 被放行", async (target) => {
+    const wrapper = mount(PathBar, {
+      props: { mode: "local", path: "C:\\data", rootPath: "C:\\data" },
+      global: { stubs },
+    });
+    await wrapper.get('[data-test="fs-path-edit"]').trigger("click");
+    const input = wrapper.get('[data-test="fs-path-input"]');
+    await input.setValue(target);
+    await input.trigger("keyup.enter");
+
+    expect(wrapper.emitted("navigate")?.[0]).toEqual([target]);
+    expect(wrapper.find('[data-test="fs-path-error"]').exists()).toBe(false);
+  });
+
+  it("本地模式拒绝穿越出 Windows 根的路径", async () => {
+    const wrapper = mount(PathBar, {
+      props: { mode: "local", path: "C:\\data", rootPath: "C:\\data" },
+      global: { stubs },
+    });
+    await wrapper.get('[data-test="fs-path-edit"]').trigger("click");
+    const input = wrapper.get('[data-test="fs-path-input"]');
+    await input.setValue("C:\\data\\..\\Windows");
+    await input.trigger("keyup.enter");
+
+    expect(wrapper.emitted("navigate")).toBeUndefined();
+    expect(wrapper.get('[data-test="fs-path-error"]').text()).toContain("超出已授权的根目录 C:\\data");
+  });
+
   it("Esc 取消编辑且不发出 navigate", async () => {
     const wrapper = mount(PathBar, {
       props: { mode: "remote", sessionId: "s1", path: "/home/user" },

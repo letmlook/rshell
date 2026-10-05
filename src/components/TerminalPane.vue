@@ -68,6 +68,18 @@ let fit: FitAddon | null = null;
 let search: SearchAddon | null = null;
 let channel: Channel<number[]> | null = null;
 let detachSizeObserver: (() => void) | null = null;
+/**
+ * R3-06：卸载闩锁。
+ *
+ * `onMounted` 是 async 的，内含 `ensurePty` / `attachTerminal` 两次 await。
+ * 用户在往返窗口内关闭标签时，`onBeforeUnmount` 会把 `term` / `channel` 置 null，
+ * 而 await 续体恢复后仍会执行 `term.onData(...)` —— 对 null 取属性抛 TypeError，
+ * 变成 unhandled rejection，并且其后的 window/document 监听与 ResizeObserver
+ * 全部不再注册。CLAUDE.md 明确要求「处理异步订阅完成晚于 unmount 的情况」。
+ *
+ * 每次 await 之后、触碰 `term` 之前都要检查它。
+ */
+let unmounted = false;
 
 // ── 连接状态 ──
 /** 本面板是否曾经连上过：只有「连过又掉」才提示断开，避免新建面板时闪红条 */
@@ -81,6 +93,22 @@ watch(
 );
 
 const isConnected = computed(() => props.connectionState === "connected");
+
+/**
+ * R3-05：连接从「非 connected」变为 connected 时补一次「确保 pty + 附加通道」。
+ *
+ * 覆盖那些在握手完成前就建好面板的路径（例如标签在握手中被打开）：那时
+ * `open_terminal` 会 NotFound，若没有这次补偿，面板会一直停在错误条上，
+ * 只能靠用户手动点「重试附加」。
+ */
+watch(isConnected, async (connected) => {
+  if (!connected || unmounted) return;
+  if (attachError.value === null && channel !== null) return; // 已经正常挂着
+  if (term && (await ensurePty(term.cols, term.rows))) {
+    if (unmounted) return; // R3-06：await 期间可能已被卸载
+    await attachTerminal();
+  }
+});
 /** 连接掉线（曾经连过、现在不是 connected）才叫「断开」 */
 const isDropped = computed(() => everConnected.value && props.connectionState !== "connected");
 
@@ -369,6 +397,8 @@ async function ensurePty(cols: number, rows: number): Promise<boolean> {
     await openTerminal(sid, tid, cols, rows);
     return true;
   } catch (e) {
+    // R3-06：卸载后不再写状态。
+    if (unmounted) return false;
     attachError.value = `无法为该标签创建独立会话：${ipcErrorMessage(e)}`;
     console.error("[TerminalPane] open_terminal failed", e);
     return false;
@@ -389,9 +419,12 @@ async function attachTerminal(): Promise<boolean> {
       terminal_id: tid,
       on_data: channel,
     });
+    // R3-06：卸载后不再写状态，避免把错误条挂到已销毁的面板上。
+    if (unmounted) return false;
     attachError.value = null;
     return true;
   } catch (e) {
+    if (unmounted) return false;
     attachError.value = ipcErrorMessage(e);
     console.error("[TerminalPane] attach_terminal failed", e);
     return false;
@@ -477,8 +510,12 @@ onMounted(async () => {
   // 是不存在的 pty，标签会一直空白。
   fit.fit();
   if (await ensurePty(term.cols, term.rows)) {
+    // R3-06：上面这次 await 期间标签可能已被关闭。
+    if (unmounted) return;
     await attachTerminal();
   }
+  // R3-06：同上，第二次 await 之后必须再确认一次，否则下面访问 `term` 会抛。
+  if (unmounted) return;
 
   // 前端 → 后端:键入数据直接转发（设计 §4.3 流程 A 末步）
   term.onData((data) => {
@@ -560,6 +597,8 @@ function onDocumentKeydown(e: KeyboardEvent) {
 }
 
 onBeforeUnmount(() => {
+  // R3-06：先置闩锁，让在途的 async onMounted / watcher 续体知道该收手了。
+  unmounted = true;
   if (copyOnSelectTimer.value) {
     clearTimeout(copyOnSelectTimer.value);
     copyOnSelectTimer.value = null;

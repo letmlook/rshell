@@ -67,7 +67,25 @@ const nonLoopbackBind = computed(() => {
   return host !== "" && !isLoopbackHost(host);
 });
 
+/**
+ * 监听字段的行内错误。提交过一次后才显示：面板刚打开就飘红字是噪音。
+ *
+ * 空 host（`:8080`）是死路，必须拦在提交之前（R3-16）：`TcpListener::bind(":port")`
+ * 会绑定**所有**网卡，而后端 `is_loopback_bind_address("")` 判 false 并要求
+ * `allow_non_loopback`——而界面对空 host 既不弹暴露确认也置不了这个标志
+ * （保守判定不变：`""` 不算回环，也绝不放行到 bind）。结果是这条输入永远建不出
+ * 隧道，提示还指向一个界面上不存在的选项。改为在表单里要求写明主机名。
+ */
+const bindSubmitted = ref(false);
+const bindError = computed<string | null>(() => {
+  if (!bindSubmitted.value) return null;
+  if (parseEndpoint(draftBind.value).host.trim() !== "") return null;
+  return '监听地址必须写明主机名（如 127.0.0.1:8080）：只写 ":8080" 会绑定所有网卡，界面不会提供暴露确认';
+});
+
 async function add() {
+  bindSubmitted.value = true;
+  if (bindError.value) return; // 监听地址无法判断暴露面：不发出必然失败的请求
   if (!draftSession.value) {
     error.value = "请先在主视图选择会话";
     return;
@@ -160,6 +178,7 @@ onBeforeUnmount(() => {
       </el-form-item>
       <el-form-item label="监听">
         <el-input v-model="draftBind" placeholder="host:port" style="width: 140px" />
+        <p v-if="bindError" class="error" role="alert" data-test="tunnel-bind-error">{{ bindError }}</p>
       </el-form-item>
       <el-form-item v-if="draftType !== 'Dynamic'" label="目标">
         <el-input v-model="draftTarget" placeholder="host:port" style="width: 140px" />
@@ -209,6 +228,11 @@ h3 {
 .error {
   color: var(--el-color-danger);
   font-size: 12px;
+}
+/* 字段级错误独占一行：el-form-item 内容是行内排版，红字跟在输入框右侧会挤掉标签 */
+.add-form .error {
+  display: block;
+  margin: 2px 0 0;
 }
 .warn {
   color: var(--el-color-warning);

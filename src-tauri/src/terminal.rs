@@ -62,7 +62,9 @@ impl TerminalChannels {
         }
     }
 
-    /// recv 循环无条件写入。未注册 pty 静默丢弃 + warn（防御性：recv 早于 attach）。
+    /// recv 循环无条件写入：未注册 pty **也会建条目并缓冲**（防御性：recv 早于 attach，
+    /// 新标签 attach 时要补发此前的输出）。代价是条目只增不减——关闭标签必须显式
+    /// `detach_terminal`，否则每个已关标签残留最多 256 KiB 积压直到整个会话被删除。
     /// 已 attach 的每个通道都收到一份；失败的（标签已关 / HMR 失效）就地摘掉。
     pub async fn push(&self, session_id: Uuid, terminal_id: Uuid, data: &[u8]) {
         let mut inner = self.inner.write().await;
@@ -124,10 +126,24 @@ impl TerminalChannels {
     }
 
     /// 显式 detach(会话删除时)：连同滚动历史一起清掉。
-    /// 单个标签关闭不需要显式 detach —— 下一次 push 时该通道 send 失败会被摘掉。
+    /// 单个标签关闭**必须**走 `detach_terminal`（`detach` 是整会话粒度的）。
     pub async fn detach(&self, session_id: Uuid) {
         let mut inner = self.inner.write().await;
         inner.retain(|(sid, _), _| *sid != session_id);
+    }
+
+    /// 关闭单个标签：只摘掉这个 `(session_id, terminal_id)` 条目。
+    ///
+    /// 此前 `detach` 只在会话删除时被调用，而 `SessionService::close_terminal`
+    /// 不会碰这张表，于是每关掉一个标签就残留一个 `TermSink`
+    /// （最多 256 KiB 滚动历史 + 通道句柄），要等整个会话删除才释放。
+    /// 同会话的其它标签、其它会话的标签一律不受影响。
+    ///
+    /// 返回是否真的摘掉了一条。未知 `terminal_id` 是幂等的 no-op
+    /// （前端可能重复发 close），不 panic 也不误删。
+    pub async fn detach_terminal(&self, session_id: Uuid, terminal_id: Uuid) -> bool {
+        let mut inner = self.inner.write().await;
+        inner.remove(&(session_id, terminal_id)).is_some()
     }
 
     /// 测试与诊断用 —— 当前 sink 状态概览。
@@ -332,5 +348,51 @@ mod tests {
         let summary = tc.debug_summary().await;
         assert_eq!(summary.len(), 1, "只应清掉该会话的 pty");
         assert_eq!(summary[0].0 .0, other);
+    }
+
+    /// 回归（R3-11）：关闭单个标签必须只摘掉那一个 `(session, terminal)` 条目。
+    /// 此前 `SessionService::close_terminal` 不碰 TerminalChannels，
+    /// 每个关掉的标签残留最多 256 KiB 积压直到整个会话被删除。
+    #[tokio::test]
+    async fn detach_terminal_removes_only_that_terminal() {
+        let tc = TerminalChannels::new();
+        let sid = Uuid::new_v4();
+        let other_sid = Uuid::new_v4();
+        let (closed, sibling, foreign) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+
+        tc.push(sid, closed, b"bye").await;
+        tc.push(sid, sibling, b"stay").await;
+        tc.push(other_sid, foreign, b"other").await;
+
+        assert!(
+            tc.detach_terminal(sid, closed).await,
+            "已存在的 terminal 应被摘掉"
+        );
+
+        let summary = tc.debug_summary().await;
+        let has = |s: Uuid, t: Uuid| summary.iter().any(|((ss, tt), _)| (*ss, *tt) == (s, t));
+        assert!(!has(sid, closed), "关闭的标签不该还留在表里（会泄漏积压）");
+        assert!(has(sid, sibling), "同会话的其它标签必须保留");
+        assert!(has(other_sid, foreign), "其它会话的标签必须保留");
+        assert_eq!(summary.len(), 2, "只应摘掉一个条目");
+    }
+
+    /// 回归（R3-11）：未知 terminal 的 detach 是幂等 no-op —— 前端重复发 close
+    /// 或后端先关 pty 后才 detach 时不能 panic，更不能误删同会话的兄弟标签。
+    #[tokio::test]
+    async fn detach_terminal_unknown_is_noop() {
+        let tc = TerminalChannels::new();
+        let (sid, tid) = (Uuid::new_v4(), Uuid::new_v4());
+        tc.push(sid, tid, b"x").await;
+
+        assert!(!tc.detach_terminal(sid, Uuid::new_v4()).await);
+        assert!(!tc.detach_terminal(Uuid::new_v4(), tid).await);
+        assert!(!tc.detach_terminal(Uuid::new_v4(), Uuid::new_v4()).await);
+
+        assert_eq!(
+            tc.debug_summary().await,
+            vec![((sid, tid), "buffering".to_string())],
+            "未知 terminal 不该动到任何已登记的条目"
+        );
     }
 }

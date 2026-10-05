@@ -13,6 +13,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { readDir, stat } from "@tauri-apps/plugin-fs";
 import { browseRemoteDir } from "../../ipc/client";
+import { isWithinRoot } from "../../utils/rootBoundary";
 import PathBar from "./PathBar.vue";
 import type { Uuid, FilePermissions } from "../../ipc/types";
 
@@ -222,7 +223,10 @@ function refresh() { return load(props.path, false); }
 defineExpose({ refresh });
 
 function navigateTo(path: string, pushHistory = true) {
-  if (props.mode === "local" && props.rootPath && path !== props.rootPath && !path.startsWith(`${props.rootPath}/`)) return;
+  // 越出已授权根目录的导航直接丢弃（面包屑 / 目录树 / 双击 / 上级都汇到这里）。
+  // 判定与 PathBar.commitEdit 共用 isWithinRoot：前缀比较会放过
+  // `/home/user/../etc`，且只判 `/` 会误挡 Windows 根 `C:\data`（R3-10）。
+  if (props.mode === "local" && props.rootPath && !isWithinRoot(path, props.rootPath)) return;
   emit("navigate", path);
   if (pushHistory) emit("request-sync", path);
   void load(path, pushHistory);

@@ -119,16 +119,42 @@ export const useSessionsStore = defineStore("sessions", () => {
     return create(copy, null);
   }
 
+  /**
+   * R3-05：同一会话的并发 connect 复用同一个 in-flight Promise。
+   *
+   * 旧实现没有去重，两个调用方各自发一次 `connect_session`。更麻烦的是调用方
+   * 只能靠 `connectionState === "connecting"` 猜测连接是否在进行，于是
+   * `openTabSession` 会选择「跳过等待、直接建面板」——那时后端还没把会话放进
+   * `connections`，`open_terminal` 必然 NotFound，标签页就此空白（见 App.vue）。
+   * 让 connect 可等待，调用方就不必再靠状态猜。
+   */
+  const inflightConnects = new Map<Uuid, Promise<void>>();
+
   async function connect(id: Uuid) {
+    const existing = inflightConnects.get(id);
+    if (existing) return existing;
+
     connectionState.value.set(id, "connecting");
     connectionState.value = new Map(connectionState.value); // trigger reactivity
-    try {
-      await connectSession(id);
-    } catch (e) {
-      connectionState.value.set(id, "failed");
-      connectionState.value = new Map(connectionState.value);
-      throw e;
-    }
+
+    const task = (async () => {
+      try {
+        await connectSession(id);
+      } catch (e) {
+        connectionState.value.set(id, "failed");
+        connectionState.value = new Map(connectionState.value);
+        throw e;
+      } finally {
+        inflightConnects.delete(id);
+      }
+    })();
+    inflightConnects.set(id, task);
+    return task;
+  }
+
+  /** 会话是否正在握手中（含本进程发起的连接） */
+  function isConnecting(id: Uuid): boolean {
+    return connectionState.value.get(id) === "connecting" || inflightConnects.has(id);
   }
 
   async function disconnect(id: Uuid) {
@@ -190,6 +216,7 @@ export const useSessionsStore = defineStore("sessions", () => {
     refresh,
     create,
     connect,
+    isConnecting,
     disconnect,
     delete: deleteSessionById,
     subscribeEvents,

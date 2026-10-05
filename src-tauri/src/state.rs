@@ -14,8 +14,8 @@ use crate::terminal::TerminalChannels;
 
 pub struct AppState {
     pub dispatcher: Arc<CommandDispatcher>,
-    /// 终端字节双态 sink。切片 1.1 暂未被薄壳读取 —— 切片 1.2 的 `attach_terminal`
-    /// 命令与 recv 循环会同时接入 push/attach（设计 §4.1）。
-    #[allow(dead_code)]
+    /// 终端字节双态 sink：`attach_terminal` 登记通道，recv 循环 `push` 字节，
+    /// 会话删除与标签关闭分别按会话 / 按 `(session, terminal)` 粒度清理
+    /// （见 lib.rs 的删除回调与 commands.rs 的 close_terminal）。
     pub terminal_channels: Arc<TerminalChannels>,
 }

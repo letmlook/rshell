@@ -11,7 +11,7 @@
  * 数据源:目前 sessions store 的 items 是扁平 list;我们用一个前端派生算法
  * 按 'group' 字段聚合成树,后端将来接入分组 API 后只需替换 buildTree。
  */
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, ref } from "vue";
 import { useSessionsStore } from "../stores/sessions";
 import type { Uuid } from "../ipc/types";
 import type { SessionConfig } from "../ipc/types";
@@ -84,75 +84,96 @@ const contextMenu = ref<{
   session: SessionConfig | null;
 }>({ visible: false, x: 0, y: 0, session: null });
 
+/** 摘除 openContextMenu 挂上的兜底 window 监听（菜单项点击也要摘，不能等下一次外部点击） */
+let detachOutsideClose: (() => void) | null = null;
+
+function closeContextMenu() {
+  contextMenu.value.visible = false;
+  detachOutsideClose?.();
+  detachOutsideClose = null;
+}
+
 function openContextMenu(s: SessionConfig, e: MouseEvent) {
   e.preventDefault();
+  // 重复右键时先摘掉上一次的兜底监听，避免叠加
+  closeContextMenu();
   contextMenu.value = {
     visible: true,
     x: e.clientX,
     y: e.clientY,
     session: s,
   };
-  const close = () => {
-    contextMenu.value.visible = false;
-    window.removeEventListener("click", close);
-    window.removeEventListener("contextmenu", close);
-  };
-  setTimeout(() => {
+  const close = () => closeContextMenu();
+  // 延到本次事件派发结束后再挂：否则同一次右键自己就会把菜单关掉
+  const timer = setTimeout(() => {
     window.addEventListener("click", close);
     window.addEventListener("contextmenu", close);
   }, 0);
+  detachOutsideClose = () => {
+    clearTimeout(timer);
+    window.removeEventListener("click", close);
+    window.removeEventListener("contextmenu", close);
+  };
 }
 
-function ctxConnect() {
-  if (!contextMenu.value.session) return;
-  emit("select", contextMenu.value.session.id);
+/**
+ * 菜单项的统一入口：执行动作 + 关菜单 + 摘除兜底 window 监听。
+ *
+ * 菜单容器带 `@click.stop`，菜单项的点击不会再冒泡到 window，因此
+ * 「靠 window 监听关闭」这条老路对菜单项**无效**。每个菜单项都必须走这里，
+ * 否则新增项很容易再漏一次关闭（R3-14）。
+ */
+function runMenuItem(action: (session: SessionConfig) => void) {
+  const target = contextMenu.value.session;
+  if (!target) return;
+  closeContextMenu();
+  action(target);
 }
-function ctxOpenSftp() {
-  if (!contextMenu.value.session) return;
-  emit("open-sftp", contextMenu.value.session.id);
+
+function ctxConnect(s: SessionConfig) {
+  emit("select", s.id);
 }
-function ctxOpenTerminal() {
-  if (!contextMenu.value.session) return;
-  emit("open-terminal", contextMenu.value.session.id, "~");
+function ctxOpenSftp(s: SessionConfig) {
+  emit("open-sftp", s.id);
+}
+function ctxOpenTerminal(s: SessionConfig) {
+  emit("open-terminal", s.id, "~");
 }
 /** 新开窗口：同连接信息可以同时开多个 shell，不复用已存在的终端面板 */
-function ctxOpenTerminalWindow() {
-  if (!contextMenu.value.session) return;
-  emit("open-terminal-window", contextMenu.value.session.id);
+function ctxOpenTerminalWindow(s: SessionConfig) {
+  emit("open-terminal-window", s.id);
 }
-function ctxDisconnect() {
-  if (!contextMenu.value.session) return;
-  store.disconnect(contextMenu.value.session.id).catch(console.warn);
+function ctxDisconnect(s: SessionConfig) {
+  store.disconnect(s.id).catch(console.warn);
 }
-function ctxUpdateCredential() {
-  credentialSession.value = contextMenu.value.session;
-  contextMenu.value.visible = false;
+function ctxUpdateCredential(s: SessionConfig) {
+  credentialSession.value = s;
 }
 
-/** 口令类认证且新条目还没有凭据时，才需要立刻补录 */
 // 复制流程由 App.vue 持有（入口有左侧列表与终端 tab 两处，而本组件按侧栏
 // 当前面板条件挂载），这里只负责发出意图。
-function ctxDuplicate() {
-  const target = contextMenu.value.session;
-  if (!target) return;
-  contextMenu.value.visible = false;
-  emit("duplicate-session", target.id);
+function ctxDuplicate(s: SessionConfig) {
+  emit("duplicate-session", s.id);
 }
-async function ctxDelete() {
-  const target = contextMenu.value.session;
-  if (!target) return;
+async function ctxDelete(s: SessionConfig) {
   // 应用内确认窗替代 tauri-plugin-dialog 的 confirm()：不弹操作系统窗口
   const ok = await confirmDialog({
     title: "删除连接信息",
-    message: `确定删除连接「${target.name}」吗？此操作不可撤销。`,
-    detail: `${target.host}:${target.port}`,
+    message: `确定删除连接「${s.name}」吗？此操作不可撤销。`,
+    detail: `${s.host}:${s.port}`,
     confirmText: "删除",
     danger: true,
   });
   if (!ok) return;
   // 失败原因由 sessions store 写入 store.error，列表顶部已有展示位
-  await store.delete?.(target.id).catch(console.warn);
+  await store.delete?.(s.id).catch(console.warn);
 }
+
+// 面板按侧栏当前面板条件卸载：兜底 window 监听不能比组件活得久
+onBeforeUnmount(() => {
+  detachOutsideClose?.();
+  detachOutsideClose = null;
+});
 </script>
 
 <template>
@@ -231,16 +252,28 @@ async function ctxDelete() {
       :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }"
       @click.stop
     >
-      <button class="ctx-item" @click="ctxConnect">连接</button>
-      <button class="ctx-item" @click="ctxDisconnect">断开</button>
-      <button v-if="contextMenu.session?.protocol === 'SSH'" class="ctx-item" @click="ctxUpdateCredential">更新凭据</button>
+      <button class="ctx-item" @click="runMenuItem(ctxConnect)">连接</button>
+      <button class="ctx-item" @click="runMenuItem(ctxDisconnect)">断开</button>
+      <button
+        v-if="contextMenu.session?.protocol === 'SSH'"
+        class="ctx-item"
+        @click="runMenuItem(ctxUpdateCredential)"
+      >
+        更新凭据
+      </button>
       <div class="ctx-sep" />
-      <button v-if="contextMenu.session?.protocol === 'SSH'" class="ctx-item" @click="ctxOpenSftp">打开 SFTP</button>
-      <button class="ctx-item" @click="ctxOpenTerminal">打开标签</button>
+      <button
+        v-if="contextMenu.session?.protocol === 'SSH'"
+        class="ctx-item"
+        @click="runMenuItem(ctxOpenSftp)"
+      >
+        打开 SFTP
+      </button>
+      <button class="ctx-item" @click="runMenuItem(ctxOpenTerminal)">打开标签</button>
       <button
         class="ctx-item"
         data-test="ctx-open-terminal-window"
-        @click="ctxOpenTerminalWindow"
+        @click="runMenuItem(ctxOpenTerminalWindow)"
       >
         新开标签
       </button>
@@ -248,11 +281,11 @@ async function ctxDelete() {
       <button
         class="ctx-item"
         data-test="ctx-duplicate"
-        @click="ctxDuplicate"
+        @click="runMenuItem(ctxDuplicate)"
       >
         复制连接信息
       </button>
-      <button class="ctx-item ctx-danger" @click="ctxDelete">删除连接</button>
+      <button class="ctx-item ctx-danger" @click="runMenuItem(ctxDelete)">删除连接</button>
     </div>
   </div>
 </template>

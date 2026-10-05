@@ -253,19 +253,36 @@ fn describe_transfer_error(e: &str) -> String {
     }
 }
 
-/// 由「所在目录 + 新文件名」拼出目标路径。
+/// R3-04：文件名必须是**单个路径分量**——不含分隔符、不为 `.`/`..`、非空非空白。
 ///
-/// 拒绝含分隔符、`.`/`..`、空白的名字——否则「重命名」会成为任意路径写入的
-/// 旁路，绕过 `validate_remote_mutation_path` 的越界检查。
-pub fn sibling_path(base: &str, name: &str) -> Result<String, CoreError> {
-    if name.is_empty()
+/// 远端版（[`sibling_path`]）与本地版（[`resolve_local_target`]）共用此判定。
+/// 原因：`Path::with_file_name` 只替换最后一个分量而**不做任何净化**，含 `/`、
+/// `\`、`..` 或驱动器前缀的名字会让结果逃出目标目录：
+///
+/// ```text
+/// C:\Users\me\Downloads\report.txt + "..\..\Startup\evil.exe"
+///   => C:\Users\me\Downloads\..\..\Startup\evil.exe   （解析后已逃出）
+/// /home/user/downloads/report.txt  + "C:evil.txt"
+///   => C:evil.txt                                     （整条路径被替换）
+/// ```
+///
+/// 漏掉这一层，「重命名」就成了任意路径写入的旁路。
+fn is_unsafe_component(name: &str) -> bool {
+    name.is_empty()
         || name == "."
         || name == ".."
         || name.contains('/')
         || name.contains('\\')
         || name.contains('\0')
         || name.trim().is_empty()
-    {
+}
+
+/// 由「所在目录 + 新文件名」拼出目标路径。
+///
+/// 拒绝含分隔符、`.`/`..`、空白的名字——否则「重命名」会成为任意路径写入的
+/// 旁路，绕过 `validate_remote_mutation_path` 的越界检查。
+pub fn sibling_path(base: &str, name: &str) -> Result<String, CoreError> {
+    if is_unsafe_component(name) {
         return Err(CoreError::InvalidState(format!("Unsafe file name: {name}")));
     }
     let dir = match base.rfind('/') {
@@ -288,6 +305,12 @@ pub fn sibling_path(base: &str, name: &str) -> Result<String, CoreError> {
 /// 本地下载目标解析：语义与远端版一致。
 ///
 /// `Overwrite` 直接沿用原路径——`tokio::fs::File::create` 本身会截断既有文件。
+///
+/// R3-04：此处原先只拒绝空串/`.`/`..`，**漏掉分隔符检查**，与上面
+/// `sibling_path` 的注释所声称的「远端版语义」并不一致，且让本地下载的
+/// 「重命名」成为任意路径写入的旁路。现与远端版共用 [`is_unsafe_component`]，
+/// 并额外要求解析结果仍位于原父目录内（纵深防御：驱动器相对名如 `C:x`
+/// 能通过名字检查，但父目录会变）。
 pub fn resolve_local_target(
     target: &std::path::Path,
     conflict: &ConflictPolicy,
@@ -302,10 +325,16 @@ pub fn resolve_local_target(
             target.display()
         ))),
         ConflictPolicy::Rename(name) => {
-            if name.is_empty() || name == "." || name == ".." {
+            if is_unsafe_component(name) {
                 return Err(CoreError::InvalidState(format!("Unsafe file name: {name}")));
             }
             let renamed = target.with_file_name(name);
+            if renamed.parent() != target.parent() {
+                return Err(CoreError::InvalidState(format!(
+                    "重命名目标逃出了目标目录：{}",
+                    renamed.display()
+                )));
+            }
             if renamed.exists() {
                 return Err(CoreError::TargetExists(format!(
                     "重命名目标也已存在：{}",
@@ -1204,6 +1233,60 @@ mod tests {
             resolve_local_target(&existing, &ConflictPolicy::Rename("b.txt".into())).unwrap_err(),
             CoreError::TargetExists(_)
         ));
+    }
+
+    /// 回归 R3-04：本地下载的「重命名」不得成为任意路径写入的旁路。
+    ///
+    /// 旧实现只拒绝空串/`.`/`..`，不检查分隔符，而 `Path::with_file_name`
+    /// 不做净化 —— 含 `../`、`\`、驱动器前缀的名字会让下载落到目标目录之外。
+    /// 远端孪生实现 `sibling_path` 早已逐项拒绝，本地版此前漏了这层。
+    #[test]
+    fn local_rename_rejects_names_that_escape_the_destination_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("a.txt");
+        std::fs::write(&existing, b"old").unwrap();
+
+        for hostile in [
+            "../evil.txt",      // POSIX 上一层
+            "../../evil.txt",   // POSIX 多层
+            "sub/evil.txt",     // POSIX 子目录
+            "..\\evil.txt",     // Windows 上一层
+            "..\\..\\evil.txt", // Windows 多层
+            "sub\\evil.txt",    // Windows 子目录
+            "C:evil.txt",       // 驱动器相对：能过名字检查，但父目录会变
+            "",
+            ".",
+            "..",
+            "   ",
+        ] {
+            let err = resolve_local_target(&existing, &ConflictPolicy::Rename(hostile.into()))
+                .expect_err(&format!("改名 {hostile:?} 必须被拒绝"));
+            assert!(
+                matches!(err, CoreError::InvalidState(_)),
+                "改名 {hostile:?} 应报 InvalidState，实际: {err:?}"
+            );
+        }
+    }
+
+    /// 回归 R3-04（配套）：合法的单分量改名仍须放行，且不越出目标目录。
+    #[test]
+    fn local_rename_accepts_a_plain_component_staying_in_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("a.txt");
+        std::fs::write(&existing, b"old").unwrap();
+
+        let renamed =
+            resolve_local_target(&existing, &ConflictPolicy::Rename("b.txt".into())).unwrap();
+        assert_eq!(renamed, dir.path().join("b.txt"));
+        assert_eq!(
+            renamed.parent(),
+            existing.parent(),
+            "改名结果必须仍在原父目录内"
+        );
+
+        // 远端版与本地版对同一个名字必须给出同样的裁决（语义一致）。
+        assert!(sibling_path("/home/user/a.txt", "../evil.txt").is_err());
+        assert!(sibling_path("/home/user/a.txt", "b.txt").is_ok());
     }
 
     #[tokio::test]

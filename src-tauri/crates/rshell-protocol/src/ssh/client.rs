@@ -60,6 +60,29 @@ use crate::{Connection, ProtocolError};
 /// 强制断开。
 const SSH_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// R3-01：等待 pty actor 应答的上限。
+///
+/// actor 在 `select!` 分支里内联 `await channel.data(...)`。对端不读 stdin
+/// （或只是链路很慢）时发送窗口会被填满，这次写就一直等到对端回
+/// `WINDOW_ADJUST` 才返回——actor 在此期间**回不到 `select!`**，后续
+/// `Send`/`Resize`/`Close` 全部滞留在 mpsc 里不被处理。若调用方无上限地
+/// 等应答（`close_terminal` / `disconnect_ssh` 的老写法），断开流程会被
+/// 永久挂住，进而连带卡住持有 `SshClient` 写锁的上层。
+///
+/// 该上限只用来把「永久挂起」降级为「一次可见的失败」：超时后调用方放弃
+/// 等待继续拆除，actor 与通道由 `handle.disconnect()` 收尾。
+const PTY_ACTOR_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 断开连接时等待 russh 发送 disconnect 消息的上限。
+const SSH_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// R3-03：请求对端开 `direct-tcpip` 通道的上限。
+///
+/// 调用方在隧道 accept 路径上持有 `SshClient` 读锁跨越这次调用；russh 的
+/// `wait_channel_confirmation` 自身没有超时，因此这里必须自己兜底，否则一个
+/// 不响应的对端就能把该会话的所有写操作（新标签、关闭、断开）永久堵死。
+const DIRECT_TCPIP_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 构建 russh 传输层配置：启用空闲 keepalive，不设 inactivity_timeout。
 ///
 /// 窗口与包长保持 russh 默认值（2 MiB / 32 KiB）。曾试过放大到 16 MiB /
@@ -96,6 +119,29 @@ async fn open_nodelay_socket(addr: &str) -> Result<tokio::net::TcpStream, Protoc
 struct TerminalHandle {
     sender: mpsc::Sender<ShellRequest>,
     channel: u32,
+}
+
+/// R3-01：等待 pty actor 应答，并给等待加上限。
+///
+/// 抽成独立函数是为了让「有界」这一性质能被快速单测覆盖——生产超时是
+/// [`PTY_ACTOR_REPLY_TIMEOUT`]，测试传毫秒级的值即可，不必让整个测试套件
+/// 为一个 10 秒的 sleep 买单。
+///
+/// `what` 只用于错误文案，便于定位是输入还是 resize 被卡住。
+async fn await_actor_reply(
+    reply: oneshot::Receiver<Result<(), ProtocolError>>,
+    timeout: std::time::Duration,
+    what: &str,
+) -> Result<(), ProtocolError> {
+    match tokio::time::timeout(timeout, reply).await {
+        Ok(Ok(result)) => result,
+        // sender 被丢弃：actor 任务结束
+        Ok(Err(_)) => Err(ProtocolError::ConnectionClosed),
+        Err(_) => Err(ProtocolError::ProtocolError(format!(
+            "pty actor did not accept {what} within {timeout:?}; \
+             the remote end is not reading (SSH send window full)"
+        ))),
+    }
 }
 
 /// 在已建立的连接上开一个 session channel，请求 PTY 与 shell。
@@ -854,7 +900,18 @@ impl SshClient {
         if let Some(handle) = self.terminals.remove(&terminal_id) {
             let (reply, received) = oneshot::channel();
             if handle.sender.send(ShellRequest::Close(reply)).await.is_ok() {
-                let _ = received.await;
+                // R3-01：actor 卡在写上时永远回不到 select!，无限等应答会挂死
+                // 断开流程（其调用方还持着 SshClient 写锁）。超时即放弃等待：
+                // 丢弃 sender 后 actor 的 `None` 分支会自行 close 通道。
+                if tokio::time::timeout(PTY_ACTOR_REPLY_TIMEOUT, received)
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        terminal_id = %terminal_id,
+                        "close_terminal: pty actor busy (send window full?), reply timed out; continuing teardown"
+                    );
+                }
             }
         }
     }
@@ -872,9 +929,9 @@ impl SshClient {
             .send(ShellRequest::Send(data.to_vec(), reply))
             .await
             .map_err(|_| ProtocolError::ConnectionClosed)?;
-        received
-            .await
-            .map_err(|_| ProtocolError::ConnectionClosed)?
+        // R3-01：actor 卡在一次写上时不会处理后续请求，这里必须有上限，
+        // 否则一次按键就能把调用方永久挂住。
+        await_actor_reply(received, PTY_ACTOR_REPLY_TIMEOUT, "input").await
     }
 
     /// 调整指定 pty 的窗口尺寸。
@@ -895,9 +952,7 @@ impl SshClient {
             .send(ShellRequest::Resize(cols, rows, reply))
             .await
             .map_err(|_| ProtocolError::ConnectionClosed)?;
-        received
-            .await
-            .map_err(|_| ProtocolError::ConnectionClosed)?
+        await_actor_reply(received, PTY_ACTOR_REPLY_TIMEOUT, "resize").await
     }
 
     /// 该连接上已登记的 pty 数量（诊断/测试用）。
@@ -907,20 +962,30 @@ impl SshClient {
 
     /// 断开连接
     pub async fn disconnect_ssh(&mut self) -> Result<(), ProtocolError> {
-        // 先关掉全部 pty：只关主 pty 会让额外标签的 actor 任务继续挂在
-        // 通道上，直到 TCP 断开才结束。
-        let ids: Vec<Uuid> = self.terminals.keys().copied().collect();
-        for id in ids {
-            self.close_terminal(id).await;
-        }
+        // R3-01：**不再**逐个 await close_terminal 的应答。旧写法在 actor 卡于
+        // `channel.data()`（对端不读 stdin、发送窗口打满）时会永久挂住，而调用方
+        // 此刻正持有 `SshClient` 写锁 —— 整个会话就此再也关不掉，只能重启应用。
+        //
+        // 直接丢弃 sender 即可：actor 的 `requests.recv()` 收到 `None` 会走
+        // `None => { let _ = channel.close().await; break }` 自行收尾；即便它此刻
+        // 正卡在写上，紧随其后的 `handle.disconnect()` 拆掉 russh 会话也会让那次
+        // 写返回错误、任务结束。
         self.terminals.clear();
         self.channel = None;
         self.channel_id = None;
 
         if let Some(handle) = self.handle.take() {
-            let _ = handle
-                .disconnect(russh::Disconnect::ByApplication, "User disconnect", "en")
-                .await;
+            // 同样加上限：disconnect 不应成为第二个可能永久挂起的点。
+            if tokio::time::timeout(SSH_DISCONNECT_TIMEOUT, async {
+                let _ = handle
+                    .disconnect(russh::Disconnect::ByApplication, "User disconnect", "en")
+                    .await;
+            })
+            .await
+            .is_err()
+            {
+                warn!("SSH disconnect did not complete within {SSH_DISCONNECT_TIMEOUT:?}; dropping handle");
+            }
         }
 
         self.shell_output.lock().unwrap().close(None);
@@ -1027,6 +1092,12 @@ impl SshClient {
     /// 1. 拿到 channel 后调 `.make_reader()` / `.make_writer()` 拿 AsyncRead/AsyncWrite
     /// 2. 用 `tokio::io::copy_bidirectional` 在 `TcpStream` 和 channel 之间搬运
     /// 3. 关闭时调 `channel.eof()` + `channel.close()`
+    ///
+    /// R3-03：channel-open 必须**有上限**。调用方（隧道 accept 路径）持有
+    /// `SshClient` 的读锁跨越这次调用，而 tokio `RwLock` 写优先：对端不回应
+    /// channel-open 时 russh 的 `wait_channel_confirmation` 会一直等，既没有
+    /// 自带超时也不该由我们无限等下去——那会让 `open_terminal` /
+    /// `close_terminal` / `disconnect_ssh` 全部堵在写者队列里，会话再也关不掉。
     pub async fn open_direct_tcpip(
         &self,
         host: &str,
@@ -1036,12 +1107,21 @@ impl SshClient {
             .handle
             .as_ref()
             .ok_or(ProtocolError::ConnectionClosed)?;
-        handle
-            .channel_open_direct_tcpip(host, port, "127.0.0.1", 0)
-            .await
-            .map_err(|e| {
-                ProtocolError::ConnectionFailed(format!("direct-tcpip open failed: {}", e))
-            })
+        match tokio::time::timeout(
+            DIRECT_TCPIP_OPEN_TIMEOUT,
+            handle.channel_open_direct_tcpip(host, port, "127.0.0.1", 0),
+        )
+        .await
+        {
+            Ok(Ok(channel)) => Ok(channel),
+            Ok(Err(e)) => Err(ProtocolError::ConnectionFailed(format!(
+                "direct-tcpip open failed: {e}"
+            ))),
+            Err(_) => Err(ProtocolError::ConnectionFailed(format!(
+                "direct-tcpip open to {host}:{port} timed out after {DIRECT_TCPIP_OPEN_TIMEOUT:?}; \
+                 the SSH peer did not answer the channel request"
+            ))),
+        }
     }
 }
 
@@ -1794,6 +1874,109 @@ mod tests {
             client.primary_terminal_id(),
             session_id,
             "主 pty 的 terminal_id 必须等于 session_id，否则首标签输入会被丢弃",
+        );
+    }
+
+    /// 造一个只配好配置、没有任何连接的 SshClient（供纯本地的锁/生命周期测试用）。
+    fn bare_client() -> SshClient {
+        let session_id = Uuid::new_v4();
+        SshClient::new(
+            SessionConfig {
+                id: session_id,
+                name: "test".to_string(),
+                folder_id: None,
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                protocol: rshell_api::types::Protocol::SSH,
+                auth_method: AuthMethod::Password {
+                    username: "root".to_string(),
+                    has_password: true,
+                },
+                serial_config: None,
+            },
+            ResolvedAuthMethod::Password {
+                username: "root".into(),
+                password: "test".into(),
+            },
+        )
+    }
+
+    /// 回归 R3-01：`disconnect_ssh` 不得因某个 pty actor 卡住而挂起。
+    ///
+    /// 这里用「sender 的接收端永不 poll」精确模拟 actor 卡在 `channel.data()`
+    /// （对端不读 stdin、发送窗口打满）的状态：actor 任务还活着，所以
+    /// `send(Close)` 会成功；但它永远不会回 select!，`reply` 也就永远收不到。
+    ///
+    /// 旧实现逐个 `await close_terminal(id)` → `received.await` 永久挂起 →
+    /// 调用方（`SessionService::disconnect`）持有的 `SshClient` 写锁永不释放 →
+    /// 整个会话卡死、只能重启应用。本测试断言断开**立即**完成。
+    #[tokio::test]
+    async fn disconnect_completes_even_when_a_pty_actor_never_replies() {
+        let mut client = bare_client();
+        let stuck_terminal = Uuid::new_v4();
+
+        // 保留 `_never_polled`：它就是那个「卡住不再处理请求」的 actor。
+        let (_tx, _never_polled) = mpsc::channel::<ShellRequest>(32);
+        client.terminals.insert(
+            stuck_terminal,
+            TerminalHandle {
+                sender: _tx,
+                channel: 0,
+            },
+        );
+        assert_eq!(client.terminal_count(), 1);
+
+        let disconnected =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.disconnect_ssh()).await;
+
+        assert!(
+            disconnected.is_ok(),
+            "disconnect_ssh 在 pty actor 不应答时挂住了（R3-01 回归）"
+        );
+        assert!(disconnected.expect("checked above").is_ok());
+        assert_eq!(client.terminal_count(), 0, "断开后不应残留任何 pty 条目");
+    }
+
+    /// 回归 R3-01（配套）：等待 pty actor 应答必须有上限。
+    ///
+    /// 直接测 `await_actor_reply` 并传毫秒级超时，这样「有界」这一性质能被
+    /// 快速覆盖，而不必让测试套件为生产值（10 秒）买单。
+    #[tokio::test]
+    async fn awaiting_a_stuck_actor_reply_is_bounded_not_infinite() {
+        // 构造一个「actor 卡住」的等价形态：sender 存在但接收端永不 poll，
+        // 因此 reply 永远收不到。两者都刻意保活到断言结束。
+        let (_tx, _never_polled) = mpsc::channel::<ShellRequest>(32);
+        let (_reply, received) = oneshot::channel();
+
+        let started = std::time::Instant::now();
+        let result =
+            await_actor_reply(received, std::time::Duration::from_millis(150), "input").await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "actor 不应答时必须返回错误，不能伪装成发送成功"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "等待应答应按超时返回，实际耗时 {elapsed:?}"
+        );
+
+        // 对照：应答 sender 被丢弃时（actor 任务已结束）应立刻返回
+        // ConnectionClosed，而不是等满超时。
+        let (reply2, received2) = oneshot::channel::<Result<(), ProtocolError>>();
+        drop(reply2);
+        let started = std::time::Instant::now();
+        let err = await_actor_reply(received2, std::time::Duration::from_secs(30), "input")
+            .await
+            .expect_err("sender dropped must not look like success");
+        assert!(
+            matches!(err, ProtocolError::ConnectionClosed),
+            "sender 被丢弃应报 ConnectionClosed，实际 {err:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "sender 已丢弃时应立即返回，不该等满超时"
         );
     }
 }

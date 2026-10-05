@@ -18,6 +18,7 @@
 import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { readDir } from "@tauri-apps/plugin-fs";
 import { browseRemoteDir } from "../../ipc/client";
+import { isWithinRoot } from "../../utils/rootBoundary";
 import type { Uuid } from "../../ipc/types";
 
 const props = defineProps<{
@@ -342,12 +343,12 @@ function commitEdit() {
     inputError.value = "请输入绝对路径（如 /var/log 或 D:\\data）";
     return;
   }
-  // 本地只允许在已授权根目录内导航：越界直接说明原因，不静默丢弃输入
+  // 本地只允许在已授权根目录内导航：越界直接说明原因，不静默丢弃输入。
+  // 判定用共享的 isWithinRoot（词法消解 `.` / `..` 后逐段比较），
+  // 与 FileBrowserPane.navigateTo 同一份实现，两个入口不会对 `..` 或
+  // Windows 根给出相反结论。
   if (props.mode === "local" && props.rootPath) {
-    const root = props.rootPath.replace(/[\\/]+$/, "");
-    const normalized = target.replace(/\//g, "\\");
-    const rootNorm = root.replace(/\//g, "\\").replace(/[\\/]+$/, "");
-    if (normalized !== rootNorm && !normalized.startsWith(`${rootNorm}\\`) && !normalized.startsWith(`${rootNorm}/`)) {
+    if (!isWithinRoot(target, props.rootPath)) {
       inputError.value = `路径超出已授权的根目录 ${props.rootPath}`;
       return;
     }

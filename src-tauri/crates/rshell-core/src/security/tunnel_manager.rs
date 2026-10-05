@@ -7,12 +7,13 @@
 //! 上次进程残留端口冲突；恢复在重启时再次 create_tunnel）。
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -82,6 +83,19 @@ pub struct ActiveTunnel {
     ssh_client: SshClientHandle,
     /// 监听任务的句柄
     listener_handle: Option<tokio::task::JoinHandle<()>>,
+    /// R3-02：取消信号，广播给**每一条已接受的转发连接**。
+    ///
+    /// 此前只有 accept 循环的 `listener_handle` 会被 abort，而每条连接各自
+    /// `tokio::spawn` 出来的转发任务句柄被直接丢弃（`:618`），文件里没有任何
+    /// 其它取消路径。结果是关闭/挂起隧道只停掉 accept 循环，**已建立的转发
+    /// 连接继续双向中继直到对端自己断开**——撤销 LAN 暴露后访问权其实还在，
+    /// 而 `close_tunnel` 已经返回 Ok 并广播了 `TunnelStateChanged{Error("Closed")}`。
+    ///
+    /// 用 `watch` 而非 `JoinHandle` 列表：任务在取消时正卡在
+    /// `tokio::io::copy` 里，只有能被 select 打断的信号才能真正断掉中继，
+    /// 而 abort 一个正持有 TcpStream 与 SSH channel 的任务会把计数与收尾
+    /// 逻辑一起跳过。
+    cancel: watch::Sender<bool>,
 }
 
 /// 手动实现 Debug：`SshClientHandle` 未实现 Debug，也不应把连接内部
@@ -374,6 +388,10 @@ impl TunnelManager {
             );
         }
 
+        // R3-02：每条已接受的连接都持有一份 `cancel` 接收端，关闭/挂起隧道时
+        // 广播取消即可真正断掉在途中继（只 abort accept 循环是不够的）。
+        let cancel = watch::channel(false).0;
+
         // 启动监听任务（与 resume_tunnel 共用同一 accept 循环）。
         // ssh_client 实际参与转发：每条接入连接均通过 SSH direct-tcpip
         // 通道转发；同时保留一份在 ActiveTunnel 上供 resume 重建（PROB-21）。
@@ -383,6 +401,7 @@ impl TunnelManager {
             rule.clone(),
             ssh_client.clone(),
             listener,
+            cancel.clone(),
         );
 
         let tunnel = ActiveTunnel {
@@ -395,6 +414,7 @@ impl TunnelManager {
             created_at: Instant::now(),
             ssh_client,
             listener_handle: Some(handle),
+            cancel,
         };
 
         self.tunnels.write().await.insert(tunnel_id, tunnel);
@@ -422,6 +442,9 @@ impl TunnelManager {
                 if let Some(handle) = tunnel.listener_handle.take() {
                     handle.abort();
                 }
+                // R3-02：广播取消，断掉已建立连接的中继。少了这一步，
+                // 「关闭隧道」只停 accept 循环，已连上的客户端仍继续访问。
+                let _ = tunnel.cancel.send(true);
                 true
             } else {
                 false
@@ -478,6 +501,9 @@ impl TunnelManager {
             if let Some(handle) = tunnel.listener_handle.take() {
                 handle.abort();
             }
+            // R3-02：挂起同样必须断掉已建立连接的中继，否则挂起只是不再接受
+            // 新连接，旧连接仍畅通——与 close 的语义要求一致。
+            let _ = tunnel.cancel.send(true);
             tunnel.state = TunnelState::Suspended;
         }
 
@@ -520,7 +546,17 @@ impl TunnelManager {
             .await
             .map_err(|e| CoreError::Internal(format!("Failed to bind {}: {}", bind_addr, e)))?;
 
-        let handle = spawn_accept_loop(self.tunnels.clone(), tunnel_id, rule, ssh_client, listener);
+        // R3-02：suspend 已把旧通道广播为「已取消」，resume 必须换一条新的
+        // 取消通道，否则新 accept 循环一出生就处于已取消状态。
+        let cancel = watch::channel(false).0;
+        let handle = spawn_accept_loop(
+            self.tunnels.clone(),
+            tunnel_id,
+            rule,
+            ssh_client,
+            listener,
+            cancel.clone(),
+        );
 
         // 快照与 bind 之间隧道可能已被关闭或因会话断开停用：复核不通过
         // 则放弃刚启动的 listener，保持原状态不复活。（move 与 abort 必须
@@ -530,6 +566,7 @@ impl TunnelManager {
             match tunnels.get_mut(&tunnel_id) {
                 Some(tunnel) if matches!(tunnel.state, TunnelState::Suspended) => {
                     tunnel.listener_handle = Some(handle);
+                    tunnel.cancel = cancel;
                     tunnel.state = TunnelState::Active;
                 }
                 _ => {
@@ -582,16 +619,42 @@ impl TunnelManager {
     }
 }
 
+/// R3-02：转发连接结束（含被取消）时递减 `connections_count`。
+///
+/// 用 Drop 而非在任务体末尾显式递减：取消路径会从 `select!` 分支直接 return，
+/// 显式递减会被跳过，计数就永远停在非零，UI 会一直显示有连接在跑。
+struct ConnectionCountGuard {
+    tunnels: Arc<RwLock<HashMap<Uuid, ActiveTunnel>>>,
+    tunnel_id: Uuid,
+}
+
+impl Drop for ConnectionCountGuard {
+    fn drop(&mut self) {
+        // Drop 里不能 await：克隆句柄，交给一个短任务完成递减。
+        let tunnels = self.tunnels.clone();
+        let tunnel_id = self.tunnel_id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut tunnels = tunnels.write().await;
+                if let Some(t) = tunnels.get_mut(&tunnel_id) {
+                    t.connections_count = t.connections_count.saturating_sub(1);
+                }
+            });
+        }
+    }
+}
+
 /// 启动隧道 accept 循环：接受接入连接并按规则经 SSH 转发。
 ///
-/// `create_tunnel` 与 `resume_tunnel`（PROB-21）共用；任务被 abort 或
-/// drop 时监听 socket 一并关闭，新连接随即被拒绝。
+/// R3-02：`cancel` 的接收端会分发给每一条已接受的连接，关闭/挂起隧道时
+/// 广播取消，断掉**已经在中继**的连接——只停 accept 循环不足以撤销访问权。
 fn spawn_accept_loop(
     tunnels: Arc<RwLock<HashMap<Uuid, ActiveTunnel>>>,
     tunnel_id: Uuid,
     rule: PortForwardRule,
     ssh_client: SshClientHandle,
     listener: TcpListener,
+    cancel: watch::Sender<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -612,35 +675,55 @@ fn spawn_accept_loop(
                     let direction = rule.direction;
                     let tunnels_clone = tunnels.clone();
                     let tid = tunnel_id;
+                    // R3-02：每条连接订阅一份取消信号。
+                    let mut cancel_rx = cancel.subscribe();
 
                     // 为每条连接 spawn 一个转发任务
                     let ssh_client_for_task = ssh_client.clone();
                     tokio::spawn(async move {
-                        let res = match direction {
-                            ForwardDirection::Local => {
-                                forward_local(
+                        // 计数守卫：取消会从 select 分支直接跳出，后面的收尾代码
+                        // 不会执行，因此递减必须交给 Drop（R3-02）。
+                        let _count_guard = ConnectionCountGuard {
+                            tunnels: tunnels_clone,
+                            tunnel_id: tid,
+                        };
+
+                        // 装箱：Local / Dynamic 两条路径是不同类型，select! 需要
+                        // 同一种 future。
+                        let forwarded: std::pin::Pin<Box<dyn Future<Output = _> + Send>> =
+                            match direction {
+                                ForwardDirection::Local => Box::pin(forward_local(
                                     ssh_client_for_task,
                                     inbound,
                                     &remote_host,
                                     remote_port,
                                     tid,
-                                )
-                                .await
+                                )),
+                                ForwardDirection::Dynamic => {
+                                    // SOCKS5 DynamicForward: 解析客户端握手得到目标 host:port,
+                                    // 再用 SSH direct-tcpip 转发(无 SSH client 时走 plain TCP)。
+                                    Box::pin(forward_dynamic_socks5(
+                                        ssh_client_for_task,
+                                        inbound,
+                                        tid,
+                                    ))
+                                }
+                            };
+
+                        // R3-02：与中继并行 select 取消信号。取消命中时直接 return，
+                        // `forwarded` future 被 drop → TcpStream 与 SSH channel 一并
+                        // 关闭，已授予的访问权这才真正被收回。
+                        let res = tokio::select! {
+                            biased;
+                            _ = cancel_rx.changed() => {
+                                info!("Tunnel {}: connection cancelled (tunnel closed/suspended)", tid);
+                                return;
                             }
-                            ForwardDirection::Dynamic => {
-                                // SOCKS5 DynamicForward: 解析客户端握手得到目标 host:port,
-                                // 再用 SSH direct-tcpip 转发(无 SSH client 时走 plain TCP)。
-                                forward_dynamic_socks5(ssh_client_for_task, inbound, tid).await
-                            }
+                            res = forwarded => res,
                         };
+
                         if let Err(msg) = res {
                             warn!("Tunnel {}: {}", tid, msg);
-                        }
-
-                        // 连接关闭后更新计数
-                        let mut tunnels = tunnels_clone.write().await;
-                        if let Some(t) = tunnels.get_mut(&tid) {
-                            t.connections_count = t.connections_count.saturating_sub(1);
                         }
                     });
                 }
@@ -678,6 +761,9 @@ async fn deactivate_session_tunnels(
             if let Some(handle) = tunnel.listener_handle.take() {
                 handle.abort();
             }
+            // R3-02：会话断开后同样要断掉已建立连接的中继。SSH 连接已死，
+            // 留着这些连接只是让它们逐条报错，不该继续算作可用转发。
+            let _ = tunnel.cancel.send(true);
             tunnel.state = TunnelState::Error(SESSION_DISCONNECTED_REASON.into());
             deactivated.push(*tunnel_id);
         }
@@ -868,6 +954,9 @@ impl Drop for ActiveTunnel {
         if let Some(handle) = self.listener_handle.take() {
             handle.abort();
         }
+        // R3-02：条目从表里移除（close / 覆盖写入）时同样要断掉在途连接，
+        // 避免只停 accept 循环而旧连接继续畅通。
+        let _ = self.cancel.send(true);
     }
 }
 
@@ -1071,6 +1160,165 @@ mod tests {
     /// 集成验收（PROB-08）：建隧道 → 会话断开 → 隧道离开 Active、listener
     /// 停止接受新连接、TunnelStateChanged 已发布；重连后旧隧道不复活。
     ///
+    /// 回归 R3-02：关闭 / 挂起隧道必须向**在途转发连接**广播取消。
+    ///
+    /// 修复前只有 accept 循环的 `listener_handle` 会被 abort，每条连接各自
+    /// spawn 的转发任务句柄被直接丢弃且无其它取消路径 —— 于是「关闭隧道」
+    /// 只停 accept，已建立的连接继续双向中继，撤销 LAN 暴露拿不回访问权。
+    ///
+    /// 说明：本测试断言的是**撤销信号确实发出**这一机制。完整的中继字节
+    /// 验证需要一个会对 `direct-tcpip` 回话的 SSH 对端，当前测试环境没有，
+    /// 因此这里不假装覆盖端到端字节流。
+    #[tokio::test]
+    async fn closing_a_tunnel_cancels_its_in_flight_forwarded_connections() {
+        let bus = Arc::new(EventBus::new());
+        let mgr = Arc::new(TunnelManager::new(bus.clone()));
+        let session_id = Uuid::new_v4();
+
+        let port = free_loopback_port().await;
+        let mut rule = make_rule("127.0.0.1", 9);
+        rule.bind_port = port;
+        let tunnel_id = mgr
+            .create_tunnel(session_id, rule, Some(make_ssh_handle()))
+            .await
+            .unwrap();
+
+        // 在关闭前订阅，模拟一条「已经在中继」的连接所持有的接收端。
+        let live = mgr
+            .tunnels
+            .read()
+            .await
+            .get(&tunnel_id)
+            .expect("tunnel exists")
+            .cancel
+            .subscribe();
+        assert!(!*live.borrow(), "新隧道的取消信号初始必须为未取消");
+
+        mgr.close_tunnel(tunnel_id).await.unwrap();
+
+        assert!(
+            *live.borrow(),
+            "close_tunnel 必须广播取消，否则已建立的转发连接不会被撤销（R3-02）"
+        );
+    }
+
+    /// 回归 R3-02（配套）：挂起同样要断掉在途连接，而不只是停止接受新连接。
+    #[tokio::test]
+    async fn suspending_a_tunnel_cancels_its_in_flight_forwarded_connections() {
+        let bus = Arc::new(EventBus::new());
+        let mgr = Arc::new(TunnelManager::new(bus.clone()));
+        let session_id = Uuid::new_v4();
+
+        let port = free_loopback_port().await;
+        let mut rule = make_rule("127.0.0.1", 9);
+        rule.bind_port = port;
+        let tunnel_id = mgr
+            .create_tunnel(session_id, rule, Some(make_ssh_handle()))
+            .await
+            .unwrap();
+
+        let live = mgr
+            .tunnels
+            .read()
+            .await
+            .get(&tunnel_id)
+            .expect("tunnel exists")
+            .cancel
+            .subscribe();
+
+        mgr.suspend_tunnel(tunnel_id).await.unwrap();
+        assert!(*live.borrow(), "suspend_tunnel 必须广播取消（R3-02）");
+    }
+
+    /// 回归 R3-02（配套）：resume 必须换一条**未取消**的新通道。
+    ///
+    /// suspend 已把旧通道置为已取消；若 resume 沿用同一条通道，新 accept
+    /// 循环一出生就处于已取消状态，恢复出来的隧道会连一条连接都接不住。
+    #[tokio::test]
+    async fn resume_starts_from_a_fresh_uncancelled_channel() {
+        let bus = Arc::new(EventBus::new());
+        let mgr = Arc::new(TunnelManager::new(bus.clone()));
+        let session_id = Uuid::new_v4();
+
+        let port = free_loopback_port().await;
+        let mut rule = make_rule("127.0.0.1", 9);
+        rule.bind_port = port;
+        let tunnel_id = mgr
+            .create_tunnel(session_id, rule, Some(make_ssh_handle()))
+            .await
+            .unwrap();
+
+        let bind_addr = format!("127.0.0.1:{}", port);
+        mgr.suspend_tunnel(tunnel_id).await.unwrap();
+
+        // 与既有测试一致：abort 是异步生效的，等监听端口真正释放再 resume，
+        // 否则会撞上与本条无关的 bind 竞态。
+        for _ in 0..40 {
+            if tokio::net::TcpStream::connect(&bind_addr).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        mgr.resume_tunnel(tunnel_id)
+            .await
+            .expect("resume 应在监听端口释放后成功");
+
+        let restored = mgr
+            .tunnels
+            .read()
+            .await
+            .get(&tunnel_id)
+            .unwrap()
+            .cancel
+            .clone();
+        assert!(
+            !*restored.borrow(),
+            "resume 后的取消通道必须是全新且未取消的，否则隧道一恢复就收不了连接（R3-02）"
+        );
+    }
+
+    /// 回归 R3-02（配套）：取消路径也必须递减 `connections_count`。
+    ///
+    /// 取消会从 `select!` 分支直接 return，任务体末尾的显式递减被跳过；
+    /// 若没有 Drop 守卫，计数会永远停在非零，UI 一直显示「有连接在跑」。
+    #[tokio::test]
+    async fn connection_count_drops_to_zero_when_a_connection_is_cancelled() {
+        let bus = Arc::new(EventBus::new());
+        let mgr = Arc::new(TunnelManager::new(bus.clone()));
+        let session_id = Uuid::new_v4();
+        let tunnel_id = Uuid::new_v4();
+
+        mgr.tunnels.write().await.insert(
+            tunnel_id,
+            ActiveTunnel {
+                id: tunnel_id,
+                session_id,
+                rule: make_rule("127.0.0.1", 9),
+                state: TunnelState::Active,
+                bytes_transferred: 0,
+                connections_count: 1,
+                created_at: std::time::Instant::now(),
+                ssh_client: make_ssh_handle(),
+                listener_handle: None,
+                cancel: watch::channel(false).0,
+            },
+        );
+
+        {
+            // 守卫 drop 即模拟「转发任务被取消后离开作用域」
+            let _guard = ConnectionCountGuard {
+                tunnels: mgr.tunnels.clone(),
+                tunnel_id,
+            };
+        }
+        // Drop 里是 spawn 出去的异步递减，给它一个调度点
+        tokio::task::yield_now().await;
+
+        let count = mgr.get_tunnel(tunnel_id).await.unwrap().connections_count;
+        assert_eq!(count, 0, "取消后连接计数必须归零（R3-02）");
+    }
+
     /// 断开通过发布 SessionService 各断开路径（用户断开 detach_session、
     /// 远端 EOF 读循环清理、删除会话）共同广播的
     /// `ConnectionStateChanged { Disconnected }` 事件模拟。
@@ -1403,6 +1651,7 @@ mod tests {
                 created_at: std::time::Instant::now(),
                 ssh_client: make_ssh_handle(),
                 listener_handle: None,
+                cancel: watch::channel(false).0,
             },
         );
         mgr.save_to_disk().await;

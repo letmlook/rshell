@@ -2,11 +2,17 @@
 //!
 //! 基于 `wasmtime` 27 提供安全执行 WASM 插件的能力。
 //!
-//! 资源限制：
-//! - **内存上限**：通过 `Config::max_wasm_stack` 间接控制；模块线性内存由实例宿主内存
-//!   （wasmtime 27 默认 `Memory` 类型）约束，可由插件在 import 端自行 declare max。
-//! - **执行时间上限**：使用 wasmtime 的 fuel 机制（在 `Config::consume_fuel` 开启后，
+//! 资源限制（**每一条都由代码真正强制**，不再是"声明了但没人读"的字段）：
+//! - **内存上限**：`execute` 每次调用新建 Store 时挂 `StoreLimits`
+//!   （`store.limiter`），单块线性内存最多增长到 `SandboxConfig::max_wasm_memory_bytes`。
+//!   没有它，guest 可以把线性内存涨到自身声明的上限（wasm32 最高 4 GiB）把宿主进程撑爆。
+//! - **调用栈上限**：`Config::max_wasm_stack` = `SandboxConfig::max_wasm_stack_bytes`，
+//!   引擎级生效，栈溢出直接 trap。
+//! - **执行时间上限**：wasmtime 的 fuel 机制（`Config::consume_fuel` 开启后，
 //!   `Store::set_fuel` 设置初始 fuel，`OutOfFuel` 错误表示用尽）。
+//! - **网络 / 文件系统**：**结构性关闭**——`Instance::new` 的 imports 恒为 `&[]`，
+//!   guest 拿不到任何 host function。`allow_network` / `allow_filesystem` 为 `true`
+//!   时 `WasmSandbox::new` 直接返回错误，而不是"配置被忽略"后静默按关闭执行。
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -15,7 +21,9 @@ use thiserror::Error;
 use tokio::task;
 use tracing::{debug, info};
 
-use wasmtime::{Config, Engine, Func, Instance, Module, Store, Val};
+use wasmtime::{
+    Config, Engine, Func, Instance, Module, Store, StoreLimits, StoreLimitsBuilder, Val,
+};
 
 /// 沙箱错误
 #[derive(Debug, Error)]
@@ -34,6 +42,8 @@ pub enum SandboxError {
     NotLoaded,
     #[error("Task join error: {0}")]
     JoinError(String),
+    #[error("Sandbox configuration rejected: {0}")]
+    ConfigRejected(String),
 }
 
 /// WASM 沙箱配置
@@ -41,11 +51,15 @@ pub enum SandboxError {
 pub struct SandboxConfig {
     /// 最大执行时间（毫秒）— 转换为 fuel 单位（近似 1ms = 1k fuel）
     pub max_execution_time_ms: u64,
-    /// 最大调用栈深度（字节）
+    /// 单块线性内存的最大字节数（`StoreLimits::memory_size`）
+    pub max_wasm_memory_bytes: usize,
+    /// 最大调用栈深度（字节）— 映射到 `Config::max_wasm_stack`
     pub max_wasm_stack_bytes: usize,
-    /// 是否允许网络访问（预留 — 当前 wasmtime 配置不开放网络 API）
+    /// 是否允许网络访问。guest 拿不到任何 host import，本字段为 `true` 时
+    /// `WasmSandbox::new` 报错而不是被忽略。
     pub allow_network: bool,
-    /// 是否允许文件系统访问（预留 — 通过 host functions 控制）
+    /// 是否允许文件系统访问。能力同样来自 host import（当前一个都没有），
+    /// 本字段为 `true` 时 `WasmSandbox::new` 报错而不是被忽略。
     pub allow_filesystem: bool,
 }
 
@@ -53,7 +67,10 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             max_execution_time_ms: 30_000,
-            max_wasm_stack_bytes: 512 * 1024, // 512 KiB
+            // 64 MiB：远低于 wasm32 的 4 GiB 上限，够脚本型插件用；
+            // 不设限则一次 memory.grow 就能把宿主进程 OOM 掉（R3-15）
+            max_wasm_memory_bytes: 64 * 1024 * 1024,
+            max_wasm_stack_bytes: 512 * 1024, // 512 KiB，与 wasmtime 默认一致
             allow_network: false,
             allow_filesystem: false,
         }
@@ -182,12 +199,43 @@ pub struct WasmSandbox {
 }
 
 impl WasmSandbox {
-    /// 用默认配置创建沙箱
+    /// 用给定配置创建沙箱
+    ///
+    /// 选 (a) 方案：把声明的限流字段真正接进 wasmtime，而不是删字段改注释。
+    /// `wasmtime` 已是本 crate 的直接依赖且带 `cranelift` feature（`runtime`
+    /// 是默认 feature），`StoreLimits` / `Config::max_wasm_stack` 都不需要新增依赖。
     pub fn new(config: SandboxConfig) -> Result<Self, SandboxError> {
+        // 能力开关必须"要么真的生效、要么明确报错"：当前 guest 一个 host import
+        // 都拿不到（`Instance::new(..., &[])`），网络/文件系统在结构上就不存在。
+        // 放任 `true` 被忽略等于"配置静默成功"，与 CLAUDE.md 的验收口径冲突。
+        if config.allow_network {
+            return Err(SandboxError::ConfigRejected(
+                "allow_network is not implemented: guests receive no host imports at all \
+                 (Instance::new is called with an empty import list)"
+                    .to_string(),
+            ));
+        }
+        if config.allow_filesystem {
+            return Err(SandboxError::ConfigRejected(
+                "allow_filesystem is not implemented: guests receive no host imports at all \
+                 (Instance::new is called with an empty import list)"
+                    .to_string(),
+            ));
+        }
+        if config.max_wasm_memory_bytes == 0 || config.max_wasm_stack_bytes == 0 {
+            return Err(SandboxError::ConfigRejected(
+                "max_wasm_memory_bytes and max_wasm_stack_bytes must be greater than 0 \
+                 (0 would silently disable the limit)"
+                    .to_string(),
+            ));
+        }
+
         let mut engine_config = Config::new();
         engine_config
             .cranelift_opt_level(wasmtime::OptLevel::Speed)
-            .consume_fuel(true);
+            .consume_fuel(true)
+            // 声明的栈上限真正落到引擎：超过即 trap（wasmtime 默认同样是 512 KiB）
+            .max_wasm_stack(config.max_wasm_stack_bytes);
 
         let engine = Engine::new(&engine_config)
             .map_err(|e| SandboxError::CompilationFailed(format!("engine init: {}", e)))?;
@@ -197,6 +245,20 @@ impl WasmSandbox {
             engine,
             modules: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// 为一次调用构造带资源上限的 Store。
+    ///
+    /// `StoreLimits` 挂在 Store 的 data 上（不是局部变量）：`store.limiter` 要求
+    /// 闭包返回 `&mut dyn ResourceLimiter`，引用必须活得和 Store 一样久。
+    /// 每次调用一个独立 Store，limits 也因此天然按调用隔离。
+    fn new_limited_store(&self) -> Store<StoreLimits> {
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(self.config.max_wasm_memory_bytes)
+            .build();
+        let mut store = Store::new(&self.engine, limits);
+        store.limiter(|state| state);
+        store
     }
 
     /// 加载 WASM 模块二进制并编译
@@ -255,8 +317,8 @@ impl WasmSandbox {
                 .ok_or_else(|| SandboxError::FunctionNotFound(module_name.to_string()))?
         };
 
-        // 每个调用独立 Store 以隔离状态
-        let mut store = Store::new(&self.engine, ());
+        // 每个调用独立 Store 以隔离状态，并挂上内存上限（R3-15）
+        let mut store = self.new_limited_store();
         // 初始 fuel：约 1ms → 1000 fuel 的比例
         let initial_fuel = self.config.max_execution_time_ms.saturating_mul(1_000);
         store
@@ -461,5 +523,165 @@ mod tests {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, m)| m.clone())
+    }
+
+    /// R3-15 回归：声明了超过上限的线性内存的模块必须被 limiter 拒绝。
+    /// 旧实现 `Store::new(&engine, ())` 不挂任何 ResourceLimiter，
+    /// 128 MiB 的 min memory 会被照常实例化，guest 可以一路涨到 4 GiB 把宿主撑爆。
+    #[test]
+    fn memory_limit_refuses_oversized_linear_memory() {
+        use wat::parse_str;
+        // min 2048 page = 128 MiB > 默认上限 64 MiB；max 4096 page = 256 MiB
+        let wat = r#"
+        (module
+          (memory (export "memory") 2048 4096)
+          (func (export "noop")))
+        "#;
+        let sandbox = WasmSandbox::default();
+        sandbox
+            .load(&WasmModule {
+                name: "greedy".to_string(),
+                bytes: parse_str(wat).expect("valid wat"),
+            })
+            .unwrap();
+
+        let err = sandbox
+            .execute("greedy", "noop", &[])
+            .expect_err("超过 max_wasm_memory_bytes 的模块必须被拒绝");
+        let message = err.to_string();
+        assert!(
+            message.to_lowercase().contains("memory"),
+            "错误信息应指向内存上限，实际：{}",
+            message
+        );
+    }
+
+    /// R3-15 回归：内存上限在运行期也生效——`memory.grow` 越界返回 -1，
+    /// 而不是让 guest 真的把线性内存涨上去。
+    #[test]
+    fn memory_grow_beyond_limit_is_refused() {
+        use wat::parse_str;
+        let wat = r#"
+        (module
+          (memory (export "memory") 1 4096)
+          (func (export "grow") (param i32) (result i32)
+            local.get 0
+            memory.grow))
+        "#;
+        let sandbox = WasmSandbox::default();
+        let cap_pages = (SandboxConfig::default().max_wasm_memory_bytes / (64 * 1024)) as i32;
+        sandbox
+            .load(&WasmModule {
+                name: "grower".to_string(),
+                bytes: parse_str(wat).expect("valid wat"),
+            })
+            .unwrap();
+
+        // 涨到上限以内：允许（memory.grow 返回的是**增长前**的页数，不是 0）
+        let ok = sandbox
+            .execute("grower", "grow", &[WasmValue::I32(cap_pages - 1)])
+            .unwrap();
+        assert_ne!(
+            ok,
+            vec![WasmValue::I32(-1)],
+            "上限以内的增长应成功，实际：{:?}",
+            ok
+        );
+
+        // 再涨到声明上限以上：被 limiter 拒绝，wasm 语义下返回 -1
+        let denied = sandbox
+            .execute("grower", "grow", &[WasmValue::I32(4096)])
+            .unwrap();
+        assert_eq!(
+            denied,
+            vec![WasmValue::I32(-1)],
+            "越过 max_wasm_memory_bytes 的 memory.grow 必须失败"
+        );
+    }
+
+    /// R3-15 回归：能力开关不能"被忽略后静默按关闭执行"。
+    /// guest 一个 host import 都拿不到，宣称允许网络/文件系统就是撒谎。
+    #[test]
+    fn capability_toggles_are_rejected_instead_of_ignored() {
+        let network = SandboxConfig {
+            allow_network: true,
+            ..SandboxConfig::default()
+        };
+        assert!(
+            WasmSandbox::new(network).is_err(),
+            "allow_network 尚未实现，必须报错而不是被忽略"
+        );
+
+        let fs = SandboxConfig {
+            allow_filesystem: true,
+            ..SandboxConfig::default()
+        };
+        assert!(
+            WasmSandbox::new(fs).is_err(),
+            "allow_filesystem 尚未实现，必须报错而不是被忽略"
+        );
+    }
+
+    /// R3-15 回归：`max_wasm_stack_bytes` 必须真正接进引擎配置。
+    ///
+    /// 同一个有界递归模块：栈配 8 MiB 时 20_000 层跑完，栈用 wasmtime 默认的
+    /// 512 KiB 时 trap。只有字段真的进了 `Config::max_wasm_stack` 才有这个差别
+    /// ——否则两边行为一致（要么都成功、要么都 trap），测试不成立。
+    #[test]
+    fn max_wasm_stack_bytes_is_applied_to_the_engine() {
+        use wat::parse_str;
+        let wat = r#"
+        (module
+          (global $n (mut i32) (i32.const 0))
+          (func $rec (export "recurse") (param i32) (result i32)
+            (if (i32.lt_u (global.get $n) (local.get 0))
+              (then
+                (global.set $n (i32.add (global.get $n) (i32.const 1)))
+                (drop (call $rec (local.get 0)))))
+            (i32.const 1)))
+        "#;
+        let bytes = parse_str(wat).expect("valid wat");
+        let depth = 20_000i32;
+
+        let wide = SandboxConfig {
+            max_wasm_stack_bytes: 8 * 1024 * 1024,
+            ..SandboxConfig::default()
+        };
+        let wide_sandbox = WasmSandbox::new(wide).expect("valid config");
+        wide_sandbox
+            .load(&WasmModule {
+                name: "stackhog_wide".to_string(),
+                bytes: bytes.clone(),
+            })
+            .unwrap();
+        assert!(
+            wide_sandbox
+                .execute("stackhog_wide", "recurse", &[WasmValue::I32(depth)])
+                .is_ok(),
+            "配置 8 MiB 栈时 {} 层递归应跑完（栈上限字段必须真的生效）",
+            depth
+        );
+
+        // 对照组：默认 512 KiB 栈必须 trap——证明上一条不是因为"压根没限制"
+        let narrow_sandbox = WasmSandbox::default();
+        assert_eq!(
+            narrow_sandbox.config.max_wasm_stack_bytes,
+            512 * 1024,
+            "对照组用的就是 wasmtime 默认栈大小"
+        );
+        narrow_sandbox
+            .load(&WasmModule {
+                name: "stackhog_narrow".to_string(),
+                bytes,
+            })
+            .unwrap();
+        assert!(
+            narrow_sandbox
+                .execute("stackhog_narrow", "recurse", &[WasmValue::I32(depth)])
+                .is_err(),
+            "默认 {} 栈跑 {} 层递归必须 trap",
+            narrow_sandbox.config.max_wasm_stack_bytes,
+            depth
+        );
     }
 }

@@ -167,7 +167,7 @@ function pickWorkspace(w: WorkspaceKind) {
           title="新开标签"
           aria-label="新开标签"
           data-testid="new-terminal-window"
-          :disabled="!terminalAvailable"
+          :disabled="!terminalAvailable || connectionState === 'connecting'"
           @click="onNewTab"
         >
           <svg width="14" height="14" viewBox="0 0 16 16">

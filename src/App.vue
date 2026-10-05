@@ -38,7 +38,7 @@ import WorkspaceToolbar, {
   type PanelKind,
 } from "./components/WorkspaceToolbar.vue";
 import TransferPanel, { type TransferItem } from "./components/TransferPanel.vue";
-import { listTransfers, pauseTransfer, resumeTransfer, cancelTransfer, removeTransfer } from "./ipc/client";
+import { listTransfers, pauseTransfer, resumeTransfer, cancelTransfer, removeTransfer, ipcErrorMessage } from "./ipc/client";
 import { subscribeAppEvents } from "./ipc/events";
 import {
   DEFAULT_SIDEBAR_WIDTH,
@@ -455,11 +455,17 @@ async function openTabSession(id: Uuid) {
   workspace.value = "terminal";
   activeTerminal.value = id;
   store.currentId = id;
-  if (store.connectionState.get(id) !== "connected" && store.connectionState.get(id) !== "connecting") {
+  // R3-05：握手中也要**等连接完成**再建面板。
+  // 旧实现在 `connectionState === "connecting"` 时直接跳过等待去建面板，那时后端
+  // 还没把会话放进 `connections`，`open_terminal` 必然 NotFound，标签页渲染一条
+  // 永久错误条；而 TerminalPane 没有任何 watcher 会在握手完成后重试，于是要用户
+  // 手动点「重试附加」。现在 `store.connect` 对同一会话是幂等的：要么发起连接，
+  // 要么复用正在进行的那次，await 它即可。
+  if (store.connectionState.get(id) !== "connected") {
     try {
       await store.connect(id);
     } catch (e) {
-      ElMessage.error(`连接失败：${String(e)}`);
+      ElMessage.error(`连接失败：${ipcErrorMessage(e)}`);
       return;
     }
   }
