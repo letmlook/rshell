@@ -145,6 +145,11 @@ mod tests {
         assert_eq!(IpcErrorKind::OutcomeMismatch.as_str(), "outcome_mismatch");
         assert_eq!(IpcErrorKind::Internal.as_str(), "internal");
         assert_eq!(IpcErrorKind::Storage.as_str(), "storage");
+        assert_eq!(IpcErrorKind::TargetExists.as_str(), "target_exists");
+        assert_eq!(
+            IpcErrorKind::TerminalRecoveryRequired.as_str(),
+            "terminal_recovery_required"
+        );
     }
 
     #[test]
@@ -153,8 +158,10 @@ mod tests {
             CoreError::NotFound("x".into()),
             CoreError::AuthError("x".into()),
             CoreError::AuthenticationFailed("x".into()),
+            CoreError::TerminalRecoveryRequired,
             CoreError::ConnectionError("x".into()),
             CoreError::StorageError("x".into()),
+            CoreError::TargetExists("x".into()),
             CoreError::InvalidState("x".into()),
             CoreError::ServiceError("x".into()),
             CoreError::Internal("x".into()),
@@ -166,16 +173,18 @@ mod tests {
                 ipc.kind
             })
             .collect();
-        // 必须全部命中 5 个稳定 kind 之一(不含 HostKeyMismatch —— 它由
-        // host_key_decision 单独 publish,不走 CoreError 路径)
+        // 必须全部命中 CoreError → IpcError 映射产生的稳定 kind 之一
+        //(不含 HostKeyMismatch —— 它由 host_key_decision 单独 publish,不走 CoreError 路径)
         for k in &kinds {
             assert!(
                 [
                     "not_found",
                     "auth_failed",
+                    "terminal_recovery_required",
                     "connection",
                     "storage",
-                    "internal"
+                    "target_exists",
+                    "internal",
                 ]
                 .iter()
                 .any(|allowed| allowed == &k.as_str()),
