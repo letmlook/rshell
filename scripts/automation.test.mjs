@@ -815,6 +815,8 @@ test('release workflow keeps the shared verification script as the gate', () => 
   const workflow = readReleaseWorkflow();
   assert.match(workflow, /needs: verify/, 'installers must not be built before verification passes');
   assert.match(workflow, /bash scripts\/verify\.sh --skip-install/);
+  // A tag push never triggers ci.yml, so the release gate must audit too.
+  assert.match(workflow, /bash scripts\/audit\.sh/, 'the release gate must run the shared audits');
   assert.match(workflow, /check-release-version\.mjs "\$RELEASE_TAG"/,
     'the tag must be checked against the bundled version before building');
   // The workflow must not re-implement the verification chain.

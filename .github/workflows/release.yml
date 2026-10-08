@@ -61,6 +61,7 @@ jobs:
       - name: Install Rust toolchain components
         run: |
           rustup component add clippy rustfmt
+          cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Install Node dependencies
         run: npm ci
@@ -73,6 +74,12 @@ jobs:
       # Single shared entry point; the release build never re-implements it.
       - name: Run shared verification
         run: bash scripts/verify.sh --skip-install
+
+      # A tag push does not trigger ci.yml (that workflow only listens to main),
+      # so the audit has to run here too. Without it a tag on an unverified
+      # commit would still publish installers.
+      - name: Run shared dependency audits
+        run: bash scripts/audit.sh
 
   build:
     name: Build ${{ matrix.target }}
