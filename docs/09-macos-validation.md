@@ -233,7 +233,7 @@ npm 侧同期修复了 4 项高危漏洞（vue 3.5.43、brace-expansion 2.1.7、
 | Task 3 凭据错误分类 + 主机密钥并发/取消/过期 | `3c309f6` | DONE_WITH_CONCERNS（3 concerns，已修 1 项） | `6445486` |
 | Task 4 集成验证 | 见下文 | 待独立全分支审查 | — |
 
-Task 1 之前的 baseline commit 为 `86c6ac0`；本轮最终 HEAD 为 `6445486`。未推送、未合并、未发布；分支继续按用户授权保留在 worktree。
+Task 1 之前的 baseline commit 为 `86c6ac0`；本轮最终 HEAD 为 `a50245e`（Task 4 集成文档提交）。未推送、未合并、未发布；分支继续按用户授权保留在 worktree。
 
 ### 验证（Windows 环境，逐项对应 `scripts/verify.sh` / `scripts/audit.sh` 顺序）
 
