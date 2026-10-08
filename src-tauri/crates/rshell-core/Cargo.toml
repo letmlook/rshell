@@ -22,6 +22,7 @@ rhai = { version = "1", features = ["sync"] }
 regex = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
 # ssh-key 0.7 依赖的 rand_core 0.10 删掉了 `OsRng`，系统熵源改由
 # getrandom::SysRng 提供；`sys_rng` feature 才会暴露它与 rand_core 桥接。
 getrandom = { version = "0.4", features = ["sys_rng"] }

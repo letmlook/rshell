@@ -409,6 +409,7 @@ const OUTCOME_RETURN_MAP: Record<string, { helper: string; typeText: string }> =
   },
   Transfers: { helper: "listTransfers", typeText: "TransferTaskInfo[]" },
   Verified: { helper: "verifyMasterPassword", typeText: "boolean" },
+  TaskId: { helper: "retryTransfer", typeText: "Uuid" },
 };
 
 /** 无 call<T> 返回标注的 CommandOutcome 变体白名单 */

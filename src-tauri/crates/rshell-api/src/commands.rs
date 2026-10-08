@@ -118,6 +118,13 @@ pub enum AppCommand {
     RemoveTransfer {
         task_id: Uuid,
     },
+    /// R2-T2：从零重试一个**终态**传输任务 —— 创建新 task id 并入队。
+    /// 原任务保留其终态；新任务总是 `Fail` 策略（staged lifecycle
+    /// 提交前会再检一次冲突，不再自动覆盖）。
+    /// 非终态任务会被拒为 `InvalidState`，需先取消。
+    RetryTransfer {
+        task_id: Uuid,
+    },
     /// 浏览远程目录
     BrowseRemoteDir {
         session_id: Uuid,

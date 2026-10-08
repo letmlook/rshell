@@ -38,7 +38,7 @@ import WorkspaceToolbar, {
   type PanelKind,
 } from "./components/WorkspaceToolbar.vue";
 import TransferPanel, { type TransferItem } from "./components/TransferPanel.vue";
-import { listTransfers, pauseTransfer, resumeTransfer, cancelTransfer, removeTransfer, ipcErrorMessage } from "./ipc/client";
+import { listTransfers, pauseTransfer, resumeTransfer, cancelTransfer, removeTransfer, retryTransfer, ipcErrorMessage } from "./ipc/client";
 import { subscribeAppEvents } from "./ipc/events";
 import {
   DEFAULT_SIDEBAR_WIDTH,
@@ -91,7 +91,7 @@ const transferPanelHeight = ref<number | undefined>(undefined);
  * - pause/resume/cancel 操作传输循环
  * - remove 只把终态条目移出队列，不删除已传输文件
  */
-type TransferAction = "pause" | "resume" | "cancel" | "remove";
+type TransferAction = "pause" | "resume" | "cancel" | "remove" | "retry";
 let unlistenTransfers: (() => void) | null = null;
 let mounted = false;
 
@@ -108,7 +108,7 @@ async function refreshTransfers() {
 }
 
 function actionLabel(action: TransferAction) {
-  return { pause: "暂停", resume: "继续", cancel: "取消", remove: "删除" }[action];
+  return { pause: "暂停", resume: "继续", cancel: "取消", remove: "删除", retry: "重试" }[action];
 }
 
 /** 任务名用于日志文案：优先用队列里的名字，查不到（已移出队列）就退回 ID */
@@ -129,6 +129,11 @@ async function runTransferAction(taskId: string, action: TransferAction) {
       await resumeTransfer(taskId as Uuid);
     } else if (action === "cancel") {
       await cancelTransfer(taskId as Uuid);
+    } else if (action === "retry") {
+      const newId = await retryTransfer(taskId as Uuid);
+      // 后端已创建新任务并入队 —— 原任务保留终态，新任务走 staging lifecycle。
+      // 前端无需主动干预：新任务事件经 TransferQueueChanged + TransferProgress 推送。
+      console.info(`retry: ${taskId} -> new task ${newId}`);
     } else {
       await removeTransfer(taskId as Uuid);
     }
@@ -797,6 +802,7 @@ onBeforeUnmount(() => {
               @resume="(taskId) => runTransferAction(taskId, 'resume')"
               @cancel="(taskId) => runTransferAction(taskId, 'cancel')"
               @remove="(taskId) => runTransferAction(taskId, 'remove')"
+              @retry="(taskId) => runTransferAction(taskId, 'retry')"
               @remove-many="removeTransfers"
               @update:height="transferPanelHeight = $event"
               @clear-log="clearTransferLogs"

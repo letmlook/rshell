@@ -173,6 +173,17 @@ export const resumeTransfer = (task_id: Uuid) => call({ ResumeTransfer: { task_i
 export const cancelTransfer = (task_id: Uuid) => call({ CancelTransfer: { task_id } });
 /** 从队列移除终态条目；不删除已传输文件。仅终态任务可移除 */
 export const removeTransfer = (task_id: Uuid) => call({ RemoveTransfer: { task_id } });
+/**
+ * R2-T2：从零重试一个**终态**传输任务 —— 创建新 task id 并入队。
+ *
+ * 故意不复用 `EnqueueUpload` / `EnqueueDownload` 的「hidden flag」：
+ * retry 的语义与首次入队不同（强制 `Fail` 策略、跳过预检的存在性检查、
+ * 原任务保留其终态），单独命令更安全。
+ *
+ * 非终态任务会被拒为 `InvalidState`，需先取消再重试。
+ */
+export const retryTransfer = (task_id: Uuid) =>
+  call<Uuid>({ RetryTransfer: { task_id } });
 
 export const browseRemoteDir = (session_id: Uuid, path: string) =>
   call<{ path: string; entries: RemoteFileEntry[] }>({ BrowseRemoteDir: { session_id, path } });

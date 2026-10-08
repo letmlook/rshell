@@ -8,6 +8,8 @@
 pub mod serial;
 pub mod ssh;
 pub mod telnet;
+/// R2-T2：传输抽象与本地 sink
+pub mod transfer;
 
 use thiserror::Error;
 
@@ -34,6 +36,19 @@ pub enum ProtocolError {
     /// 保证既有文件不被破坏。
     #[error("Transfer target already exists: {0}")]
     TransferConflict(String),
+    /// R2-T2：提交前重新检查目标，发现冲突且用户策略不允许覆盖。
+    /// 与 `TransferConflict` 不同：发生在「临时文件已写完、即将替换之前」，
+    /// 用于拦截预检之后、提交之前这段窗口里新出现的同名文件。
+    #[error("Transfer target appeared before commit: {0}")]
+    TransferLateConflict(String),
+    /// R2-T2：临时文件已写完，但最终提交（rename / posix-rename）失败。
+    /// 旧目标保持原样，临时文件可能残留，调用方应报告确切路径与原因。
+    #[error("Transfer commit failed for {path}: {reason}")]
+    TransferCommitFailed { path: String, reason: String },
+    /// R2-T2：临时文件已写完，但提交失败后清理临时文件也失败。
+    /// 调用方应把残留路径原样告诉用户，不假装清理成功。
+    #[error("Transfer cleanup failed for {path}: {reason}")]
+    TransferCleanupFailed { path: String, reason: String },
 }
 
 /// 连接 trait（所有协议的统一抽象）

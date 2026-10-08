@@ -122,6 +122,14 @@ export interface TransferTaskInfo {
   /** 当前传输速度（字节/秒），仅 Transferring 状态有值 */
   speed_bps: number;
   error_message: string | null;
+  /** R2-T2：staging temp 路径（远端 / 本地侧）。活跃任务为 null；
+   * 终态下若 cleanup 失败则 temp 仍存在 —— 此字段告诉用户残留位置。 */
+  temp_path: string | null;
+  /** R2-T2：终态下的清理结果（`"cleaned"` / `"residue"`）。活跃任务为 null。 */
+  cleanup_status: string | null;
+  /** R2-T2：终态下的提交策略（`"posix_rename"` / `"standard_rename"`）。
+   * 仅 Completed 终态有值；前端据此告诉用户「这次拿到了原子替换保证吗」。 */
+  commit_strategy: string | null;
 }
 
 // ===== 隧道相关 =====
@@ -361,6 +369,8 @@ export type AppCommand =
   | { ResumeTransfer: { task_id: Uuid } }
   | { CancelTransfer: { task_id: Uuid } }
   | { RemoveTransfer: { task_id: Uuid } }
+  /** R2-T2：从零重试终态任务 —— 强制 Fail 策略，原任务保留其终态。 */
+  | { RetryTransfer: { task_id: Uuid } }
   | { BrowseRemoteDir: { session_id: Uuid; path: string } }
   | { GetRemoteHomeDir: { session_id: Uuid } }
   | { CreateRemoteDirectory: { session_id: Uuid; path: string } }

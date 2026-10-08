@@ -10,12 +10,14 @@
  * 数据来自后端真实传输队列快照(utils/transferItem.ts 映射),日志来自
  * utils/transferLog.ts 的真实事件流——两者都不允许假数据兜底。
  *
- * 暂停/恢复/取消/删除控制:
+ * 暂停/恢复/取消/重试/删除控制:
  *   - 仅对 `active` 任务渲染"暂停",仅对 `paused` 任务渲染"继续"。
  *   - `active`/`paused` 渲染"取消":调用 CancelTransfer 置终态 Cancelled。
+ *   - `failed`/`cancelled` 渲染"重试":调用 RetryTransfer 从零创建新任务,
+ *     原任务保留其终态（不会自动覆盖 —— staged lifecycle 提交前会再检一次）。
  *   - 仅终态(done/failed/cancelled)渲染"删除":调用 RemoveTransfer 移除队列条目。
  *     移除只作用于队列列表,不会删除已传输的本地/远端文件。
- *   - 按钮调用期间由调用方控制,本组件只发出 pause/resume/cancel/remove 事件。
+ *   - 按钮调用期间由调用方控制,本组件只发出 pause/resume/cancel/retry/remove 事件。
  *   - 进行中(`pendingTaskIds`)的按钮自动禁用,避免重复点击。
  *   - 失败提示由调用方写入 `actionError`,本组件原样展示,不做乐观更新。
  */
@@ -34,6 +36,12 @@ export interface TransferItem {
   remote: string;
   speed: number; // bytes/sec
   error?: string | null;
+  /** R2-T2：终态下的清理结果标签（`"cleaned"` / `"residue"`）。活跃任务为 null。 */
+  cleanup_status?: string | null;
+  /** R2-T2：staging temp 路径 —— 终态下若 cleanup 失败则给出，否则为 null。 */
+  temp_path?: string | null;
+  /** R2-T2：提交策略标签（`"posix_rename"` / `"standard_rename"`）。仅 Completed 终态有值。 */
+  commit_strategy?: string | null;
 }
 
 /** 展开态默认高度;与 tokens.css 的 --rs-transfer-panel-h-expanded 保持一致 */
@@ -66,6 +74,8 @@ const emit = defineEmits<{
   (e: "resume", taskId: string): void;
   (e: "cancel", taskId: string): void;
   (e: "remove", taskId: string): void;
+  /** R2-T2：从零重试 —— 调用 retryTransfer(task_id)；仅终态任务显示。 */
+  (e: "retry", taskId: string): void;
   /** 队列生命周期批量操作：按终态分组移除条目 */
   (e: "remove-many", taskIds: string[]): void;
   /** 拖动边缘后回写展开态高度 */
@@ -113,6 +123,14 @@ function onRemove(taskId: string, event: Event) {
   emit("remove", taskId);
 }
 
+/** R2-T2：终态任务（failed / cancelled）可重试。Completed 不重试——
+ * 「重试」是「重新传一份」，不是「重看结果」。 */
+function onRetry(taskId: string, event: Event) {
+  event.stopPropagation();
+  if (isPending(taskId)) return;
+  emit("retry", taskId);
+}
+
 /** 终态（完成/失败/已取消）才允许从队列移除 */
 function isRemovable(phase: TransferPhase): boolean {
   return phase === "done" || phase === "failed" || phase === "cancelled";
@@ -120,10 +138,12 @@ function isRemovable(phase: TransferPhase): boolean {
 
 /**
  * 某一行在当前相位下会渲染几个操作按钮。
- * 活跃/暂停 = 暂停(继续) + 取消；终态 = 删除。
+ * 活跃/暂停 = 暂停(继续) + 取消；
+ * 终态 failed/cancelled = 重试 + 删除（done 仅删除）。
  */
 function actionCount(phase: TransferPhase): number {
   if (phase === "active" || phase === "paused") return 2;
+  if (phase === "failed" || phase === "cancelled") return 2;
   if (isRemovable(phase)) return 1;
   return 0;
 }
@@ -533,6 +553,20 @@ const columns = [
                 @click="onCancel(row.id, $event)"
               >
                 取消
+              </button>
+              <!-- R2-T2：失败 / 已取消的任务可重试 —— 从零创建新任务，
+                   原任务保留其终态。Completed 不重试（避免「重看结果」误解）。 -->
+              <button
+                v-if="row.phase === 'failed' || row.phase === 'cancelled'"
+                type="button"
+                class="xfer-action"
+                data-test="xfer-retry"
+                :data-task-id="row.id"
+                aria-label="重试传输"
+                :disabled="isPending(row.id)"
+                @click="onRetry(row.id, $event)"
+              >
+                重试
               </button>
               <button
                 v-if="isRemovable(row.phase)"

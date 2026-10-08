@@ -148,6 +148,111 @@ pub enum TransferControl {
     Cancel,
 }
 
+/// R2-T2：服务器声明的 SFTP 扩展集合，用于决定安全提交策略。
+///
+/// 仅记录**本轮需要用到**的扩展——其它扩展（`statvfs`、`expand-path`、
+/// `hardlink`、`fsync`、`limits`）由 `russh-sftp` 高层 API 自行处理。
+/// 这里聚焦「提交语义」相关的两条：`posix-rename@openssh.com` 与
+/// `hardlink@openssh.com`（后者仅作探测参考，提交路径不会用）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SftpCapabilities {
+    /// `posix-rename@openssh.com`：远端接受 POSIX 语义的重命名（原子替换）。
+    pub posix_rename: bool,
+}
+
+/// R2-T2：传输状态机用的 sink 抽象 —— 把远端（`SftpClient`）和本地
+/// (`tokio::fs`) 统一成同一组操作：独占打开、stat、safe_commit、try_remove。
+///
+/// 该 trait 的存在意义是把「提交语义」与具体文件系统解耦：
+/// - `RemoteSink`（rshell-protocol 内）：把 `SftpClient` 的方法拼成
+///   staging 操作；
+/// - `LocalSink`（rshell-protocol 内）：把 `tokio::fs` 拼成同样的接口；
+/// - 测试里：用一个内存 fake 实现来驱动状态机分支
+///   （取消/提交竞态、晚冲突、清理失败等），不必起真实服务器。
+///
+/// `commit` 与 `cleanup` 都返回 `Result`，失败一律透传：上层（core
+/// 传输服务）按错误种类写终态与 residue；trait 不吞错。
+///
+/// 用 `async_trait` 而不是原生 AFIT 是因为 `&dyn TransferSink` 要走
+/// 动态分发——`impl Trait` 不能在 `dyn` 里使用，`async_trait` 展开后
+/// 的 `Box<dyn Future + Send>` 才能满足这个需求。
+#[allow(clippy::double_must_use)]
+#[async_trait::async_trait]
+pub trait TransferSink: Send + Sync {
+    /// 远端 staging temp 路径的「存在性」检测（提交前再做一次）。
+    /// 用 `exists()` 而非 `metadata()`：stat 失败一律视为「存在」，
+    /// 与现有 `SftpClient::exists` 语义一致，宁可弹冲突也不静默覆盖。
+    async fn exists(&self, path: &str) -> bool;
+
+    /// 独占方式打开/创建文件用于 staging；返回 `AsyncWrite + Send`。
+    async fn exclusive_open_write(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn tokio::io::AsyncWrite + Unpin + Send>, ProtocolError>;
+
+    /// 打开已存在的目标文件用于下载读。
+    async fn open_read(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn tokio::io::AsyncRead + Unpin + Send>, ProtocolError>;
+
+    /// 安全提交（rename）；成功即目标被替换，失败保留旧目标。
+    async fn safe_commit(
+        &self,
+        from: &str,
+        to: &str,
+        caps: SftpCapabilities,
+    ) -> Result<CommitOutcome, ProtocolError>;
+
+    /// 尽力删除临时文件；「不存在」视为成功。
+    async fn try_remove(&self, path: &str) -> Result<(), ProtocolError>;
+
+    /// 当前 sink 是远程还是本地（仅供日志与 residue 报告区分）。
+    fn is_remote(&self) -> bool;
+}
+
+/// R2-T2：提交阶段使用的策略，由 `SftpCapabilities` 决定。
+///
+/// 语义差别：
+/// - `PosixRename`：明确走 `posix-rename@openssh.com` 扩展，远端保证
+///   **原子替换**——若 `newpath` 已存在则覆盖，旧 `newpath`（若有）消失。
+///   整个过程对其它客户端而言是原子的。
+/// - `StandardRename`：仅走标准 `SSH_FXP_RENAME`（draft-02）。RFC 文本里
+///   对「`newpath` 已存在时怎么处理」并未强制；多数主流服务器在实践中
+///   是替换，但**不能**作为通用保证。我们只声明「尽量原子替换」，不
+///   承诺。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitStrategy {
+    /// 远端声明 `posix-rename@openssh.com`：原子替换有保证
+    PosixRename,
+    /// 走标准 SSH_FXP_RENAME：不普遍承诺原子性，但成功即可生效
+    StandardRename,
+}
+
+/// R2-T2：安全提交的执行结果——附带选用的策略，供上层如实报告。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitOutcome {
+    pub strategy: CommitStrategy,
+}
+
+/// 由「目标路径 + 任务 UUID」拼出 staging temp 路径。
+///
+/// 选择与目标同目录、同名后追加 `.partial-<task_uuid>`：
+/// - 同目录：保证最终 rename 在大多数文件系统上**不需要跨目录**，
+///   跨目录 rename 在某些远端 / 文件系统上可能不是原子替换。
+/// - `.partial-<uuid>`：后缀可识别（前端/扫描器能定位「属于某次任务的」残留），
+///   `task_uuid` 区分并发任务，避免两个任务抢同一个临时路径。
+pub fn staging_temp_path(target: &str, task_uuid: &str) -> String {
+    if let Some(slash) = target.rfind('/') {
+        let dir = if slash == 0 { "/" } else { &target[..slash] };
+        let name = &target[slash + 1..];
+        format!("{dir}/{name}.partial-{task_uuid}")
+    } else {
+        // 远端路径通常以 `/` 开头；这里兜底裸名
+        format!("{target}.partial-{task_uuid}")
+    }
+}
+
 /// SFTP 客户端
 ///
 /// 封装 russh_sftp::client::SftpSession，提供高层文件操作接口。
@@ -441,6 +546,109 @@ impl SftpClient {
         self.session.metadata(path).await.is_ok()
     }
 
+    /// R2-T2：探测远端 SFTP 扩展，仅返回本轮提交语义相关的两条。
+    ///
+    /// `russh-sftp 2.4` 的 `SftpSession` 把 `RawSftpSession` 藏在私有字段里——
+    /// 没有公开 `extended()` 入口，所以本轮**没**法直接探测
+    /// `posix-rename@openssh.com`。详见研究文档 capability 调查。
+    ///
+    /// 保守策略：所有字段返回 `false`，提交路径走标准 `SSH_FXP_RENAME`；
+    /// 一旦后续能访问 raw handle，这里就能升级为真正的探测。
+    /// 此函数保留是为了**契约**：上层按「探测→决策→提交」三步走，
+    /// 未来升级时不改上层调用方。
+    pub async fn probe_capabilities(&self) -> Result<SftpCapabilities, ProtocolError> {
+        Ok(SftpCapabilities::default())
+    }
+
+    /// R2-T2：以「独占」方式打开/创建临时文件用于 staging。
+    ///
+    /// `OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE` 等价于
+    /// POSIX 的 `O_CREAT | O_EXCL`：文件已存在时**拒绝**创建，避免覆盖另一个
+    /// 任务的临时文件（两个任务撞同一目标路径就会在这里失败）。
+    pub async fn open_exclusive(
+        &self,
+        path: &str,
+    ) -> Result<russh_sftp::client::fs::File, ProtocolError> {
+        use russh_sftp::protocol::OpenFlags;
+        let handle = self
+            .session
+            .open_with_flags(
+                path,
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            )
+            .await
+            .map_err(|e| {
+                ProtocolError::ProtocolError(format!("Failed to open exclusive file: {e}"))
+            })?;
+        Ok(handle)
+    }
+
+    /// R2-T2：把 `SftpClient` 包成 `TransferSink`，供 core 传输服务使用。
+    ///
+    /// 生命周期与 `SftpClient` 相同：`SshClientHandle` 关闭时 SFTP 通道一并关闭，
+    /// 这里仅持有 `Arc<SftpClient>`，**不**额外拉长 SFTP 会话寿命。
+    pub fn as_sink(&self) -> RemoteSink {
+        RemoteSink {
+            client: Arc::new(self.clone_for_sink()),
+        }
+    }
+
+    /// 给 `as_sink` 用：`SftpClient` 内部仅 `Arc<SftpSession>`，克隆代价低。
+    fn clone_for_sink(&self) -> SftpClient {
+        SftpClient {
+            session: self.session.clone(),
+        }
+    }
+
+    /// R2-T2：把临时文件提交到目标位置（rename），附带原子性信息。
+    ///
+    /// 当前实现走标准 `SSH_FXP_RENAME`：OpenSSH 等主流服务器在「`newpath`
+    /// 已存在时」会替换（RFC 文本未强制），但**不**作为通用保证返回。
+    /// `CommitStrategy::StandardRename` 的语义就是「成功即生效，不普遍承诺
+    /// 原子性」——上游据实报告，由 `TransferTaskInfo` 透出。
+    ///
+    /// 何时能升级到 `posix-rename@openssh.com`：见研究文档 capability 调查。
+    /// 调用前**必须**再次检查目标是否存在——本客户端把策略决定提前到
+    /// 此处之外的位置，避免「先删后改」的脏路径（ADR-0002 明令禁止）。
+    pub async fn safe_commit(
+        &self,
+        from: &str,
+        to: &str,
+        _capabilities: SftpCapabilities,
+    ) -> Result<CommitOutcome, ProtocolError> {
+        self.session
+            .rename(from, to)
+            .await
+            .map_err(|e| ProtocolError::TransferCommitFailed {
+                path: to.to_string(),
+                reason: format!("rename failed: {e}"),
+            })?;
+        Ok(CommitOutcome {
+            strategy: CommitStrategy::StandardRename,
+        })
+    }
+
+    /// R2-T2：尽力删除临时文件，吞掉「不存在」类错误。
+    ///
+    /// 调用方在 cancel / commit-failure 之后做清理：远端可能已被网络断开，
+    /// 此时应当返回失败而不是 panic——上层把错误传回终端状态里报告。
+    pub async fn try_remove(&self, path: &str) -> Result<(), ProtocolError> {
+        match self.session.remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("No such file") || msg.contains("not found") {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::TransferCleanupFailed {
+                        path: path.to_string(),
+                        reason: msg,
+                    })
+                }
+            }
+        }
+    }
+
     /// 删除远程文件
     pub async fn remove_file(&self, path: &str) -> Result<(), ProtocolError> {
         self.session
@@ -483,6 +691,58 @@ impl SftpClient {
             .await
             .map_err(|e| ProtocolError::ProtocolError(format!("close failed: {}", e)))?;
         Ok(())
+    }
+}
+
+/// R2-T2：`TransferSink` 的远端实现，把 SFTP 操作拼成 staging 接口。
+///
+/// 整个类型仅一个 `Arc<SftpClient>`，方法全部委托给它——上层按 trait
+/// 注入，可以在测试里换成内存 fake。
+#[derive(Clone)]
+pub struct RemoteSink {
+    client: Arc<SftpClient>,
+}
+
+#[allow(clippy::double_must_use)]
+#[async_trait::async_trait]
+impl TransferSink for RemoteSink {
+    async fn exists(&self, path: &str) -> bool {
+        self.client.exists(path).await
+    }
+
+    async fn exclusive_open_write(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn tokio::io::AsyncWrite + Unpin + Send>, ProtocolError> {
+        let file = self.client.open_exclusive(path).await?;
+        Ok(Box::new(file))
+    }
+
+    async fn open_read(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn tokio::io::AsyncRead + Unpin + Send>, ProtocolError> {
+        let file = self.client.session.open(path).await.map_err(|e| {
+            ProtocolError::ProtocolError(format!("Failed to open remote file: {e}"))
+        })?;
+        Ok(Box::new(file))
+    }
+
+    async fn safe_commit(
+        &self,
+        from: &str,
+        to: &str,
+        caps: SftpCapabilities,
+    ) -> Result<CommitOutcome, ProtocolError> {
+        self.client.safe_commit(from, to, caps).await
+    }
+
+    async fn try_remove(&self, path: &str) -> Result<(), ProtocolError> {
+        self.client.try_remove(path).await
+    }
+
+    fn is_remote(&self) -> bool {
+        true
     }
 }
 

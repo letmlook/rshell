@@ -319,6 +319,10 @@ impl CommandDispatcher {
                 self.transfer_service.remove_transfer(task_id).await?;
                 Ok(CommandOutcome::None)
             }
+            AppCommand::RetryTransfer { task_id } => {
+                let new_task_id = self.transfer_service.enqueue_retry(task_id).await?;
+                Ok(CommandOutcome::TaskId(new_task_id))
+            }
             AppCommand::BrowseRemoteDir { session_id, path } => {
                 let entries = self
                     .session_service

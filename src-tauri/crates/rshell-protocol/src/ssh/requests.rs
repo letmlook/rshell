@@ -99,11 +99,13 @@ fn recovery() -> ProtocolError {
     ProtocolError::TerminalRecoveryRequired
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub(super) trait Writer: Send {
     async fn execute(&mut self, operation: Operation) -> Result<(), ProtocolError>;
     async fn close(&mut self);
 }
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 impl Writer for russh::ChannelWriteHalf<russh::client::Msg> {
     async fn execute(&mut self, operation: Operation) -> Result<(), ProtocolError> {
@@ -186,6 +188,7 @@ pub(super) mod tests {
         block: bool,
         closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
+    #[allow(clippy::double_must_use)]
     #[async_trait::async_trait]
     impl Writer for ControlledWriter {
         async fn execute(&mut self, operation: Operation) -> Result<(), ProtocolError> {

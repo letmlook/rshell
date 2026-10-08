@@ -54,6 +54,8 @@ pub enum CommandOutcome {
     PublicKey(String),
     /// 响应 `VerifyMasterPassword`
     Verified(bool),
+    /// R2-T2：响应 `RetryTransfer` —— 新任务的 id，前端据此监听后续事件。
+    TaskId(Uuid),
 }
 
 impl CommandOutcome {
@@ -77,6 +79,7 @@ impl CommandOutcome {
             Self::Transfers(_) => "transfers",
             Self::PublicKey(_) => "public_key",
             Self::Verified(_) => "verified",
+            Self::TaskId(_) => "task_id",
         }
     }
 }

@@ -143,6 +143,56 @@ describe("TransferPanel cancel/remove controls", () => {
   });
 });
 
+describe("TransferPanel R2-T2 retry control", () => {
+  it("shows 重试 only for failed / cancelled terminal tasks (not done)", () => {
+    const wrapper = mountPanel({ items: [...sampleItems, {
+      id: "t-cancelled", name: "cancelled", phase: "cancelled",
+      progress: 0.3, size: 100, local: "/a", remote: "/b", speed: 0,
+    }] });
+    const retries = wrapper.findAll('[data-test="xfer-retry"]');
+    // failed + cancelled 都该有重试；done 没有；active/paused 没有
+    expect(retries.map((b) => b.attributes("data-task-id")).sort())
+      .toEqual(["t-cancelled", "t-failed"]);
+    expect(wrapper.find('[data-row-id="t-done"] [data-test="xfer-retry"]').exists()).toBe(false);
+    expect(wrapper.find('[data-row-id="t-active"] [data-test="xfer-retry"]').exists()).toBe(false);
+  });
+
+  it("emits retry(taskId) from the failed row", async () => {
+    const wrapper = mountPanel();
+    await wrapper.find('[data-row-id="t-failed"] [data-test="xfer-retry"]').trigger("click");
+    expect(wrapper.emitted("retry")).toEqual([["t-failed"]]);
+    expect(wrapper.emitted("remove")).toBeUndefined();
+  });
+
+  it("emits retry(taskId) from the cancelled row", async () => {
+    const wrapper = mountPanel({ items: [...sampleItems, {
+      id: "t-cancelled", name: "cancelled", phase: "cancelled",
+      progress: 0.3, size: 100, local: "/a", remote: "/b", speed: 0,
+    }] });
+    await wrapper.find('[data-row-id="t-cancelled"] [data-test="xfer-retry"]').trigger("click");
+    expect(wrapper.emitted("retry")).toEqual([["t-cancelled"]]);
+  });
+
+  it("disables 重试 while that task's action is pending", () => {
+    const wrapper = mountPanel({
+      pendingTaskIds: new Set(["t-failed"]),
+    });
+    const retry = wrapper.find('[data-row-id="t-failed"] [data-test="xfer-retry"]')
+      .element as HTMLButtonElement;
+    expect(retry.disabled).toBe(true);
+  });
+
+  it("ignores retry clicks while pending and shows the failure banner", async () => {
+    const wrapper = mountPanel({
+      pendingTaskIds: new Set(["t-failed"]),
+      actionError: "重试失败：原任务仍在传输中",
+    });
+    await wrapper.find('[data-row-id="t-failed"] [data-test="xfer-retry"]').trigger("click");
+    expect(wrapper.emitted("retry")).toBeUndefined();
+    expect(wrapper.find('[data-test="xfer-action-error"]').text()).toContain("重试失败");
+  });
+});
+
 describe("TransferPanel 队列生命周期菜单", () => {
   it("disables the queue menu when there is no finished entry to clear", () => {
     const wrapper = mountPanel({

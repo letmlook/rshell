@@ -14,6 +14,9 @@ function task(overrides: Partial<TransferTaskInfo> = {}): TransferTaskInfo {
     total_bytes: 0,
     speed_bps: 0,
     error_message: null,
+    temp_path: null,
+    cleanup_status: null,
+    commit_strategy: null,
     ...overrides,
   };
 }
@@ -46,5 +49,52 @@ describe("toTransferItem", () => {
 
   it("uses the remote file name as display name", () => {
     expect(toTransferItem(task()).name).toBe("a.bin");
+  });
+
+  // ── R2-T2：residue / commit_strategy 透传 ──
+
+  it("failed task with residue: error includes the temp path so the user knows where to look", () => {
+    const row = toTransferItem(
+      task({
+        state: "Failed",
+        error_message: "commit failed: server unreachable",
+        cleanup_status: "residue",
+        temp_path: "/remote/a.bin.partial-task-uuid",
+      }),
+    );
+    expect(row.error).toContain("commit failed");
+    expect(row.error).toContain("/remote/a.bin.partial-task-uuid");
+    expect(row.cleanup_status).toBe("residue");
+    expect(row.temp_path).toBe("/remote/a.bin.partial-task-uuid");
+  });
+
+  it("cleaned failure: error keeps the original cause, no residue appended", () => {
+    const row = toTransferItem(
+      task({
+        state: "Failed",
+        error_message: "boom",
+        cleanup_status: "cleaned",
+      }),
+    );
+    expect(row.error).toBe("boom");
+    expect(row.cleanup_status).toBe("cleaned");
+  });
+
+  it("Completed task surfaces commit_strategy so the panel can tell the user what atomicity we got", () => {
+    const row = toTransferItem(
+      task({
+        state: "Completed",
+        cleanup_status: "cleaned",
+        commit_strategy: "standard_rename",
+      }),
+    );
+    expect(row.commit_strategy).toBe("standard_rename");
+  });
+
+  it("active task: cleanup_status / commit_strategy are null (nothing to report yet)", () => {
+    const row = toTransferItem(task({ state: "Transferring" }));
+    expect(row.cleanup_status).toBeNull();
+    expect(row.temp_path).toBeNull();
+    expect(row.commit_strategy).toBeNull();
   });
 });

@@ -143,6 +143,7 @@ describe("App layout", () => {
       id: "transfer-1", session_id: "session-1", direction: "Upload", state: "Failed",
       local_path: "/tmp/file", remote_path: "/remote/file", total_bytes: 10,
       bytes_transferred: 0, speed_bps: 0, error_message: "Permission denied: /remote/file",
+      temp_path: null, cleanup_status: null, commit_strategy: null,
     }]);
     const wrapper = mount(App, { global: { plugins: [ElementPlus], stubs: { ...childStubs, TransferPanel: false } } });
     await flushPromises();

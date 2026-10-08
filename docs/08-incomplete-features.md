@@ -1,6 +1,6 @@
 # 当前功能与限制
 
-更新：2026-10-04（文件面板/传输面板/终端面板/弹窗/图标一轮）。本文件替代历史未完成列表，区分实现范围与验收证据。
+更新：2026-10-08（传输任务生命周期：临时文件 + 提交 + 清理 + 重试，R2-T2 一轮）。本文件替代历史未完成列表，区分实现范围与验收证据。
 
 ## 术语：连接信息与标签会话
 
@@ -58,7 +58,9 @@ SSH 密码和密钥口令存放在 macOS 钥匙串（Keychain），会话 TOML �
 
 SSH 密钥管理面板提供生成、导入、删除与列表展示，当前仅为托管存储：私钥保存在应用数据目录的 keys_dir（生成/导入时提供口令则以 OpenSSH 加密格式落盘），没有「关联到会话」入口，不参与会话认证。会话公钥认证使用会话自身凭据配置的外部私钥文件路径，口令经钥匙串提供。因此，在密钥管理面板生成或导入的私钥（含带口令加密的）目前无法在本应用内用于 SSH 连接；界面提示与该边界一致。
 
-传输队列界面提供可见的「暂停/继续/取消/删除」操作，分别调用 `PauseTransfer`/`ResumeTransfer`/`CancelTransfer`/`RemoveTransfer`。前三者通过按任务的 `watch` 控制通道驱动 SFTP 拷贝循环，在每个分块前检查：暂停后字节停止增长、恢复后从已传字节继续；取消立即中止并保持 `cancelled` 终态，不会被改写为完成或失败。「删除」只把**终态**（完成/失败/已取消）条目移出队列列表，不删除本地或远端已传输的文件；活跃任务调用会返回 `InvalidState`，必须先取消。未知条目重复删除按幂等处理，不报错。面板标题栏另有队列管理菜单，可按「清除已完成/失败/已取消/全部已结束」批量移除，并显示各分组当前条数；批量逐条调用 `RemoveTransfer` 而非新增批量命令，以便部分失败可见（否则用户会以为已清空而实际仍有残留）。进行中的任务在任何分组里都不会被批量清除。该行为由协议层拷贝循环与任务服务的自动化测试覆盖，真实 SSH/SFTP 服务器上的暂停/恢复观感仍属待验收项。
+传输队列界面提供可见的「暂停/继续/取消/重试/删除」操作，分别调用 `PauseTransfer`/`ResumeTransfer`/`CancelTransfer`/`RetryTransfer`/`RemoveTransfer`。前三者通过按任务的 `watch` 控制通道驱动 staged lifecycle 拷贝循环；「重试」由专用的 `RetryTransfer` 命令入口（**不**复用 `EnqueueUpload`/`EnqueueDownload` 配 hidden flag），从零创建新任务 id 并强制使用 `Fail` 策略，让 staged lifecycle 提交前再检一次冲突；「删除」只把**终态**（完成/失败/已取消）条目移出队列列表，不删除本地或远端已传输的文件；活跃任务调用会返回 `InvalidState`，必须先取消。未知条目重复删除按幂等处理，不报错。失败 / 已取消的终态任务上额外显示「重试」按钮（仅这两个终态——「完成」不提供重试，避免「重看结果」误解）。面板标题栏另有队列管理菜单，可按「清除已完成/失败/已取消/全部已结束」批量移除，并显示各分组当前条数；批量逐条调用 `RemoveTransfer` 而非新增批量命令，以便部分失败可见（否则用户会以为已清空而实际仍有残留）。进行中的任务在任何分组里都不会被批量清除。
+
+R2-T2：上传与下载都跑「独占打开 staging temp → 字节拷贝 → 提交前再检查冲突 → 安全提交（rename）→ 失败/取消时清理 temp」这个完整生命周期。temp 文件路径形如 `<target>.partial-<task_uuid>`（同目录，便于跨平台 rename 都是同文件系统内操作），任务独占创建（O_EXCL / `OpenFlags::EXCLUDE`）。提交前再次检查目标是否存在——预检通过后目标出现会触发 `late_conflict` 并清理 temp、保留旧目标。取消与提交由 `cancel_decision: AtomicU8` 仲裁：commit 发送之前取消到达 → 取消胜出、commit 不发送、旧目标保留、temp 清理；commit 已在飞（已发出 rename） → commit 完成即收尾（取消意图被吞，因为目标已被替换）。「100% 字节进度」**不**代表提交成功——commit 失败时 `error_message` 与 `cleanup_status: "residue"`（含 temp 路径）一起返回给前端，告知用户残留临时文件的**确切位置**与清理失败原因，**不**静默吞掉。该行为由 staged lifecycle（`rshell-core/transfer/staged.rs`）的 13 条 RED-first 回归测试 + 服务层 retry 入口的 3 条测试覆盖。提交语义：当前走标准 `SSH_FXP_RENAME`（多数服务器在「newpath 已存在」时会替换，但 RFC 文本未强制），不能保证通用原子替换；真正原子替换需要 `posix-rename@openssh.com` 扩展，而 `russh-sftp 2.4` 的 `SftpSession` 未暴露 `extended()` 入口，本轮没找到安全的 raw handle 路径。详见 `docs/research/2026-10-08-sftp-staged-commit-report.md` 的 capability 调查结论。
 
 远端文件面板默认打开登录用户的工作目录，而不是文件系统根 `/`：新增 `GetRemoteHomeDir` 命令，用 SFTP `realpath(".")` 解析（sftp 子系统启动时的当前目录即用户 home，远端无需额外支持 `~` 展开），解析失败回退 `/` 并在前端保持当前目录，不把远端面板打成空白。外部显式传入 `remotePath` 时不覆盖。
 

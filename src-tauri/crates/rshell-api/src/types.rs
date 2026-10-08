@@ -152,6 +152,19 @@ pub struct TransferTaskInfo {
     /// 当前传输速度（字节/秒），仅 Transferring 状态有值
     pub speed_bps: f64,
     pub error_message: Option<String>,
+    /// R2-T2：staging temp 路径（远端 / 本地侧）—— 终态下若 cleanup 失败
+    /// 则该 temp 仍存在；前端据此展示「残留临时文件」的位置与原因。
+    /// 活跃任务上为 `None`（temp 已独占、commit 即将发起）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_path: Option<String>,
+    /// R2-T2：终态下的清理结果标签（`"cleaned"` / `"residue"`）。`None` 表示
+    /// 活跃任务或终态尚未结算清理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_status: Option<String>,
+    /// R2-T2：终态下的提交策略标签（仅 `Completed` 上有值）。前端据此向
+    /// 用户说明「这次传输拿到了原子替换保证吗」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_strategy: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

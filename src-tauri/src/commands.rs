@@ -370,6 +370,24 @@ pub async fn remove_transfer(task_id: Uuid, state: State<'_, AppState>) -> Resul
     Ok(())
 }
 
+/// R2-T2：从零重试终态传输 —— 创建新 task id 并入队。
+///
+/// 故意不复用 `EnqueueUpload` / `EnqueueDownload` 的「hidden flag」：
+/// retry 的语义与首次入队不同（强制 `Fail` 策略、跳过预检的存在性检查、
+/// 原任务保留其终态），单独命令更安全。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn retry_transfer(task_id: Uuid, state: State<'_, AppState>) -> Result<Uuid, IpcError> {
+    let outcome = state
+        .dispatcher
+        .dispatch(AppCommand::RetryTransfer { task_id })
+        .await
+        .map_err(IpcError::from)?;
+    match outcome {
+        CommandOutcome::TaskId(id) => Ok(id),
+        other => Err(IpcError::outcome_mismatch("TaskId", other.kind())),
+    }
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn browse_remote_dir(
     session_id: Uuid,

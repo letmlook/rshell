@@ -7,16 +7,24 @@ use crate::error::CoreError;
 use crate::event_bus::EventBus;
 use crate::session::service::validate_remote_mutation_path;
 use crate::session::service::SshClientHandle;
+use crate::transfer::staged::{
+    run_staged_download, run_staged_upload, staging_local_temp_path, staging_temp_path_str,
+    DownloadRequest, FailedStage, StagedOutcome, UploadRequest, DECISION_CANCELLED,
+    DECISION_PENDING,
+};
 use rshell_api::types::{
     ConflictPolicy, TransferDirection as ApiTransferDirection, TransferTaskInfo,
     TransferTaskState as ApiTransferTaskState,
 };
 use rshell_api::AppEvent;
-use rshell_protocol::ssh::sftp::{SftpClient, TransferControl};
+use rshell_protocol::ssh::sftp::{CommitStrategy, SftpClient, TransferControl, TransferSink};
+use rshell_protocol::transfer::LocalSink;
+use rshell_protocol::ProtocolError;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
@@ -91,6 +99,55 @@ pub struct TransferTask {
     /// 目标已存在时的策略。上传在 SFTP `create` 之前强制执行（防竞态覆盖），
     /// 下载在入队时用本地文件系统检查（无需额外往返）。
     pub conflict: ConflictPolicy,
+    // ── R2-T2 字段 ──
+    /// 该任务拥有的 staging temp 路径（远端侧 / 本地侧）。
+    /// 成功路径上提交 rename 后该字段**仍保留**，用于「清理失败 → 残留」的展示。
+    /// 在任务进入 `Completed` 终态时由 staged lifecycle 标记完成。
+    pub temp_path: Option<String>,
+    /// 终态下的清理结果 —— 失败时 residue 路径与原因。
+    pub cleanup_status: Option<CleanupStatus>,
+    /// 提交结果：仅成功路径上为 `Some(Committed(_))`，
+    /// 失败/取消路径为 None。
+    pub commit_status: Option<CommitStatus>,
+}
+
+/// R2-T2：终态下的清理结果。
+///
+/// `Cleaned` 表示 temp 已被成功移除（成功路径）或清理失败路径上的清理成功；
+/// `Residue { path, reason }` 表示清理失败 —— temp 仍存在，路径与原因如实告诉用户。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupStatus {
+    /// temp 已被成功移除
+    Cleaned,
+    /// temp 仍存在 —— 用户可见的「残留」
+    Residue { path: String, reason: String },
+}
+
+impl CleanupStatus {
+    /// 终态展示 —— 直接给前端 `TransferTaskInfo` 的清理状态字段用
+    pub fn label(&self) -> &'static str {
+        match self {
+            CleanupStatus::Cleaned => "cleaned",
+            CleanupStatus::Residue { .. } => "residue",
+        }
+    }
+}
+
+/// R2-T2：提交结果。
+///
+/// 仅在 `Completed` 终态上为 `Some(Committed(strategy))`；其余终态为 None
+/// （失败 / 取消路径上提交并未发生）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitStatus {
+    Committed(CommitStrategy),
+}
+
+impl CommitStatus {
+    pub fn strategy(&self) -> CommitStrategy {
+        match self {
+            CommitStatus::Committed(s) => *s,
+        }
+    }
 }
 
 impl TransferTask {
@@ -100,6 +157,37 @@ impl TransferTask {
             0.0
         } else {
             self.bytes_transferred as f64 / self.total_bytes as f64
+        }
+    }
+
+    /// R2-T2：算出 staging temp 路径 —— `execute_transfer` 启动前需要它写
+    /// 回 `temp_path` 字段，以便取消 / cleanup 失败时知道路径。启动窗口
+    /// 内 `temp_path` 已是 Some 直接返回；否则按 task_id + 方向重算。
+    pub fn temp_path_for(&self, task_id: Uuid) -> Option<String> {
+        if let Some(p) = &self.temp_path {
+            return Some(p.clone());
+        }
+        let id_str = task_id.to_string();
+        match self.direction {
+            TransferDirection::Upload => Some(staging_temp_path_str(&self.remote_path, &id_str)),
+            TransferDirection::Download => Some(
+                staging_local_temp_path(&self.local_path, &id_str)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }
+    }
+}
+
+impl FailedStage {
+    /// R2-T2：失败阶段的可读标签 —— 写进 `error_message` 前缀供前端展示。
+    pub fn label(&self) -> &'static str {
+        match self {
+            FailedStage::ExclusiveOpen => "exclusive_open",
+            FailedStage::Copy => "copy",
+            FailedStage::LateConflict => "late_conflict",
+            FailedStage::Commit => "commit",
+            FailedStage::CancelledBeforeCommit => "cancelled_before_commit",
         }
     }
 }
@@ -127,7 +215,24 @@ impl From<TransferTask> for TransferTaskInfo {
             total_bytes: task.total_bytes,
             speed_bps: task.speed_bps,
             error_message: task.error_message,
+            temp_path: task.temp_path,
+            cleanup_status: task.cleanup_status.as_ref().map(|s| s.label().to_string()),
+            commit_strategy: task
+                .commit_status
+                .as_ref()
+                .map(|c| commit_strategy_label(c.strategy()).to_string()),
         }
+    }
+}
+
+/// R2-T2：把 `CommitStrategy` 映射成给前端的稳定字符串。
+///
+/// 仅作前端展示用 —— 实际含义在 `CommitStrategy` 的注释里。这里
+/// 是为了让 `TransferTaskInfo` 的 JSON 字段保持稳定的字符串集合。
+pub fn commit_strategy_label(strategy: CommitStrategy) -> &'static str {
+    match strategy {
+        CommitStrategy::PosixRename => "posix_rename",
+        CommitStrategy::StandardRename => "standard_rename",
     }
 }
 
@@ -353,6 +458,10 @@ pub struct TransferService {
     /// 按 task_id 的传输控制通道：pause/resume/cancel 通过它驱动传输循环，
     /// cancel 与 pause 共用同一通道。任务进入终态后移除对应条目。
     control_channels: Arc<RwLock<HashMap<Uuid, watch::Sender<TransferControl>>>>,
+    /// R2-T2：取消 / 提交竞态的决策 atomic —— `cancel_transfer` 在发送
+    /// `TransferControl::Cancel` 同时把这里置 1，让 staged lifecycle 在
+    /// commit 阶段 CAS 时看见。任务进入终态后移除对应条目。
+    cancel_decisions: Arc<RwLock<HashMap<Uuid, Arc<AtomicU8>>>>,
     /// 事件总线
     event_bus: Arc<EventBus>,
     /// 获取 SSH 客户端的函数（由外部注入）
@@ -365,6 +474,7 @@ impl TransferService {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             control_channels: Arc::new(RwLock::new(HashMap::new())),
+            cancel_decisions: Arc::new(RwLock::new(HashMap::new())),
             event_bus,
             ssh_client_provider: Arc::new(std::sync::RwLock::new(None)),
         }
@@ -437,6 +547,9 @@ impl TransferService {
             speed_bps: 0.0,
             finished_at: None,
             conflict: conflict.clone(),
+            temp_path: None,
+            cleanup_status: None,
+            commit_status: None,
         };
 
         {
@@ -493,6 +606,9 @@ impl TransferService {
             speed_bps: 0.0,
             finished_at: None,
             conflict: conflict.clone(),
+            temp_path: None,
+            cleanup_status: None,
+            commit_status: None,
         };
 
         {
@@ -561,14 +677,14 @@ impl TransferService {
             }
         };
 
-        // 建立 pause/resume/cancel 共用的控制通道。
+        // 建立 pause/resume/cancel 共用的控制通道 + 取消决策 atomic。
         //
         // 通道注册必须与启动决策在同一把 tasks 写锁临界区内完成：
         // cancel/pause 在各自的 tasks 写锁内读取通道（锁序恒为
         // tasks → control_channels），使「传输启动决策」与「取消/暂停决策」
         // 互斥——provider await 期间到达的取消/暂停不会因通道尚不存在而丢失：
         // 取消拦下启动，暂停则以 Pause 初值建通道，让循环首轮即挂起。
-        let mut control_rx = {
+        let (mut control_rx, cancel_decision) = {
             let mut tasks = self.tasks.write().await;
             let Some(t) = tasks.get_mut(&task_id) else {
                 return Ok(());
@@ -589,12 +705,33 @@ impl TransferService {
                 .write()
                 .await
                 .insert(task_id, control_tx);
-            control_rx
+            // R2-T2：同时建立取消决策 atomic —— 让 cancel_transfer 在写
+            // 控制通道的同时把这里置 1，staged lifecycle 在 copy 之后、
+            // commit 之前看到。
+            let cancel_decision = Arc::new(AtomicU8::new(DECISION_PENDING));
+            self.cancel_decisions
+                .write()
+                .await
+                .insert(task_id, cancel_decision.clone());
+            // 顺手记录 temp_path —— 失败/取消的 residue 报告需要它。
+            let temp = match task.direction {
+                TransferDirection::Upload => {
+                    staging_temp_path_str(&task.remote_path, &task_id.to_string())
+                }
+                TransferDirection::Download => {
+                    staging_local_temp_path(&task.local_path, &task_id.to_string())
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            };
+            t.temp_path = Some(temp);
+            (control_rx, cancel_decision)
         };
 
         // 启动异步传输任务
         let tasks = self.tasks.clone();
         let control_channels = self.control_channels.clone();
+        let cancel_decisions = self.cancel_decisions.clone();
         let event_bus = self.event_bus.clone();
         tokio::spawn(async move {
             // R2-17：兜底守卫覆盖整个任务体——正常路径末尾 disarm；
@@ -633,50 +770,14 @@ impl TransferService {
                 }
             };
 
-            let result = async {
-                // 启动窗口内到达的暂停/取消在此收口：循环尚未触碰远端，
-                // 暂停挂起在打开 SFTP 通道之前，取消立即中止
-                wait_for_run_before_start(&mut control_rx).await?;
-                // 只在打开 SFTP 子通道时持有客户端读锁；SFTP 流独立于发送客户端，
-                // 拷贝循环（含暂停挂起期间）不得阻塞会话断开等需要写锁的操作。
-                let sftp = {
-                    let ssh = ssh_client.read().await;
-                    let channel = ssh
-                        .open_sftp_channel()
-                        .await
-                        .map_err(|e| format!("Failed to open SFTP channel: {}", e))?;
-
-                    SftpClient::new(channel)
-                        .await
-                        .map_err(|e| format!("Failed to create SFTP client: {}", e))?
-                };
-
-                match task.direction {
-                    TransferDirection::Upload => {
-                        sftp.upload(
-                            &task.local_path,
-                            &task.remote_path,
-                            matches!(task.conflict, ConflictPolicy::Overwrite),
-                            &mut control_rx,
-                            &mut progress,
-                        )
-                        .await
-                        .map_err(|e| format!("Upload failed: {}", e))?;
-                    }
-                    TransferDirection::Download => {
-                        sftp.download(
-                            &task.remote_path,
-                            &task.local_path,
-                            &mut control_rx,
-                            &mut progress,
-                        )
-                        .await
-                        .map_err(|e| format!("Download failed: {}", e))?;
-                    }
-                }
-
-                Ok::<(), String>(())
-            }
+            let outcome = Self::run_staged_transfer(
+                &task,
+                task_id,
+                &ssh_client,
+                &mut control_rx,
+                &mut progress,
+                cancel_decision,
+            )
             .await;
 
             // 关闭发送端 → forwarder 排空最后一批进度后自行退出
@@ -688,15 +789,282 @@ impl TransferService {
                 let mut controls = control_channels.write().await;
                 controls.remove(&task_id);
             }
+            // R2-T2：清理取消决策 atomic。
+            {
+                let mut decisions = cancel_decisions.write().await;
+                decisions.remove(&task_id);
+            }
 
-            // 终态写回：已被取消的任务保持 Cancelled，不广播 TransferCompleted/TransferFailed
-            Self::finalize_transfer(&tasks, &event_bus, task_id, result).await;
+            // 终态写回 —— 根据 staged outcome 把 task 写到 Completed / Failed /
+            // Cancelled，并附上 commit 策略与 cleanup residue。
+            Self::finalize_staged(&tasks, &event_bus, task_id, outcome).await;
 
             // 正常清理已全部完成：解除守卫，Drop 不再兜底
             cleanup_guard.disarm();
         });
 
         Ok(())
+    }
+
+    /// R2-T2：跑一次 staged transfer —— 包住「打开 SFTP / 选 sink / 跑
+    /// upload 或 download staged 循环」。被 [`execute_transfer`] 的
+    /// 异步任务体调用。
+    async fn run_staged_transfer(
+        task: &TransferTask,
+        task_id: Uuid,
+        ssh_client: &SshClientHandle,
+        control_rx: &mut watch::Receiver<TransferControl>,
+        progress: &mut (dyn FnMut(u64, u64) + Send),
+        cancel_decision: Arc<AtomicU8>,
+    ) -> StagedOutcome {
+        // 启动窗口内到达的暂停/取消在此收口：循环尚未触碰远端，暂停挂起
+        // 在打开 SFTP 通道之前，取消立即中止。
+        if let Err(msg) = wait_for_run_before_start(control_rx).await {
+            return StagedOutcome::Failed {
+                stage: FailedStage::Copy,
+                message: msg,
+                residue_path: None,
+            };
+        }
+
+        // 只在打开 SFTP 子通道时持有客户端读锁；SFTP 流独立于发送客户端，
+        // 拷贝循环（含暂停挂起期间）不得阻塞会话断开等需要写锁的操作。
+        let sftp_result = {
+            let ssh = ssh_client.read().await;
+            ssh.open_sftp_channel().await.map_err(|e| {
+                ProtocolError::ProtocolError(format!("Failed to open SFTP channel: {e}"))
+            })
+        };
+        let channel = match sftp_result {
+            Ok(c) => c,
+            Err(e) => {
+                return StagedOutcome::Failed {
+                    stage: FailedStage::ExclusiveOpen,
+                    message: format!("{e}"),
+                    residue_path: None,
+                };
+            }
+        };
+        let sftp = match SftpClient::new(channel).await {
+            Ok(c) => c,
+            Err(e) => {
+                return StagedOutcome::Failed {
+                    stage: FailedStage::ExclusiveOpen,
+                    message: format!("{e}"),
+                    residue_path: None,
+                };
+            }
+        };
+        let sink: Arc<dyn TransferSink> = Arc::new(sftp.as_sink());
+
+        match task.direction {
+            TransferDirection::Upload => {
+                let source_total = match tokio::fs::metadata(&task.local_path).await {
+                    Ok(m) => m.len(),
+                    Err(e) => {
+                        return StagedOutcome::Failed {
+                            stage: FailedStage::Copy,
+                            message: format!("local stat {}: {e}", task.local_path.display()),
+                            residue_path: None,
+                        };
+                    }
+                };
+                let source = match tokio::fs::File::open(&task.local_path).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        return StagedOutcome::Failed {
+                            stage: FailedStage::Copy,
+                            message: format!("local open {}: {e}", task.local_path.display()),
+                            residue_path: None,
+                        };
+                    }
+                };
+                let temp_path = match task.temp_path_for(task_id) {
+                    Some(t) => t,
+                    None => {
+                        return StagedOutcome::Failed {
+                            stage: FailedStage::ExclusiveOpen,
+                            message: "missing temp_path; enqueue must run first".into(),
+                            residue_path: None,
+                        };
+                    }
+                };
+                run_staged_upload(UploadRequest {
+                    source: Box::new(source),
+                    source_total,
+                    target: task.remote_path.clone(),
+                    temp_path,
+                    conflict: task.conflict.clone(),
+                    sink,
+                    control: control_rx,
+                    progress,
+                    cancel_decision,
+                })
+                .await
+            }
+            TransferDirection::Download => {
+                let source_total = match sftp.metadata(&task.remote_path).await {
+                    Ok(m) => m.size,
+                    Err(e) => {
+                        return StagedOutcome::Failed {
+                            stage: FailedStage::Copy,
+                            message: format!("remote stat {}: {e}", task.remote_path),
+                            residue_path: None,
+                        };
+                    }
+                };
+                let source = match sink.open_read(&task.remote_path).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return StagedOutcome::Failed {
+                            stage: FailedStage::Copy,
+                            message: format!("remote open {}: {e}", task.remote_path),
+                            residue_path: None,
+                        };
+                    }
+                };
+                let temp_path = match task.temp_path_for(task_id) {
+                    Some(t) => t,
+                    None => {
+                        return StagedOutcome::Failed {
+                            stage: FailedStage::ExclusiveOpen,
+                            message: "missing temp_path; enqueue must run first".into(),
+                            residue_path: None,
+                        };
+                    }
+                };
+                let local_sink: Arc<dyn TransferSink> = Arc::new(LocalSink::new());
+                run_staged_download(DownloadRequest {
+                    source,
+                    source_total,
+                    target: task.local_path.clone(),
+                    temp_path: std::path::PathBuf::from(&temp_path),
+                    conflict: task.conflict.clone(),
+                    sink: local_sink,
+                    control: control_rx,
+                    progress,
+                    cancel_decision,
+                })
+                .await
+            }
+        }
+    }
+
+    /// R2-T2：staged outcome → task 终态写回。
+    ///
+    /// 关键不变量：
+    /// - Cancelled 终态不写 error_message（不是失败）。
+    /// - Failed 终态必须保留原始错误 + cleanup residue。
+    /// - Completed 必须带 commit 策略；residue 为 None（temp 已被 commit rename 取代）。
+    async fn finalize_staged(
+        tasks: &Arc<RwLock<HashMap<Uuid, TransferTask>>>,
+        event_bus: &Arc<EventBus>,
+        task_id: Uuid,
+        outcome: StagedOutcome,
+    ) {
+        match outcome {
+            StagedOutcome::Completed { bytes, commit } => {
+                let mut tasks = tasks.write().await;
+                if let Some(t) = tasks.get_mut(&task_id) {
+                    if t.state == TransferTaskState::Cancelled {
+                        // commit 已在飞 / 完成后取消到达 —— commit 已生效，
+                        // 终态是 Completed（取消意图被吞，因为目标已被替换）。
+                        info!(
+                            task_id = %task_id,
+                            "Transfer commit succeeded after cancel request; keeping completed"
+                        );
+                        t.state = TransferTaskState::Completed;
+                        t.finished_at = Some(std::time::Instant::now());
+                        t.bytes_transferred = bytes;
+                        t.commit_status = Some(CommitStatus::Committed(commit.strategy));
+                        t.cleanup_status = Some(CleanupStatus::Cleaned);
+                        event_bus.publish(AppEvent::TransferQueueChanged);
+                    } else {
+                        t.state = TransferTaskState::Completed;
+                        t.finished_at = Some(std::time::Instant::now());
+                        t.bytes_transferred = bytes;
+                        t.commit_status = Some(CommitStatus::Committed(commit.strategy));
+                        t.cleanup_status = Some(CleanupStatus::Cleaned);
+                        event_bus.publish(AppEvent::TransferCompleted { task_id });
+                        event_bus.publish(AppEvent::TransferQueueChanged);
+                        info!(task_id = %task_id, strategy = ?commit.strategy, "Transfer completed");
+                    }
+                }
+                Self::prune_finished_tasks(&mut tasks);
+            }
+            StagedOutcome::Cancelled {
+                residue_path,
+                cleanup_failure,
+            } => {
+                let mut tasks = tasks.write().await;
+                if let Some(t) = tasks.get_mut(&task_id) {
+                    // 取消不是失败 —— 不写 error_message
+                    t.cleanup_status = Some(match residue_path {
+                        Some(path) => CleanupStatus::Residue {
+                            path,
+                            reason: cleanup_failure.unwrap_or_default(),
+                        },
+                        None => CleanupStatus::Cleaned,
+                    });
+                    info!(task_id = %task_id, residue = ?t.cleanup_status, "Transfer cancelled; staged cleanup done");
+                    event_bus.publish(AppEvent::TransferQueueChanged);
+                }
+                Self::prune_finished_tasks(&mut tasks);
+            }
+            StagedOutcome::Failed {
+                stage,
+                message,
+                residue_path,
+            } => {
+                let mut tasks = tasks.write().await;
+                if let Some(t) = tasks.get_mut(&task_id) {
+                    if t.state == TransferTaskState::Cancelled {
+                        // 取消 + commit 失败：保留 Cancelled 终态；residue 透出
+                        t.cleanup_status = Some(match residue_path {
+                            Some(path) => CleanupStatus::Residue {
+                                path,
+                                reason: message.clone(),
+                            },
+                            None => CleanupStatus::Cleaned,
+                        });
+                        info!(
+                            task_id = %task_id,
+                            stage = ?stage,
+                            "Transfer commit failed after cancel; keeping cancelled, residue reported"
+                        );
+                        event_bus.publish(AppEvent::TransferQueueChanged);
+                    } else {
+                        t.state = TransferTaskState::Failed;
+                        t.finished_at = Some(std::time::Instant::now());
+                        // 把 stage 与原始 message 都透到 error_message，
+                        // 方便前端按行展示：失败原因 + 残留路径
+                        let full = format!("{}: {}", stage.label(), message);
+                        t.error_message = Some(full);
+                        t.cleanup_status = Some(match residue_path {
+                            Some(path) => CleanupStatus::Residue {
+                                path,
+                                reason: message.clone(),
+                            },
+                            None => CleanupStatus::Cleaned,
+                        });
+                        // 冲突用固定前缀标记，前端据此提供「覆盖/重命名」入口
+                        if let Some(path) = conflict_target(t.error_message.as_ref().unwrap()) {
+                            event_bus.publish(AppEvent::TransferConflict {
+                                task_id,
+                                path: path.clone(),
+                            });
+                        }
+                        event_bus.publish(AppEvent::TransferFailed {
+                            task_id,
+                            error: t.error_message.clone().unwrap_or_default(),
+                        });
+                        event_bus.publish(AppEvent::TransferQueueChanged);
+                        warn!(task_id = %task_id, stage = ?stage, error = %message, "Transfer failed");
+                    }
+                }
+                Self::prune_finished_tasks(&mut tasks);
+            }
+        }
     }
 
     /// 传输循环结束后的终态写回
@@ -886,6 +1254,12 @@ impl TransferService {
                 if let Some(control) = control {
                     let _ = control.send(TransferControl::Cancel);
                 }
+                // R2-T2：同时把取消决策写入 atomic，让 staged lifecycle 在
+                // copy → precheck 阶段看见（commit 还未发，commit CAS 会失败）。
+                let decision = self.cancel_decisions.read().await.get(&task_id).cloned();
+                if let Some(decision) = decision {
+                    decision.store(DECISION_CANCELLED, std::sync::atomic::Ordering::SeqCst);
+                }
                 info!(task_id = %task_id, "Transfer cancelled");
                 self.event_bus.publish(AppEvent::TransferQueueChanged);
             }
@@ -895,6 +1269,50 @@ impl TransferService {
         Self::prune_finished_tasks(&mut tasks);
 
         Ok(())
+    }
+
+    /// R2-T2：从零重试终态任务 —— 创建新 task id，从原任务的
+    /// session_id / source / target 重建，**强制**使用 `Fail` 策略
+    /// （预检与提交之间存在时间窗，staged lifecycle 必须重新确认；
+    /// 重试自动覆盖会绕过这条保护 —— ADR-0002 / spec §二）。
+    ///
+    /// 原任务保持它的终态——retry 创建的是全新 task id，不复用。
+    /// 仅终态任务可重试；非终态（活跃 / 暂停）应先取消。
+    pub async fn enqueue_retry(&self, task_id: Uuid) -> Result<Uuid, CoreError> {
+        let source = {
+            let tasks = self.tasks.read().await;
+            tasks
+                .get(&task_id)
+                .ok_or_else(|| CoreError::NotFound(format!("Task {task_id} not found")))?
+                .clone()
+        };
+        if !source.state.is_terminal() {
+            return Err(CoreError::InvalidState(format!(
+                "transfer {task_id} is still {:?}; cancel it before retry",
+                source.state
+            )));
+        }
+        let new_conflict = ConflictPolicy::Fail;
+        match source.direction {
+            TransferDirection::Upload => {
+                self.enqueue_upload(
+                    source.local_path.clone(),
+                    source.remote_path.clone(),
+                    source.session_id,
+                    new_conflict,
+                )
+                .await
+            }
+            TransferDirection::Download => {
+                self.enqueue_download(
+                    source.remote_path.clone(),
+                    source.local_path.clone(),
+                    source.session_id,
+                    new_conflict,
+                )
+                .await
+            }
+        }
     }
 
     /// 更新传输进度
@@ -1024,6 +1442,101 @@ mod tests {
         TransferService::new(Arc::new(crate::event_bus::EventBus::new()))
     }
 
+    // ── R2-T2：retry 入口回归 ──
+
+    /// RED：retry 一个不存在的任务 → NotFound。
+    #[tokio::test]
+    async fn retry_rejects_unknown_task() {
+        let svc = make_service();
+        let err = svc
+            .enqueue_retry(Uuid::new_v4())
+            .await
+            .expect_err("retry on unknown task must fail");
+        assert!(matches!(err, CoreError::NotFound(_)), "实际: {err:?}");
+    }
+
+    /// RED：retry 非终态任务 → InvalidState。前端必须先取消再重试。
+    #[tokio::test]
+    async fn retry_rejects_non_terminal_task() {
+        let svc = make_service();
+        let id = Uuid::new_v4();
+        insert_task(&svc, make_task(id, TransferTaskState::Transferring)).await;
+        let err = svc
+            .enqueue_retry(id)
+            .await
+            .expect_err("retry on active task must fail");
+        assert!(matches!(err, CoreError::InvalidState(_)), "实际: {err:?}");
+    }
+
+    /// RED：retry 终态任务 → 强制 Fail 策略创建新任务；原任务保留终态不变。
+    ///
+    /// 注入「不阻塞、立刻返回假客户端」的 SSH provider —— 该客户端的
+    /// `open_sftp_channel` 会失败并把新任务标记 Failed，但**入队**
+    /// 这一段已经把我们关心的契约跑过了：策略为 Fail、路径与原任务相同、
+    /// id 不同、原任务终态不变。
+    #[tokio::test]
+    async fn retry_creates_new_task_from_zero_with_fail_policy_and_keeps_original_terminal() {
+        use rshell_api::types::{AuthMethod, Protocol as ApiProtocol, SessionConfig};
+        use rshell_protocol::ssh::client::{ResolvedAuthMethod, SshClient};
+        let svc = make_service();
+        // 立刻返回假客户端 —— 不阻塞。
+        svc.set_ssh_client_provider(Arc::new(|session_id| {
+            let config = SessionConfig {
+                id: session_id,
+                name: "retry-test".into(),
+                folder_id: None,
+                host: "127.0.0.1".into(),
+                port: 22,
+                protocol: ApiProtocol::SSH,
+                auth_method: AuthMethod::Password {
+                    username: "u".into(),
+                    has_password: true,
+                },
+                serial_config: None,
+            };
+            let auth = ResolvedAuthMethod::Password {
+                username: "u".into(),
+                password: "p".into(),
+            };
+            Box::pin(async move {
+                Ok(
+                    Arc::new(tokio::sync::RwLock::new(SshClient::new(config, auth)))
+                        as crate::session::service::SshClientHandle,
+                )
+            })
+        }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("source.txt");
+        std::fs::write(&local, b"payload").unwrap();
+        std::mem::forget(dir);
+        let id = Uuid::new_v4();
+        let mut task = make_task(id, TransferTaskState::Failed);
+        task.error_message = Some("boom".into());
+        task.finished_at = Some(std::time::Instant::now());
+        task.local_path = local.clone();
+        task.remote_path = "/remote/source.txt".into();
+        insert_task(&svc, task).await;
+
+        let new_id = svc
+            .enqueue_retry(id)
+            .await
+            .expect("retry on Failed task should succeed");
+        assert_ne!(new_id, id, "retry 必须创建新 task id");
+
+        // 原任务保留其 Failed 终态（spec：「retry 创建的是全新 task id」）
+        let original = svc.get_task(id).await.unwrap();
+        assert_eq!(original.state, TransferTaskState::Failed);
+        assert_eq!(original.error_message.as_deref(), Some("boom"));
+
+        // 新任务入队；execute_transfer 在假客户端上失败并把它标 Failed，
+        // 但我们要看的契约是 conflict 策略、路径、id 不同。
+        let new_task = svc.get_task(new_id).await.unwrap();
+        assert!(matches!(new_task.conflict, ConflictPolicy::Fail));
+        assert_eq!(new_task.local_path, original.local_path);
+        assert_eq!(new_task.remote_path, original.remote_path);
+    }
+
     #[tokio::test]
     async fn enqueue_upload_rejects_missing_file_before_queueing() {
         let service = make_service();
@@ -1091,6 +1604,9 @@ mod tests {
             speed_bps: 0.0,
             finished_at: None,
             conflict: ConflictPolicy::Fail,
+            temp_path: None,
+            cleanup_status: None,
+            commit_status: None,
         }
     }
 
@@ -1912,6 +2428,9 @@ mod tests {
             speed_bps: 0.0,
             finished_at: None,
             conflict: ConflictPolicy::Fail,
+            temp_path: None,
+            cleanup_status: None,
+            commit_status: None,
         };
         assert!((task.progress() - 0.5).abs() < f64::EPSILON);
 
@@ -1932,6 +2451,9 @@ mod tests {
             speed_bps: 0.0,
             finished_at: None,
             conflict: ConflictPolicy::Fail,
+            temp_path: None,
+            cleanup_status: None,
+            commit_status: None,
         };
         assert_eq!(zero.progress(), 0.0);
     }
