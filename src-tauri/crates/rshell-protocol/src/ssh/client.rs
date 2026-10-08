@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// 每个 pty 的输出目的地，按 russh 通道号索引。
@@ -66,6 +67,10 @@ const SSH_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_se
 
 /// 断开连接时等待 russh 发送 disconnect 消息的上限。
 const SSH_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Maximum time a user decision may remain pending. Tests can inject a
+/// shorter value through the handler field; production uses this bound.
+const HOST_KEY_DECISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// R3-03：请求对端开 `direct-tcpip` 通道的上限。
 ///
@@ -223,6 +228,8 @@ pub trait HostKeyDecisionSink: Send + Sync {
     /// 向 UI 端发布"请决策"通知
     fn publish_request(&self, info: HostKeyDecisionRequest);
     fn cancel_decision(&self, decision_id: Uuid);
+    /// Mark a decision stale because its bounded server wait expired.
+    fn expire_decision(&self, decision_id: Uuid);
 }
 
 /// 待决策的主机密钥信息（用于发布给 UI 端）
@@ -235,6 +242,34 @@ pub struct HostKeyDecisionRequest {
     pub fingerprint: String,
     pub expected: String,
     pub public_key_blob: String,
+}
+
+struct DecisionWaitGuard {
+    sink: Arc<dyn HostKeyDecisionSink>,
+    decision_id: Uuid,
+    armed: bool,
+}
+
+impl DecisionWaitGuard {
+    fn new(sink: Arc<dyn HostKeyDecisionSink>, decision_id: Uuid) -> Self {
+        Self {
+            sink,
+            decision_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DecisionWaitGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.sink.cancel_decision(self.decision_id);
+        }
+    }
 }
 
 /// SSH Handler 实现
@@ -250,6 +285,10 @@ pub(crate) struct SshHandler {
     known_hosts_paths: Vec<PathBuf>,
     /// 主机密钥决策 sink（未知 key 时通过它注册 + 等待 UI 决策）
     host_key_sink: Option<Arc<dyn HostKeyDecisionSink>>,
+    /// Maximum pending decision duration; injectable for tests.
+    host_key_timeout: std::time::Duration,
+    /// Set only when this handshake's host-key decision ended negatively.
+    host_key_rejected: Arc<AtomicBool>,
 }
 
 impl SshHandler {
@@ -430,6 +469,7 @@ impl russh::client::Handler for SshHandler {
                 fingerprint = %fp,
                 "Host key not found in known_hosts — rejecting (no decision sink)"
             );
+            self.host_key_rejected.store(true, Ordering::SeqCst);
             return Err(anyhow::anyhow!(
                 "Host key for {}:{} not found in known_hosts (fingerprint {})",
                 self.host,
@@ -456,9 +496,11 @@ impl russh::client::Handler for SshHandler {
         });
 
         // 3. 等待 UI 端通过 AppCommand::DecideHostKey 唤醒
-        let user_decided = tokio::time::timeout(std::time::Duration::from_secs(60), rx).await;
+        let mut wait_guard = DecisionWaitGuard::new(sink.clone(), decision_id);
+        let user_decided = tokio::time::timeout(self.host_key_timeout, rx).await;
         match user_decided {
             Ok(Ok(decision)) => {
+                wait_guard.disarm();
                 if decision.accept {
                     // TrustOnce 或 TrustPermanent 都被接受，russh 继续握手。
                     // TrustPermanent 的写入由调用方（SessionService::connect）处理。
@@ -477,13 +519,15 @@ impl russh::client::Handler for SshHandler {
                     fingerprint = %fp,
                     "User rejected host key"
                 );
+                self.host_key_rejected.store(true, Ordering::SeqCst);
                 Err(anyhow::anyhow!(
                     "User rejected host key for {}:{}",
                     self.host,
                     self.port
                 ))
             }
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(_)) => {
+                wait_guard.disarm();
                 sink.cancel_decision(decision_id);
                 warn!(
                     host = %self.host,
@@ -491,8 +535,25 @@ impl russh::client::Handler for SshHandler {
                     fingerprint = %fp,
                     "Host key decision channel closed — rejecting"
                 );
+                self.host_key_rejected.store(true, Ordering::SeqCst);
                 Err(anyhow::anyhow!(
                     "Host key decision channel closed for {}:{}",
+                    self.host,
+                    self.port
+                ))
+            }
+            Err(_) => {
+                sink.expire_decision(decision_id);
+                wait_guard.disarm();
+                warn!(
+                    host = %self.host,
+                    port = self.port,
+                    fingerprint = %fp,
+                    "Host key decision expired — rejecting"
+                );
+                self.host_key_rejected.store(true, Ordering::SeqCst);
+                Err(anyhow::anyhow!(
+                    "Host key decision expired for {}:{}",
                     self.host,
                     self.port
                 ))
@@ -631,12 +692,15 @@ impl SshClient {
         let known_hosts_paths = build_known_hosts_paths(allow_cwd_known_hosts);
 
         // 创建 Handler（带 host_key_sink）
+        let host_key_rejected = Arc::new(AtomicBool::new(false));
         let handler = SshHandler {
             shell_output: self.shell_output.clone(),
             host: self.config.host.clone(),
             port: self.config.port,
             known_hosts_paths,
             host_key_sink,
+            host_key_timeout: HOST_KEY_DECISION_TIMEOUT,
+            host_key_rejected: host_key_rejected.clone(),
         };
 
         // 连接到服务器。自行建 socket 以关闭 Nagle（见 open_nodelay_socket）。
@@ -644,7 +708,13 @@ impl SshClient {
         let socket = open_nodelay_socket(&addr).await?;
         let handle = russh::client::connect_stream(ssh_config, socket, handler)
             .await
-            .map_err(|e| ProtocolError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| {
+                if host_key_rejected.load(Ordering::SeqCst) {
+                    ProtocolError::HostKeyMismatch("host key decision was not accepted".into())
+                } else {
+                    ProtocolError::ConnectionFailed(e.to_string())
+                }
+            })?;
 
         self.handle = Some(handle);
 
@@ -1096,6 +1166,7 @@ impl Connection for SshClient {
 mod tests {
     use super::*;
     use rshell_api::types::AuthMethod;
+    use russh::client::Handler;
 
     /// 系统的密码学随机源。ssh-key 0.7 依赖的 rand_core 0.10 移除了 `OsRng`，
     /// 改用 `getrandom::SysRng`，并用 `UnwrapErr` 适配成 `CryptoRng`。
@@ -1236,6 +1307,7 @@ mod tests {
         }
         fn publish_request(&self, _: HostKeyDecisionRequest) {}
         fn cancel_decision(&self, _: Uuid) {}
+        fn expire_decision(&self, _: Uuid) {}
     }
 
     #[derive(Default)]
@@ -1643,6 +1715,8 @@ mod tests {
             port: 2222,
             known_hosts_paths: vec![path],
             host_key_sink: None,
+            host_key_timeout: HOST_KEY_DECISION_TIMEOUT,
+            host_key_rejected: Arc::new(AtomicBool::new(false)),
         };
         assert_eq!(handler.verify_known_hosts(&key), (true, None));
         let (matched, previous) = handler.verify_known_hosts(&changed_key);
@@ -1683,6 +1757,8 @@ mod tests {
             port: 22,
             known_hosts_paths: vec![path],
             host_key_sink: None,
+            host_key_timeout: HOST_KEY_DECISION_TIMEOUT,
+            host_key_rejected: Arc::new(AtomicBool::new(false)),
         };
         // pattern_matches 直接断言：裸 IPv6 命中、其他 IPv6 不命中、方括号写法不变
         assert!(
@@ -1714,6 +1790,8 @@ mod tests {
                 port: 2222,
                 known_hosts_paths: paths,
                 host_key_sink: None,
+                host_key_timeout: HOST_KEY_DECISION_TIMEOUT,
+                host_key_rejected: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -1736,6 +1814,66 @@ mod tests {
             known_opt_in,
             "显式开启（RSHELL_ALLOW_CWD_KNOWN_HOSTS）后相对路径才参与匹配"
         );
+    }
+
+    #[derive(Default)]
+    struct LifecycleSink {
+        sender: std::sync::Mutex<Option<oneshot::Sender<HostKeyDecision>>>,
+        cancelled: std::sync::atomic::AtomicUsize,
+        expired: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HostKeyDecisionSink for LifecycleSink {
+        fn register_decision(&self) -> (Uuid, oneshot::Receiver<HostKeyDecision>) {
+            let (tx, rx) = oneshot::channel();
+            *self.sender.lock().unwrap() = Some(tx);
+            (Uuid::new_v4(), rx)
+        }
+        fn publish_request(&self, _: HostKeyDecisionRequest) {}
+        fn cancel_decision(&self, _: Uuid) {
+            self.cancelled
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(tx) = self.sender.lock().unwrap().take() {
+                let _ = tx.send(HostKeyDecision {
+                    fingerprint: String::new(),
+                    key_blob: String::new(),
+                    accept: false,
+                    permanent: false,
+                });
+            }
+        }
+        fn expire_decision(&self, _: Uuid) {
+            self.expired
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.cancel_decision(Uuid::nil());
+        }
+    }
+
+    #[tokio::test]
+    async fn host_key_timeout_cancels_the_handshake_future_instead_of_waiting_for_ui() {
+        let key = ssh_key::PrivateKey::random(&mut os_rng(), ssh_key::Algorithm::Ed25519)
+            .unwrap()
+            .public_key()
+            .clone();
+        let sink = Arc::new(LifecycleSink::default());
+        let mut handler = SshHandler {
+            shell_output: Arc::new(Mutex::new(ShellOutput::default())),
+            host: "timeout.test".into(),
+            port: 22,
+            known_hosts_paths: vec![],
+            host_key_sink: Some(sink.clone()),
+            host_key_timeout: std::time::Duration::from_millis(20),
+            host_key_rejected: Arc::new(AtomicBool::new(false)),
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            handler.check_server_key(&key),
+        )
+        .await
+        .expect("host-key expiry must cancel promptly")
+        .expect_err("an undecided key must never be accepted");
+        assert!(result.to_string().to_lowercase().contains("host key"));
+        assert_eq!(sink.expired.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

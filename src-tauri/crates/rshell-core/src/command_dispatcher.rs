@@ -18,6 +18,7 @@ use crate::session::service::SessionService;
 use crate::terminal::service::TerminalService;
 use crate::theme::ThemeManager;
 use crate::transfer::service::TransferService;
+use rshell_api::events::HostKeyDecisionState;
 use rshell_api::{AppCommand, CommandOutcome, TrustHostKeyDecision};
 use rshell_plugin_sdk::loader::PluginLoader;
 use rshell_protocol::ssh::HostKeyDecision;
@@ -522,6 +523,15 @@ impl CommandDispatcher {
                          nothing was written to known_hosts"
                 ))),
             },
+            AppCommand::CancelHostKey { decision_id } => {
+                if self.host_key_registry.cancel(decision_id) {
+                    Ok(CommandOutcome::None)
+                } else {
+                    Err(CoreError::NotFound(format!(
+                        "Host key decision {decision_id} is no longer pending"
+                    )))
+                }
+            }
             AppCommand::DecideHostKey {
                 decision_id,
                 accept,
@@ -535,12 +545,32 @@ impl CommandDispatcher {
                             "Host key decision {decision_id} is no longer pending"
                         ))
                     })?;
+                let claimed = if accept && permanent {
+                    HostKeyDecisionState::DecidedTrustAlways
+                } else if accept {
+                    HostKeyDecisionState::DecidedTrustOnce
+                } else {
+                    HostKeyDecisionState::DecidedReject
+                };
+                if self.host_key_registry.claim(decision_id, claimed).is_none() {
+                    return Err(CoreError::NotFound(format!(
+                        "Host key decision {decision_id} is no longer pending"
+                    )));
+                }
+                let decision = HostKeyDecision {
+                    fingerprint: request.fingerprint.clone(),
+                    key_blob: request.public_key_blob.clone(),
+                    accept,
+                    permanent,
+                };
                 if accept && permanent {
                     let mut parts = request.public_key_blob.split_whitespace();
                     let key_type = parts.next().ok_or_else(|| {
+                        self.host_key_registry.release_claim(decision_id, claimed);
                         CoreError::InvalidState("Host key type is missing".into())
                     })?;
                     let key_blob = parts.next().ok_or_else(|| {
+                        self.host_key_registry.release_claim(decision_id, claimed);
                         CoreError::InvalidState("Host key blob is missing".into())
                     })?;
                     if let Err(error) = self
@@ -548,25 +578,14 @@ impl CommandDispatcher {
                         .trust_host_key(&request.host, request.port, key_type, key_blob)
                         .await
                     {
-                        self.host_key_registry.resolve(
-                            decision_id,
-                            HostKeyDecision {
-                                fingerprint: request.fingerprint.clone(),
-                                key_blob: request.public_key_blob.clone(),
-                                accept: false,
-                                permanent: false,
-                            },
-                        );
-                        return Err(error);
+                        self.host_key_registry.release_claim(decision_id, claimed);
+                        return Err(CoreError::HostKeyTrustPersistenceFailed(error.to_string()));
                     }
                 }
-                let decision = HostKeyDecision {
-                    fingerprint: request.fingerprint,
-                    key_blob: request.public_key_blob,
-                    accept,
-                    permanent,
-                };
-                if !self.host_key_registry.resolve(decision_id, decision) {
+                if !self
+                    .host_key_registry
+                    .settle_claimed(decision_id, claimed, decision)
+                {
                     return Err(CoreError::NotFound(format!(
                         "Host key decision {decision_id} is no longer pending"
                     )));
@@ -826,6 +845,7 @@ impl CommandDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rshell_protocol::ssh::HostKeyDecisionSink;
 
     /// 构造一个不触碰真实用户目录的最小 dispatcher(无持久化仓库)。
     fn make_dispatcher(dir: &std::path::Path) -> CommandDispatcher {
@@ -968,5 +988,53 @@ mod tests {
             .unwrap();
         let on_disk = std::fs::read_to_string(&known_hosts).unwrap();
         assert!(on_disk.contains("[perm.test]:2203 ssh-ed25519 AAAAperm"));
+    }
+
+    #[tokio::test]
+    async fn permanent_trust_failure_keeps_handshake_pending_for_session_scoped_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let known_hosts = dir.path().join("known_hosts");
+        let tmp = dir.path().join("known_hosts.tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+        let registry = dispatcher.host_key_registry.clone();
+        let (decision_id, receiver) = registry.register();
+        registry.publish_request(rshell_protocol::ssh::HostKeyDecisionRequest {
+            decision_id,
+            host: "fallback.test".into(),
+            port: 22,
+            key_type: "ssh-ed25519".into(),
+            fingerprint: "SHA256:fallback".into(),
+            expected: String::new(),
+            public_key_blob: "ssh-ed25519 AAAAfallback".into(),
+        });
+
+        let failure = dispatcher
+            .dispatch(AppCommand::DecideHostKey {
+                decision_id,
+                accept: true,
+                permanent: true,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            CoreError::HostKeyTrustPersistenceFailed(_)
+        ));
+        assert_eq!(
+            registry.state(decision_id),
+            Some(HostKeyDecisionState::Pending)
+        );
+
+        dispatcher
+            .dispatch(AppCommand::DecideHostKey {
+                decision_id,
+                accept: true,
+                permanent: false,
+            })
+            .await
+            .unwrap();
+        assert!(receiver.await.unwrap().accept);
+        assert!(!known_hosts.exists());
     }
 }

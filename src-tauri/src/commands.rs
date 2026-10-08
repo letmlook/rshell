@@ -286,6 +286,19 @@ pub async fn decide_host_key(
     Ok(())
 }
 
+#[tauri::command(rename_all = "snake_case")]
+pub async fn cancel_host_key(
+    decision_id: Uuid,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::CancelHostKey { decision_id })
+        .await
+        .map_err(IpcError::from)?;
+    Ok(())
+}
+
 // ===== 切片 5: SFTP 传输薄壳 =====
 // 写命令:返回 ()（slice 5.1 切片 5.3 验证取消/暂停链路）
 #[tauri::command(rename_all = "snake_case")]
@@ -937,6 +950,7 @@ mod tests {
             stringify!(resize_terminal),
             stringify!(attach_terminal),
             stringify!(decide_host_key),
+            stringify!(cancel_host_key),
             stringify!(list_keys),
             stringify!(list_themes),
             stringify!(verify_master_password),

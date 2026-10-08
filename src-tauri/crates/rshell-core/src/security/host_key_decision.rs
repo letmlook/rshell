@@ -1,49 +1,39 @@
-//! 主机密钥决策注册表
+//! Keyed host-key decision registry.
 //!
-//! SSH 握手期间 `SshHandler::check_server_key` 是**同步 trait 方法**,不能直接
-//! `.await`。但 UI 端需要异步响应。为了把"同步检查"翻译成"异步等待决策",
-//! 引入一个 registry:
-//!
-//! 1. `connect_ssh` 注入一个 `Arc<HostKeyDecisionRegistry>`
-//! 2. 未知 host key 时分配 `decision_id`、建 `oneshot::channel`、sender 存进
-//!    registry,然后 `event_bus.publish(HostKeyMismatch { decision_id, ... })`
-//! 3. `Handle::current().block_on(rx)` 同步阻塞直到 UI 端 `AppCommand::DecideHostKey`
-//!    通过 `CommandDispatcher` 取出 sender 并 `send(HostKeyDecision)` 唤醒
-//! 4. `DecideHostKey` 找不到 decision_id 时(超时/竞态),返回 reject
+//! Each SSH handshake gets an independent UUID and a single terminal state.
+//! A decision for one id can never resolve, cancel, or dismiss another id.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use rshell_api::events::HostKeyDecisionState;
 use rshell_api::AppEvent;
 use rshell_protocol::ssh::{HostKeyDecision, HostKeyDecisionRequest, HostKeyDecisionSink};
 
 use crate::event_bus::EventBus;
 
-/// 主机密钥决策注册表
+/// Registry of host-key handshakes waiting for a human decision.
 #[derive(Clone)]
 pub struct HostKeyDecisionRegistry {
     inner: Arc<Mutex<HashMap<Uuid, oneshot::Sender<HostKeyDecision>>>>,
     requests: Arc<Mutex<HashMap<Uuid, HostKeyDecisionRequest>>>,
-    /// 事件总线（用于在 `publish_request` 时投递 `HostKeyMismatch` 给 UI 端）
+    states: Arc<Mutex<HashMap<Uuid, HostKeyDecisionState>>>,
     event_bus: Arc<EventBus>,
 }
 
 impl HostKeyDecisionRegistry {
-    /// 创建带事件总线的 registry
     pub fn new(event_bus: Arc<EventBus>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             requests: Arc::new(Mutex::new(HashMap::new())),
+            states: Arc::new(Mutex::new(HashMap::new())),
             event_bus,
         }
     }
 
-    /// 注册一个新的待决策项,返回 (decision_id, receiver)
-    ///
-    /// 调用方应在随后 publish `HostKeyMismatch { decision_id, ... }` 事件,
-    /// 然后 `block_on(receiver)` 等待 UI 响应。
+    /// Register a new pending decision and return its one-shot receiver.
     pub fn register(&self) -> (Uuid, oneshot::Receiver<HostKeyDecision>) {
         let (tx, rx) = oneshot::channel();
         let id = Uuid::new_v4();
@@ -51,29 +41,11 @@ impl HostKeyDecisionRegistry {
             .lock()
             .expect("HostKeyDecisionRegistry mutex poisoned")
             .insert(id, tx);
-        (id, rx)
-    }
-
-    /// 提交决策（取出发送者并 send）
-    ///
-    /// 找不到 decision_id（UI 端超时/竞态/双重决策）时返回 false,调用方
-    /// 应当视为 reject。
-    pub fn resolve(&self, decision_id: Uuid, decision: HostKeyDecision) -> bool {
-        self.requests
+        self.states
             .lock()
             .expect("HostKeyDecisionRegistry mutex poisoned")
-            .remove(&decision_id);
-        let mut map = self
-            .inner
-            .lock()
-            .expect("HostKeyDecisionRegistry mutex poisoned");
-        if let Some(tx) = map.remove(&decision_id) {
-            // send 失败说明接收方已 drop(SshHandler 提前返回),忽略
-            let _ = tx.send(decision);
-            true
-        } else {
-            false
-        }
+            .insert(id, HostKeyDecisionState::Pending);
+        (id, rx)
     }
 
     pub fn request_info(&self, decision_id: Uuid) -> Option<HostKeyDecisionRequest> {
@@ -84,28 +56,199 @@ impl HostKeyDecisionRegistry {
             .cloned()
     }
 
-    pub fn cancel(&self, decision_id: Uuid) {
-        self.inner
+    pub fn state(&self, decision_id: Uuid) -> Option<HostKeyDecisionState> {
+        self.states
             .lock()
             .expect("HostKeyDecisionRegistry mutex poisoned")
-            .remove(&decision_id);
+            .get(&decision_id)
+            .copied()
+    }
+
+    /// Atomically claim a pending decision for a persistence operation.
+    ///
+    /// Trust-always uses `DecidedTrustAlways` as a claim state while the
+    /// trusted-store write is in flight. A failed write can release it back
+    /// to `Pending`; no handshake one-shot is sent until persistence succeeds.
+    pub fn claim(
+        &self,
+        decision_id: Uuid,
+        state: HostKeyDecisionState,
+    ) -> Option<HostKeyDecisionRequest> {
+        let request = self.request_info(decision_id);
+        let mut states = self
+            .states
+            .lock()
+            .expect("HostKeyDecisionRegistry mutex poisoned");
+        if states.get(&decision_id).copied() != Some(HostKeyDecisionState::Pending) {
+            return None;
+        }
+        states.insert(decision_id, state);
+        request
+    }
+
+    /// Release a failed persistence claim without consuming the handshake.
+    pub fn release_claim(&self, decision_id: Uuid, claimed: HostKeyDecisionState) -> bool {
+        let mut states = self
+            .states
+            .lock()
+            .expect("HostKeyDecisionRegistry mutex poisoned");
+        if states.get(&decision_id).copied() != Some(claimed) {
+            return false;
+        }
+        states.insert(decision_id, HostKeyDecisionState::Pending);
+        true
+    }
+
+    /// Settle a claimed decision and wake exactly its SSH handshake.
+    pub fn settle_claimed(
+        &self,
+        decision_id: Uuid,
+        claimed: HostKeyDecisionState,
+        decision: HostKeyDecision,
+    ) -> bool {
+        let terminal = match claimed {
+            HostKeyDecisionState::DecidedTrustOnce => HostKeyDecisionState::DecidedTrustOnce,
+            HostKeyDecisionState::DecidedTrustAlways => HostKeyDecisionState::DecidedTrustAlways,
+            HostKeyDecisionState::DecidedReject => HostKeyDecisionState::DecidedReject,
+            _ => return false,
+        };
+        let sender = {
+            if !self
+                .inner
+                .lock()
+                .expect("HostKeyDecisionRegistry mutex poisoned")
+                .contains_key(&decision_id)
+            {
+                return false;
+            }
+            let mut states = self
+                .states
+                .lock()
+                .expect("HostKeyDecisionRegistry mutex poisoned");
+            if states.get(&decision_id).copied() != Some(claimed) {
+                return false;
+            }
+            states.insert(decision_id, terminal);
+            self.inner
+                .lock()
+                .expect("HostKeyDecisionRegistry mutex poisoned")
+                .remove(&decision_id)
+        };
         self.requests
             .lock()
             .expect("HostKeyDecisionRegistry mutex poisoned")
             .remove(&decision_id);
+        if let Some(sender) = sender {
+            let _ = sender.send(decision);
+        }
+        self.publish_state(decision_id, terminal);
+        true
+    }
+
+    /// Resolve a pending decision. Kept as the simple public seam used by
+    /// non-persistent callers and tests.
+    pub fn resolve(&self, decision_id: Uuid, decision: HostKeyDecision) -> bool {
+        let claimed = if decision.accept && decision.permanent {
+            HostKeyDecisionState::DecidedTrustAlways
+        } else if decision.accept {
+            HostKeyDecisionState::DecidedTrustOnce
+        } else {
+            HostKeyDecisionState::DecidedReject
+        };
+        let _ = self.claim(decision_id, claimed);
+        self.settle_claimed(
+            decision_id,
+            claimed,
+            HostKeyDecision {
+                fingerprint: decision.fingerprint,
+                key_blob: decision.key_blob,
+                accept: decision.accept,
+                permanent: decision.permanent,
+            },
+        )
+    }
+
+    /// Cancel one decision without accepting its handshake.
+    pub fn cancel(&self, decision_id: Uuid) -> bool {
+        self.close(decision_id, HostKeyDecisionState::Cancelled)
+    }
+
+    /// Mark one decision stale because its bounded wait expired.
+    pub fn expire(&self, decision_id: Uuid) -> bool {
+        self.close(decision_id, HostKeyDecisionState::Expired)
+    }
+
+    fn close(&self, decision_id: Uuid, state: HostKeyDecisionState) -> bool {
+        let sender = {
+            if !self
+                .inner
+                .lock()
+                .expect("HostKeyDecisionRegistry mutex poisoned")
+                .contains_key(&decision_id)
+            {
+                return false;
+            }
+            let mut states = self
+                .states
+                .lock()
+                .expect("HostKeyDecisionRegistry mutex poisoned");
+            let current = states.get(&decision_id).copied();
+            if !matches!(
+                current,
+                Some(HostKeyDecisionState::Pending)
+                    | Some(HostKeyDecisionState::DecidedTrustOnce)
+                    | Some(HostKeyDecisionState::DecidedTrustAlways)
+                    | Some(HostKeyDecisionState::DecidedReject)
+            ) {
+                return false;
+            }
+            states.insert(decision_id, state);
+            self.inner
+                .lock()
+                .expect("HostKeyDecisionRegistry mutex poisoned")
+                .remove(&decision_id)
+        };
+        self.requests
+            .lock()
+            .expect("HostKeyDecisionRegistry mutex poisoned")
+            .remove(&decision_id);
+        // Dropping the sender cancels the waiting protocol future; sending a
+        // synthetic reject would make cancellation look like a user decision.
+        drop(sender);
+        self.publish_state(decision_id, state);
+        true
+    }
+
+    fn publish_state(&self, decision_id: Uuid, state: HostKeyDecisionState) {
+        self.event_bus
+            .publish(AppEvent::HostKeyDecisionStateChanged { decision_id, state });
     }
 }
 
 impl HostKeyDecisionSink for HostKeyDecisionRegistry {
     fn register_decision(&self) -> (Uuid, oneshot::Receiver<HostKeyDecision>) {
-        HostKeyDecisionRegistry::register(self)
+        self.register()
     }
 
     fn publish_request(&self, info: HostKeyDecisionRequest) {
-        self.requests
-            .lock()
-            .expect("HostKeyDecisionRegistry mutex poisoned")
-            .insert(info.decision_id, info.clone());
+        let accepted = {
+            let states = self
+                .states
+                .lock()
+                .expect("HostKeyDecisionRegistry mutex poisoned");
+            if states.get(&info.decision_id).copied() != Some(HostKeyDecisionState::Pending) {
+                false
+            } else {
+                self.requests
+                    .lock()
+                    .expect("HostKeyDecisionRegistry mutex poisoned")
+                    .insert(info.decision_id, info.clone());
+                true
+            }
+        };
+        if !accepted {
+            return;
+        }
         self.event_bus.publish(AppEvent::HostKeyMismatch {
             decision_id: info.decision_id,
             host: info.host,
@@ -118,7 +261,11 @@ impl HostKeyDecisionSink for HostKeyDecisionRegistry {
     }
 
     fn cancel_decision(&self, decision_id: Uuid) {
-        self.cancel(decision_id);
+        let _ = self.cancel(decision_id);
+    }
+
+    fn expire_decision(&self, decision_id: Uuid) {
+        let _ = self.expire(decision_id);
     }
 }
 
@@ -150,6 +297,107 @@ mod tests {
         assert_eq!(got.fingerprint, "fp");
     }
 
+    #[tokio::test]
+    async fn concurrent_decisions_are_keyed_and_one_resolution_cannot_clear_the_other() {
+        let bus = Arc::new(EventBus::new());
+        let reg = HostKeyDecisionRegistry::new(bus.clone());
+        let events = Arc::new(std::sync::Mutex::new(Vec::<AppEvent>::new()));
+        let sink = events.clone();
+        bus.subscribe(move |event| sink.lock().unwrap().push(event.clone()));
+
+        let (first_id, first_rx) = reg.register();
+        let (second_id, second_rx) = reg.register();
+        assert_ne!(first_id, second_id);
+        reg.publish_request(HostKeyDecisionRequest {
+            decision_id: first_id,
+            host: "first.test".into(),
+            port: 22,
+            key_type: "ssh-ed25519".into(),
+            fingerprint: "SHA256:first".into(),
+            expected: String::new(),
+            public_key_blob: "ssh-ed25519 AAAAfirst".into(),
+        });
+        reg.publish_request(HostKeyDecisionRequest {
+            decision_id: second_id,
+            host: "second.test".into(),
+            port: 22,
+            key_type: "ssh-ed25519".into(),
+            fingerprint: "SHA256:second".into(),
+            expected: String::new(),
+            public_key_blob: "ssh-ed25519 AAAAsecond".into(),
+        });
+
+        assert!(reg.resolve(
+            first_id,
+            HostKeyDecision {
+                fingerprint: "SHA256:first".into(),
+                key_blob: "ssh-ed25519 AAAAfirst".into(),
+                accept: true,
+                permanent: false,
+            },
+        ));
+        assert!(reg.request_info(second_id).is_some());
+        assert!(reg.resolve(
+            second_id,
+            HostKeyDecision {
+                fingerprint: "SHA256:second".into(),
+                key_blob: "ssh-ed25519 AAAAsecond".into(),
+                accept: false,
+                permanent: false,
+            },
+        ));
+        assert!(first_rx.await.unwrap().accept);
+        assert!(!second_rx.await.unwrap().accept);
+        let states: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::HostKeyDecisionStateChanged { decision_id, state } => {
+                    Some((*decision_id, *state))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(states.contains(&(first_id, HostKeyDecisionState::DecidedTrustOnce)));
+        assert!(states.contains(&(second_id, HostKeyDecisionState::DecidedReject)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_expiry_close_only_their_decision_and_drop_late_events() {
+        let bus = Arc::new(EventBus::new());
+        let reg = HostKeyDecisionRegistry::new(bus.clone());
+        let (cancelled_id, cancelled_rx) = reg.register();
+        let (expired_id, expired_rx) = reg.register();
+        reg.cancel(cancelled_id);
+        assert!(cancelled_rx.await.is_err());
+        assert!(!reg.resolve(
+            cancelled_id,
+            HostKeyDecision {
+                fingerprint: "SHA256:cancelled".into(),
+                key_blob: "blob".into(),
+                accept: true,
+                permanent: false,
+            },
+        ));
+        assert!(reg.expire(expired_id));
+        assert!(expired_rx.await.is_err());
+        assert!(!reg.expire(expired_id));
+        let (next_id, next_rx) = reg.register();
+        reg.publish_request(HostKeyDecisionRequest {
+            decision_id: next_id,
+            host: "next.test".into(),
+            port: 22,
+            key_type: "ssh-ed25519".into(),
+            fingerprint: "SHA256:next".into(),
+            expected: String::new(),
+            public_key_blob: "ssh-ed25519 AAAAnext".into(),
+        });
+        assert!(reg.request_info(next_id).is_some());
+        assert!(reg.cancel(next_id));
+        assert!(next_rx.await.is_err());
+    }
+
     #[test]
     fn resolve_unknown_id_returns_false() {
         let reg = HostKeyDecisionRegistry::new(Arc::new(EventBus::new()));
@@ -177,7 +425,6 @@ mod tests {
                 permanent: false,
             }
         ));
-        // 第二次 resolve 同一 id 应返回 false
         assert!(!reg.resolve(
             id,
             HostKeyDecision {
@@ -200,7 +447,7 @@ mod tests {
                 *g.lock().unwrap() = Some(event.clone());
             }
         });
-        let id = Uuid::new_v4();
+        let (id, _rx) = reg.register();
         reg.publish_request(HostKeyDecisionRequest {
             decision_id: id,
             host: "example.com".to_string(),

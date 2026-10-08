@@ -18,6 +18,11 @@ pub enum IpcErrorKind {
     NotFound,
     AuthFailed,
     HostKeyMismatch,
+    CredentialMissing,
+    CredentialInaccessible,
+    CredentialSaveFailed,
+    CredentialMigrationFailed,
+    HostKeyTrustPersistenceFailed,
     Connection,
     Io,
     Permission,
@@ -35,6 +40,11 @@ impl IpcErrorKind {
             Self::NotFound => "not_found",
             Self::AuthFailed => "auth_failed",
             Self::HostKeyMismatch => "host_key_mismatch",
+            Self::CredentialMissing => "credential_missing",
+            Self::CredentialInaccessible => "credential_inaccessible",
+            Self::CredentialSaveFailed => "credential_save_failed",
+            Self::CredentialMigrationFailed => "credential_migration_failed",
+            Self::HostKeyTrustPersistenceFailed => "host_key_trust_persistence_failed",
             Self::Connection => "connection",
             Self::Io => "io",
             Self::Permission => "permission",
@@ -93,6 +103,20 @@ impl From<CoreError> for IpcError {
                 (IpcErrorKind::TerminalRecoveryRequired, err.to_string())
             }
             CoreError::ConnectionError(_) => (IpcErrorKind::Connection, err.to_string()),
+            CoreError::CredentialMissing(_) => (IpcErrorKind::CredentialMissing, err.to_string()),
+            CoreError::CredentialInaccessible(_) => {
+                (IpcErrorKind::CredentialInaccessible, err.to_string())
+            }
+            CoreError::CredentialSaveFailed(_) => {
+                (IpcErrorKind::CredentialSaveFailed, err.to_string())
+            }
+            CoreError::CredentialMigrationFailed(_) => {
+                (IpcErrorKind::CredentialMigrationFailed, err.to_string())
+            }
+            CoreError::HostKeyMismatch(_) => (IpcErrorKind::HostKeyMismatch, err.to_string()),
+            CoreError::HostKeyTrustPersistenceFailed(_) => {
+                (IpcErrorKind::HostKeyTrustPersistenceFailed, err.to_string())
+            }
             CoreError::StorageError(_) => (IpcErrorKind::Storage, err.to_string()),
             CoreError::TargetExists(_) => (IpcErrorKind::TargetExists, err.to_string()),
             CoreError::InvalidState(_) => (IpcErrorKind::Internal, err.to_string()),
@@ -139,6 +163,26 @@ mod tests {
         assert_eq!(IpcErrorKind::NotFound.as_str(), "not_found");
         assert_eq!(IpcErrorKind::AuthFailed.as_str(), "auth_failed");
         assert_eq!(IpcErrorKind::HostKeyMismatch.as_str(), "host_key_mismatch");
+        assert_eq!(
+            IpcErrorKind::CredentialMissing.as_str(),
+            "credential_missing"
+        );
+        assert_eq!(
+            IpcErrorKind::CredentialInaccessible.as_str(),
+            "credential_inaccessible"
+        );
+        assert_eq!(
+            IpcErrorKind::CredentialSaveFailed.as_str(),
+            "credential_save_failed"
+        );
+        assert_eq!(
+            IpcErrorKind::CredentialMigrationFailed.as_str(),
+            "credential_migration_failed"
+        );
+        assert_eq!(
+            IpcErrorKind::HostKeyTrustPersistenceFailed.as_str(),
+            "host_key_trust_persistence_failed"
+        );
         assert_eq!(IpcErrorKind::Connection.as_str(), "connection");
         assert_eq!(IpcErrorKind::Io.as_str(), "io");
         assert_eq!(IpcErrorKind::Permission.as_str(), "permission");
@@ -160,6 +204,12 @@ mod tests {
             CoreError::AuthenticationFailed("x".into()),
             CoreError::TerminalRecoveryRequired,
             CoreError::ConnectionError("x".into()),
+            CoreError::CredentialMissing("x".into()),
+            CoreError::CredentialInaccessible("x".into()),
+            CoreError::CredentialSaveFailed("x".into()),
+            CoreError::CredentialMigrationFailed("x".into()),
+            CoreError::HostKeyMismatch("x".into()),
+            CoreError::HostKeyTrustPersistenceFailed("x".into()),
             CoreError::StorageError("x".into()),
             CoreError::TargetExists("x".into()),
             CoreError::InvalidState("x".into()),
@@ -182,6 +232,12 @@ mod tests {
                     "auth_failed",
                     "terminal_recovery_required",
                     "connection",
+                    "credential_missing",
+                    "credential_inaccessible",
+                    "credential_save_failed",
+                    "credential_migration_failed",
+                    "host_key_mismatch",
+                    "host_key_trust_persistence_failed",
                     "storage",
                     "target_exists",
                     "internal",

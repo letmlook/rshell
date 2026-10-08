@@ -19,6 +19,36 @@ export type Uuid = string;
 export type PathBuf = string;
 export type Timestamp = string; // ISO 8601 字符串
 
+/** Stable machine-readable errors emitted by src-tauri/src/error.rs. */
+export type IpcErrorKind =
+  | "not_found"
+  | "auth_failed"
+  | "host_key_mismatch"
+  | "credential_missing"
+  | "credential_inaccessible"
+  | "credential_save_failed"
+  | "credential_migration_failed"
+  | "host_key_trust_persistence_failed"
+  | "connection"
+  | "io"
+  | "permission"
+  | "outcome_mismatch"
+  | "internal"
+  | "storage"
+  | "target_exists"
+  | "terminal_recovery_required";
+
+/** Recovery-facing subset of IpcErrorKind used by the session list. */
+export type CoreErrorKind =
+  | "credential_missing"
+  | "credential_inaccessible"
+  | "credential_save_failed"
+  | "credential_migration_failed"
+  | "auth_failed"
+  | "connection"
+  | "host_key_mismatch"
+  | "host_key_trust_persistence_failed";
+
 /**
  * 传输目标已存在时的处理策略，与后端 `ConflictPolicy` 对应。
  *
@@ -79,8 +109,19 @@ export interface SessionInfo {
 
 export interface SessionLoadIssue {
   session_id: Uuid | null;
+  kind: "CredentialMigrationFailed" | "StorageUnavailable";
   message: string;
+  retryable: boolean;
 }
+
+export type HostKeyDecisionState =
+  | "pending"
+  | "decided_trust_once"
+  | "decided_trust_always"
+  | "decided_reject"
+  | "cancelled"
+  | "expired"
+  | "dismissed";
 
 // ===== 文件传输相关 =====
 
@@ -415,6 +456,7 @@ export type AppCommand =
       };
     }
   | { DecideHostKey: { decision_id: Uuid; accept: boolean; permanent: boolean } }
+  | { CancelHostKey: { decision_id: Uuid } }
   | { DeleteHostKey: { host: string; port: number } }
   // 隧道
   | { SuspendTunnel: { tunnel_id: Uuid } }
@@ -486,6 +528,12 @@ export type AppEvent =
         expected: string;
         received: string;
         public_key_blob: string;
+      };
+    }
+  | {
+      HostKeyDecisionStateChanged: {
+        decision_id: Uuid;
+        state: HostKeyDecisionState;
       };
     }
   // 效率工具

@@ -4525,6 +4525,7 @@ dependencies = [
  "rshell-infra",
  "rshell-plugin-sdk",
  "rshell-protocol",
+ "russh",
  "serde",
  "serde_json",
  "ssh-key",

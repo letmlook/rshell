@@ -2,6 +2,7 @@
 import { computed, ref } from "vue";
 import type { SessionConfig } from "../ipc/types";
 import { useSessionsStore } from "../stores/sessions";
+import { ipcErrorMessage } from "../ipc/client";
 
 const props = defineProps<{ session: SessionConfig }>();
 const emit = defineEmits<{ (e: "close"): void }>();
@@ -23,7 +24,7 @@ async function save() {
     await store.updateCredential(props.session.id, { secret: secret.value });
     close();
   } catch (e) {
-    error.value = String(e);
+    error.value = ipcErrorMessage(e);
   } finally {
     submitting.value = false;
   }

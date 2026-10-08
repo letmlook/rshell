@@ -2,10 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 
 const decideHostKey = vi.fn();
+const cancelHostKey = vi.fn();
 const handlers: Array<(event: unknown) => void> = [];
 
 vi.mock("../../src/ipc/client", () => ({
   decideHostKey: (...args: unknown[]) => decideHostKey(...args),
+  cancelHostKey: (...args: unknown[]) => cancelHostKey(...args),
 }));
 vi.mock("../../src/ipc/events", () => ({
   subscribeAppEvents: vi.fn(async (handler: (event: unknown) => void) => {
@@ -17,6 +19,10 @@ vi.mock("../../src/ipc/events", () => ({
 const { useHostKeyStore } = await import("../../src/stores/hostKey");
 
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
+
+function decisionState(decision_id: string, state: string) {
+  return { HostKeyDecisionStateChanged: { decision_id, state } };
+}
 
 function mismatch(decision_id: string) {
   return {
@@ -37,6 +43,7 @@ describe("hostKey store", () => {
     setActivePinia(createPinia());
     handlers.length = 0;
     decideHostKey.mockReset();
+    cancelHostKey.mockReset();
     const store = useHostKeyStore();
     await store.subscribeEvents();
   });
@@ -71,15 +78,44 @@ describe("hostKey store", () => {
     );
   });
 
-  it("clears the dialog only after a successful decision", async () => {
-    handlers.at(-1)!(mismatch("33333333-3333-3333-3333-333333333333"));
+  it("keeps concurrent requests in a map and cancelling one does not affect the other", async () => {
+    const first = "44444444-4444-4444-4444-444444444444";
+    const second = "55555555-5555-5555-5555-555555555555";
+    handlers.at(-1)!(mismatch(first));
+    handlers.at(-1)!(mismatch(second));
     const store = useHostKeyStore();
+    cancelHostKey.mockResolvedValueOnce(undefined);
+
+    expect(store.requests.size).toBe(2);
+    await store.cancel(first);
+    expect(cancelHostKey).toHaveBeenCalledWith(first);
+    expect(store.requests.has(first)).toBe(false);
+    expect(store.requests.has(second)).toBe(true);
+    expect(store.current?.decision_id).toBe(second);
+  });
+
+  it("drops state events for unknown or expired ids without clearing valid decisions", () => {
+    const valid = "66666666-6666-6666-6666-666666666666";
+    handlers.at(-1)!(mismatch(valid));
+    const store = useHostKeyStore();
+    handlers.at(-1)!(decisionState("77777777-7777-7777-7777-777777777777", "Expired"));
+    expect(store.requests.has(valid)).toBe(true);
+    handlers.at(-1)!(decisionState(valid, "Expired"));
+    expect(store.requests.has(valid)).toBe(false);
+    expect(store.requests.size).toBe(0);
+  });
+
+  it("keeps the request available after permanent trust persistence fails so trust-once remains possible", async () => {
+    const id = "88888888-8888-8888-8888-888888888888";
+    handlers.at(-1)!(mismatch(id));
+    const store = useHostKeyStore();
+    decideHostKey.mockRejectedValueOnce("known_hosts is read-only");
+    await store.trustPermanent();
+    expect(store.requests.has(id)).toBe(true);
+    expect(store.error).toContain("read-only");
     decideHostKey.mockResolvedValueOnce(undefined);
-
-    await store.reject();
-
-    expect(store.current).toBeNull();
-    expect(store.error).toBeNull();
-    expect(store.history).toHaveLength(1);
+    await store.trustOnce();
+    expect(decideHostKey).toHaveBeenLastCalledWith(id, true, false);
+    expect(store.requests.has(id)).toBe(false);
   });
 });

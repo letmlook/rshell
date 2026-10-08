@@ -13,6 +13,29 @@ pub enum CoreError {
     Internal(String),
     #[error("Connection error: {0}")]
     ConnectionError(String),
+    /// The metadata says a credential is required, but the secure store has
+    /// no entry. The UI can offer the existing credential editor.
+    #[error("Credential missing: {0}")]
+    CredentialMissing(String),
+    /// The secure store could not be accessed (for example Keychain/DPAPI/
+    /// Secret Service refused access). Never fall back to plaintext.
+    #[error("Credential storage inaccessible: {0}")]
+    CredentialInaccessible(String),
+    /// A credential write was refused. No connection may be started from the
+    /// failed save, and the editor must keep the user's input.
+    #[error("Credential save failed: {0}")]
+    CredentialSaveFailed(String),
+    /// A legacy plaintext credential migration could not be committed. The
+    /// original safe cause is retained so the explicit retry-load path can be
+    /// used after access is repaired.
+    #[error("Credential migration failed: {0}")]
+    CredentialMigrationFailed(String),
+    /// SSH host-key verification ended without an accepted, persisted decision.
+    #[error("Host key mismatch: {0}")]
+    HostKeyMismatch(String),
+    /// Permanent trust could not be persisted; the handshake remains rejected.
+    #[error("Host key trust persistence failed: {0}")]
+    HostKeyTrustPersistenceFailed(String),
     #[error(
         "Terminal recovery required: input outcome is uncertain; reconnect manually without replay"
     )]

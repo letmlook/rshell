@@ -18,6 +18,11 @@ use thiserror::Error;
 pub enum ProtocolError {
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
+    /// Host-key verification was rejected, cancelled, or expired. This is
+    /// distinct from a transport failure so the UI can offer host-key
+    /// recovery instead of a generic network retry.
+    #[error("Host key mismatch: {0}")]
+    HostKeyMismatch(String),
     #[error("Authentication failed: {0}")]
     AuthFailed(String),
     #[error("Connection closed")]

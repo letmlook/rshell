@@ -88,7 +88,7 @@ describe("session credential recovery", () => {
     expect(invoke.mock.calls.every(([command]) => ["list_sessions", "list_session_load_issues", "update_session"].includes(command))).toBe(true);
   });
 
-  it("keeps a failed credential save visible and clears the new input on dismissal", async () => {
+  it("keeps a failed credential save visible and preserves the entered value until dismissal", async () => {
     invoke.mockImplementation(async (command: string) => {
       if (command === "list_sessions") return [session];
       if (command === "list_session_load_issues") return [];
@@ -108,7 +108,9 @@ describe("session credential recovery", () => {
     button("保存凭据")!.click();
     await flushPromises();
     expect(document.body.textContent).toContain("credential store unavailable");
+    expect(document.body.querySelector<HTMLInputElement>('input[type="password"]')!.value).toBe("unsaved-secret");
     expect(JSON.stringify(store.items)).not.toContain("unsaved-secret");
+    const updateCallsBeforeCancel = invoke.mock.calls.filter(([command]) => command === "update_session").length;
     button("取消")!.click();
     await flushPromises();
     expect(document.body.querySelector('input[type="password"]')).toBeNull();
@@ -116,5 +118,6 @@ describe("session credential recovery", () => {
     button("更新凭据")!.click();
     await flushPromises();
     expect(document.body.querySelector<HTMLInputElement>('input[type="password"]')!.value).toBe("");
+    expect(invoke.mock.calls.filter(([command]) => command === "update_session")).toHaveLength(updateCallsBeforeCancel);
   });
 });

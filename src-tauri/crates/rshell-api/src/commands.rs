@@ -258,6 +258,12 @@ pub enum AppCommand {
         decision: TrustHostKeyDecision,
     },
 
+    /// Explicitly cancel one keyed host-key decision. This never accepts the
+    /// handshake and never changes any other pending decision.
+    CancelHostKey {
+        decision_id: Uuid,
+    },
+
     /// 实时决策某个 host key（握手期间通过 HostKeyMismatch 事件带过来的 decision_id）
     ///
     /// 这是**会话握手阶段**的决策通道；与 `TrustHostKey` 的区别:

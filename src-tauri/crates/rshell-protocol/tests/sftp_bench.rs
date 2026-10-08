@@ -53,6 +53,7 @@ impl rshell_protocol::ssh::client::HostKeyDecisionSink for AcceptHost {
     }
     fn publish_request(&self, _: rshell_protocol::ssh::client::HostKeyDecisionRequest) {}
     fn cancel_decision(&self, _: Uuid) {}
+    fn expire_decision(&self, _: Uuid) {}
 }
 
 fn env_or(key: &str, fallback: &str) -> String {

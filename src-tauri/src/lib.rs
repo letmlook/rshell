@@ -170,6 +170,7 @@ pub fn run() {
             commands::resize_terminal,
             commands::attach_terminal,
             commands::decide_host_key,
+            commands::cancel_host_key,
             commands::list_keys,
             commands::list_themes,
             commands::verify_master_password,

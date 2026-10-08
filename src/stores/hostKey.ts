@@ -1,14 +1,13 @@
 /**
- * hostKey pinia store —— 切片 4
+ * Keyed host-key decision store.
  *
- * 持有当前活跃的 HostKeyMismatch 请求 + 决策动作。
- * 后端经 `EventBus` → `app.emit("rshell://event")` 推 `HostKeyMismatch` 事件;
- * 本 store 监听后弹对话框,用户决策后调 `decideHostKey(decision_id, accept, permanent)`。
+ * A backend handshake is identified by decision_id. Requests are kept in a
+ * map so deciding/cancelling one cannot overwrite or dismiss another.
  */
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import { subscribeAppEvents } from "../ipc/events";
-import { decideHostKey } from "../ipc/client";
+import { cancelHostKey, decideHostKey } from "../ipc/client";
 
 export interface HostKeyRequest {
   decision_id: string;
@@ -20,75 +19,158 @@ export interface HostKeyRequest {
   public_key_blob: string;
 }
 
-/** 全零 decision_id：后端发出的不可决策告警 */
 const NIL_DECISION_ID = "00000000-0000-0000-0000-000000000000";
+const TERMINAL_STATES = new Set([
+  "cancelled",
+  "expired",
+  "dismissed",
+]);
 
 export const useHostKeyStore = defineStore("hostKey", () => {
+  const requests = ref<Map<string, HostKeyRequest>>(new Map());
+  // `current` is retained as the dialog's selected request for compatibility;
+  // all lifecycle mutations still dispatch by its explicit id.
   const current = ref<HostKeyRequest | null>(null);
-  const history = ref<HostKeyRequest[]>([]); // 已处理但留作审计
-  /** 最近一次决策提交失败的原因；非空时由对话框就地展示，对话框保持打开 */
+  const history = ref<HostKeyRequest[]>([]);
   const error = ref<string | null>(null);
+  const errorDecisionId = ref<string | null>(null);
+  const decisionErrors = ref<Map<string, string>>(new Map());
   let unlisten: (() => void) | null = null;
   let subscriptionGeneration = 0;
+
+  function syncCurrent() {
+    current.value = requests.value.values().next().value ?? null;
+  }
+
+  function removeRequest(id: string, recordHistory = true) {
+    const request = requests.value.get(id);
+    if (!request) return false;
+    requests.value.delete(id);
+    requests.value = new Map(requests.value);
+    if (recordHistory) history.value.push(request);
+    if (errorDecisionId.value === id) {
+      errorDecisionId.value = null;
+      error.value = null;
+    }
+    if (current.value?.decision_id === id) syncCurrent();
+    return true;
+  }
 
   async function subscribeEvents() {
     if (unlisten) return;
     const generation = ++subscriptionGeneration;
     const stop = await subscribeAppEvents((event) => {
-      if (typeof event === "string" || !("HostKeyMismatch" in event)) return;
-      const request = event.HostKeyMismatch;
-      // nil decision_id 表示「已知密钥指纹变化」的单向告警，没有可回写的
-      // 决策通道，弹决策框只会让按钮全部失败 —— 这里显式忽略。
-      if (request.decision_id === NIL_DECISION_ID) return;
-      error.value = null;
-      current.value = request;
+      if (typeof event === "string") return;
+      if ("HostKeyMismatch" in event) {
+        const request = event.HostKeyMismatch;
+        if (request.decision_id === NIL_DECISION_ID) return;
+        // Duplicate/late events for an id already decided are ignored.
+        if (requests.value.has(request.decision_id)) return;
+        requests.value.set(request.decision_id, request);
+        requests.value = new Map(requests.value);
+        decisionErrors.value.delete(request.decision_id);
+        decisionErrors.value = new Map(decisionErrors.value);
+        error.value = null;
+        errorDecisionId.value = null;
+        syncCurrent();
+        return;
+      }
+      if ("HostKeyDecisionStateChanged" in event) {
+        const { decision_id, state } = event.HostKeyDecisionStateChanged;
+        // Unknown/stale ids are deliberately harmless and cannot clear a
+        // different valid request.
+        if (!requests.value.has(decision_id)) return;
+        if (TERMINAL_STATES.has(state.toLowerCase())) removeRequest(decision_id);
+      }
     });
     if (generation === subscriptionGeneration) unlisten = stop;
     else stop();
   }
 
-  function disposeEvents() { subscriptionGeneration++; unlisten?.(); unlisten = null; }
+  function disposeEvents() {
+    subscriptionGeneration++;
+    unlisten?.();
+    unlisten = null;
+  }
 
-  /** 提交决策；成功才收起对话框，失败保留对话框并记录错误供界面展示。 */
+  function setError(id: string, value: unknown) {
+    const message = value instanceof Error ? value.message : String(value);
+    error.value = message;
+    errorDecisionId.value = id;
+    decisionErrors.value.set(id, message);
+    decisionErrors.value = new Map(decisionErrors.value);
+  }
+
+  /** Submit an explicit decision; successful settlement removes only this id. */
   async function submit(decision_id: string, accept: boolean, permanent: boolean) {
     error.value = null;
+    errorDecisionId.value = null;
+    decisionErrors.value.delete(decision_id);
+    decisionErrors.value = new Map(decisionErrors.value);
     try {
       await decideHostKey(decision_id, accept, permanent);
     } catch (e) {
-      error.value = String(e);
-      return;
+      setError(decision_id, e);
+      return false;
     }
-    const req = current.value;
-    if (req) history.value.push(req);
-    current.value = null;
+    if (!removeRequest(decision_id)) {
+      // This also supports the legacy dialog test seam where `current` was
+      // assigned directly rather than through a mismatch event.
+      if (current.value?.decision_id === decision_id) current.value = null;
+    }
+    if (!current.value) error.value = null;
+    return true;
   }
 
-  async function trustOnce() {
-    if (current.value) await submit(current.value.decision_id, true, false);
+  async function trustOnce(id = current.value?.decision_id) {
+    if (id) return submit(id, true, false);
+    return false;
   }
 
-  async function trustPermanent() {
-    if (current.value) await submit(current.value.decision_id, true, true);
+  async function trustPermanent(id = current.value?.decision_id) {
+    if (id) return submit(id, true, true);
+    return false;
   }
 
-  async function reject() {
-    if (current.value) await submit(current.value.decision_id, false, false);
+  async function reject(id = current.value?.decision_id) {
+    if (id) return submit(id, false, false);
+    return false;
   }
 
-  function dismiss() {
-    current.value = null;
+  /** Explicit cancellation never submits an accepting decision. */
+  async function cancel(id = current.value?.decision_id) {
+    if (!id) return false;
     error.value = null;
+    errorDecisionId.value = null;
+    try {
+      await cancelHostKey(id);
+    } catch (e) {
+      setError(id, e);
+      return false;
+    }
+    removeRequest(id);
+    if (!current.value) error.value = null;
+    return true;
+  }
+
+  /** Dismiss a stale dialog locally; cancellation is explicit and keyed. */
+  async function dismiss(id = current.value?.decision_id) {
+    return cancel(id);
   }
 
   return {
+    requests,
     current,
     history,
     error,
+    decisionErrors,
     subscribeEvents,
     disposeEvents,
+    submit,
     trustOnce,
     trustPermanent,
     reject,
+    cancel,
     dismiss,
   };
 });

@@ -11,6 +11,19 @@ use crate::types::{
     TunnelState,
 };
 
+/// Stable lifecycle states for a single host-key decision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKeyDecisionState {
+    Pending,
+    DecidedTrustOnce,
+    DecidedTrustAlways,
+    DecidedReject,
+    Cancelled,
+    Expired,
+    Dismissed,
+}
+
 /// 后端发布的所有事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AppEvent {
@@ -75,6 +88,12 @@ pub enum AppEvent {
         received: String,
         /// ssh-keygen 风格的 base64 编码公钥 blob,用于用户交叉校验
         public_key_blob: String,
+    },
+    /// One terminal transition for one keyed host-key decision. The frontend
+    /// removes only this id; an event for an unknown/stale id is harmless.
+    HostKeyDecisionStateChanged {
+        decision_id: Uuid,
+        state: HostKeyDecisionState,
     },
     // ===== 效率工具 =====
     /// 快速命令列表变化

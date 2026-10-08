@@ -1,59 +1,75 @@
 <script setup lang="ts">
-/**
- * HostKeyMismatchDialog —— 切片 4
- *
- * 设计 §4.3 流程 B：握手期间弹窗显示指纹对比 + 三按钮（信任一次/永久/拒绝）。
- * 用户决策后通过 `decide_host_key` 唤醒阻塞的 SshHandler oneshot。
- */
 import { computed } from "vue";
-import { useHostKeyStore } from "../stores/hostKey";
+import { useHostKeyStore, type HostKeyRequest } from "../stores/hostKey";
 
 const store = useHostKeyStore();
-const visible = computed(() => store.current !== null);
+const visibleRequests = computed<HostKeyRequest[]>(() => {
+  const values = [...store.requests.values()];
+  if (store.current && !values.some((request) => request.decision_id === store.current?.decision_id)) {
+    values.unshift(store.current);
+  }
+  return values;
+});
+const visible = computed(() => visibleRequests.value.length > 0);
+const errorFor = (request: HostKeyRequest) =>
+  store.decisionErrors.get(request.decision_id) ?? store.error;
 </script>
 
 <template>
   <el-dialog
     :model-value="visible"
-    :title="store.current?.expected ? '警告：主机密钥已改变' : '确认新主机密钥'"
+    :title="visibleRequests.some((request) => request.expected) ? '警告：主机密钥已改变' : '确认新主机密钥'"
     width="520px"
     :show-close="false"
     :close-on-click-modal="false"
     :close-on-press-escape="false"
   >
-    <template v-if="store.current">
-      <p>
-        <strong>{{ store.current.host }}:{{ store.current.port }}</strong>
-        的 SSH 服务器{{ store.current.expected ? '密钥与已保存记录不一致' : '密钥尚未保存' }}。
-      </p>
-      <dl class="key-info">
-        <dt>算法</dt>
-        <dd>{{ store.current.key_type }}</dd>
-        <dt>收到的指纹 (SHA256)</dt>
-        <dd class="mono">{{ store.current.received }}</dd>
-        <template v-if="store.current.expected">
-          <dt>原有指纹 (SHA256)</dt>
-          <dd class="mono">{{ store.current.expected }}</dd>
-        </template>
-        <dt>公钥 blob</dt>
-        <dd class="mono small">{{ store.current.public_key_blob }}</dd>
-      </dl>
-      <p class="warning">
-        ⚠️ 连接前请确认以上指纹与服务器管理员公布的一致。指纹不一致可能意味着中间人攻击。
-      </p>
-      <p v-if="store.error" class="decision-error" role="alert">
-        决策提交失败：{{ store.error }}。连接会在超时后被拒绝，请重试或检查后端状态。
-      </p>
-    </template>
-    <template #footer>
-      <el-button @click="store.reject()">拒绝</el-button>
-      <el-button type="primary" plain @click="store.trustOnce()">信任一次</el-button>
-      <el-button type="primary" @click="store.trustPermanent()">永久信任</el-button>
+    <template v-for="request in visibleRequests" :key="request.decision_id">
+      <section class="host-key-request" :data-decision-id="request.decision_id">
+        <p>
+          <strong>{{ request.host }}:{{ request.port }}</strong>
+          的 SSH 服务器{{ request.expected ? '密钥与已保存记录不一致' : '密钥尚未保存' }}。
+        </p>
+        <dl class="key-info">
+          <dt>算法</dt>
+          <dd>{{ request.key_type }}</dd>
+          <dt>收到的指纹 (SHA256)</dt>
+          <dd class="mono">{{ request.received }}</dd>
+          <template v-if="request.expected">
+            <dt>原有指纹 (SHA256)</dt>
+            <dd class="mono">{{ request.expected }}</dd>
+          </template>
+          <dt>公钥 blob</dt>
+          <dd class="mono small">{{ request.public_key_blob }}</dd>
+        </dl>
+        <p class="warning">
+          ⚠️ 连接前请确认以上指纹与服务器管理员公布的一致。指纹不一致可能意味着中间人攻击。
+        </p>
+        <p v-if="errorFor(request)" class="decision-error" role="alert">
+          决策提交失败：{{ errorFor(request) }}。请修复后重试，或选择信任一次/取消连接。
+        </p>
+        <div class="request-actions">
+          <el-button @click="store.reject(request.decision_id)">拒绝</el-button>
+          <el-button type="primary" plain @click="store.trustOnce(request.decision_id)">信任一次</el-button>
+          <el-button type="primary" @click="store.trustPermanent(request.decision_id)">永久信任</el-button>
+          <el-button text @click="store.cancel(request.decision_id)">取消连接</el-button>
+        </div>
+      </section>
     </template>
   </el-dialog>
 </template>
 
 <style scoped>
+.host-key-request + .host-key-request {
+  border-top: 1px solid var(--el-border-color);
+  margin-top: 16px;
+  padding-top: 16px;
+}
+.request-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 .key-info {
   display: grid;
   grid-template-columns: max-content 1fr;

@@ -6,7 +6,7 @@
  */
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
-import type { SessionConfig, SessionCredential, SessionLoadIssue, Uuid } from "../ipc/types";
+import type { CoreErrorKind, SessionConfig, SessionCredential, SessionLoadIssue, Uuid } from "../ipc/types";
 import {
   listSessions,
   createSession,
@@ -16,11 +16,23 @@ import {
   listSessionLoadIssues,
   retrySessionLoad,
   updateSession,
+  IpcCallError,
 } from "../ipc/client";
 import { subscribeAppEvents } from "../ipc/events";
 import { newUuid } from "../utils/uuid";
 
 type ConnectionStateValue = "disconnected" | "connecting" | "connected" | "failed";
+
+const RECOVERY_KINDS = new Set<CoreErrorKind>([
+  "credential_missing",
+  "credential_inaccessible",
+  "credential_save_failed",
+  "credential_migration_failed",
+  "auth_failed",
+  "connection",
+  "host_key_mismatch",
+  "host_key_trust_persistence_failed",
+]);
 
 export const useSessionsStore = defineStore("sessions", () => {
   const items = ref<SessionConfig[]>([]);
@@ -31,6 +43,18 @@ export const useSessionsStore = defineStore("sessions", () => {
   const error = ref<string | null>(null);
   const loadIssues = ref<SessionLoadIssue[]>([]);
   const retryingLoad = ref(false);
+  const connectionErrors = ref<Map<Uuid, { kind: CoreErrorKind; message: string }>>(new Map());
+
+  function setConnectionError(id: Uuid, kind: CoreErrorKind, message: string) {
+    connectionErrors.value.set(id, { kind, message });
+    connectionErrors.value = new Map(connectionErrors.value);
+  }
+
+  function clearConnectionError(id: Uuid) {
+    if (!connectionErrors.value.has(id)) return;
+    connectionErrors.value.delete(id);
+    connectionErrors.value = new Map(connectionErrors.value);
+  }
   let unlisten: (() => void) | null = null;
   let subscriptionGeneration = 0;
 
@@ -140,9 +164,15 @@ export const useSessionsStore = defineStore("sessions", () => {
     const task = (async () => {
       try {
         await connectSession(id);
+        clearConnectionError(id);
       } catch (e) {
         connectionState.value.set(id, "failed");
         connectionState.value = new Map(connectionState.value);
+        const kind: CoreErrorKind =
+      e instanceof IpcCallError && RECOVERY_KINDS.has(e.kind as CoreErrorKind)
+        ? (e.kind as CoreErrorKind)
+        : "connection";
+        setConnectionError(id, kind, e instanceof IpcCallError ? e.message : String(e));
         throw e;
       } finally {
         inflightConnects.delete(id);
@@ -165,6 +195,7 @@ export const useSessionsStore = defineStore("sessions", () => {
       throw e;
     }
     error.value = null;
+    clearConnectionError(id);
     connectionState.value.set(id, "disconnected");
     connectionState.value = new Map(connectionState.value);
   }
@@ -205,6 +236,9 @@ export const useSessionsStore = defineStore("sessions", () => {
     currentId,
     current,
     connectionState,
+    connectionErrors,
+    setConnectionError,
+    clearConnectionError,
     searchKeyword,
     loading,
     error,

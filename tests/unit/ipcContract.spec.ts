@@ -558,6 +558,34 @@ describe("client.ts helper 调用方契约（R2-11）", () => {
   });
 });
 
+describe("Task 3 typed error IPC contract", () => {
+  const TASK3_ERROR_KINDS = [
+    "CredentialMissing",
+    "CredentialInaccessible",
+    "CredentialSaveFailed",
+    "CredentialMigrationFailed",
+    "AuthFailed",
+    "HostKeyMismatch",
+    "HostKeyTrustPersistenceFailed",
+  ] as const;
+
+  it("requires every recovery error category in Rust IpcErrorKind", () => {
+    const rustErrorSource = readFileSync("src-tauri/src/error.rs", "utf8");
+    for (const kind of TASK3_ERROR_KINDS) {
+      expect(rustErrorSource).toMatch(new RegExp(`\\b${kind}\\b`));
+    }
+  });
+
+  it("requires the matching stable snake_case values in the TypeScript mirror", () => {
+    for (const kind of TASK3_ERROR_KINDS) {
+      const stable = kind
+        .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+        .toLowerCase();
+      expect(typesTsSource).toContain(`"${stable}"`);
+    }
+  });
+});
+
 describe("TransferTaskInfo R2-T2 fields contract reconciliation", () => {
   // 显式化 R2-T2 契约：staging residue / cleanup / commit strategy 必须从后端
   // 一路透传到面板，少任一字段都会让 staged lifecycle 的对外承诺失效。

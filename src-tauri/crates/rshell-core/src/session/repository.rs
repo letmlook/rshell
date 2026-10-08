@@ -2,14 +2,126 @@
 //!
 //! 提供会配置的持久化操作接口。
 
-use rshell_api::credentials::{CredentialKey, CredentialKind, CredentialStore};
+use rshell_api::credentials::{CredentialError, CredentialKey, CredentialKind, CredentialStore};
 use rshell_api::types::{
     AuthMethod, CredentialUpdate, SessionConfig, SessionCredential, SessionLoadIssue,
+    SessionLoadIssueKind,
 };
 use rshell_infra::storage::session_store::SessionStore;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use thiserror::Error;
 use uuid::Uuid;
+
+/// Sanitized failures at the session metadata / credential boundary.
+///
+/// The credential adapter deliberately discards backend diagnostics.  This
+/// enum keeps the useful *category* and safe reason while preventing raw
+/// keychain/TOML messages (which may contain paths or source text) from
+/// crossing the IPC boundary.
+#[derive(Debug, Error)]
+pub enum SessionRepositoryError {
+    #[error("credential store unavailable")]
+    CredentialInaccessible,
+    #[error("credential store save failed")]
+    CredentialSaveFailed,
+    #[error("stored session credential is unavailable")]
+    CredentialMissing,
+    #[error("legacy credential migration failed: {reason}")]
+    CredentialMigrationFailed { reason: String },
+    #[error("session metadata storage unavailable: {0}")]
+    Storage(String),
+    #[error("session transaction unavailable")]
+    Transaction,
+}
+
+impl From<CredentialError> for SessionRepositoryError {
+    fn from(error: CredentialError) -> Self {
+        match error {
+            CredentialError::Unavailable => Self::CredentialInaccessible,
+            CredentialError::BackendFailure => Self::CredentialSaveFailed,
+        }
+    }
+}
+
+impl From<anyhow::Error> for SessionRepositoryError {
+    fn from(_error: anyhow::Error) -> Self {
+        // SessionStore errors are already sanitized by its decode boundary;
+        // retain only a category here rather than exposing an arbitrary
+        // backend/TOML diagnostic.
+        Self::Storage("metadata operation failed".into())
+    }
+}
+
+fn write_credential(result: Result<(), CredentialError>) -> Result<(), SessionRepositoryError> {
+    result.map_err(|_| SessionRepositoryError::CredentialSaveFailed)
+}
+
+fn migration_error(error: SessionRepositoryError) -> SessionRepositoryError {
+    match error {
+        SessionRepositoryError::CredentialInaccessible => {
+            SessionRepositoryError::CredentialMigrationFailed {
+                reason: "credential store unavailable".into(),
+            }
+        }
+        SessionRepositoryError::CredentialSaveFailed => {
+            SessionRepositoryError::CredentialMigrationFailed {
+                reason: "credential store write failed".into(),
+            }
+        }
+        SessionRepositoryError::CredentialMissing => {
+            SessionRepositoryError::CredentialMigrationFailed {
+                reason: "credential entry missing".into(),
+            }
+        }
+        SessionRepositoryError::CredentialMigrationFailed { .. } => error,
+        SessionRepositoryError::Storage(_) => SessionRepositoryError::CredentialMigrationFailed {
+            reason: "metadata storage unavailable".into(),
+        },
+        SessionRepositoryError::Transaction => SessionRepositoryError::CredentialMigrationFailed {
+            reason: "session transaction unavailable".into(),
+        },
+    }
+}
+
+fn load_issue(session_id: Uuid, error: &SessionRepositoryError) -> SessionLoadIssue {
+    match error {
+        SessionRepositoryError::CredentialMigrationFailed { reason } => SessionLoadIssue {
+            session_id: Some(session_id),
+            kind: SessionLoadIssueKind::CredentialMigrationFailed,
+            message: format!("Legacy credential migration failed: {reason}. Repair access, then retry loading."),
+            retryable: true,
+        },
+        SessionRepositoryError::CredentialInaccessible => SessionLoadIssue {
+            session_id: Some(session_id),
+            kind: SessionLoadIssueKind::CredentialMigrationFailed,
+            message: "Credential store is unavailable. Repair Keychain access, then retry loading."
+                .into(),
+            retryable: true,
+        },
+        SessionRepositoryError::CredentialSaveFailed => SessionLoadIssue {
+            session_id: Some(session_id),
+            kind: SessionLoadIssueKind::CredentialMigrationFailed,
+            message: "Credential store write failed during migration. Repair access, then retry loading."
+                .into(),
+            retryable: true,
+        },
+        SessionRepositoryError::CredentialMissing => SessionLoadIssue {
+            session_id: Some(session_id),
+            kind: SessionLoadIssueKind::CredentialMigrationFailed,
+            message: "The credential entry is missing. Update the credential, then retry loading."
+                .into(),
+            retryable: true,
+        },
+        SessionRepositoryError::Storage(_) | SessionRepositoryError::Transaction => SessionLoadIssue {
+            session_id: Some(session_id),
+            kind: SessionLoadIssueKind::StorageUnavailable,
+            message: "Session metadata storage is unavailable. Repair storage access, then retry loading."
+                .into(),
+            retryable: true,
+        },
+    }
+}
 
 /// 会话仓库
 pub struct SessionRepository {
@@ -45,15 +157,16 @@ impl SessionRepository {
         &self,
         session: &SessionConfig,
         credential: Option<SessionCredential>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), SessionRepositoryError> {
         let _guard = self
             .transaction
             .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
-        anyhow::ensure!(
-            self.store.load_pending(session.id)?.is_none(),
-            "Session already exists"
-        );
+            .map_err(|_| SessionRepositoryError::Transaction)?;
+        if self.store.load_pending(session.id)?.is_some() {
+            return Err(SessionRepositoryError::Storage(
+                "session already exists".into(),
+            ));
+        }
         match credential {
             Some(credential) if !credential.secret.is_empty() => {
                 self.save_locked(session, CredentialUpdate::Set(credential))
@@ -61,33 +174,42 @@ impl SessionRepository {
             _ => {
                 let mut metadata = session.clone();
                 set_presence(&mut metadata, false);
-                self.store.save(&metadata)
+                Ok(self.store.save(&metadata)?)
             }
         }
     }
 
     /// 保存会话
-    pub fn save(&self, session: &SessionConfig, update: CredentialUpdate) -> anyhow::Result<()> {
+    pub fn save(
+        &self,
+        session: &SessionConfig,
+        update: CredentialUpdate,
+    ) -> Result<(), SessionRepositoryError> {
         let _guard = self
             .transaction
             .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+            .map_err(|_| SessionRepositoryError::Transaction)?;
         self.save_locked(session, update)
     }
 
-    fn save_locked(&self, session: &SessionConfig, update: CredentialUpdate) -> anyhow::Result<()> {
+    fn save_locked(
+        &self,
+        session: &SessionConfig,
+        update: CredentialUpdate,
+    ) -> Result<(), SessionRepositoryError> {
         let mut metadata = session.clone();
         let kind = credential_kind(&metadata);
         if matches!(update, CredentialUpdate::Keep) {
             let previous = self.store.load(session.id)?;
             if let Some(previous) = &previous {
-                anyhow::ensure!(
-                    credential_kind(previous) == kind,
-                    "Changing credential kind requires Set or Clear"
-                );
+                if credential_kind(previous) != kind {
+                    return Err(SessionRepositoryError::Storage(
+                        "changing credential kind requires Set or Clear".into(),
+                    ));
+                }
             }
             set_presence(&mut metadata, previous.as_ref().is_some_and(has_credential));
-            return self.store.save(&metadata);
+            return Ok(self.store.save(&metadata)?);
         }
         let keys =
             [CredentialKind::Password, CredentialKind::Passphrase].map(|kind| CredentialKey {
@@ -105,17 +227,17 @@ impl SessionRepository {
             _ => None,
         };
         set_presence(&mut metadata, secret.is_some());
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> Result<(), SessionRepositoryError> {
             for key in &keys {
                 if key.kind == kind {
                     if let Some(secret) = secret {
-                        self.credentials.set(key, secret)?;
+                        write_credential(self.credentials.set(key, secret))?;
                         continue;
                     }
                 }
-                self.credentials.delete(key)?;
+                write_credential(self.credentials.delete(key))?;
             }
-            self.store.save(&metadata)
+            Ok(self.store.save(&metadata)?)
         })();
         if let Err(error) = result {
             let mut rollback_failed = false;
@@ -127,9 +249,7 @@ impl SessionRepository {
                 rollback_failed |= restored.is_err();
             }
             if rollback_failed {
-                return Err(anyhow::anyhow!(
-                    "Session save failed; credential rollback failed"
-                ));
+                return Err(SessionRepositoryError::CredentialSaveFailed);
             }
             return Err(error);
         }
@@ -137,30 +257,30 @@ impl SessionRepository {
     }
 
     /// 加载会话
-    pub fn load(&self, id: Uuid) -> anyhow::Result<Option<SessionConfig>> {
+    pub fn load(&self, id: Uuid) -> Result<Option<SessionConfig>, SessionRepositoryError> {
         let _guard = self
             .transaction
             .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+            .map_err(|_| SessionRepositoryError::Transaction)?;
         self.load_locked(id)
     }
 
-    fn load_locked(&self, id: Uuid) -> anyhow::Result<Option<SessionConfig>> {
+    fn load_locked(&self, id: Uuid) -> Result<Option<SessionConfig>, SessionRepositoryError> {
         let Some((config, migration)) = self.store.load_pending(id)? else {
             return Ok(None);
         };
         if let Some(update) = migration {
-            self.save_locked(&config, update)?;
+            self.save_locked(&config, update).map_err(migration_error)?;
         }
         Ok(Some(config))
     }
 
     /// 删除会话
-    pub fn delete(&self, id: Uuid) -> anyhow::Result<()> {
+    pub fn delete(&self, id: Uuid) -> Result<(), SessionRepositoryError> {
         let _guard = self
             .transaction
             .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+            .map_err(|_| SessionRepositoryError::Transaction)?;
         self.store.delete(id)?;
         // Attempt both entries even when one backend deletion fails.
         let password = self.credentials.delete(&CredentialKey {
@@ -171,28 +291,25 @@ impl SessionRepository {
             session_id: id,
             kind: CredentialKind::Passphrase,
         });
-        password?;
-        passphrase?;
+        write_credential(password)?;
+        write_credential(passphrase)?;
         Ok(())
     }
 
     /// 列出所有会话
-    pub fn list_all(&self) -> anyhow::Result<SessionLoadReport> {
+    pub fn list_all(&self) -> Result<SessionLoadReport, SessionRepositoryError> {
         let _guard = self
             .transaction
             .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+            .map_err(|_| SessionRepositoryError::Transaction)?;
         let mut report = SessionLoadReport::default();
         for id in self.store.list_ids()? {
             match self.load_locked(id) {
                 Ok(Some(config)) => report.sessions.push(config),
                 Ok(None) => {}
-                Err(_) => {
+                Err(error) => {
                     tracing::warn!(session_id = %id, "Could not load or migrate session");
-                    report.issues.push(SessionLoadIssue {
-                        session_id: Some(id),
-                        message: "Could not load or migrate saved session. Check configuration and Keychain access, then retry.".into(),
-                    });
+                    report.issues.push(load_issue(id, &error));
                 }
             }
         }
@@ -200,11 +317,14 @@ impl SessionRepository {
     }
 
     /// Resolve only at the SSH connection boundary; never cache in session state.
-    pub fn credential(&self, config: &SessionConfig) -> anyhow::Result<Option<String>> {
+    pub fn credential(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<Option<String>, SessionRepositoryError> {
         let _guard = self
             .transaction
             .lock()
-            .map_err(|_| anyhow::anyhow!("Session transaction unavailable"))?;
+            .map_err(|_| SessionRepositoryError::Transaction)?;
         if !has_credential(config) {
             return Ok(None);
         }
@@ -212,10 +332,9 @@ impl SessionRepository {
             session_id: config.id,
             kind: credential_kind(config),
         })?;
-        anyhow::ensure!(
-            secret.as_ref().is_some_and(|s| !s.is_empty()),
-            "Stored session credential is unavailable"
-        );
+        if !secret.as_ref().is_some_and(|s| !s.is_empty()) {
+            return Err(SessionRepositoryError::CredentialMissing);
+        }
         Ok(secret)
     }
 }
@@ -260,6 +379,9 @@ pub(crate) mod tests {
     pub(crate) struct MemoryCredentials {
         pub entries: Mutex<HashMap<CredentialKey, String>>,
         pub fail: Mutex<bool>,
+        /// Refuse writes while reads remain available. This models a keychain
+        /// that is visible for lookup but rejects a new credential save.
+        pub fail_write: Mutex<bool>,
     }
     impl CredentialStore for MemoryCredentials {
         fn get(&self, key: &CredentialKey) -> Result<Option<String>, CredentialError> {
@@ -269,7 +391,7 @@ pub(crate) mod tests {
             Ok(self.entries.lock().unwrap().get(key).cloned())
         }
         fn set(&self, key: &CredentialKey, secret: &str) -> Result<(), CredentialError> {
-            if *self.fail.lock().unwrap() {
+            if *self.fail.lock().unwrap() || *self.fail_write.lock().unwrap() {
                 return Err(CredentialError::Unavailable);
             }
             self.entries.lock().unwrap().insert(*key, secret.into());
@@ -358,6 +480,14 @@ pub(crate) mod tests {
         let report = repo.list_all().unwrap();
         assert!(report.sessions.is_empty());
         assert_eq!(report.issues[0].session_id, Some(id));
+        assert_eq!(
+            report.issues[0].kind,
+            rshell_api::types::SessionLoadIssueKind::CredentialMigrationFailed
+        );
+        assert!(report.issues[0].retryable);
+        assert!(report.issues[0]
+            .message
+            .contains("credential store unavailable"));
         assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
     }
 

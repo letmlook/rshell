@@ -16,6 +16,7 @@ import { useSessionsStore } from "../stores/sessions";
 import type { Uuid } from "../ipc/types";
 import type { SessionConfig } from "../ipc/types";
 import SessionCredentialDialog from "./SessionCredentialDialog.vue";
+import ConnectionRecoveryNotice from "./ConnectionRecoveryNotice.vue";
 import { confirmDialog } from "../utils/dialog";
 
 const emit = defineEmits<{
@@ -150,6 +151,15 @@ function ctxUpdateCredential(s: SessionConfig) {
   credentialSession.value = s;
 }
 
+function openCredentialRecovery(id: Uuid) {
+  const session = store.items.find((item) => item.id === id);
+  if (session) credentialSession.value = session;
+}
+
+function retryConnection(id: Uuid) {
+  void store.connect(id).catch(() => undefined);
+}
+
 // 复制流程由 App.vue 持有（入口有左侧列表与终端 tab 两处，而本组件按侧栏
 // 当前面板条件挂载），这里只负责发出意图。
 function ctxDuplicate(s: SessionConfig) {
@@ -240,6 +250,15 @@ onBeforeUnmount(() => {
               {{ node.label }}
             </span>
             <span class="leaf-host">{{ node.session!.host }}</span>
+             <ConnectionRecoveryNotice
+               v-if="store.connectionErrors.get(node.session!.id)"
+               :session-id="node.session!.id"
+               :kind="store.connectionErrors.get(node.session!.id)!.kind"
+               :message="store.connectionErrors.get(node.session!.id)!.message"
+               @update-credential="openCredentialRecovery"
+               @retry-connect="retryConnection"
+               @retry-load="store.retryLoad"
+             />
           </li>
         </ul>
       </div>
@@ -393,6 +412,10 @@ h3 {
 }
 .leaf:hover { background: var(--rs-row-hover); }
 .leaf.is-active { background: var(--rs-row-selected); }
+.leaf > .connection-recovery {
+  grid-column: 1 / -1;
+}
+
 .leaf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .leaf-host {
   font-size: var(--rs-fs-xs);

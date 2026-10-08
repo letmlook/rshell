@@ -4,11 +4,14 @@ use crate::error::CoreError;
 use crate::event_bus::EventBus;
 use crate::script::trigger_engine::TriggerEngine;
 use crate::security::host_key_decision::HostKeyDecisionRegistry;
-use crate::session::repository::{has_credential, set_presence, SessionRepository};
+use crate::session::repository::{
+    has_credential, set_presence, SessionRepository, SessionRepositoryError,
+};
 use crate::terminal::service::TerminalService;
 use rshell_api::types::{
     AuthMethod, ConnectionInfo, ConnectionState, CredentialUpdate, FileType, Protocol,
-    RemoteFileEntry, SessionConfig, SessionCredential, SessionLoadIssue, TriggerAction,
+    RemoteFileEntry, SessionConfig, SessionCredential, SessionLoadIssue, SessionLoadIssueKind,
+    TriggerAction,
 };
 use rshell_protocol::serial::{SerialConfig as ProtocolSerialConfig, SerialConnection};
 use rshell_protocol::ssh::sftp::SftpClient;
@@ -34,6 +37,18 @@ pub type SshClientHandle = Arc<tokio::sync::RwLock<SshClient>>;
 const DISCONNECT_SSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 const TERMINAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn ssh_connect_error(error: rshell_protocol::ProtocolError) -> CoreError {
+    match error {
+        rshell_protocol::ProtocolError::AuthFailed(_) => {
+            CoreError::AuthError("SSH authentication failed".into())
+        }
+        rshell_protocol::ProtocolError::HostKeyMismatch(_) => {
+            CoreError::HostKeyMismatch("SSH host key was not accepted".into())
+        }
+        error => CoreError::ConnectionError(error.to_string()),
+    }
+}
 
 fn terminal_io_error(error: rshell_protocol::ProtocolError) -> CoreError {
     match error {
@@ -87,7 +102,8 @@ fn resolved_auth(
     config: &SessionConfig,
     secret: Option<String>,
 ) -> Result<ResolvedAuthMethod, CoreError> {
-    let missing = || CoreError::InvalidState("Stored session credential is unavailable".into());
+    let missing =
+        || CoreError::CredentialMissing("stored session credential is unavailable".into());
     if has_credential(config) && secret.is_none() {
         return Err(missing());
     }
@@ -108,6 +124,26 @@ fn resolved_auth(
                 username: username.clone(),
                 password: secret,
             })
+        }
+    }
+}
+
+fn repository_error(error: SessionRepositoryError) -> CoreError {
+    match error {
+        SessionRepositoryError::CredentialMissing => {
+            CoreError::CredentialMissing("stored session credential is unavailable".into())
+        }
+        SessionRepositoryError::CredentialInaccessible => {
+            CoreError::CredentialInaccessible("credential store unavailable".into())
+        }
+        SessionRepositoryError::CredentialSaveFailed => {
+            CoreError::CredentialSaveFailed("credential store save failed".into())
+        }
+        SessionRepositoryError::CredentialMigrationFailed { reason } => {
+            CoreError::CredentialMigrationFailed(reason)
+        }
+        SessionRepositoryError::Storage(_) | SessionRepositoryError::Transaction => {
+            CoreError::StorageError("session metadata storage unavailable".into())
         }
     }
 }
@@ -256,9 +292,7 @@ impl SessionService {
     }
     fn resolve_auth(&self, config: &SessionConfig) -> Result<ResolvedAuthMethod, CoreError> {
         let secret = match &self.repository {
-            Some(repo) => repo.credential(config).map_err(|_| {
-                CoreError::InvalidState("Stored session credential is unavailable".into())
-            })?,
+            Some(repo) => repo.credential(config).map_err(repository_error)?,
             None => None,
         };
         resolved_auth(config, secret)
@@ -335,10 +369,23 @@ impl SessionService {
             .expect("on_session_deleted lock poisoned") = Some(callback);
     }
 
+    fn load_issue_error(issue: &SessionLoadIssue) -> CoreError {
+        match issue.kind {
+            SessionLoadIssueKind::CredentialMigrationFailed => {
+                CoreError::CredentialMigrationFailed(issue.message.clone())
+            }
+            SessionLoadIssueKind::StorageUnavailable => {
+                CoreError::StorageError(issue.message.clone())
+            }
+        }
+    }
+
     fn storage_load_issue() -> SessionLoadIssue {
         SessionLoadIssue {
             session_id: None,
+            kind: rshell_api::types::SessionLoadIssueKind::StorageUnavailable,
             message: "Could not read saved sessions. Check storage access, then retry.".into(),
+            retryable: true,
         }
     }
 
@@ -379,6 +426,15 @@ impl SessionService {
     #[instrument(skip(self))]
     pub async fn connect(&self, session_id: Uuid) -> Result<(), CoreError> {
         info!(session_id = %session_id, "Connecting session");
+        if let Some(issue) = self
+            .load_issues
+            .read()
+            .await
+            .iter()
+            .find(|issue| issue.session_id == Some(session_id))
+        {
+            return Err(Self::load_issue_error(issue));
+        }
         let attempt = Uuid::new_v4();
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let config = self
@@ -632,7 +688,7 @@ impl SessionService {
                 // 完整 SendText 派发到 send_data 的逻辑留到切片 7 触发器域,本切片仅
                 // 保证触发器不再做假回显（设计 §2.4 修复方向已落地）。
 
-                Err(CoreError::ConnectionError(e.to_string()))
+                Err(ssh_connect_error(e))
             }
         }
     }
@@ -1092,9 +1148,7 @@ impl SessionService {
         // 切片 1.0：先落盘再入内存。落盘失败时阻断 create —— 避免出现
         // "内存有但磁盘无"的不可恢复分裂状态（设计 §4.5 完成判据前提）。
         if let Some(repo) = self.repository.as_ref() {
-            repo.create(&config, credential).map_err(|e| {
-                CoreError::StorageError(format!("save session {} failed: {}", id, e))
-            })?;
+            repo.create(&config, credential).map_err(repository_error)?;
         }
 
         let state = SessionState {
@@ -1162,9 +1216,7 @@ impl SessionService {
         info!(session_id = %id, "Updating session");
 
         if let Some(repo) = self.repository.as_ref() {
-            repo.save(&config, credential).map_err(|e| {
-                CoreError::StorageError(format!("save session {} failed: {}", id, e))
-            })?;
+            repo.save(&config, credential).map_err(repository_error)?;
         }
 
         state.config = config;
@@ -1186,7 +1238,7 @@ impl SessionService {
         let mut cleanup_error = None;
         if let Some(repo) = self.repository.as_ref() {
             if let Err(error) = repo.delete(id) {
-                let error = CoreError::StorageError(format!("delete session {id} failed: {error}"));
+                let error = repository_error(error);
                 // Metadata deletion is committed before Keychain cleanup. Do
                 // not leave a connectable in-memory session after that commit.
                 if !matches!(repo.load(id), Ok(None)) {
@@ -1394,7 +1446,7 @@ mod tests {
         let mut config = make_config("credential", "example.test");
         assert!(matches!(
             make_service().resolve_auth(&config),
-            Err(CoreError::InvalidState(_))
+            Err(CoreError::CredentialMissing(_))
         ));
         config.auth_method = AuthMethod::Password {
             username: "user".into(),
@@ -1410,7 +1462,7 @@ mod tests {
         };
         assert!(matches!(
             make_service().resolve_auth(&config),
-            Err(CoreError::InvalidState(_))
+            Err(CoreError::CredentialMissing(_))
         ));
         config.auth_method = AuthMethod::PublicKey {
             username: "user".into(),
@@ -1424,6 +1476,235 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn missing_and_inaccessible_stored_credentials_keep_distinct_categories() {
+        use crate::session::repository::tests::{set, MemoryCredentials};
+        use rshell_api::credentials::{CredentialKey, CredentialKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let repo = Arc::new(SessionRepository::new(
+            dir.path().into(),
+            credentials.clone(),
+        ));
+        let svc = make_service_with_repo(repo.clone());
+        let cfg = make_config("credential recovery", "example.test");
+        repo.save(&cfg, set("stored-value")).unwrap();
+
+        credentials.entries.lock().unwrap().remove(&CredentialKey {
+            session_id: cfg.id,
+            kind: CredentialKind::Password,
+        });
+        assert!(matches!(
+            svc.resolve_auth(&cfg),
+            Err(CoreError::CredentialMissing(_))
+        ));
+
+        repo.save(&cfg, set("stored-value")).unwrap();
+        *credentials.fail.lock().unwrap() = true;
+        assert!(matches!(
+            svc.resolve_auth(&cfg),
+            Err(CoreError::CredentialInaccessible(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn credential_save_failure_is_typed_and_never_publishes_connected() {
+        use crate::session::repository::tests::MemoryCredentials;
+        use rshell_api::types::{CredentialUpdate, SessionCredential};
+
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let repo = Arc::new(SessionRepository::new(
+            dir.path().into(),
+            credentials.clone(),
+        ));
+        let bus = Arc::new(EventBus::new());
+        let terminal_service = Arc::new(TerminalService::new(bus.clone()));
+        let trigger_engine = Arc::new(TriggerEngine::new(bus.clone()));
+        let registry = Arc::new(HostKeyDecisionRegistry::new(bus.clone()));
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = connected.clone();
+        bus.subscribe(move |event| {
+            if matches!(
+                event,
+                AppEvent::ConnectionStateChanged {
+                    state: ConnectionState::Connected,
+                    ..
+                }
+            ) {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let svc = SessionService::with_repository(
+            bus,
+            terminal_service,
+            trigger_engine,
+            registry,
+            Some(repo),
+        );
+        let mut cfg = make_config("save refusal", "example.test");
+        cfg.auth_method = AuthMethod::Password {
+            username: "user".into(),
+            has_password: false,
+        };
+        let id = svc.create_session(cfg.clone()).await.unwrap();
+        *credentials.fail_write.lock().unwrap() = true;
+
+        let error = svc
+            .update_session_with_credential(
+                id,
+                cfg,
+                CredentialUpdate::Set(SessionCredential {
+                    secret: "runtime-value".into(),
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CoreError::CredentialSaveFailed(_)));
+        assert!(!connected.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            svc.get_state(id).await.unwrap(),
+            ConnectionState::Disconnected
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_credential_save_then_wrong_password_returns_auth_failed() {
+        use crate::session::repository::tests::MemoryCredentials;
+        use rshell_api::types::SessionCredential;
+        use russh::server::{Auth, ChannelOpenHandle, Session as RusshSession};
+
+        struct RejectPasswordServer;
+        impl russh::server::Handler for RejectPasswordServer {
+            type Error = russh::Error;
+            async fn auth_password(
+                &mut self,
+                _user: &str,
+                _password: &str,
+            ) -> Result<Auth, Self::Error> {
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
+            async fn channel_open_session(
+                &mut self,
+                _channel: russh::Channel<russh::server::Msg>,
+                reply: ChannelOpenHandle,
+                _session: &mut RusshSession,
+            ) -> Result<(), Self::Error> {
+                reply.accept().await;
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let repo = Arc::new(SessionRepository::new(dir.path().into(), credentials));
+        let bus = Arc::new(EventBus::new());
+        let registry = Arc::new(HostKeyDecisionRegistry::new(bus.clone()));
+        let terminal_service = Arc::new(TerminalService::new(bus.clone()));
+        let trigger_engine = Arc::new(TriggerEngine::new(bus.clone()));
+        let (mismatch_tx, mut mismatch_rx) = tokio::sync::mpsc::unbounded_channel::<Uuid>();
+        let observed = mismatch_tx.clone();
+        bus.subscribe(move |event| {
+            if let AppEvent::HostKeyMismatch { decision_id, .. } = event {
+                let _ = observed.send(*decision_id);
+            }
+        });
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connected_observer = connected.clone();
+        bus.subscribe(move |event| {
+            if matches!(
+                event,
+                AppEvent::ConnectionStateChanged {
+                    state: ConnectionState::Connected,
+                    ..
+                }
+            ) {
+                connected_observer.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let svc = Arc::new(SessionService::with_repository(
+            bus,
+            terminal_service,
+            trigger_engine,
+            registry.clone(),
+            Some(repo),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let key = ssh_key::PrivateKey::random(
+                &mut getrandom::rand_core::UnwrapErr(getrandom::SysRng),
+                ssh_key::Algorithm::Ed25519,
+            )
+            .unwrap();
+            let running = russh::server::run_stream(
+                Arc::new(russh::server::Config {
+                    keys: vec![key],
+                    auth_rejection_time: std::time::Duration::ZERO,
+                    ..Default::default()
+                }),
+                stream,
+                RejectPasswordServer,
+            )
+            .await
+            .unwrap();
+            let _ = running.await;
+        });
+        let mut cfg = make_config("wrong after save", "127.0.0.1");
+        cfg.port = port;
+        let id = svc
+            .create_session_with_credential(
+                cfg.clone(),
+                Some(SessionCredential {
+                    secret: "initial-value".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        svc.update_session_with_credential(
+            id,
+            cfg,
+            rshell_api::types::CredentialUpdate::Set(SessionCredential {
+                secret: "wrong-value".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let connect = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.connect(id).await })
+        };
+        let decision_id =
+            tokio::time::timeout(std::time::Duration::from_secs(3), mismatch_rx.recv())
+                .await
+                .expect("host-key prompt must arrive")
+                .expect("host-key event channel must remain open");
+        assert!(registry.resolve(
+            decision_id,
+            rshell_protocol::ssh::HostKeyDecision {
+                fingerprint: String::new(),
+                key_blob: String::new(),
+                accept: true,
+                permanent: false,
+            },
+        ));
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), connect)
+            .await
+            .expect("authentication must settle")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, CoreError::AuthError(_)));
+        assert!(!connected.load(std::sync::atomic::Ordering::SeqCst));
+        server.abort();
     }
 
     #[tokio::test]
@@ -2103,7 +2384,10 @@ mod tests {
         let svc = Arc::new(make_service_with_repo(repo));
         let dispatcher = make_dispatcher(svc.clone(), tmp.path());
         assert!(svc.list_sessions().await.unwrap().is_empty());
-        assert!(svc.connect(id).await.is_err());
+        assert!(matches!(
+            svc.connect(id).await,
+            Err(CoreError::CredentialMigrationFailed(_))
+        ));
         let issues = svc.list_load_issues().await;
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].session_id, Some(id));
@@ -2261,7 +2545,7 @@ mod tests {
         credentials.entries.lock().unwrap().clear();
         assert!(matches!(
             svc.connect(id).await,
-            Err(CoreError::InvalidState(_))
+            Err(CoreError::CredentialMissing(_))
         ));
         assert_eq!(
             svc.get_state(id).await.unwrap(),

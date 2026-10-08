@@ -29,6 +29,7 @@ import type {
   CredentialUpdate,
   SessionCredential,
   SessionLoadIssue,
+  IpcErrorKind,
 } from "./types";
 
 // ===== 通用 helper =====
@@ -72,16 +73,35 @@ async function call<T = unknown>(cmd: AppCommand): Promise<T> {
 
 /** 后端 IpcError 经 Tauri IPC 序列化后抵达前端的形状 */
 export interface IpcErrorShape {
-  kind: string;
+  kind: IpcErrorKind;
   message: string;
   session_id?: string | null;
 }
+
+const IPC_ERROR_KINDS = new Set<IpcErrorKind>([
+  "not_found",
+  "auth_failed",
+  "host_key_mismatch",
+  "credential_missing",
+  "credential_inaccessible",
+  "credential_save_failed",
+  "credential_migration_failed",
+  "host_key_trust_persistence_failed",
+  "connection",
+  "io",
+  "permission",
+  "outcome_mismatch",
+  "internal",
+  "storage",
+  "target_exists",
+  "terminal_recovery_required",
+]);
 
 export function isIpcErrorShape(value: unknown): value is IpcErrorShape {
   return (
     typeof value === "object" &&
     value !== null &&
-    typeof (value as { kind?: unknown }).kind === "string" &&
+    IPC_ERROR_KINDS.has((value as { kind?: unknown }).kind as IpcErrorKind) &&
     typeof (value as { message?: unknown }).message === "string"
   );
 }
@@ -89,7 +109,7 @@ export function isIpcErrorShape(value: unknown): value is IpcErrorShape {
 /** 可读的后端错误：String(e) 显示 message 而非 "[object Object]" */
 export class IpcCallError extends Error {
   /** 稳定的机器可读判别串（not_found / connection / ...），供前端分支 */
-  readonly kind: string;
+  readonly kind: IpcErrorKind;
   /** 可选会话 id，便于把错误挂到正确的会话行 */
   readonly session_id: string | null;
   constructor(shape: IpcErrorShape) {
@@ -277,6 +297,8 @@ export const trustHostKey = (
   });
 export const decideHostKey = (decision_id: Uuid, accept: boolean, permanent: boolean) =>
   call({ DecideHostKey: { decision_id, accept, permanent } });
+export const cancelHostKey = (decision_id: Uuid) =>
+  call({ CancelHostKey: { decision_id } });
 export const deleteHostKey = (host: string, port: number) =>
   call({ DeleteHostKey: { host, port } });
 

@@ -226,7 +226,19 @@ pub struct UnsupportedTunnelRule {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionLoadIssue {
     pub session_id: Option<Uuid>,
+    pub kind: SessionLoadIssueKind,
+    /// A safe, human-readable cause. It may identify the storage boundary, but
+    /// never contains a raw credential, TOML source line, or backend secret.
     pub message: String,
+    /// Whether the explicit retry-load action can make progress after the
+    /// underlying access/configuration problem is repaired.
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionLoadIssueKind {
+    CredentialMigrationFailed,
+    StorageUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
