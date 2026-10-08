@@ -1,0 +1,15 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-10-08-reliability-recovery.md
+
+Pre-flight: Task 1 SSH outcomes are consumed only in Task 1 UI; Task 2 preserves existing transfer contract unless both ends change; Task 3 event changes update both Rust and TS; Task 4 integrates all. Shared core service, IPC and UI files are modified sequentially. Task briefs align tests with their deliverables.
+Ruling: Use the managed worktree and sequential subagent implementation without another approval round — user approved design and requested continuation; reversible work is authorized — incorrect task interpretation would require rework.
+Ruling: Use Windows-compatible bookkeeping and shared Cargo cache serially — POSIX helpers unavailable and cold Rust compilation costly — environment-specific scripts must still be reported honestly.
+Baseline: frontend 37 files, 276 passed and 3 skipped; rshell-protocol 64 passed. Task 1 BASE b4e3d68.
+Baseline environment: npm audit 0 vulnerabilities; script self-tests fail under WSL Bash (Windows paths) and Git Bash (POSIX/Windows expected-path mismatch). cargo audit default advisory-db directory is nonempty but cannot be initialized; retry with isolated database.
+Task 2 dependency fact: russh-sftp2.4 high-level API lacks safe overwrite extension. Ruling: follow accepted explicit-failure contract on unsupported servers, never pre-delete target; cost is unavailable overwrite on those servers.
+Rust dependency audit: isolated database scan exit0 with reviewed RSA ignore and9 nonblocking warnings (8 unmaintained, glib unsound). Original default advisory db untouched. These inherited warnings are explicitly reported, not expanded into this feature scope.
+Task1 observed RED: saturated queue admission, main terminal reply, queued close; focused protocol3/UI5 green. Additional queued-expiry RED confirms expired command can execute. Primary output EOF already drives shared connection teardown; recovery preserves it and reports disconnected sibling labels. Extra terminal recovery can be isolated; independent connections must remain unaffected.
+Task1 protocol full69 passed. First full frontend277 passed/1 failed/3 skipped: legacy successful Backspace fixture defaulted to disconnected but expected sending. Agent corrects fixture to connected while retaining recovery-input suppression regression; rerun pending.
+Task1 implementer final reports protocol69/core189/frontend278 passed+3 skipped/typecheck0; strict lint pending. Tauri terminal_recovery_required mapping test must run in final workspace verification.
+Task1 implementation c1afefc done, awaiting independent task review. Final protocol69/core189/frontend279+3skip/typecheck/focusedclippy/fmt green. Shared deadline10s includes lock admission. Pre-lock close failure explicitly retains resource until teardown, surfaced for review.
+
+User explicitly paused implementation. SSH Task1 committed c1afefc; independent reviewer interrupted without final verdict. Tasks2/3 not started; Task4 not completed. Resume from Task1 review, not from reimplementation. Persistent status and next-step evidence: 2026-10-08-reliability-recovery-progress.md.

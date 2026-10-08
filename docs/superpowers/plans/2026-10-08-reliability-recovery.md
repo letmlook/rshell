@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-08-reliability-improvement-design.md`.
 
+**Execution status:** Paused by user on 2026-10-08. Task 1 implementation committed as `c1afefc` with scoped tests passing; independent task review interrupted without verdict. Tasks 2/3 not started, Task 4 pending. Resume from [saved progress](2026-10-08-reliability-recovery-progress.md), not by reimplementing Task 1.
+
 ## Global Constraints
 
 - Retain Tauri; macOS is the acceptance platform. No egui or expanded platform scope.

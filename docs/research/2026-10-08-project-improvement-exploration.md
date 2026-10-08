@@ -1,6 +1,6 @@
 # RShell 完善与优化探索
 
-日期：2026-10-08。状态：目标、范围、恢复行为与完整方案均已获用户确认，探索阶段完成，功能改动尚未实施。
+日期：2026-10-08。状态：方案已确认；SSH 部分已实施，当前按用户要求暂停，其余任务与验收尚未完成。恢复入口见 [实施进度](../superpowers/plans/2026-10-08-reliability-recovery-progress.md)。
 
 完整方案见 [可靠性与恢复体验完善方案](../superpowers/specs/2026-10-08-reliability-improvement-design.md)。
 
