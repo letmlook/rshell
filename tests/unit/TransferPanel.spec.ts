@@ -193,6 +193,54 @@ describe("TransferPanel R2-T2 retry control", () => {
   });
 });
 
+describe("TransferPanel R2-T2 commit_strategy rendering", () => {
+  function itemWithStrategy(id: string, strategy: string | null): TransferItem {
+    return {
+      id, name: id, phase: "done", progress: 1, size: 100, local: "/a", remote: "/b", speed: 0,
+      commit_strategy: strategy,
+    };
+  }
+
+  it("shows 标准重命名（非原子） for standard_rename so the user knows atomicity wasn't claimed", () => {
+    const wrapper = mountPanel({
+      items: [itemWithStrategy("t-done-std", "standard_rename")],
+    });
+    const info = wrapper.find('[data-test="xfer-commit-info-t-done-std"]');
+    expect(info.exists()).toBe(true);
+    expect(info.text()).toContain("提交方式");
+    expect(info.text()).toContain("标准重命名");
+    expect(info.text()).toContain("非原子");
+  });
+
+  it("shows POSIX 重命名（原子） for posix_rename when the server provides atomic replace", () => {
+    const wrapper = mountPanel({
+      items: [itemWithStrategy("t-done-posix", "posix_rename")],
+    });
+    const info = wrapper.find('[data-test="xfer-commit-info-t-done-posix"]');
+    expect(info.exists()).toBe(true);
+    expect(info.text()).toContain("POSIX 重命名");
+    expect(info.text()).toContain("原子");
+  });
+
+  it("omits the commit info row when commit_strategy is null on a completed task", () => {
+    const wrapper = mountPanel({
+      items: [itemWithStrategy("t-done-null", null)],
+    });
+    expect(wrapper.find('[data-test="xfer-commit-info-t-done-null"]').exists()).toBe(false);
+  });
+
+  it("does not render commit info for non-done phases even if commit_strategy is leaked", () => {
+    const wrapper = mountPanel({
+      items: [{
+        id: "t-failed-strategy", name: "failed", phase: "failed",
+        progress: 0.5, size: 100, local: "/a", remote: "/b", speed: 0, error: "boom",
+        commit_strategy: "standard_rename",
+      }],
+    });
+    expect(wrapper.find('[data-test="xfer-commit-info-t-failed-strategy"]').exists()).toBe(false);
+  });
+});
+
 describe("TransferPanel 队列生命周期菜单", () => {
   it("disables the queue menu when there is no finished entry to clear", () => {
     const wrapper = mountPanel({

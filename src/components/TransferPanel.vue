@@ -232,6 +232,24 @@ function phaseLabel(p: TransferPhase): string {
   return { queued: "排队", active: "传输中", paused: "已暂停", failed: "失败", done: "完成", cancelled: "已取消" }[p];
 }
 
+/** R2-T2：把后端的提交策略标签翻译成给用户的诚实措辞。
+ *
+ *  当前 russh-sftp 2.4 高层 API 不暴露 `posix-rename@openssh.com` 探测，
+ *  本轮实现只会落到 `standard_rename`；但 UI 必须如实告诉用户「这次拿到了
+ *  原子替换保证吗」，避免他们误把「已完成」当成「远端已原子提交」。
+ *  spec §二约束：100% 字节进度不代表提交成功。
+ */
+function commitStrategyLabel(strategy: string): string {
+  switch (strategy) {
+    case "posix_rename":
+      return "POSIX 重命名（原子）";
+    case "standard_rename":
+      return "标准重命名（非原子）";
+    default:
+      return strategy;
+  }
+}
+
 function phaseClass(p: TransferPhase): string {
   return {
     queued: "rs-status-dot--disconnected",
@@ -516,6 +534,16 @@ const columns = [
             <div class="xfer-col xfer-remaining">{{ fmtRemaining(row) }}</div>
             <div class="xfer-col xfer-error" v-if="row.phase === 'failed'" role="alert">
               {{ row.error || '传输失败，请检查连接和文件权限后重试。' }}
+            </div>
+            <!-- R2-T2：完成行附带提交策略。失败/已取消不会到这一步，
+                 因为没真正提交；residue 由 xfer-error 行承载。 -->
+            <div
+              v-if="row.phase === 'done' && row.commit_strategy"
+              class="xfer-col xfer-commit-info"
+              role="status"
+              :data-test="`xfer-commit-info-${row.id}`"
+            >
+              提交方式：{{ commitStrategyLabel(row.commit_strategy) }}
             </div>
             <div class="xfer-col xfer-actions">
               <button
@@ -831,6 +859,16 @@ const columns = [
   color: var(--el-color-danger);
   font-size: var(--rs-fs-xs);
   margin-top: var(--rs-s-1);
+}
+
+/* R2-T2：完成行的提交策略 —— muted 字体颜色，区别于失败行的 danger 红。
+   信息性，不视作错误。 */
+.xfer-commit-info {
+  grid-column: 1 / -1;
+  color: var(--rs-fg-muted);
+  font-size: var(--rs-fs-xs);
+  margin-top: var(--rs-s-1);
+  font-family: var(--rs-font-mono);
 }
 
 .phase {

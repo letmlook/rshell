@@ -412,6 +412,46 @@ const OUTCOME_RETURN_MAP: Record<string, { helper: string; typeText: string }> =
   TaskId: { helper: "retryTransfer", typeText: "Uuid" },
 };
 
+// R2-T2：TransferTaskInfo 新增 R2-T2 字段（temp_path / cleanup_status / commit_strategy）
+// 必须在前后端双向存在，否则 stage 残留透传、清理结果报告、提交策略诚实标记都会静默失效。
+const TRANSFER_TASK_INFO_R2_T2_FIELDS = [
+  "temp_path",
+  "cleanup_status",
+  "commit_strategy",
+] as const;
+
+function extractTransferTaskInfoFieldsFromTypesTs(): string[] {
+  const source = readFileSync("src/ipc/types.ts", "utf8");
+  const start = source.indexOf("export interface TransferTaskInfo");
+  if (start < 0) throw new Error("TransferTaskInfo interface not found in src/ipc/types.ts");
+  const braceStart = source.indexOf("{", start);
+  const braceEnd = matchBrace(source, braceStart);
+  if (braceEnd < 0) throw new Error("TransferTaskInfo interface body not closed");
+  const body = source.slice(braceStart + 1, braceEnd);
+  const fieldNames: string[] = [];
+  for (const line of body.split("\n")) {
+    const m = line.match(/^\s*([a-z_][a-z0-9_]*)\s*[:?]/);
+    if (m) fieldNames.push(m[1]);
+  }
+  return fieldNames;
+}
+
+function extractTransferTaskInfoFieldsFromRust(): string[] {
+  const source = readFileSync("src-tauri/crates/rshell-api/src/types.rs", "utf8");
+  const start = source.indexOf("pub struct TransferTaskInfo");
+  if (start < 0) throw new Error("TransferTaskInfo struct not found in rshell-api/src/types.rs");
+  const braceStart = source.indexOf("{", start);
+  const braceEnd = matchBrace(source, braceStart);
+  if (braceEnd < 0) throw new Error("TransferTaskInfo struct body not closed");
+  const body = source.slice(braceStart + 1, braceEnd);
+  const fieldNames: string[] = [];
+  for (const line of body.split("\n")) {
+    const m = line.match(/^\s*pub\s+([a-z_][a-z0-9_]*)\s*:/);
+    if (m) fieldNames.push(m[1]);
+  }
+  return fieldNames;
+}
+
 /** 无 call<T> 返回标注的 CommandOutcome 变体白名单 */
 const OUTCOME_WHITELIST = new Set([
   "None", // 写命令统一返回 None；前端 call() 不带 <T>
@@ -515,5 +555,33 @@ describe("client.ts helper 调用方契约（R2-11）", () => {
   it("helper 白名单只包含真实存在的 helper（防止白名单腐化）", () => {
     const unknown = [...HELPER_WHITELIST].filter((n) => !helperNames.includes(n));
     expect(unknown).toEqual([]);
+  });
+});
+
+describe("TransferTaskInfo R2-T2 fields contract reconciliation", () => {
+  // 显式化 R2-T2 契约：staging residue / cleanup / commit strategy 必须从后端
+  // 一路透传到面板，少任一字段都会让 staged lifecycle 的对外承诺失效。
+  it("src/ipc/types.ts TransferTaskInfo 包含全部 R2-T2 字段", () => {
+    const fields = extractTransferTaskInfoFieldsFromTypesTs();
+    for (const required of TRANSFER_TASK_INFO_R2_T2_FIELDS) {
+      expect(fields).toContain(required);
+    }
+  });
+
+  it("rshell-api TransferTaskInfo 与前端 R2-T2 字段一一对应", () => {
+    const tsFields = extractTransferTaskInfoFieldsFromTypesTs();
+    const rustFields = extractTransferTaskInfoFieldsFromRust();
+    for (const required of TRANSFER_TASK_INFO_R2_T2_FIELDS) {
+      expect(tsFields).toContain(required);
+      expect(rustFields).toContain(required);
+    }
+  });
+
+  it("前后端 TransferTaskInfo 没有意外漂移的同名字段（结构层 sanity）", () => {
+    const tsFields = new Set(extractTransferTaskInfoFieldsFromTypesTs());
+    const rustFields = new Set(extractTransferTaskInfoFieldsFromRust());
+    // 两侧字段集相同；任何一侧多出来都会让对账失败 —— serde 序列化按字段
+    // 名匹配，多余字段会被前端丢掉或后端 serde 拒掉。
+    expect([...tsFields].sort()).toEqual([...rustFields].sort());
   });
 });
