@@ -6,7 +6,7 @@
 
 所有本地验证与审计都通过下列脚本完成，CI 与文档只调用这些入口，不重复脚本内部命令：
 
-- `npm run verify`（底层 `bash scripts/verify.sh [--skip-install]`）：从仓库根目录运行前端类型检查、单元测试、构建、文档契约、脚本测试，再依次执行 `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`。任一子命令失败立即返回非零退出码，不会被静默吞掉。
+- `npm run verify`（底层 `bash scripts/verify.sh [--skip-install]`）：从仓库根目录运行前端类型检查、单元测试、构建、文档契约、bundle 体积检查、发布版本一致性检查、脚本测试，再依次执行 `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`。任一子命令失败立即返回非零退出码，不会被静默吞掉。
 - `npm run audit`（底层 `bash scripts/audit.sh`）：`npm audit --registry=https://registry.npmjs.org` 加 `cargo audit --file src-tauri/Cargo.lock`。`cargo-audit` 缺失时给出明确安装提示并以非零退出，不允许“未执行”冒充通过。
 
 Cargo 命令一律通过 `RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1` 触发，避免 rustup 自动更新冲突；脚本永远不会打印或接受签名、notarytool 或会话凭据。
@@ -24,5 +24,17 @@ Cargo 命令一律通过 `RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1` 触�
 - `bash scripts/macos-release-preflight.sh [--unsigned] [app-path]`：确认 Bundle ID、`Contents/Info.plist` 完整、app 路径存在。`--unsigned` 模式只校验这些条件，CI 与本地都可跑；不传则要求同时设置 `APPLE_SIGNING_IDENTITY` 与 `APPLE_NOTARY_PROFILE`，并执行 `codesign --verify --deep --strict`、`xcrun notarytool submit --wait`、`xcrun stapler staple`、`spctl --assess`。脚本不会回显任何凭据，也不会与 `--unsigned` 同时接受签名/公证变量。
 - `bash scripts/macos-verify-app.sh <app-path>`：对已经构建好的 `.app` 验证 Bundle ID、严格代码签名和 Gatekeeper 评估；不执行签名或公证，仅作为产物验收工具。
 - `app-path` 默认为 `src-tauri/target/release/bundle/macos/RShell.app`（或调试包 `src-tauri/target/debug/bundle/macos/RShell.app`），调试 `.app` 体积不作为发布体积结论。
+
+## Tag 发布流水线
+
+`node scripts/check-release-version.mjs [tag]`：比对 `package.json`、`src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[workspace.package]` 版本。不带参数时只要求三处一致；带 tag（如 `v0.2.0`）时额外要求版本等于 tag。不一致或非语义化版本一律非零退出，并列出全部来源，避免改错文件。该检查已进入 `npm run verify`，PR 阶段即可发现版本漂移；CI 在打包前再带 tag 跑一次，防止 `v0.2.0` 打出自称 `0.1.0` 的安装包。
+
+`.github/workflows/release.yml` 在推送 `v*` tag 时触发，也可通过 `workflow_dispatch` 指定已有 tag 重建：
+
+1. `verify` job 在 macOS runner 上先跑 `node scripts/check-release-version.mjs "$RELEASE_TAG"`，再跑 `bash scripts/verify.sh --skip-install`，作为所有打包的前置门禁；不复制 verify 内部命令。
+2. `build` job 以矩阵并行构建 macOS universal（`universal-apple-darwin`）、Windows x64（`x86_64-pc-windows-msvc`）与 Linux x64（`x86_64-unknown-linux-gnu`）；`fail-fast: false`，单个平台失败不取消其余平台。
+3. `tauri-apps/tauri-action` 负责创建/复用该 tag 的 Release 并上传产物，全部第三方 action 按提交 SHA 锁定；Release 说明里显式声明产物未签名、未公证。
+
+发布边界：CI 不注入 `APPLE_SIGNING_IDENTITY`、`APPLE_NOTARY_PROFILE` 或任何 Tauri 签名私钥，签名与公证仍未接入流水线；应用未集成 updater 插件，因此 `includeUpdaterJson: false`，不发布无人消费的更新清单。Linux aarch64 不在本矩阵内。
 
 完整环境说明见 [macOS 开发环境](../docs/07-project-setup-guide.md)，证据见 [验证记录](../docs/09-macos-validation.md)。

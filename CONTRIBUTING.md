@@ -25,6 +25,15 @@ npm run audit    # scripts/audit.sh：npm audit (官方 registry) + cargo audit 
 
 桌面调试和打包命令分别为 `npm run tauri:dev`、`npm run tauri:build`。macOS 调试 `.app` 的预检用 `bash scripts/macos-release-preflight.sh --unsigned <app-path>`，已构建产物的合规检查用 `bash scripts/macos-verify-app.sh <app-path>`。详情见 [环境指南](docs/07-project-setup-guide.md)。
 
+## 发版
+
+推送 `v*` tag 触发 `.github/workflows/release.yml`：先跑共享校验与版本一致性检查，再并行构建 macOS universal、Windows x64、Linux x64 安装包并上传到该 tag 的 GitHub Release。流水线细节与产物边界见 [scripts/README.md](scripts/README.md)。
+
+- 打 tag 前必须把 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`（`[workspace.package]`）改成同一个版本，`npm run verify` 会拦截不一致。
+- tag 格式为 `v<major>.<minor>.<patch>`；带 `-rc1` 之类的后缀会发布为 prerelease。
+- 签名与公证未接入 CI：`APPLE_SIGNING_IDENTITY`、`APPLE_NOTARY_PROFILE` 不在流水线中提供，Release 说明会声明产物未签名。不要在 PR 或文档中把 CI 产出的安装包写成已签名或已公证。
+- 发布说明会由 GitHub 自动生成变更列表，因此提交信息应写清面向用户的变化。
+
 ## 代码约定
 
 - Rust 使用 rustfmt；错误传递到调用者，避免静默吞掉网络或持久化失败。

@@ -54,6 +54,26 @@ npm run audit    # 走 scripts/audit.sh：npm audit (官方 registry) + cargo au
 
 仅在不需要 npm ci 的快速复跑时使用 `bash scripts/verify.sh --skip-install`。
 
+## 发布
+
+推送 `v*` tag 即触发 `.github/workflows/release.yml`：先在 macOS runner 上跑共享校验（`scripts/verify.sh`）并核对 tag 与 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 的版本一致，然后并行构建 macOS universal（arm64 + x86_64）、Windows x64 和 Linux x64 安装包，并作为该 tag 的 GitHub Release 附件上传。
+
+发布步骤：
+
+```bash
+# 1. 把 package.json、src-tauri/tauri.conf.json、src-tauri/Cargo.toml 的版本改成同一个值
+# 2. 本地跑通共享校验
+npm run verify
+# 3. 提交并打 tag
+git commit -am "release: v0.1.0"
+git tag v0.1.0
+git push origin main && git push origin v0.1.0
+```
+
+版本三处不一致时流水线会在打包前失败，不会发布自称旧版本的安装包；打包失败可用 Actions 页面上的手动触发重跑同一个 tag。
+
+产物的真实验证范围见 [macOS 验证记录](docs/09-macos-validation.md)。安装包**未签名、未公证**：macOS 首次打开需在「系统设置 → 隐私与安全性」确认，Windows 可能有 SmartScreen 提示，Linux AppImage 需先 `chmod +x`。Windows 与 Linux 安装包由 CI 产出，但这两条链路尚未做真实设备功能验收。
+
 Bundle ID 与脚本细节见 [scripts/README.md](scripts/README.md)。自动化检查、真实启动结果及尚未执行的外部设备/服务器场景，统一记录在 [macOS 验证记录](docs/09-macos-validation.md)。测试通过不能替代真实 SSH/SFTP 服务端或物理串口验证。
 
 ## 代码结构

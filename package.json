@@ -11,6 +11,7 @@
     "test": "vitest run",
     "check:docs": "node scripts/check-docs.mjs",
     "check:bundle": "node scripts/check-build-output.mjs",
+    "check:release": "node scripts/check-release-version.mjs",
     "icons": "node scripts/gen-icons.mjs",
     "test:scripts": "node --test scripts/*.test.mjs",
     "verify": "bash scripts/verify.sh",

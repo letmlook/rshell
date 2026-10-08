@@ -1,0 +1,172 @@
+name: release
+
+# Tag-driven installer build. Pushing a `v*` tag runs the shared verification
+# gate first, then builds the macOS, Windows and Linux bundles in parallel and
+# attaches them to the GitHub Release for that tag.
+on:
+  push:
+    tags:
+      - 'v*'
+  # Re-run an existing tag (for example after fixing a packaging problem)
+  # without deleting and re-pushing it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish, for example v0.1.0'
+        required: true
+        type: string
+
+# Default to read-only; only the build job needs to write Releases.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  # A release is never cancelled halfway: half-uploaded assets are worse than a
+  # duplicate run.
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release gate
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      # On a tag push ref_name is the tag; on workflow_dispatch it is the branch,
+      # so the manual input wins there.
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_NO_UPDATE_CHECK: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Rust toolchain components
+        run: |
+          rustup component add clippy rustfmt
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      # Fail before the expensive workspace build if the tag and the bundled
+      # versions disagree: nothing downstream rewrites these three files.
+      - name: Check tag against the bundled version
+        run: node scripts/check-release-version.mjs "$RELEASE_TAG"
+
+      # Single shared entry point; the release build never re-implements it.
+      - name: Run shared verification
+        run: bash scripts/verify.sh --skip-install
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_NO_UPDATE_CHECK: 1
+    strategy:
+      # One platform failing must not cancel the others: the release stays
+      # incomplete and reports exactly which target is missing.
+      fail-fast: false
+      matrix:
+        include:
+          # macOS ships one universal bundle (arm64 + x86_64) instead of two
+          # separate downloads.
+          - os: macos-latest
+            target: universal-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Tauri Linux prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            wget
+
+      - name: Install macOS bundle targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build bundles and publish to the GitHub Release
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: RShell ${{ env.RELEASE_TAG }}
+          releaseBody: |
+            由 `.github/workflows/release.yml` 在 tag `${{ env.RELEASE_TAG }}` 上自动构建。
+
+            安装包均**未签名、未公证**：
+
+            - macOS：首次打开需在「系统设置 → 隐私与安全性」中确认，或右键选择「打开」。签名与公证尚未接入 CI。
+            - Windows：SmartScreen 可能提示未知发布者。
+            - Linux：AppImage 需要先 `chmod +x`；deb/rpm 依赖发行版系统库。
+
+            已验证范围以 [docs/09-macos-validation.md](https://github.com/letmlook/rshell/blob/main/docs/09-macos-validation.md) 为准；仅 macOS 完成了真实设备与真实 SSH/SFTP 服务端验证。
+          # GitHub generates the changelog; the body above is prepended to it.
+          generateReleaseNotes: true
+          releaseDraft: false
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
+          # No Tauri updater plugin is bundled yet, so an updater manifest would
+          # advertise a channel that does not exist.
+          includeUpdaterJson: false
+          # The three matrix jobs create the same release concurrently.
+          retryAttempts: 3
+          args: --target ${{ matrix.target }}

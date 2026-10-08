@@ -39,6 +39,10 @@ npm test
 npm run build
 npm run check:docs
 npm run check:bundle
+# Without a tag argument this only asserts that package.json, tauri.conf.json
+# and Cargo.toml agree; the release workflow passes the tag to catch a mis-tagged
+# release before any installer is built.
+npm run check:release
 npm run test:scripts
 
 # Cargo must run from the workspace root (src-tauri/), not the repo root,

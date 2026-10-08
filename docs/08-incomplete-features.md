@@ -123,9 +123,19 @@ RDP 已删除。Remote Forward、FTP/FTPS、Windows ConPTY、截图、录屏、�
 
 在 Developer ID 证书、notarytool 凭据和真实公证步骤落地之前，CI 与本地文档只允许运行 `--unsigned` 预检与 `macos-verify-app.sh`，不允许把未签名/未公证的 `.app` 写为“已发布”。签名与公证的成功证据将单独记录到 [macOS 验证](09-macos-validation.md)。
 
+## Tag 发布流水线（已实现，未做真实 tag 运行验证）
+
+`.github/workflows/release.yml` 在推送 `v*` tag 后构建 macOS universal、Windows x64、Linux x64 安装包并上传为该 tag 的 GitHub Release 附件；`scripts/check-release-version.mjs` 负责在打包前比对 tag 与三处版本号。当前状态下必须明确区分「已实现」与「已验证」：
+
+- **尚未执行过一次真实的 tag 发布**：流水线只经过 YAML 结构校验、action SHA 锁定校验与契约测试，没有真实 GitHub Actions 运行记录，也没有真实产物可供检查。
+- **产物未签名、未公证**：流水线不注入 `APPLE_SIGNING_IDENTITY`、`APPLE_NOTARY_PROFILE` 或 Tauri 签名私钥；macOS 产物会触发 Gatekeeper 拦截，需手动确认后打开，Windows 可能有 SmartScreen 提示。
+- **Windows 与 Linux 缺少真实验收**：安装包由 CI 产出，但这两条链路的启动、SSH/SFTP、隧道与串口行为没有真实设备验证记录，验证证据只有 macOS。
+- **平台覆盖不完整**：未构建 Linux aarch64 与 Windows aarch64；应用未集成 updater 插件，因此不发布 updater 清单。
+- **SSH/SFTP、隧道与物理串口**在 macOS 上同样属于未验证项，见 [macOS 验证](09-macos-validation.md) 的验收清单。
+
 ## 尚待真实环境验收
 
-自动检查、调试应用打包和基础 GUI 交互证据见 [macOS 验证](09-macos-validation.md)。未执行的 GUI 写操作、真实 SSH/SFTP 与隧道、物理串口、签名公证不能仅凭单元测试标记完成。
+自动检查、调试应用打包和基础 GUI 交互证据见 [macOS 验证](09-macos-validation.md)。未执行的 GUI 写操作、真实 SSH/SFTP 与隧道、物理串口、签名公证不能仅凭单元测试标记完成。Tag 发布流水线、Windows/Linux 产物与真实服务器场景同样不因存在配置文件而记为已验证。
 
 本轮（2026-10-04）新增的文件面板路径树、双向滚动、传输日志页、面板拖动高度、终端右键菜单与选中即复制、终端配色设置、终端断开态、多标签独立 pty、全局自定义弹窗与本地路径选择器，**仅由单元测试与构建检查覆盖，尚无 macOS 真实 GUI 人工验收记录**：路径树的懒加载与 SFTP 目录读取、右键粘贴在真实 WebView 中的剪贴板授权、拖动高度的手感与上下限、断线后终端重连、复制会话后钥匙串补录凭据、自定义弹窗在真实窗口中的焦点循环与遮罩点击，以及**两个标签各自跑不同命令**（每标签独立 pty）都需在真机走一遍。复制会话没有后端凭据复制命令这一点是设计边界，不是缺陷。
 

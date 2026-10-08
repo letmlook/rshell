@@ -12,7 +12,7 @@ macOS 本机，Rust stable 1.98.1，Tauri 2 + Vue 3 + xterm.js。依赖由 `npm 
 
 本轮同时运行仓库内统一入口脚本（与 CI 复用同一份逻辑，命令清单见 [scripts/README.md](../scripts/README.md)）：
 
-- `npm run verify`（`scripts/verify.sh`）：前端 `typecheck` / `test` / `build` / `check:docs` / `check:bundle` / `test:scripts`，Rust `fmt` / `clippy --workspace --all-targets -- -D warnings` / `test --workspace`，全部 0 失败。
+- `npm run verify`（`scripts/verify.sh`）：前端 `typecheck` / `test` / `build` / `check:docs` / `check:bundle` / `check:release` / `test:scripts`，Rust `fmt` / `clippy --workspace --all-targets -- -D warnings` / `test --workspace`，全部 0 失败。
 - `npm run audit`（`scripts/audit.sh`）：`npm audit --registry=https://registry.npmjs.org` 与 `RUSTUP_TOOLCHAIN=stable cargo audit --file src-tauri/Cargo.lock`，本地开发机需先 `cargo install cargo-audit --version 0.22.2 --locked`，否则脚本立即以非零退出并指出安装命令。
 
 `npm test` 累计 75 项通过（20 文件），`node --test scripts/*.test.mjs` 累计 32 项通过；`npm run check:bundle` 在 macOS 调试包构建后扫描 `dist/assets/` 并断言每个 JS chunk ≤ 500 KiB、无 `.map`，最大 chunk 403 KiB（vendor-xterm）。
@@ -149,3 +149,23 @@ release 下上传超过 OpenSSH 对照，下载与用户用 Xshell 观测到的�
 **新增构建配置**：`[profile.dev.package."*"] opt-level = 3`，只提升依赖的优化级别，工作区自身 crate 仍为 dev，使 `tauri dev` 在保留调试符号与快速增量编译的前提下获得接近 release 的传输性能。
 
 **未验证**：跨网（非局域网）链路的表现、macOS 上的对应数字（该项目以 macOS 为验收平台，本次仅在 Windows + 局域网实测）。
+
+## 2026-10-08：Tag 驱动的多平台打包与 Release 发布
+
+本节记录**实现**与**已验证项**的区别，未执行的一律不记为通过。
+
+**新增内容**：`.github/workflows/release.yml`、版本一致性守卫 `scripts/check-release-version.mjs`（接入 `npm run check:release` 与 `scripts/verify.sh`）、以及 9 项对应的契约测试。
+
+**设计上解决的问题**：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`（`[workspace.package]`）各自带版本号，而 Tauri 打包只读取其中一处，没有任何环节强制三者一致——直接打 `v0.2.0` 的 tag 会产出自称 `0.1.0` 的安装包。守卫脚本在打包前比对 tag 与三处版本，不一致或非语义化版本即非零退出并列出全部来源；`npm run verify` 在 PR 阶段即可发现版本漂移。
+
+**action 锁定**：`tauri-apps/tauri-action` 锁定到 v0 对应提交 `84b9d35b5fc46c1e45415bdb6144030364f7ebc5`，`checkout` / `setup-node` / `cache` 复用 `ci.yml` 已有的三个 SHA，两条流水线的锁定由契约测试强制一致。SHAs 于本轮通过 GitHub API 解析注解 tag 得到，非记忆填写。
+
+**本轮实际执行的检查**：两份 workflow 文件的 YAML 结构解析通过；`node --test scripts/automation.test.mjs` 中 9 项新增测试全部通过（版本守卫 4 项、发布工作流 5 项）。这些检查只覆盖配置与契约，**不等于**流水线可用。
+
+**未验证**：
+
+- 未推送过任何测试 tag，没有真实的 GitHub Actions 运行记录；矩阵构建、Release 创建与产物上传均未端到端跑通。
+- macOS universal、Windows x64、Linux x64 三个目标只做了配置层面的核对，实际产物未下载检查。
+- 产物未签名、未公证，签名与公证状态不变；Release 说明会显式声明这一点。
+- Windows 与 Linux 产物没有真机功能验收。
+- 本机为 Windows + WSL 环境，24 项调用 POSIX `bash` 的既有脚本测试（`verify.sh` / `audit.sh` / `macos-*.sh`）在本机因 WSL 挂载失败而报错；本轮已用 `git stash` 对比确认这 24 项在改动前后**失败数量不变**，非本次引入。
