@@ -30,7 +30,9 @@ jobs:
   verify:
     name: Verify release gate
     runs-on: macos-latest
-    timeout-minutes: 60
+    # Same cold-cache reality as ci.yml: a dependency bump forces a full rebuild
+    # before clippy and cargo test can even start.
+    timeout-minutes: 90
     env:
       # On a tag push ref_name is the tag; on workflow_dispatch it is the branch,
       # so the manual input wins there.

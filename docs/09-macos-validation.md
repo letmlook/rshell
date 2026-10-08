@@ -192,6 +192,10 @@ npm 侧同期修复了 4 项高危漏洞（vue 3.5.43、brace-expansion 2.1.7、
 - `rsa::RsaPublicKey` 的 `n` 字段私有化，RSA 位数改用 ssh-key 官方的 `key_size()`（已按 Mpint 前导零规则算好，不再手工剥字节）。
 - `russh` 0.62 默认 feature 含 `aws-lc-rs`，其 `aws-lc-sys` 在 Windows 上需要 NASM；改用 `ring` 后端，避免把「装 NASM」变成每个 Windows 开发者的硬前置。
 
+### 根因四：30 分钟的 job 超时（依赖大改后冷缓存重建）
+
+依赖升级让 `Cargo.lock` 整体失效，`actions/cache` 的 key 随之变化，macOS runner 必须从零重建 wasmtime（Cranelift）、russh 与 Tauri，而 clippy 与 `cargo test` 各自还需要独立产物。`ci.yml` 原先的 `timeout-minutes: 30` 在「共享校验」还没跑完时就把 job 杀掉（run 37740101334：`The job has exceeded the maximum execution time of 30m0s`），GitHub 呈现为 `cancelled` 而非 `failure`，容易被误读成人为取消。现将 ci.yml 与 release.yml 的 verify job 均提高到 90 分钟；lockfile 不变时缓存命中，后续运行仍是分钟级。
+
 **未验证**：本节记录的编译与测试结果全部来自 Windows + Git Bash 环境；macOS runner 上的实际结果以 CI 为准。真实 SSH/SFTP 服务器、物理串口与签名公证状态不变。
 
 ## 2026-10-08：Tag 驱动的多平台打包与 Release 发布

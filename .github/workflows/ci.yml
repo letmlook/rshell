@@ -15,7 +15,12 @@ concurrency:
 jobs:
   verify:
     runs-on: macos-latest
-    timeout-minutes: 30
+    # A dependency bump invalidates the Cargo.lock-derived cache, so the job has
+    # to rebuild wasmtime (Cranelift), russh and Tauri from scratch, and clippy
+    # plus cargo test each need their own artifacts. 30 minutes was not enough:
+    # the 2026-10-08 run was killed mid-verification with every Rust check still
+    # pending. The cache makes later runs on an unchanged lockfile fast.
+    timeout-minutes: 90
     env:
       RUSTUP_TOOLCHAIN: stable
       RUSTUP_NO_UPDATE_CHECK: 1
