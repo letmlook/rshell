@@ -33,6 +33,28 @@ pub type SshClientHandle = Arc<tokio::sync::RwLock<SshClient>>;
 /// 等待 pty 应答，这里是防止其它未知阻塞点的最后一道兜底。
 const DISCONNECT_SSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+const TERMINAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn terminal_io_error(error: rshell_protocol::ProtocolError) -> CoreError {
+    match error {
+        rshell_protocol::ProtocolError::TerminalRecoveryRequired => {
+            CoreError::TerminalRecoveryRequired
+        }
+        error => CoreError::ConnectionError(error.to_string()),
+    }
+}
+
+// Include lock admission in the user-visible budget. Dropping an admitted
+// protocol request signals its per-PTY cancellation guard.
+async fn terminal_request<F>(request: F) -> Result<(), CoreError>
+where
+    F: std::future::Future<Output = Result<(), CoreError>>,
+{
+    tokio::time::timeout(TERMINAL_REQUEST_TIMEOUT, request)
+        .await
+        .unwrap_or(Err(CoreError::TerminalRecoveryRequired))
+}
+
 fn validate_session_config(config: &SessionConfig) -> Result<(), CoreError> {
     match config.protocol {
         Protocol::SSH | Protocol::Telnet => {
@@ -578,7 +600,10 @@ impl SessionService {
                     }
                     // Close transport resources on remote shell EOF as well as
                     // local cancellation before retiring this generation.
-                    let _ = client.write().await.disconnect_ssh().await;
+                    let _ = tokio::time::timeout(DISCONNECT_SSH_TIMEOUT, async {
+                        client.write().await.disconnect_ssh().await
+                    })
+                    .await;
                     let _lifecycle = lifecycle.lock().await;
                     let mut states = sessions.write().await;
                     if let Some(state) = states
@@ -842,8 +867,12 @@ impl SessionService {
             // 关闭标签、删除会话、重连与每一次 send_input 会被一起卡死。
             // 协议层已不再逐个等待 pty 应答，这里再加一道兜底上限：最坏情况下
             // 只是放弃优雅关闭，锁仍会按时释放。
-            let mut client = conn.client.write().await;
-            match tokio::time::timeout(DISCONNECT_SSH_TIMEOUT, client.disconnect_ssh()).await {
+            match tokio::time::timeout(DISCONNECT_SSH_TIMEOUT, async {
+                let mut client = conn.client.write().await;
+                client.disconnect_ssh().await
+            })
+            .await
+            {
                 Ok(Err(e)) => {
                     warn!(session_id = %session_id, error = %e, "Error disconnecting SSH");
                 }
@@ -896,20 +925,18 @@ impl SessionService {
                     CoreError::NotFound(format!("Connection {} not found", session_id))
                 })?
         };
-        let client = client.read().await;
-        // 指定 terminal_id 就投到那个 pty；None = 主 pty（首标签）
-        if let Some(id) = terminal_id {
-            client
-                .send_data_to(id, data)
-                .await
-                .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-            return Ok(());
-        }
-        client
-            .send_data(data)
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        Ok(())
+        terminal_request(async {
+            let client = client.read().await;
+            if let Some(id) = terminal_id {
+                client
+                    .send_data_to(id, data)
+                    .await
+                    .map_err(terminal_io_error)
+            } else {
+                client.send_data(data).await.map_err(terminal_io_error)
+            }
+        })
+        .await
     }
 
     /// 调整终端大小
@@ -946,19 +973,21 @@ impl SessionService {
                     CoreError::NotFound(format!("Connection {} not found", session_id))
                 })?
         };
-        let client = client.read().await;
-        if let Some(id) = terminal_id {
-            client
-                .resize_terminal_of(id, cols, rows)
-                .await
-                .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-            return Ok(());
-        }
-        client
-            .resize_terminal(cols, rows)
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        Ok(())
+        terminal_request(async {
+            let client = client.read().await;
+            if let Some(id) = terminal_id {
+                client
+                    .resize_terminal_of(id, cols, rows)
+                    .await
+                    .map_err(terminal_io_error)
+            } else {
+                client
+                    .resize_terminal(cols, rows)
+                    .await
+                    .map_err(terminal_io_error)
+            }
+        })
+        .await
     }
 
     /// 在已连接的会话上另开一个 pty（= 新增一个独立标签会话）。
@@ -1020,9 +1049,12 @@ impl SessionService {
                     CoreError::NotFound(format!("Connection {} not found", session_id))
                 })?
         };
-        let mut guard = client.write().await;
-        guard.close_terminal(terminal_id).await;
-        drop(guard);
+        terminal_request(async {
+            let mut guard = client.write().await;
+            guard.close_terminal(terminal_id).await;
+            Ok(())
+        })
+        .await?;
         let _ = self.terminal_service.destroy_terminal(terminal_id);
         Ok(())
     }
@@ -2420,5 +2452,122 @@ mod tests {
         let svc = make_service();
         svc.load_from_disk().await;
         assert!(svc.list_sessions().await.unwrap().is_empty());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn recovery_ssh_lock_admission_is_bounded_and_other_connection_is_independent() {
+        let svc = make_service();
+        let cfg = make_config("locked", "127.0.0.1");
+        let id = cfg.id;
+        let client = Arc::new(RwLock::new(SshClient::new(
+            cfg,
+            ResolvedAuthMethod::Password {
+                username: "test".into(),
+                password: "test".into(),
+            },
+        )));
+        let (cancel, _rx) = mpsc::channel(1);
+        svc.connections.write().await.insert(
+            id,
+            ActiveConnection {
+                client: client.clone(),
+                _cancel_tx: cancel,
+            },
+        );
+        let _writer = client.write().await;
+        let other = make_config("independent", "127.0.0.1");
+        let other_id = other.id;
+        let other_client = Arc::new(RwLock::new(SshClient::new(
+            other,
+            ResolvedAuthMethod::Password {
+                username: "test".into(),
+                password: "test".into(),
+            },
+        )));
+        let (cancel, _other_rx) = mpsc::channel(1);
+        svc.connections.write().await.insert(
+            other_id,
+            ActiveConnection {
+                client: other_client,
+                _cancel_tx: cancel,
+            },
+        );
+        let other_result = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            svc.send_data(other_id, None, b"independent"),
+        )
+        .await;
+        assert!(
+            other_result.is_ok(),
+            "unrelated connection must not wait on the stuck client lock"
+        );
+        let send = tokio::time::timeout(
+            std::time::Duration::from_secs(11),
+            svc.send_data(id, None, b"input"),
+        );
+        let resize = tokio::time::timeout(
+            std::time::Duration::from_secs(11),
+            svc.resize_terminal(id, None, 80, 24),
+        );
+        let close = tokio::time::timeout(
+            std::time::Duration::from_secs(11),
+            svc.close_terminal(id, Uuid::new_v4()),
+        );
+        let (send, resize, close) = tokio::join!(send, resize, close);
+        assert!(send.is_ok(), "send waits indefinitely for SSH lock");
+        assert!(resize.is_ok(), "resize waits indefinitely for SSH lock");
+        assert!(close.is_ok(), "close waits indefinitely for SSH lock");
+        assert!(matches!(
+            send.unwrap(),
+            Err(CoreError::TerminalRecoveryRequired)
+        ));
+        assert!(matches!(
+            resize.unwrap(),
+            Err(CoreError::TerminalRecoveryRequired)
+        ));
+        assert!(matches!(
+            close.unwrap(),
+            Err(CoreError::TerminalRecoveryRequired)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_disconnect_lock_wait_is_bounded_and_retires_old_generation() {
+        let svc = make_service();
+        let cfg = make_config("locked", "127.0.0.1");
+        let id = cfg.id;
+        let client = Arc::new(RwLock::new(SshClient::new(
+            cfg.clone(),
+            ResolvedAuthMethod::Password {
+                username: "test".into(),
+                password: "test".into(),
+            },
+        )));
+        let (cancel, _rx) = mpsc::channel(1);
+        svc.connections.write().await.insert(
+            id,
+            ActiveConnection {
+                client: client.clone(),
+                _cancel_tx: cancel,
+            },
+        );
+        svc.sessions.write().await.insert(
+            id,
+            SessionState {
+                config: cfg,
+                connection_state: ConnectionState::Connected,
+                connection_info: None,
+                attempt: Some(Uuid::new_v4()),
+                cancel_connect: None,
+            },
+        );
+        let _writer = client.write().await;
+        tokio::time::timeout(std::time::Duration::from_secs(16), svc.disconnect(id))
+            .await
+            .expect("disconnect lock admission exceeded its budget")
+            .unwrap();
+        assert!(!svc.connections.read().await.contains_key(&id));
+        let states = svc.sessions.read().await;
+        assert!(states[&id].attempt.is_none());
+        assert_eq!(states[&id].connection_state, ConnectionState::Disconnected);
     }
 }

@@ -12,7 +12,10 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
+import { useSessionsStore } from "../../src/stores/sessions";
 import TerminalPane from "../../src/components/TerminalPane.vue";
+
+const terminalRuntime = vi.hoisted(() => ({ input: (_data: string) => {}, key: (_event: KeyboardEvent): boolean => true, options: { disableStdin: false } }));
 
 const { openTerminalMock, closeTerminalMock, sendInputMock, resizeTerminalMock, invokeMock } =
   vi.hoisted(() => ({
@@ -30,12 +33,13 @@ vi.mock("@xterm/xterm", () => ({
     rows = 24;
     selection = "";
     options: { theme: unknown; disableStdin: boolean } = { theme: undefined, disableStdin: false };
+    constructor() { terminalRuntime.options = this.options; }
     loadAddon() {}
     open() {}
-    onData() {}
+    onData(callback: (data: string) => void) { terminalRuntime.input = callback; terminalRuntime.options = this.options; }
     dispose() {}
     write() {}
-    attachCustomKeyEventHandler() {}
+    attachCustomKeyEventHandler(callback: (event: KeyboardEvent) => boolean) { terminalRuntime.key = callback; }
     onSelectionChange() {}
     getSelection() {
       return this.selection;
@@ -43,7 +47,7 @@ vi.mock("@xterm/xterm", () => ({
     clear() {
       this.selection = "";
     }
-    paste() {}
+    paste(text: string) { terminalRuntime.input(text); }
   },
 }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
@@ -195,4 +199,80 @@ describe("R3-05 握手完成后自动补挂", () => {
     ).toBeGreaterThanOrEqual(2);
     wrapper.unmount();
   });
+});
+
+
+describe("SSH uncertain input recovery", () => {
+  it("one uncertain input stops keyboard, backspace and paste until real reconnect finishes", async () => {
+    const wrapper = mount(TerminalPane, { props: { sessionId: "session-1", connectionState: "connected" } });
+    await flushPromises();
+    const store = useSessionsStore();
+    const disconnect = vi.spyOn(store, "disconnect").mockResolvedValue(undefined);
+    let finish: () => void = () => {};
+    const connect = vi.spyOn(store, "connect").mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
+    sendInputMock.mockRejectedValueOnce({ kind: "terminal_recovery_required", message: "input outcome uncertain" });
+    terminalRuntime.input("first");
+    await flushPromises();
+    expect(wrapper.find('[data-test="term-recovery"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain("不确定");
+    expect(terminalRuntime.options.disableStdin).toBe(true);
+    terminalRuntime.input("later");
+    terminalRuntime.key(new KeyboardEvent("keydown", { key: "Backspace" }));
+    vi.stubGlobal("navigator", { clipboard: { readText: vi.fn().mockResolvedValue("clipboard") } });
+    window.dispatchEvent(new CustomEvent("rshell:terminal-action", { detail: { sessionId: "session-1", action: "paste" } }));
+    await flushPromises();
+    expect(sendInputMock).toHaveBeenCalledTimes(1);
+    await wrapper.find('[data-test="term-reconnect"]').trigger("click");
+    await flushPromises();
+    expect(disconnect).toHaveBeenCalledWith("session-1");
+    expect(connect).toHaveBeenCalledWith("session-1");
+    expect(terminalRuntime.options.disableStdin).toBe(true);
+    finish();
+    await flushPromises();
+    expect(wrapper.find('[data-test="term-recovery"]').exists()).toBe(false);
+    expect(terminalRuntime.options.disableStdin).toBe(false);
+    terminalRuntime.input("new input");
+    await flushPromises();
+    expect(sendInputMock).toHaveBeenCalledTimes(2);
+    expect(new TextDecoder().decode(sendInputMock.mock.calls[1][1])).toBe("new input");
+    wrapper.unmount();
+  });
+
+  it("failed reconnect and late successful IO cannot clear uncertain recovery", async () => {
+    const wrapper = mount(TerminalPane, { props: { sessionId: "session-1", connectionState: "connected" } });
+    await flushPromises();
+    const store = useSessionsStore();
+    vi.spyOn(store, "disconnect").mockResolvedValue(undefined);
+    vi.spyOn(store, "connect").mockRejectedValue(new Error("network unavailable"));
+    let lateSuccess: () => void = () => {};
+    sendInputMock.mockImplementationOnce(() => new Promise<void>(resolve => { lateSuccess = resolve; }));
+    sendInputMock.mockRejectedValueOnce({ kind: "terminal_recovery_required", message: "input outcome uncertain" });
+    terminalRuntime.input("earlier pending");
+    terminalRuntime.input("first");
+    await flushPromises();
+    lateSuccess();
+    await flushPromises();
+    expect(wrapper.find('[data-test="term-recovery"]').exists()).toBe(true);
+    await wrapper.find('[data-test="term-reconnect"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("network unavailable");
+    expect(wrapper.find('[data-test="term-recovery"]').exists()).toBe(true);
+    expect(terminalRuntime.options.disableStdin).toBe(true);
+    wrapper.unmount();
+  });
+  it("a sibling label keeps input disabled until its replacement PTY and attach succeed", async () => {
+    openTerminalMock.mockRejectedValueOnce(new Error("not connected"));
+    const wrapper = mount(TerminalPane, { props: { ...EXTRA_TAB, connectionState: "connecting" } });
+    await flushPromises();
+    let finish: () => void = () => {};
+    openTerminalMock.mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
+    await wrapper.setProps({ connectionState: "connected" });
+    await flushPromises();
+    expect(terminalRuntime.options.disableStdin).toBe(true);
+    finish();
+    await flushPromises();
+    expect(terminalRuntime.options.disableStdin).toBe(false);
+    wrapper.unmount();
+  });
+
 });

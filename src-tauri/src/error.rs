@@ -26,6 +26,7 @@ pub enum IpcErrorKind {
     Storage,
     /// 传输目标已存在；前端弹覆盖/重命名对话框后用对应策略重试。
     TargetExists,
+    TerminalRecoveryRequired,
 }
 
 impl IpcErrorKind {
@@ -41,6 +42,7 @@ impl IpcErrorKind {
             Self::Internal => "internal",
             Self::Storage => "storage",
             Self::TargetExists => "target_exists",
+            Self::TerminalRecoveryRequired => "terminal_recovery_required",
         }
     }
 }
@@ -86,6 +88,9 @@ impl From<CoreError> for IpcError {
             CoreError::NotFound(_) => (IpcErrorKind::NotFound, err.to_string()),
             CoreError::AuthError(_) | CoreError::AuthenticationFailed(_) => {
                 (IpcErrorKind::AuthFailed, err.to_string())
+            }
+            CoreError::TerminalRecoveryRequired => {
+                (IpcErrorKind::TerminalRecoveryRequired, err.to_string())
             }
             CoreError::ConnectionError(_) => (IpcErrorKind::Connection, err.to_string()),
             CoreError::StorageError(_) => (IpcErrorKind::Storage, err.to_string()),
@@ -187,5 +192,12 @@ mod tests {
         assert_eq!(json["kind"], "connection");
         assert_eq!(json["message"], "boom");
         assert!(json["session_id"].is_null());
+    }
+    #[test]
+    fn terminal_recovery_has_a_structured_ipc_kind() {
+        let error: IpcError = CoreError::TerminalRecoveryRequired.into();
+        let json = serde_json::to_value(error).unwrap();
+        assert_eq!(json["kind"], "terminal_recovery_required");
+        assert!(json["message"].as_str().unwrap().contains("uncertain"));
     }
 }

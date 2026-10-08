@@ -92,7 +92,12 @@ watch(
   { immediate: true },
 );
 
-const isConnected = computed(() => props.connectionState === "connected");
+const terminalReady = ref(false);
+const recoveryRequired = ref(false);
+const recoveryError = ref<string | null>(null);
+const reconnecting = ref(false);
+let ioGeneration = 0;
+const isConnected = computed(() => props.connectionState === "connected" && terminalReady.value && !recoveryRequired.value && !reconnecting.value);
 
 /**
  * R3-05：连接从「非 connected」变为 connected 时补一次「确保 pty + 附加通道」。
@@ -101,9 +106,9 @@ const isConnected = computed(() => props.connectionState === "connected");
  * `open_terminal` 会 NotFound，若没有这次补偿，面板会一直停在错误条上，
  * 只能靠用户手动点「重试附加」。
  */
-watch(isConnected, async (connected) => {
-  if (!connected || unmounted) return;
-  if (attachError.value === null && channel !== null) return; // 已经正常挂着
+watch(() => props.connectionState, async (state) => {
+  if (state !== "connected") { terminalReady.value = false; return; }
+  if (reconnecting.value || unmounted) return;
   if (term && (await ensurePty(term.cols, term.rows))) {
     if (unmounted) return; // R3-06：await 期间可能已被卸载
     await attachTerminal();
@@ -117,16 +122,27 @@ const droppedLabel = computed(() =>
   props.connectionState === "connecting" ? "重新连接中" : "已断开",
 );
 
-const reconnecting = ref(false);
-
 /** 真实重连:走 sessions store 的 connect（后端握手 + 事件广播），失败如实提示 */
 async function reconnect() {
   if (!props.sessionId || reconnecting.value) return;
   reconnecting.value = true;
   try {
+    ioGeneration += 1;
+    terminalReady.value = false;
+    await sessionsStore.disconnect(props.sessionId);
+    if (unmounted) return;
     await sessionsStore.connect(props.sessionId);
+    if (unmounted) return;
+    if (!term || !(await ensurePty(term.cols, term.rows)) || !(await attachTerminal())) {
+      throw new Error(attachError.value ?? "终端附加失败");
+    }
+    if (unmounted) return;
+    recoveryRequired.value = false;
+    recoveryError.value = null;
   } catch (error) {
-    ElMessage.error(`重连失败：${String(error)}`);
+    if (unmounted) return;
+    recoveryError.value = `重连失败：${ipcErrorMessage(error)}`;
+    ElMessage.error(recoveryError.value);
   } finally {
     reconnecting.value = false;
   }
@@ -359,14 +375,30 @@ function noteIoSuccess() {
 }
 
 function noteIoFailure(what: string, e: unknown) {
+  if (unmounted) return;
+  if (typeof e === "object" && e !== null && "kind" in e && e.kind === "terminal_recovery_required") {
+    recoveryRequired.value = true;
+    recoveryError.value = null;
+    if (term) term.options.disableStdin = true;
+    return;
+  }
   console.error(`[TerminalPane] ${what} failed`, e);
   ioFailureStreak += 1;
   if (ioFailureStreak >= IO_FAILURE_NOTICE_THRESHOLD && !ioFailureNotified) {
     ioFailureNotified = true;
     ElMessage.error(
-      "终端与后端通信持续失败：输入/尺寸调整未送达。请检查会话连接状态，必要时重连会话。",
+      "终端与后端通信持续失败：请检查会话连接状态，必要时重连会话。",
     );
   }
+}
+
+function submitInput(data: string) {
+  const sid = props.sessionId;
+  if (!sid || !isConnected.value) return;
+  const generation = ioGeneration;
+  sendInput(sid, new TextEncoder().encode(data), ptyId.value ?? undefined)
+    .then(() => { if (generation === ioGeneration && !unmounted) noteIoSuccess(); })
+    .catch(e => { if (generation === ioGeneration) noteIoFailure("send_input", e); });
 }
 
 /**
@@ -394,6 +426,7 @@ async function ensurePty(cols: number, rows: number): Promise<boolean> {
   const tid = ptyId.value;
   if (!sid || !tid || isMainPty.value) return true;
   try {
+    terminalReady.value = false;
     await openTerminal(sid, tid, cols, rows);
     return true;
   } catch (e) {
@@ -422,9 +455,11 @@ async function attachTerminal(): Promise<boolean> {
     // R3-06：卸载后不再写状态，避免把错误条挂到已销毁的面板上。
     if (unmounted) return false;
     attachError.value = null;
+    terminalReady.value = props.connectionState === "connected";
     return true;
   } catch (e) {
     if (unmounted) return false;
+    terminalReady.value = false;
     attachError.value = ipcErrorMessage(e);
     console.error("[TerminalPane] attach_terminal failed", e);
     return false;
@@ -464,9 +499,7 @@ onMounted(async () => {
     event.stopPropagation();
     const sid = props.sessionId;
     if (!sid) return false;
-    sendInput(sid, new TextEncoder().encode("\x08"), ptyId.value ?? undefined)
-      .then(() => noteIoSuccess())
-      .catch((e) => noteIoFailure("send_input", e));
+    submitInput("\x08");
     return false;
   });
 
@@ -526,9 +559,7 @@ onMounted(async () => {
       ElMessage.warning("会话未连接，输入已忽略。请先重连会话。");
       return;
     }
-    sendInput(sid, new TextEncoder().encode(data), ptyId.value ?? undefined)
-      .then(() => noteIoSuccess())
-      .catch((e) => noteIoFailure("send_input", e));
+    submitInput(data);
   });
 
   // 切片 2.4:搜索栏经 rshell:terminal-action 路由（R2-13：window 级
@@ -549,9 +580,11 @@ onMounted(async () => {
         const { cols, rows } = term;
         const sid = props.sessionId;
         if (!sid) return;
+        if (!isConnected.value) return;
+        const generation = ioGeneration;
         resizeTerminal(sid, cols, rows, ptyId.value ?? undefined)
-          .then(() => noteIoSuccess())
-          .catch((e) => noteIoFailure("resize_terminal", e));
+          .then(() => { if (generation === ioGeneration && !unmounted) noteIoSuccess(); })
+          .catch(e => { if (generation === ioGeneration) noteIoFailure("resize_terminal", e); });
       } catch {
         /* ignore fit errors during teardown */
       }
@@ -627,8 +660,15 @@ onBeforeUnmount(() => {
       <el-button size="small" type="danger" plain @click="retryAttach">重试附加</el-button>
     </div>
 
+    <div v-if="recoveryRequired" class="terminal-dropped-bar" role="alert" data-test="term-recovery">
+      <span class="dropped-text">输入结果不确定，远端可能已执行部分输入。该标签输入已暂停；重连不会重放输入。</span>
+      <span v-if="recoveryError">{{ recoveryError }}</span>
+      <el-button size="small" type="primary" plain data-test="term-reconnect"
+        :loading="reconnecting" :disabled="reconnecting || !sessionId" @click="reconnect">重新连接</el-button>
+    </div>
+
     <!-- 断开/连接中的状态条：状态取自后端 ConnectionStateChanged，不是本地猜测 -->
-    <div v-if="isDropped" class="terminal-dropped-bar" role="status" data-test="term-dropped">
+    <div v-else-if="isDropped" class="terminal-dropped-bar" role="status" data-test="term-dropped">
       <span class="rs-status-dot rs-status-dot--failed" aria-hidden="true" />
       <span class="dropped-text">会话已{{ droppedLabel }}，输入已暂停。重新连接后可继续键入。</span>
       <el-button

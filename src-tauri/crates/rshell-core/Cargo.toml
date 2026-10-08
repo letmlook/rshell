@@ -32,6 +32,7 @@ dirs = "5"
 toml = "0.8"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 mockall = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }

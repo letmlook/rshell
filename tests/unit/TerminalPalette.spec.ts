@@ -158,7 +158,7 @@ describe("TerminalPane 右键粘贴", () => {
   it("sends BS for Backspace and leaves other keys to xterm", async () => {
     keyHandlers.length = 0;
     sendInputMock.mockClear();
-    const wrapper = mount(TerminalPane, { props: { sessionId: "session-1" } });
+    const wrapper = mount(TerminalPane, { props: { sessionId: "session-1", connectionState: "connected" } });
     await flushPromises();
 
     const handler = keyHandlers.at(-1);

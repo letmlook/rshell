@@ -34,5 +34,6 @@ dirs = "5"
 uuid = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }

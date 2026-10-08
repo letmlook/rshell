@@ -13,6 +13,10 @@ pub enum CoreError {
     Internal(String),
     #[error("Connection error: {0}")]
     ConnectionError(String),
+    #[error(
+        "Terminal recovery required: input outcome is uncertain; reconnect manually without replay"
+    )]
+    TerminalRecoveryRequired,
     #[error("Authentication error: {0}")]
     AuthError(String),
     #[error("Invalid state: {0}")]

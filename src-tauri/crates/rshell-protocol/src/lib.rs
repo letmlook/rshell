@@ -22,6 +22,10 @@ pub enum ProtocolError {
     ConnectionClosed,
     #[error("Protocol error: {0}")]
     ProtocolError(String),
+    #[error(
+        "Terminal recovery required: input outcome is uncertain; reconnect manually without replay"
+    )]
+    TerminalRecoveryRequired,
     #[error("Timeout")]
     Timeout,
     #[error("Transfer cancelled")]

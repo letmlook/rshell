@@ -49,6 +49,10 @@ use uuid::Uuid;
 
 use crate::{Connection, ProtocolError};
 
+#[path = "requests.rs"]
+mod requests;
+use requests::{Operation, TerminalHandle, REQUEST_BUDGET};
+
 /// 空闲会话 keepalive 探测间隔。
 ///
 /// 双向静默时每 15s 向服务器发送一次带应答的 keepalive
@@ -59,19 +63,6 @@ use crate::{Connection, ProtocolError};
 /// 该超时在双向静默（长时间无输出的命令、只读观察）时会把会话无提示
 /// 强制断开。
 const SSH_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// R3-01：等待 pty actor 应答的上限。
-///
-/// actor 在 `select!` 分支里内联 `await channel.data(...)`。对端不读 stdin
-/// （或只是链路很慢）时发送窗口会被填满，这次写就一直等到对端回
-/// `WINDOW_ADJUST` 才返回——actor 在此期间**回不到 `select!`**，后续
-/// `Send`/`Resize`/`Close` 全部滞留在 mpsc 里不被处理。若调用方无上限地
-/// 等应答（`close_terminal` / `disconnect_ssh` 的老写法），断开流程会被
-/// 永久挂住，进而连带卡住持有 `SshClient` 写锁的上层。
-///
-/// 该上限只用来把「永久挂起」降级为「一次可见的失败」：超时后调用方放弃
-/// 等待继续拆除，actor 与通道由 `handle.disconnect()` 收尾。
-const PTY_ACTOR_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 断开连接时等待 russh 发送 disconnect 消息的上限。
 const SSH_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -113,35 +104,6 @@ async fn open_nodelay_socket(addr: &str) -> Result<tokio::net::TcpStream, Protoc
         .set_nodelay(true)
         .map_err(|e| ProtocolError::ConnectionFailed(format!("failed to set TCP_NODELAY: {e}")))?;
     Ok(socket)
-}
-
-/// 一个 pty 的句柄：请求发送端（Send/Resize/Close）+ 它对应的 russh 通道号。
-struct TerminalHandle {
-    sender: mpsc::Sender<ShellRequest>,
-    channel: u32,
-}
-
-/// R3-01：等待 pty actor 应答，并给等待加上限。
-///
-/// 抽成独立函数是为了让「有界」这一性质能被快速单测覆盖——生产超时是
-/// [`PTY_ACTOR_REPLY_TIMEOUT`]，测试传毫秒级的值即可，不必让整个测试套件
-/// 为一个 10 秒的 sleep 买单。
-///
-/// `what` 只用于错误文案，便于定位是输入还是 resize 被卡住。
-async fn await_actor_reply(
-    reply: oneshot::Receiver<Result<(), ProtocolError>>,
-    timeout: std::time::Duration,
-    what: &str,
-) -> Result<(), ProtocolError> {
-    match tokio::time::timeout(timeout, reply).await {
-        Ok(Ok(result)) => result,
-        // sender 被丢弃：actor 任务结束
-        Ok(Err(_)) => Err(ProtocolError::ConnectionClosed),
-        Err(_) => Err(ProtocolError::ProtocolError(format!(
-            "pty actor did not accept {what} within {timeout:?}; \
-             the remote end is not reading (SSH send window full)"
-        ))),
-    }
 }
 
 /// 在已建立的连接上开一个 session channel，请求 PTY 与 shell。
@@ -188,7 +150,7 @@ pub struct SshClient {
     /// 连接句柄
     handle: Option<russh::client::Handle<SshHandler>>,
     /// 主 pty（连接时创建）的请求发送端；保留单值是为了兼容既有 Connection 契约
-    channel: Option<mpsc::Sender<ShellRequest>>,
+    channel: Option<TerminalHandle>,
     /// 主 pty 的通道号
     channel_id: Option<u32>,
     /// 全部 pty：terminal_id → 句柄。同一连接上的多个标签各自一个 pty
@@ -207,6 +169,18 @@ pub struct SshClient {
     keepalive_interval: std::time::Duration,
 }
 
+impl Drop for SshClient {
+    fn drop(&mut self) {
+        for handle in self.terminals.values() {
+            handle.close();
+        }
+        if let Some(handle) = &self.channel {
+            handle.close();
+        }
+        self.shell_output.lock().unwrap().close(None);
+    }
+}
+
 /// 每次连接临时解析的认证材料。不得序列化或存入 SessionConfig。
 pub enum ResolvedAuthMethod {
     Password {
@@ -222,12 +196,6 @@ pub enum ResolvedAuthMethod {
         username: String,
         password: Option<String>,
     },
-}
-
-enum ShellRequest {
-    Send(Vec<u8>, oneshot::Sender<Result<(), ProtocolError>>),
-    Resize(u32, u32, oneshot::Sender<Result<(), ProtocolError>>),
-    Close(oneshot::Sender<Result<(), ProtocolError>>),
 }
 
 /// 主机密钥决策（从 UI 传回 SSH 层）
@@ -808,7 +776,7 @@ impl SshClient {
         let primary = self.primary_terminal_id();
         let (handle, rx) = self.spawn_shell_channel(primary, 80, 24).await?;
         // 主 pty 的请求端另外记一份，供既有 Connection 契约（send_data/resize）使用
-        self.channel = Some(handle.sender.clone());
+        self.channel = Some(handle.clone());
         self.channel_id = Some(handle.channel);
         self.terminals.insert(primary, handle);
         self.data_rx = Some(rx);
@@ -854,9 +822,12 @@ impl SshClient {
             .handle
             .take()
             .ok_or_else(|| ProtocolError::ConnectionFailed("Not connected".to_string()))?;
-        let opened = open_pty_channel(&mut handle, cols, rows).await;
+        let opened =
+            tokio::time::timeout(REQUEST_BUDGET, open_pty_channel(&mut handle, cols, rows))
+                .await
+                .unwrap_or(Err(ProtocolError::Timeout));
         self.handle = Some(handle);
-        let mut channel = opened?;
+        let channel = opened?;
         let channel_id: u32 = channel.id().into();
 
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -865,68 +836,40 @@ impl SshClient {
             .unwrap()
             .register(channel_id, out_tx);
 
-        let (tx, mut requests) = mpsc::channel(32);
+        let (terminal, requests) = TerminalHandle::new(channel_id, 32, REQUEST_BUDGET);
+        let (mut reader, writer) = channel.split();
+        let drain_handle = terminal.clone();
         let output = self.shell_output.clone();
-        // russh 0.48 has no channel split API. Own the shell channel in an
-        // actor so its unbounded receive queue is drained continuously while
-        // callers can send/resize without holding a client lock for a read.
+        // russh 0.62 can split channels. Receive draining remains independent
+        // of a writer waiting for the remote send window.
         tokio::spawn(async move {
+            let mut state = drain_handle.subscribe();
             loop {
                 tokio::select! {
-                    request = requests.recv() => match request {
-                        Some(ShellRequest::Send(data, reply)) => {
-                            let _ = reply.send(channel.data(std::io::Cursor::new(data)).await
-                                .map_err(|e| ProtocolError::ProtocolError(e.to_string())));
-                        }
-                        Some(ShellRequest::Resize(cols, rows, reply)) => {
-                            let _ = reply.send(channel.window_change(cols, rows, 0, 0).await
-                                .map_err(|e| ProtocolError::ProtocolError(e.to_string())));
-                        }
-                        Some(ShellRequest::Close(reply)) => {
-                            let _ = reply.send(channel.close().await
-                                .map_err(|e| ProtocolError::ProtocolError(e.to_string())));
+                    biased;
+                    _ = state.changed() => break,
+                    message = reader.wait() => {
+                        if matches!(message, None | Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close)) {
+                            drain_handle.close();
                             break;
                         }
-                        None => { let _ = channel.close().await; break; }
-                    },
-                    message = channel.wait() => {
-                        // Output is routed once by SshHandler. Drain the library's
-                        // duplicate messages, including status and window updates.
-                        if matches!(message, None | Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close)) { break; }
                     }
                 }
             }
-            drop(requests);
             output.lock().unwrap().close(Some(channel_id));
         });
-
-        Ok((
-            TerminalHandle {
-                sender: tx,
-                channel: channel_id,
-            },
-            out_rx,
-        ))
+        tokio::spawn(requests::run_writer(writer, requests, terminal.clone()));
+        Ok((terminal, out_rx))
     }
 
-    /// 关闭一个 pty（标签关闭）。未知 id 视为已关闭，幂等。
+    /// Close is idempotent and bypasses write queue admission and execution.
     pub async fn close_terminal(&mut self, terminal_id: Uuid) {
         if let Some(handle) = self.terminals.remove(&terminal_id) {
-            let (reply, received) = oneshot::channel();
-            if handle.sender.send(ShellRequest::Close(reply)).await.is_ok() {
-                // R3-01：actor 卡在写上时永远回不到 select!，无限等应答会挂死
-                // 断开流程（其调用方还持着 SshClient 写锁）。超时即放弃等待：
-                // 丢弃 sender 后 actor 的 `None` 分支会自行 close 通道。
-                if tokio::time::timeout(PTY_ACTOR_REPLY_TIMEOUT, received)
-                    .await
-                    .is_err()
-                {
-                    warn!(
-                        terminal_id = %terminal_id,
-                        "close_terminal: pty actor busy (send window full?), reply timed out; continuing teardown"
-                    );
-                }
-            }
+            handle.close();
+            self.shell_output
+                .lock()
+                .unwrap()
+                .close(Some(handle.channel));
         }
     }
 
@@ -937,15 +880,7 @@ impl SshClient {
                 "terminal {terminal_id} not found on this connection"
             ))
         })?;
-        let (reply, received) = oneshot::channel();
-        handle
-            .sender
-            .send(ShellRequest::Send(data.to_vec(), reply))
-            .await
-            .map_err(|_| ProtocolError::ConnectionClosed)?;
-        // R3-01：actor 卡在一次写上时不会处理后续请求，这里必须有上限，
-        // 否则一次按键就能把调用方永久挂住。
-        await_actor_reply(received, PTY_ACTOR_REPLY_TIMEOUT, "input").await
+        handle.request(Operation::Send(data.to_vec())).await
     }
 
     /// 调整指定 pty 的窗口尺寸。
@@ -960,13 +895,7 @@ impl SshClient {
                 "terminal {terminal_id} not found on this connection"
             ))
         })?;
-        let (reply, received) = oneshot::channel();
-        handle
-            .sender
-            .send(ShellRequest::Resize(cols, rows, reply))
-            .await
-            .map_err(|_| ProtocolError::ConnectionClosed)?;
-        await_actor_reply(received, PTY_ACTOR_REPLY_TIMEOUT, "resize").await
+        handle.request(Operation::Resize(cols, rows)).await
     }
 
     /// 该连接上已登记的 pty 数量（诊断/测试用）。
@@ -976,14 +905,9 @@ impl SshClient {
 
     /// 断开连接
     pub async fn disconnect_ssh(&mut self) -> Result<(), ProtocolError> {
-        // R3-01：**不再**逐个 await close_terminal 的应答。旧写法在 actor 卡于
-        // `channel.data()`（对端不读 stdin、发送窗口打满）时会永久挂住，而调用方
-        // 此刻正持有 `SshClient` 写锁 —— 整个会话就此再也关不掉，只能重启应用。
-        //
-        // 直接丢弃 sender 即可：actor 的 `requests.recv()` 收到 `None` 会走
-        // `None => { let _ = channel.close().await; break }` 自行收尾；即便它此刻
-        // 正卡在写上，紧随其后的 `handle.disconnect()` 拆掉 russh 会话也会让那次
-        // 写返回错误、任务结束。
+        for handle in self.terminals.values() {
+            handle.close();
+        }
         self.terminals.clear();
         self.channel = None;
         self.channel_id = None;
@@ -1020,14 +944,7 @@ impl SshClient {
             .as_ref()
             .ok_or(ProtocolError::ConnectionClosed)?;
 
-        let (reply, received) = oneshot::channel();
-        channel
-            .send(ShellRequest::Send(data.to_vec(), reply))
-            .await
-            .map_err(|_| ProtocolError::ConnectionClosed)?;
-        received
-            .await
-            .map_err(|_| ProtocolError::ConnectionClosed)?
+        channel.request(Operation::Send(data.to_vec())).await
     }
 
     /// 接收数据（从通道读取）
@@ -1057,14 +974,7 @@ impl SshClient {
             .as_ref()
             .ok_or(ProtocolError::ConnectionClosed)?;
 
-        let (reply, received) = oneshot::channel();
-        channel
-            .send(ShellRequest::Resize(cols, rows, reply))
-            .await
-            .map_err(|_| ProtocolError::ConnectionClosed)?;
-        received
-            .await
-            .map_err(|_| ProtocolError::ConnectionClosed)?
+        channel.request(Operation::Resize(cols, rows)).await
     }
 
     /// 获取 SSH 连接句柄（用于打开 SFTP 通道等）
@@ -1271,7 +1181,7 @@ mod tests {
             }
         ));
         assert!(
-            matches!(client.auth, Some(ResolvedAuthMethod::Password { password, .. }) if password == "sample-secret-password")
+            matches!(&client.auth, Some(ResolvedAuthMethod::Password { password, .. }) if password == "sample-secret-password")
         );
     }
 
@@ -1307,7 +1217,7 @@ mod tests {
             }
         ));
         assert!(
-            matches!(client.auth, Some(ResolvedAuthMethod::PublicKey { passphrase: Some(value), .. }) if value == "sample-secret-passphrase")
+            matches!(&client.auth, Some(ResolvedAuthMethod::PublicKey { passphrase: Some(value), .. }) if value == "sample-secret-passphrase")
         );
     }
 
@@ -1929,14 +1839,8 @@ mod tests {
         let stuck_terminal = Uuid::new_v4();
 
         // 保留 `_never_polled`：它就是那个「卡住不再处理请求」的 actor。
-        let (_tx, _never_polled) = mpsc::channel::<ShellRequest>(32);
-        client.terminals.insert(
-            stuck_terminal,
-            TerminalHandle {
-                sender: _tx,
-                channel: 0,
-            },
-        );
+        let (_tx, _never_polled) = TerminalHandle::new(0, 32, REQUEST_BUDGET);
+        client.terminals.insert(stuck_terminal, _tx);
         assert_eq!(client.terminal_count(), 1);
 
         let disconnected =
@@ -1950,46 +1854,75 @@ mod tests {
         assert_eq!(client.terminal_count(), 0, "断开后不应残留任何 pty 条目");
     }
 
-    /// 回归 R3-01（配套）：等待 pty actor 应答必须有上限。
-    ///
-    /// 直接测 `await_actor_reply` 并传毫秒级超时，这样「有界」这一性质能被
-    /// 快速覆盖，而不必让测试套件为生产值（10 秒）买单。
-    #[tokio::test]
-    async fn awaiting_a_stuck_actor_reply_is_bounded_not_infinite() {
-        // 构造一个「actor 卡住」的等价形态：sender 存在但接收端永不 poll，
-        // 因此 reply 永远收不到。两者都刻意保活到断言结束。
-        let (_tx, _never_polled) = mpsc::channel::<ShellRequest>(32);
-        let (_reply, received) = oneshot::channel();
-
-        let started = std::time::Instant::now();
-        let result =
-            await_actor_reply(received, std::time::Duration::from_millis(150), "input").await;
-        let elapsed = started.elapsed();
-
+    #[tokio::test(start_paused = true)]
+    async fn recovery_saturated_primary_queue_has_end_to_end_deadline() {
+        let mut client = bare_client();
+        let (tx, _rx, _received) = requests::tests::saturated().await;
+        client.channel = Some(tx);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(11),
+            client.send_data(b"queued"),
+        )
+        .await;
         assert!(
-            result.is_err(),
-            "actor 不应答时必须返回错误，不能伪装成发送成功"
+            result.is_ok(),
+            "queue admission must be part of the request deadline"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "等待应答应按超时返回，实际耗时 {elapsed:?}"
+            result.unwrap().is_err(),
+            "saturation must not report success"
         );
+    }
 
-        // 对照：应答 sender 被丢弃时（actor 任务已结束）应立刻返回
-        // ConnectionClosed，而不是等满超时。
-        let (reply2, received2) = oneshot::channel::<Result<(), ProtocolError>>();
-        drop(reply2);
-        let started = std::time::Instant::now();
-        let err = await_actor_reply(received2, std::time::Duration::from_secs(30), "input")
+    #[tokio::test(start_paused = true)]
+    async fn recovery_primary_reply_has_deadline() {
+        let mut client = bare_client();
+        let (tx, _rx) = TerminalHandle::new(0, 1, REQUEST_BUDGET);
+        client.channel = Some(tx);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(11),
+                client.resize_terminal(90, 30)
+            )
             .await
-            .expect_err("sender dropped must not look like success");
-        assert!(
-            matches!(err, ProtocolError::ConnectionClosed),
-            "sender 被丢弃应报 ConnectionClosed，实际 {err:?}"
+            .is_ok(),
+            "main pty reply must be bounded"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_close_bypasses_saturated_request_queue() {
+        let mut client = bare_client();
+        let tid = Uuid::new_v4();
+        let (tx, _rx, _received) = requests::tests::saturated().await;
+        client.terminals.insert(tid, tx);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "sender 已丢弃时应立即返回，不该等满超时"
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                client.close_terminal(tid)
+            )
+            .await
+            .is_ok(),
+            "close must not wait for write admission"
+        );
+        client.close_terminal(tid).await;
+        assert_eq!(client.terminal_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_drop_client_cancels_all_old_terminal_actors() {
+        let mut client = bare_client();
+        let (terminal, _requests) = TerminalHandle::new(0, 1, REQUEST_BUDGET);
+        let mut state = terminal.subscribe();
+        let _actor_handle = terminal.clone();
+        client.channel = Some(terminal.clone());
+        client.terminals.insert(client.config.id, terminal);
+        drop(client);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), state.changed())
+                .await
+                .is_ok(),
+            "dropping old transport must cancel actors rather than leave admitted input alive"
         );
     }
 }
