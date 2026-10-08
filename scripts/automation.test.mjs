@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
+import { accessSync, constants, mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -35,6 +35,19 @@ function makeFailingFakeBin(name, log, code = '17') {
   ].join('\n');
 }
 
+// Pure-shell stand-ins for the only non-faked externals the scripts under test
+// need. They keep the fixture self-contained so `PATH` can be the fixture alone
+// (see runVerify/runAudit) without depending on what the host happens to ship.
+const DIRNAME_SHIM = [
+  '#!/bin/sh',
+  'case "$1" in',
+  '  */*) d="${1%/*}"; [ -n "$d" ] || d="/"; echo "$d" ;;',
+  '  *) echo "." ;;',
+  'esac',
+  '',
+].join('\n');
+const BASENAME_SHIM = ['#!/bin/sh', 'case "$1" in', '  */*) echo "${1##*/}" ;;', '  *) echo "$1" ;;', 'esac', ''].join('\n');
+
 function setupFixture({ failingArgv = '', includeCargoAudit = true } = {}) {
   const fixture = mkdtempSync(join(tmpdir(), 'rshell-automation-'));
   const logPath = join(fixture, 'invocations.log');
@@ -52,6 +65,8 @@ function setupFixture({ failingArgv = '', includeCargoAudit = true } = {}) {
   };
   writeFileSync(join(fixture, 'npm'), wrapper('npm'), { mode: 0o700 });
   writeFileSync(join(fixture, 'cargo'), wrapper('cargo'), { mode: 0o700 });
+  writeFileSync(join(fixture, 'dirname'), DIRNAME_SHIM, { mode: 0o700 });
+  writeFileSync(join(fixture, 'basename'), BASENAME_SHIM, { mode: 0o700 });
   if (includeCargoAudit) {
     writeFileSync(join(fixture, 'cargo-audit'), wrapper('cargo-audit'), { mode: 0o700 });
   }
@@ -67,15 +82,44 @@ function readLog(logPath) {
   return readFileSync(logPath, 'utf8');
 }
 
+// The audit/verify tests hand the child a fixture-only PATH so that a
+// host-installed cargo-audit cannot satisfy the "cargo-audit is missing"
+// scenario. The interpreter itself must therefore be resolved from the real
+// PATH up front, otherwise the child could not be started at all.
+function resolveBash() {
+  const candidates = [];
+  for (const dir of (process.env.PATH ?? '').split(/[:;]/)) {
+    if (dir) candidates.push(join(dir, 'bash'));
+  }
+  candidates.push('/bin/bash', '/usr/bin/bash');
+  for (const candidate of candidates) {
+    // fs calls do not apply PATHEXT, so the Windows form has to be tried too.
+    for (const name of [candidate, `${candidate}.exe`]) {
+      try {
+        accessSync(name, constants.X_OK);
+        return name;
+      } catch {
+        // Keep looking: an earlier PATH entry may simply not carry bash.
+      }
+    }
+  }
+  return 'bash';
+}
+
+const bashBin = resolveBash();
+
 function runVerify(args, { cwd, fixture, logPath, extra = {} } = {}) {
   const env = {
     ...process.env,
-    PATH: `${fixture}:${process.env.PATH}`,
+    // Fixture only: appending the host PATH would let a real cargo-audit
+    // satisfy the "cargo-audit is missing" scenario on machines that have one
+    // installed, which is exactly what the CI runner does.
+    PATH: fixture,
     ...extra,
   };
   delete env.RUSTUP_TOOLCHAIN;
   delete env.RUSTUP_NO_UPDATE_CHECK;
-  return spawnSync('bash', [verify, ...args], {
+  return spawnSync(bashBin, [verify, ...args], {
     cwd: cwd ?? fixture,
     env,
     encoding: 'utf8',
@@ -86,12 +130,12 @@ function runVerify(args, { cwd, fixture, logPath, extra = {} } = {}) {
 function runAudit(args, { cwd, fixture, extra = {} } = {}) {
   const env = {
     ...process.env,
-    PATH: `${fixture}:${process.env.PATH}`,
+    PATH: fixture,
     ...extra,
   };
   delete env.RUSTUP_TOOLCHAIN;
   delete env.RUSTUP_NO_UPDATE_CHECK;
-  return spawnSync('bash', [audit, ...args], {
+  return spawnSync(bashBin, [audit, ...args], {
     cwd: cwd ?? fixture,
     env,
     encoding: 'utf8',
@@ -634,4 +678,136 @@ test('macOS CI workflow pins Rust toolchain via RUSTUP_* env, not a fixed toolch
   assert.ok(!workflow.includes('rust-toolchain:'), 'CI must not depend on rust-toolchain.toml');
   // Sanity: the file itself still exists.
   assert.match(toolchainFile, /\[toolchain\]/);
+});
+
+// --- Release version guard --------------------------------------------------
+
+const releaseVersionScript = join(root, 'scripts/check-release-version.mjs');
+
+function runReleaseVersionCheck(args = []) {
+  return spawnSync(process.execPath, [releaseVersionScript, ...args], { cwd: root, encoding: 'utf8' });
+}
+
+function currentVersion() {
+  return JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
+}
+
+test('check-release-version.mjs accepts the repository state without a tag', () => {
+  const result = runReleaseVersionCheck([]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Release version check passed/);
+});
+
+test('check-release-version.mjs accepts a tag that matches every version source', () => {
+  const version = currentVersion();
+  for (const tag of [version, `v${version}`]) {
+    const result = runReleaseVersionCheck([tag]);
+    assert.equal(result.status, 0, `${tag} should pass: ${result.stderr}`);
+  }
+});
+
+test('check-release-version.mjs rejects a tag that no version source matches', () => {
+  const [major, minor, patch] = currentVersion().split('-')[0].split('.').map(Number);
+  const result = runReleaseVersionCheck([`v${major}.${minor}.${patch + 1}`]);
+  assert.notEqual(result.status, 0, 'a mis-tagged release must fail');
+  // Every bundled version source has to be named, otherwise an operator cannot
+  // tell which file to bump.
+  for (const source of ['package.json', 'src-tauri/tauri.conf.json', 'src-tauri/Cargo.toml']) {
+    assert.match(result.stderr, new RegExp(source.replace(/[.\\/]/g, '\\$&')));
+  }
+});
+
+test('check-release-version.mjs rejects a tag that is not a semantic version', () => {
+  const result = runReleaseVersionCheck(['latest']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /semantic version/);
+});
+
+// --- Release workflow -------------------------------------------------------
+
+const releaseWorkflowPath = join(root, '.github/workflows/release.yml');
+
+function readReleaseWorkflow() {
+  return readFileSync(releaseWorkflowPath, 'utf8');
+}
+
+test('release workflow builds installers from a tag and publishes them to a GitHub Release', () => {
+  const workflow = readReleaseWorkflow();
+  assert.match(workflow, /^on:/m);
+  assert.match(workflow, /push:\s*\n\s*tags:\s*\n\s*- 'v\*'/, 'release must trigger on v* tags');
+  assert.match(workflow, /workflow_dispatch:/, 'an existing tag must be re-runnable');
+  assert.match(workflow, /tauri-apps\/tauri-action@[0-9a-f]{40}/);
+  assert.match(workflow, /GITHUB_TOKEN: \$\{\{ secrets\.GITHUB_TOKEN \}\}/);
+  assert.match(workflow, /tagName: \$\{\{ env\.RELEASE_TAG \}\}/,
+    'assets must land on the release for the tag that was pushed');
+});
+
+test('release workflow pins every third-party action to a full commit SHA', () => {
+  const workflow = readReleaseWorkflow();
+  for (const match of workflow.matchAll(/uses:\s*([^@\s]+)@([0-9a-f]+)/g)) {
+    const action = match[1];
+    const sha = match[2];
+    assert.ok(/^[0-9a-f]{40}$/.test(sha), `${action} must be pinned to a full 40-char SHA, got "${sha}"`);
+  }
+  // The same three base actions are pinned in ci.yml; a bump in one workflow
+  // must not silently drift from the other.
+  const ci = readCiWorkflow();
+  for (const action of ['actions/checkout', 'actions/setup-node', 'actions/cache']) {
+    const ciPin = new RegExp(`${action}@[0-9a-f]{40}`).exec(ci)?.[0];
+    const releasePin = new RegExp(`${action}@[0-9a-f]{40}`).exec(workflow)?.[0];
+    assert.ok(ciPin, `${action} missing from ci.yml`);
+    assert.equal(releasePin, ciPin, `${action} pin differs between ci.yml and release.yml`);
+  }
+});
+
+test('release workflow keeps the shared verification script as the gate', () => {
+  const workflow = readReleaseWorkflow();
+  assert.match(workflow, /needs: verify/, 'installers must not be built before verification passes');
+  assert.match(workflow, /bash scripts\/verify\.sh --skip-install/);
+  assert.match(workflow, /check-release-version\.mjs "\$RELEASE_TAG"/,
+    'the tag must be checked against the bundled version before building');
+  // The workflow must not re-implement the verification chain.
+  for (const duplicate of [
+    /npm run typecheck/,
+    /npm run check:docs/,
+    /npm run test:scripts/,
+    /cargo fmt/,
+    /cargo clippy/,
+    /cargo test --workspace/,
+    /npm audit/,
+    /cargo audit/,
+  ]) {
+    assert.ok(
+      !duplicate.test(workflow),
+      `release workflow duplicates shared-script command ${duplicate}; call the script instead`,
+    );
+  }
+});
+
+test('release workflow builds macOS, Windows and Linux bundles and only the build job can write', () => {
+  const workflow = readReleaseWorkflow();
+  for (const target of ['universal-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu']) {
+    assert.ok(workflow.includes(target), `release workflow must build ${target}`);
+  }
+  for (const os of ['macos-latest', 'windows-latest', 'ubuntu-22.04']) {
+    assert.ok(workflow.includes(os), `release workflow must run on ${os}`);
+  }
+  // fail-fast: false keeps a single platform failure from cancelling the others.
+  assert.match(workflow, /fail-fast: false/);
+  // Read-only by default, write scoped to the build job.
+  assert.match(workflow, /^permissions:\s*\n\s*contents: read/m);
+  assert.match(workflow, /permissions:\s*\n\s*contents: write/);
+});
+
+test('release workflow stays honest about unsigned artifacts and unused signing secrets', () => {
+  const workflow = readReleaseWorkflow();
+  // Signing and notarization are not wired into CI, so the release notes must
+  // say the bundles are unsigned instead of implying a verified signature.
+  assert.match(workflow, /未签名/);
+  // No signing credential may be referenced while signing remains unverified.
+  for (const secret of ['APPLE_SIGNING_IDENTITY', 'APPLE_NOTARY_PROFILE', 'TAURI_SIGNING_PRIVATE_KEY']) {
+    assert.ok(!workflow.includes(secret), `release workflow must not reference ${secret} while signing is unverified`);
+  }
+  // No updater plugin is bundled, so no updater manifest may be published.
+  assert.match(workflow, /includeUpdaterJson: false/);
 });
