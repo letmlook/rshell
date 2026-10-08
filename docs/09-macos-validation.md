@@ -217,3 +217,67 @@ npm 侧同期修复了 4 项高危漏洞（vue 3.5.43、brace-expansion 2.1.7、
 - 产物未签名、未公证，签名与公证状态不变；Release 说明会显式声明这一点。
 - Windows 与 Linux 产物没有真机功能验收。
 - 本机为 Windows + WSL 环境，24 项调用 POSIX `bash` 的既有脚本测试（`verify.sh` / `audit.sh` / `macos-*.sh`）在本机因 WSL 挂载失败而报错；本轮已用 `git stash` 对比确认这 24 项在改动前后**失败数量不变**，非本次引入。
+
+## 2026-10-08：可靠性与恢复体验完善轮（branch `codex/reliability-recovery`）
+
+本节记录实施侧的真实证据与已知边界；未执行项（macOS 实机、原生服务器、签名公证）一律不记为通过。
+
+### 范围
+
+四个任务按顺序完成，全部 RED-first 落地、独立审查、审查修复三步走：
+
+| 任务 | 实施提交 | 审查 | 修复提交 |
+|---|---|---|---|
+| Task 1 SSH 请求有界 + 终端手动恢复 | `c1afefc` | DONE_WITH_CONCERNS（2 Minor，已修） | `86c6ac0` |
+| Task 2 SFTP 临时传输 + 最终提交 + 从头重试 | `07f7c69` | DONE_WITH_CONCERNS（1 Notable + 1 Minor，已修） | `28ba8df` |
+| Task 3 凭据错误分类 + 主机密钥并发/取消/过期 | `3c309f6` | DONE_WITH_CONCERNS（3 concerns，已修 1 项） | `6445486` |
+| Task 4 集成验证 | 见下文 | 待独立全分支审查 | — |
+
+Task 1 之前的 baseline commit 为 `86c6ac0`；本轮最终 HEAD 为 `6445486`。未推送、未合并、未发布；分支继续按用户授权保留在 worktree。
+
+### 验证（Windows 环境，逐项对应 `scripts/verify.sh` / `scripts/audit.sh` 顺序）
+
+共享入口脚本在本机不可用：`.sh` 文件 CRLF + WSL 挂载失败（与前几轮已记录的根因一致），故按脚本内部顺序逐项手动执行并如实记录结果。
+
+| 命令 | 结果 |
+|---|---|
+| `npm run build` | exit 0（10 个 chunk，最大 403 KiB / vendor-xterm） |
+| `npm run typecheck` | exit 0 |
+| `npm test` | **38 文件 / 313 passed**（基线 37 / 279 → +1 文件 / +34 测试，跨 Task 1/2/3） |
+| `npm run check:docs` | exit 0（14 份文档契约通过） |
+| `npm run check:bundle` | exit 0（chunk ≤ 500 KiB 约束、10 chunk） |
+| `npm run check:release` | exit 0（repo / version 0.1.0 三处一致） |
+| `npm run test:scripts` | **失败**：Windows 临时目录清理 EPERM（环境问题，测试本身 2196ms 跑完被中断于 `rmSync`） |
+| `cargo fmt --all --manifest-path src-tauri/Cargo.toml --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings` | exit 0 |
+| `cargo test --workspace --manifest-path src-tauri/Cargo.toml` | exit 0（基线与每个任务的累加值：rshell-protocol 70、rshell-core 211、rshell 15、其他 crate 全 0 失败） |
+| `npm audit --registry=https://registry.npmjs.org` | exit 0（0 vulnerabilities） |
+| `cargo audit --db <isolated-dir> --ignore RUSTSEC-2023-0071 --file src-tauri/Cargo.lock` | exit 0；4 项非阻断警告：`unic-common`/`unic-ucd-ident`/`unic-ucd-version` unmaintained（RUSTSEC-2025-0080/0100/0098）+ `glib 0.18.5` unsound（RUSTSEC-2024-0429）。默认 `~/.cargo/advisory-db` 不可初始化，沿用独立数据库；未删除或改写原数据库。 |
+
+`git diff --check` 无空白错误。新增日志格式串经 `git grep` 不含 `password|passphrase|secret` 字面量。
+
+### 关键能力的诚实边界
+
+- **SFTP 提交原子性**：本轮实现走标准 `SSH_FXP_RENAME`（draft-ietf-secsh-filexfer-02）。`russh-sftp 2.4.0` 高层 API（`SftpSession`）不暴露 `posix-rename@openssh.com` 探测；底层 `RawSftpSession::extended` 入口可发 `SSH_FXP_EXTENDED`，但从 `SftpSession` 拆出 `RawSftpSession` 需 unsafe 重新解释内存布局（UB 风险 + 维护成本均不取），故本轮不采用 unsafe。UI 在 `commit_strategy` 字段如实显示「标准重命名（非原子）」；当 russh-sftp 升级或上层 `RawSftpSession` 公开后再切到 `posix_rename`，契约不变。
+- **取消/提交仲裁**：commit 未发送时取消抢先；commit 已发时视为 Completed（取消意图吞掉，因为目标已被替换）；状态机不会产出「已取消但目标被替换」的反例。Pause/resume 不修改既有拷贝循环的写阻塞路径（沿用 R2-08/R3-08 测试覆盖）。
+- **重试语义**：`RetryTransfer` 是显式命令，新 task id + Fail policy + 重新冲突确认；活跃任务不允许 retry；retry 不复用 `EnqueueTransfer` 的 hidden flag；从不自动覆盖。
+- **凭据错误分类**：`CoreError` 新增 `CredentialMissing` / `CredentialInaccessible` / `CredentialSaveFailed` / `CredentialMigrationFailed` / `HostKeyMismatch` / `HostKeyTrustPersistenceFailed`；每类有独立 IPC kind 与前端恢复指引。`CredentialInaccessible` 不回退旧明文；save 失败时阻塞连接，绝不发 `Connected`；原 `AuthError` / `AuthenticationFailed` 继续走 `auth_failed`，不冒充新分类。
+- **主机密钥生命周期**：按 `decision_id` 的 keyed map + CAS，状态 `Pending → DecidedTrustOnce/TrustAlways/Reject | Cancelled | Expired`，前端本地 `Dismissed`；`TrustAlways` 必须先持久化到 trusted-store 再发接受 oneshot；持久化失败回到 `Pending`，不唤醒握手，不发 `Connected`。
+- **持久化 vs 过期 race**：若 `trust_host_key` 写入成功后过期触发，状态机正确拒绝握手但磁盘 `known_hosts` 已含条目，下次 connect 会「静默接受」。事后回滚会冒删既有条目风险，所以只能防御性「过期不再唤醒」+ 下次 connect 弹一次「上次未完成握手留下的信任条目，保留吗？」由用户决策（已记为 follow-up issue，本轮不修）。
+- **设计层决断记录**：见三份 untracked 工作产物 —— `docs/research/2026-10-08-ssh-recovery-implementation-report.md` / `2026-10-08-sftp-staged-commit-report.md` / `2026-10-08-credential-hostkey-recovery-report.md`。
+
+### 仍待真实环境验收
+
+按 spec 划分，本节列出的「开发验证完成」≠「产品验收完成」。以下场景**未执行**，不视为通过：
+
+- macOS 钥匙串凭据缺失 / 不可访问 / 旧配置迁移的真实提示与恢复
+- macOS 钥匙串访问授权对话框
+- 真实 SSH/SFTP 服务器（外部网络与不同文件系统）上的传输观感与 commit 行为
+- 真实多标签独立 SSH / SFTP / 网络故障下的故障隔离
+- 物理串口
+- 签名与公证（`APPLE_SIGNING_IDENTITY` / `APPLE_NOTARY_PROFILE` 凭据未注入）
+- 跨连接断点续传（spec 明确本轮不实现）
+- 进程崩溃后的跨进程 staging 残留扫描（spec 明确另行规划）
+- Windows DPAPI / Linux Secret Service 的真实平台适配
+
+完整计划与对应 spec 参见 [`docs/superpowers/specs/2026-10-08-reliability-improvement-design.md`](superpowers/specs/2026-10-08-reliability-improvement-design.md) 与 [`docs/superpowers/plans/2026-10-08-reliability-recovery.md`](superpowers/plans/2026-10-08-reliability-recovery.md)。

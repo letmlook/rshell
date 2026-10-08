@@ -1,6 +1,6 @@
 # RShell 可靠性优化实施进度
 
-更新时间：2026-10-08 17:16（Asia/Shanghai）。状态：按用户要求暂停。
+更新时间：2026-10-08 22:20（Asia/Shanghai）。状态：本轮 4 个任务实施完成；每任务独立审查为 `DONE_WITH_CONCERNS`，全部修复已落地；集成验证在 Windows 环境完成并记录到 `docs/09-macos-validation.md`。分支未合并、推送、发布；macOS 产品验收按 spec 划分仍待真机。
 
 ## 保存位置
 
@@ -8,7 +8,12 @@
 - 托管工作区：`C:/Users/lp/.codex/worktrees/reliability-recovery/rshell`。
 - 原始工作区：`C:/code/github/rshell`，仍在 main；未合并、推送或发布。
 - 设计及实施计划提交：`b4e3d687c1e45a215891437df9a63b9c3b296600`。
-- SSH 实现提交：`c1afefcc72f1d594f34329571bfb3c21ab5648a1`。
+- 本轮 HEAD：`6445486`（Task 3 审查修复）。基线 HEAD：Task 1 实现 `c1afefc`，本轮累计新增：
+  - `86c6ac0` Task 1 审查修复（IpcError mapping 加固）
+  - `07f7c69` Task 2 实施（staged SFTP commit）
+  - `28ba8df` Task 2 审查修复（commit_strategy UI 渲染 + ipcContract 字段对账）
+  - `3c309f6` Task 3 实施（凭据分类 + host-key 生命周期）
+  - `6445486` Task 3 审查修复（双击取消幂等）
 
 ## 已完成
 
