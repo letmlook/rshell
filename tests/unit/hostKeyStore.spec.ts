@@ -118,4 +118,36 @@ describe("hostKey store", () => {
     expect(decideHostKey).toHaveBeenLastCalledWith(id, true, false);
     expect(store.requests.has(id)).toBe(false);
   });
+
+  it("double-cancel is idempotent: the second call neither dispatches nor surfaces an error", async () => {
+    const id = "99999999-9999-9999-9999-999999999999";
+    handlers.at(-1)!(mismatch(id));
+    const store = useHostKeyStore();
+    cancelHostKey.mockResolvedValueOnce(undefined);
+
+    // 第一次取消：派发后端，移除请求，错误被清掉
+    await store.cancel(id);
+    expect(cancelHostKey).toHaveBeenCalledTimes(1);
+    expect(store.requests.has(id)).toBe(false);
+    expect(store.error).toBeNull();
+
+    // 第二次取消：id 已不在 store，跳过派发、不写错误，意图已被满足
+    await store.cancel(id);
+    expect(cancelHostKey).toHaveBeenCalledTimes(1);
+    expect(store.error).toBeNull();
+  });
+
+  it("cancel on an id removed by an Expired event is a no-op (no dispatch, no error)", async () => {
+    const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    handlers.at(-1)!(mismatch(id));
+    const store = useHostKeyStore();
+    // 后端超时先把请求从 store 移除
+    handlers.at(-1)!(decisionState(id, "Expired"));
+    expect(store.requests.has(id)).toBe(false);
+
+    // 残留 UI 触发的取消：不应再发到后端，也不应写错误
+    await store.cancel(id);
+    expect(cancelHostKey).not.toHaveBeenCalled();
+    expect(store.error).toBeNull();
+  });
 });

@@ -140,6 +140,19 @@ export const useHostKeyStore = defineStore("hostKey", () => {
   /** Explicit cancellation never submits an accepting decision. */
   async function cancel(id = current.value?.decision_id) {
     if (!id) return false;
+    // R3-T3 reviewer (Minor UX bug): if the request has already been removed
+    // from the store (e.g. user double-clicks cancel, or backend already
+    // dropped it via Expired / Cancelled event), the user's intent — cancel —
+    // is already satisfied. Skip dispatch so the second call cannot overwrite
+    // the cleared error state with a misleading "decision no longer pending"
+    // message from a NotFound response.
+    if (!requests.value.has(id)) {
+      if (errorDecisionId.value === id) {
+        error.value = null;
+        errorDecisionId.value = null;
+      }
+      return true;
+    }
     error.value = null;
     errorDecisionId.value = null;
     try {
