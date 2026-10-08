@@ -419,7 +419,9 @@ impl SshHandler {
     }
 }
 
-#[async_trait::async_trait]
+// russh 0.62 的 Handler 改用 RPITIT（`-> impl Future`）声明回调，不再是
+// `#[async_trait]`。保留该属性会引入 `#[async_trait]` 的生命周期形参，导致
+// 每个方法的签名都与 trait 声明不匹配。
 impl russh::client::Handler for SshHandler {
     type Error = anyhow::Error;
 
@@ -704,12 +706,14 @@ impl SshClient {
 
         match &auth {
             ResolvedAuthMethod::Password { password, .. } => {
-                let success = handle
+                // russh 0.62 起 authenticate_* 返回 AuthResult 而非 bool：
+                // 失败时还会带回服务端建议的后续认证方法。
+                let result = handle
                     .authenticate_password(username, password)
                     .await
                     .map_err(|e| ProtocolError::AuthFailed(e.to_string()))?;
 
-                if !success {
+                if !result.success() {
                     return Err(ProtocolError::AuthFailed(
                         "Password authentication failed".to_string(),
                     ));
@@ -720,17 +724,27 @@ impl SshClient {
                 passphrase,
                 ..
             } => {
-                // 加载私钥
-                let key = russh_keys::load_secret_key(key_path, passphrase.as_deref())
-                    .map_err(|e| ProtocolError::AuthFailed(format!("Failed to load key: {}", e)))?;
+                // 加载私钥。russh-keys 已并入 russh::keys。
+                let key = russh::keys::load_secret_key(key_path, passphrase.as_deref())
+                    .map_err(|e| ProtocolError::AuthFailed(format!("Failed to load key: {e}")))?;
 
-                let key = Arc::new(key);
-                let success = handle
-                    .authenticate_publickey(username, key)
+                // RSA 私钥必须显式带上哈希算法：传 None 会退回已被多数服务端
+                // 拒绝的 sha-rsa(SHA-1)。best_supported_rsa_hash 会与服务端协商。
+                let hash_alg = handle
+                    .best_supported_rsa_hash()
+                    .await
+                    .map_err(|e| ProtocolError::AuthFailed(e.to_string()))?
+                    .flatten();
+
+                let result = handle
+                    .authenticate_publickey(
+                        username,
+                        russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
+                    )
                     .await
                     .map_err(|e| ProtocolError::AuthFailed(e.to_string()))?;
 
-                if !success {
+                if !result.success() {
                     return Err(ProtocolError::AuthFailed(
                         "Public key authentication failed".to_string(),
                     ));
@@ -767,7 +781,7 @@ impl SshClient {
                             }
                         }
                     }
-                    russh::client::KeyboardInteractiveAuthResponse::Failure => {
+                    russh::client::KeyboardInteractiveAuthResponse::Failure { .. } => {
                         return Err(ProtocolError::AuthFailed(
                             "Keyboard-interactive authentication failed".to_string(),
                         ));
@@ -1173,6 +1187,12 @@ mod tests {
     use super::*;
     use rshell_api::types::AuthMethod;
 
+    /// 系统的密码学随机源。ssh-key 0.7 依赖的 rand_core 0.10 移除了 `OsRng`，
+    /// 改用 `getrandom::SysRng`，并用 `UnwrapErr` 适配成 `CryptoRng`。
+    fn os_rng() -> getrandom::rand_core::UnwrapErr<getrandom::SysRng> {
+        getrandom::rand_core::UnwrapErr(getrandom::SysRng)
+    }
+
     // 回归：曾用 russh::client::connect，它从不设 TCP_NODELAY。Nagle 与对端延迟
     // ACK 在局域网上叠加出数百毫秒停顿，把 SFTP 吞吐压到个位数 MB/s。这里对真实
     // socket 断言 nodelay 已生效，防止改回 russh 的封装。
@@ -1314,7 +1334,7 @@ mod tests {
         allowed_key: Option<ssh_key::PublicKey>,
     }
 
-    #[async_trait::async_trait]
+    // 与 SshHandler 同理：russh 0.62 的 server::Handler 也不再是 `#[async_trait]`。
     impl russh::server::Handler for OutputTestServer {
         type Error = russh::Error;
         async fn auth_password(
@@ -1327,6 +1347,7 @@ mod tests {
             } else {
                 russh::server::Auth::Reject {
                     proceed_with_methods: None,
+                    partial_success: false,
                 }
             })
         }
@@ -1341,16 +1362,21 @@ mod tests {
                 } else {
                     russh::server::Auth::Reject {
                         proceed_with_methods: None,
+                        partial_success: false,
                     }
                 },
             )
         }
+        // 0.62 起 reply 是 `ChannelOpenHandle`：必须显式 accept，否则丢 handle
+        // 等同于拒绝，会话通道开不起来。
         async fn channel_open_session(
             &mut self,
-            _: russh::Channel<russh::server::Msg>,
-            _: &mut russh::server::Session,
-        ) -> Result<bool, Self::Error> {
-            Ok(true)
+            _channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
         }
         async fn shell_request(
             &mut self,
@@ -1358,7 +1384,8 @@ mod tests {
             session: &mut russh::server::Session,
         ) -> Result<(), Self::Error> {
             self.shell = Some(channel);
-            session.data(channel, russh::CryptoVec::from_slice(b"shell output"))?;
+            session.channel_success(channel)?;
+            session.data(channel, b"shell output".to_vec())?;
             Ok(())
         }
         async fn subsystem_request(
@@ -1367,13 +1394,12 @@ mod tests {
             _: &str,
             session: &mut russh::server::Session,
         ) -> Result<(), Self::Error> {
-            session.data(
-                channel,
-                russh::CryptoVec::from_slice(b"binary sftp payload"),
-            )?;
+            session.data(channel, b"binary sftp payload".to_vec())?;
             session.eof(channel)?;
             session.close(channel)?;
-            session.eof(self.shell.unwrap())?;
+            if let Some(shell) = self.shell {
+                session.eof(shell)?;
+            }
             Ok(())
         }
         async fn data(
@@ -1382,7 +1408,7 @@ mod tests {
             data: &[u8],
             session: &mut russh::server::Session,
         ) -> Result<(), Self::Error> {
-            session.data(channel, russh::CryptoVec::from_slice(data))?;
+            session.data(channel, data.to_vec())?;
             Ok(())
         }
     }
@@ -1391,11 +1417,7 @@ mod tests {
     async fn ssh_loopback_isolates_subsystem_payload_and_closes_shell_receiver() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let key = ssh_key::PrivateKey::random(
-            &mut ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap();
+        let key = ssh_key::PrivateKey::random(&mut os_rng(), ssh_key::Algorithm::Ed25519).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let config = russh::server::Config {
@@ -1460,11 +1482,7 @@ mod tests {
     async fn idle_session_survives_bidirectional_silence_via_keepalive() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let key = ssh_key::PrivateKey::random(
-            &mut ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap();
+        let key = ssh_key::PrivateKey::random(&mut os_rng(), ssh_key::Algorithm::Ed25519).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let config = russh::server::Config {
@@ -1546,11 +1564,10 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let config = russh::server::Config {
-                keys: vec![ssh_key::PrivateKey::random(
-                    &mut ssh_key::rand_core::OsRng,
-                    ssh_key::Algorithm::Ed25519,
-                )
-                .unwrap()],
+                keys: vec![
+                    ssh_key::PrivateKey::random(&mut os_rng(), ssh_key::Algorithm::Ed25519)
+                        .unwrap(),
+                ],
                 auth_rejection_time: std::time::Duration::ZERO,
                 ..Default::default()
             };
@@ -1624,12 +1641,8 @@ mod tests {
     async fn encrypted_private_key_authenticates_and_drops_passphrase() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("id_ed25519");
-        let key = ssh_key::PrivateKey::random(
-            &mut ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap();
-        key.encrypt(&mut ssh_key::rand_core::OsRng, "key-passphrase")
+        let key = ssh_key::PrivateKey::random(&mut os_rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        key.encrypt(&mut os_rng(), "key-passphrase")
             .unwrap()
             .write_openssh_file(&path, ssh_key::LineEnding::LF)
             .unwrap();

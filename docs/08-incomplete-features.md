@@ -133,6 +133,24 @@ RDP 已删除。Remote Forward、FTP/FTPS、Windows ConPTY、截图、录屏、�
 - **平台覆盖不完整**：未构建 Linux aarch64 与 Windows aarch64；应用未集成 updater 插件，因此不发布 updater 清单。
 - **SSH/SFTP、隧道与物理串口**在 macOS 上同样属于未验证项，见 [macOS 验证](09-macos-validation.md) 的验收清单。
 
+## 已知依赖风险：rsa 的 Marvin 时序攻击（RUSTSEC-2023-0071）
+
+2026-10-08 的依赖升级把 `wasmtime` 提到 36.0.17、`russh` 提到 0.62，清掉了 20 项 RustSec 告警。剩下这一项**无法通过升级消除**，是本项目当前唯一的显式例外：
+
+- 上游 RustCrypto/RSA 的 advisory 把 `patched` 有意留空：最新稳定版 `rsa 0.9.10` 与最新预发布 `rsa 0.10.0-rc.18` 均仍受影响。私钥信息可经**网络可观测的时序侧信道**泄漏。
+- `russh` 的默认 feature 依赖 `rsa`。关闭它会失去 `rsa-sha2-256/512` 主机密钥算法，使仅提供 RSA 主机密钥的 SSH 服务器无法连接——对一个远程终端客户端是真实的互操作性回退，因此保留。
+- 该风险记录在 [scripts/audit-ignored.txt](../scripts/audit-ignored.txt)，`scripts/audit.sh` 逐条回显到 stderr；清单之外的任何新告警仍然让 CI 失败。
+- 复查条件：`rsa` 发布修复版本，或 `russh` 默认不再依赖 `rsa`。
+
+本条只描述依赖状态，**不等于**已验证的抗侧信道能力；真实 SSH/SFTP 服务器场景仍见下文的未验证清单。
+
+同一份审计另有 9 条 `cargo-audit` 归类为 **warning**（默认不阻断 CI）的传递依赖，现状如实列出，不作为「已解决」处理：
+
+- `unmaintained` 8 条：`fxhash`、`proc-macro-error`、`smartstring`、`unic-char-property`、`unic-char-range`、`unic-common`、`unic-ucd-ident`、`unic-ucd-version`。均为构建期/间接依赖，上游停止维护，升级路径需逐个替换。
+- `unsound` 1 条：`glib 0.18.5`（Linux GTK 传递依赖，修复版本为 0.20）。
+
+这两类与 rsa 例外不同：它们是上游维护状态与单个 crate 的不健全标记，不是可利用漏洞，但确实意味着依赖树尚未现代化，后续应择机替换。
+
 ## 尚待真实环境验收
 
 自动检查、调试应用打包和基础 GUI 交互证据见 [macOS 验证](09-macos-validation.md)。未执行的 GUI 写操作、真实 SSH/SFTP 与隧道、物理串口、签名公证不能仅凭单元测试标记完成。Tag 发布流水线、Windows/Linux 产物与真实服务器场景同样不因存在配置文件而记为已验证。

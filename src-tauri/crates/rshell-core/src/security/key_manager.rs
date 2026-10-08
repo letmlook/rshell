@@ -18,13 +18,25 @@ use rshell_infra::crypto::hash::sha256_fingerprint;
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
 
+/// 系统的密码学随机源。
+///
+/// ssh-key 0.7 依赖的 rand_core 0.10 移除了 `OsRng`，系统熵源改由
+/// `getrandom::SysRng` 提供；它实现的是 `TryRng`（错误可能非 `Infallible`），
+/// 用 `UnwrapErr` 包装后即为 `CryptoRng`，正好满足 `PrivateKey::random` /
+/// `RsaKeypair::random` 的约束。
+fn os_rng() -> getrandom::rand_core::UnwrapErr<getrandom::SysRng> {
+    getrandom::rand_core::UnwrapErr(getrandom::SysRng)
+}
+
 /// 根据公钥算法推导密钥类型；RSA 按模数位数区分 2048/4096
 fn ssh_key_type_of(public_key: &ssh_key::PublicKey) -> SshKeyType {
     match public_key.algorithm() {
         ssh_key::Algorithm::Ed25519 => SshKeyType::ED25519,
         ssh_key::Algorithm::Rsa { .. } => {
+            // ssh-key 0.7 起 rsa::RsaPublicKey 的 `n` 字段私有，位数改用
+            // 官方 `key_size()`（已按 Mpint 前导零规则算好），不再手工剥字节。
             let bits = match public_key.key_data() {
-                ssh_key::public::KeyData::Rsa(rsa) => rsa.n.as_bytes().len().saturating_mul(8),
+                ssh_key::public::KeyData::Rsa(rsa) => rsa.key_size() as usize,
                 _ => 0,
             };
             if bits >= 4096 {
@@ -247,12 +259,13 @@ impl KeyManager {
         info!("Generating SSH key: name={}, type={:?}", name, key_type);
 
         // 使用 ssh-key crate 生成密钥
+        let mut rng = os_rng();
         let mut private_key = match key_type {
-            SshKeyType::ED25519 => ssh_key::PrivateKey::random(
-                &mut ssh_key::rand_core::OsRng,
-                ssh_key::Algorithm::Ed25519,
-            )
-            .map_err(|e| CoreError::Internal(format!("Failed to generate ED25519 key: {}", e)))?,
+            SshKeyType::ED25519 => {
+                ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519).map_err(|e| {
+                    CoreError::Internal(format!("Failed to generate ED25519 key: {}", e))
+                })?
+            }
             SshKeyType::RSA2048 | SshKeyType::RSA4096 => {
                 // R2-05：ssh-key 的 PrivateKey::random 对 RSA 固定使用
                 // DEFAULT_RSA_KEY_SIZE(4096) 且无位数入参，两种请求都会生成
@@ -263,37 +276,32 @@ impl KeyManager {
                 } else {
                     4096
                 };
-                let rsa_keypair =
-                    ssh_key::private::RsaKeypair::random(&mut ssh_key::rand_core::OsRng, bit_size)
-                        .map_err(|e| {
-                            CoreError::Internal(format!("Failed to generate RSA key: {}", e))
-                        })?;
+                let rsa_keypair = ssh_key::private::RsaKeypair::random(&mut rng, bit_size)
+                    .map_err(|e| CoreError::Internal(format!("Failed to generate RSA key: {e}")))?;
                 ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Rsa(rsa_keypair), "")
-                    .map_err(|e| {
-                        CoreError::Internal(format!("Failed to generate RSA key: {}", e))
-                    })?
+                    .map_err(|e| CoreError::Internal(format!("Failed to generate RSA key: {e}")))?
             }
             SshKeyType::ECDSA256 => ssh_key::PrivateKey::random(
-                &mut ssh_key::rand_core::OsRng,
+                &mut rng,
                 ssh_key::Algorithm::Ecdsa {
                     curve: ssh_key::EcdsaCurve::NistP256,
                 },
             )
-            .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {}", e)))?,
+            .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {e}")))?,
             SshKeyType::ECDSA384 => ssh_key::PrivateKey::random(
-                &mut ssh_key::rand_core::OsRng,
+                &mut rng,
                 ssh_key::Algorithm::Ecdsa {
                     curve: ssh_key::EcdsaCurve::NistP384,
                 },
             )
-            .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {}", e)))?,
+            .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {e}")))?,
             SshKeyType::ECDSA521 => ssh_key::PrivateKey::random(
-                &mut ssh_key::rand_core::OsRng,
+                &mut rng,
                 ssh_key::Algorithm::Ecdsa {
                     curve: ssh_key::EcdsaCurve::NistP521,
                 },
             )
-            .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {}", e)))?,
+            .map_err(|e| CoreError::Internal(format!("Failed to generate ECDSA key: {e}")))?,
         };
 
         // 将密钥名写入注释：重启后从磁盘重建索引时可恢复名称
@@ -317,11 +325,9 @@ impl KeyManager {
         // 进入密文，解密后可恢复名称；公钥部分不受加密影响
         let has_passphrase = match effective_passphrase(passphrase) {
             Some(pass) => {
-                private_key = private_key
-                    .encrypt(&mut ssh_key::rand_core::OsRng, pass)
-                    .map_err(|e| {
-                        CoreError::Internal(format!("Failed to encrypt private key: {}", e))
-                    })?;
+                private_key = private_key.encrypt(&mut os_rng(), pass).map_err(|e| {
+                    CoreError::Internal(format!("Failed to encrypt private key: {}", e))
+                })?;
                 true
             }
             None => false,
@@ -442,11 +448,9 @@ impl KeyManager {
                 true
             }
             Some(pass) => {
-                private_key = private_key
-                    .encrypt(&mut ssh_key::rand_core::OsRng, pass)
-                    .map_err(|e| {
-                        CoreError::Internal(format!("Failed to encrypt private key: {}", e))
-                    })?;
+                private_key = private_key.encrypt(&mut os_rng(), pass).map_err(|e| {
+                    CoreError::Internal(format!("Failed to encrypt private key: {}", e))
+                })?;
                 true
             }
             None => was_encrypted,
@@ -594,11 +598,8 @@ mod tests {
     async fn imported_key_survives_manager_restart() {
         let src_dir = tempfile::tempdir().unwrap();
         let src = src_dir.path().join("id_test");
-        let generated = ssh_key::PrivateKey::random(
-            &mut ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap();
+        let generated =
+            ssh_key::PrivateKey::random(&mut os_rng(), ssh_key::Algorithm::Ed25519).unwrap();
         let pem = generated.to_openssh(ssh_key::LineEnding::LF).unwrap();
         std::fs::write(&src, pem.as_bytes()).unwrap();
 
@@ -683,11 +684,8 @@ mod tests {
     async fn imported_unencrypted_key_with_passphrase_is_stored_encrypted() {
         let src_dir = tempfile::tempdir().unwrap();
         let src = src_dir.path().join("id_enc");
-        let generated = ssh_key::PrivateKey::random(
-            &mut ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap();
+        let generated =
+            ssh_key::PrivateKey::random(&mut os_rng(), ssh_key::Algorithm::Ed25519).unwrap();
         let pem = generated.to_openssh(ssh_key::LineEnding::LF).unwrap();
         std::fs::write(&src, pem.as_bytes()).unwrap();
 
@@ -715,14 +713,9 @@ mod tests {
     async fn import_of_encrypted_key_rejects_wrong_passphrase() {
         let src_dir = tempfile::tempdir().unwrap();
         let src = src_dir.path().join("id_enc");
-        let generated = ssh_key::PrivateKey::random(
-            &mut ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap();
-        let encrypted = generated
-            .encrypt(&mut ssh_key::rand_core::OsRng, "right-pass")
-            .unwrap();
+        let generated =
+            ssh_key::PrivateKey::random(&mut os_rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let encrypted = generated.encrypt(&mut os_rng(), "right-pass").unwrap();
         let pem = encrypted.to_openssh(ssh_key::LineEnding::LF).unwrap();
         std::fs::write(&src, pem.as_bytes()).unwrap();
 
@@ -795,16 +788,13 @@ mod tests {
         );
 
         // 私钥模数必须是 2048 位（回归：实际生成 4096 级密钥）。
-        // Mpint::as_bytes 在最高位为 1 时带一个前导零字节（实测 2048 位模数
-        // 计 257 字节），归类前剥掉该字节得到真实位数
+        // Mpint 在最高位为 1 时带一个前导零字节（实测 2048 位模数计 257
+        // 字节），所以这里用 ssh-key 的 `key_size()`，它已按同一规则算好，
+        // 不再手工剥字节——后者正是回归当初写错的地方。
         let bytes = std::fs::read(dir.path().join(format!("{}.key", key.id))).unwrap();
         let parsed = ssh_key::PrivateKey::from_openssh(bytes.as_slice()).unwrap();
         let modulus_bits = match parsed.public_key().key_data() {
-            ssh_key::public::KeyData::Rsa(rsa) => {
-                let n = rsa.n.as_bytes();
-                let significant = if n.first() == Some(&0) { &n[1..] } else { n };
-                significant.len().saturating_mul(8)
-            }
+            ssh_key::public::KeyData::Rsa(rsa) => rsa.key_size() as usize,
             other => panic!("expected RSA key, got {:?}", other.algorithm()),
         };
         assert_eq!(modulus_bits, 2048, "RSA2048 请求必须生成 2048 位模数");

@@ -150,6 +150,50 @@ release 下上传超过 OpenSSH 对照，下载与用户用 Xshell 观测到的�
 
 **未验证**：跨网（非局域网）链路的表现、macOS 上的对应数字（该项目以 macOS 为验收平台，本次仅在 Windows + 局域网实测）。
 
+## 2026-10-08：CI 连续失败的根因与依赖升级
+
+本节记录**根因定位**与**已验证项**；未执行的一律不记为通过。
+
+### 根因一：CI 自 2026-09-27 起连续 11 次失败
+
+`bash scripts/verify.sh` 中的 `npm run test:scripts` 一直红，掩盖了后面的所有步骤。根因是 `scripts/automation.test.mjs` 的 fixture 把目录**前置**到真实 PATH：
+
+```
+PATH: `${fixture}:${process.env.PATH}`
+```
+
+`ci.yml` 在跑测试前执行了 `cargo install cargo-audit`，于是「cargo-audit 未安装」这一场景里 `command -v cargo-audit` 命中了真身，`audit.sh` 正常退出 0，而测试断言它必须非零退出——一个无法成立的断言。修复：给子进程只传 fixture 目录作为 PATH，并补上纯 shell 的 `dirname`/`basename` 垫片（这两个是 `verify.sh`/`audit.sh` 唯一需要的非伪造外部命令）；bash 解释器本身在收窄 PATH **之前**用绝对路径解析，否则子进程连启动都做不到。修复后脚本测试在 CI 上为 46 通过 / 0 失败。
+
+### 根因二：被掩盖的 macOS 专属测试失败
+
+脚本测试转绿后，`cargo test --workspace` 暴露出 `rshell-core` 的 `local_rename_rejects_names_that_escape_the_destination_directory` 在 macOS 失败。根因是**测试把 Windows 文件系统语义当成了跨平台不变式**：`C:evil.txt` 在 Windows 上 `Path::with_file_name` 会把整条路径换成驱动器相对路径从而逃出目录，在 POSIX 上 `:` 只是普通文件名字符、结果仍落在目标目录内。生产代码本身是安全的（名字校验 + 父目录校验两道），因此改的是测试：统一断言真正的不变式「不得逃出目标目录」，而不是断言某个平台专属的报错。
+
+### 根因三：Rust 依赖告警（21 项）
+
+`cargo audit` 首次真正跑起来后（此前从未成功执行到该步骤）报告 21 项，集中在 4 个 crate：
+
+| crate | 原版本 | 条数 | 处置 |
+|---|---|---|---|
+| `wasmtime` | 27.0.0 | 18 | 升级到 36.0.17（36.x 线满足全部修复区间，迁移面小于 49.x） |
+| `russh` | 0.48.2 | 1 | 升级到 0.62 |
+| `russh-cryptovec` | 0.48.0 | 1 | 随 russh 升级（传递依赖） |
+| `rsa` | 0.9.10 | 1 | 上游无可用修复，记为显式例外 |
+
+npm 侧同期修复了 4 项高危漏洞（vue 3.5.43、brace-expansion 2.1.7、source-map-js 1.2.2），`npm audit` 归零。
+
+迁移中确认并记录的事实：
+
+- `russh` 0.62 的 `Handler`（client 与 server）改用 RPITIT 声明回调，不再是 `#[async_trait]`；保留该属性会让每个方法签名都因生命周期形参与 trait 声明不匹配。
+- `authenticate_*` 返回 `AuthResult` 而非 `bool`；`Auth::Reject` 新增 `partial_success`；`server::Auth::Reject` 同样新增该字段。
+- `channel_open_session` 多了一个 `ChannelOpenHandle` 回调参数，且 `accept()` 是异步的——不显式 accept 等同于拒绝。
+- `Session::data` 的负载从 `CryptoVec` 改为 `Bytes`。
+- RSA 私钥认证必须显式带哈希算法：`PrivateKeyWithHashAlg::new(key, None)` 会退回已被多数服务端拒绝的 `sha-rsa`(SHA-1)，改用 `best_supported_rsa_hash()` 与服务端协商。
+- ssh-key 0.7 依赖的 rand_core 0.10 移除了 `OsRng`，系统熵源改为 `getrandom::SysRng` + `UnwrapErr`。
+- `rsa::RsaPublicKey` 的 `n` 字段私有化，RSA 位数改用 ssh-key 官方的 `key_size()`（已按 Mpint 前导零规则算好，不再手工剥字节）。
+- `russh` 0.62 默认 feature 含 `aws-lc-rs`，其 `aws-lc-sys` 在 Windows 上需要 NASM；改用 `ring` 后端，避免把「装 NASM」变成每个 Windows 开发者的硬前置。
+
+**未验证**：本节记录的编译与测试结果全部来自 Windows + Git Bash 环境；macOS runner 上的实际结果以 CI 为准。真实 SSH/SFTP 服务器、物理串口与签名公证状态不变。
+
 ## 2026-10-08：Tag 驱动的多平台打包与 Release 发布
 
 本节记录**实现**与**已验证项**的区别，未执行的一律不记为通过。

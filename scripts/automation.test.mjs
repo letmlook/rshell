@@ -286,11 +286,62 @@ test('audit.sh sets RUSTUP_TOOLCHAIN=stable and RUSTUP_NO_UPDATE_CHECK=1 for car
   }
 });
 
+// Reviewed cargo-audit exceptions live in a committed file so the gate stays
+// honest: only these IDs are waived, and every other advisory still fails.
+const auditIgnoreFile = join(root, 'scripts/audit-ignored.txt');
+
+function readIgnoredAdvisories() {
+  return readFileSync(auditIgnoreFile, 'utf8')
+    .split('\n')
+    .map((line) => line.replace(/#.*$/, '').trim())
+    .filter(Boolean);
+}
+
+function expectedCargoAuditArgv() {
+  const argv = ['audit'];
+  for (const id of readIgnoredAdvisories()) argv.push('--ignore', id);
+  argv.push('--file', 'src-tauri/Cargo.lock');
+  return argv.join(' ');
+}
+
 test('audit.sh propagates child exit codes unchanged', () => {
-  const { fixture } = setupFixture({ failingArgv: 'audit --file src-tauri/Cargo.lock' });
+  const { fixture } = setupFixture({ failingArgv: expectedCargoAuditArgv() });
   try {
     const result = runAudit([], { cwd: fixture, fixture });
     assert.equal(result.status, 17, `expected cargo audit failure to propagate, got ${result.status}: ${result.stderr}`);
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test('reviewed cargo-audit exceptions are listed with a rationale', () => {
+  const ignored = readIgnoredAdvisories();
+  assert.ok(ignored.length > 0, 'the exception file must not be empty');
+  for (const id of ignored) {
+    assert.match(id, /^(RUSTSEC-\d{4}-\d{4}|GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})$/, `not an advisory ID: ${id}`);
+  }
+  // A bare list is an unreviewed allowlist; each ID needs its own explanation
+  // and a condition that tells a future reader when to drop it again.
+  const body = readFileSync(auditIgnoreFile, 'utf8');
+  assert.match(body, /复查条件/, 'each exception must state when it should be re-reviewed');
+  assert.match(body, /patched/, 'the reason must cite whether upstream has a fix');
+});
+
+test('audit.sh waives exactly the reviewed advisories and keeps the rest fatal', () => {
+  const { fixture, logPath } = setupFixture();
+  try {
+    const result = runAudit([], { cwd: fixture, fixture, logPath });
+    assert.equal(result.status, 0, result.stderr);
+    const body = readLog(logPath);
+    for (const id of readIgnoredAdvisories()) {
+      assert.ok(body.includes(`--ignore ${id}`), `audit.sh did not waive ${id}: ${body}`);
+    }
+    // The waiver list must not become a blanket pass: the real scan still runs.
+    assert.match(body, /\s--file src-tauri\/Cargo\.lock$/m);
+    // Transparency: every waiver is echoed so CI logs show what was excused.
+    for (const id of readIgnoredAdvisories()) {
+      assert.match(result.stderr, new RegExp(id), `${id} must be visible in audit.sh stderr`);
+    }
   } finally {
     cleanup(fixture);
   }

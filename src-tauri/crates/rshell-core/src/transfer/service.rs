@@ -1253,7 +1253,6 @@ mod tests {
             "..\\evil.txt",     // Windows 上一层
             "..\\..\\evil.txt", // Windows 多层
             "sub\\evil.txt",    // Windows 子目录
-            "C:evil.txt",       // 驱动器相对：能过名字检查，但父目录会变
             "",
             ".",
             "..",
@@ -1265,6 +1264,24 @@ mod tests {
                 matches!(err, CoreError::InvalidState(_)),
                 "改名 {hostile:?} 应报 InvalidState，实际: {err:?}"
             );
+        }
+
+        // 驱动器相对名 `C:evil.txt` 的语义因平台而异：Windows 上
+        // `Path::with_file_name` 会把整条路径替换成驱动器相对路径，从而逃出目标
+        // 目录，必须被拒；POSIX 上 `:` 只是普通文件名字符，结果仍落在目标目录内，
+        // 放行并不构成旁路。两条分支都断言同一个跨平台不变式——不得逃出目录，
+        // 而不是断言某个平台专属的报错。
+        match resolve_local_target(&existing, &ConflictPolicy::Rename("C:evil.txt".into())) {
+            Err(err) => assert!(
+                matches!(err, CoreError::InvalidState(_)),
+                "改名 \"C:evil.txt\" 被拒时应报 InvalidState，实际: {err:?}"
+            ),
+            Ok(path) => assert_eq!(
+                path.parent(),
+                existing.parent(),
+                "改名 \"C:evil.txt\" 放行时必须仍在原父目录内，实际: {}",
+                path.display()
+            ),
         }
     }
 

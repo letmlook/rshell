@@ -14,13 +14,22 @@ tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-russh = "0.48"
-russh-keys = "0.48"
-russh-sftp = "2.3"
+# RUSTSEC-2026-0154 / RUSTSEC-2026-0153 要求 russh 与 russh-cryptovec >= 0.60.3。
+# 0.62 是仍可与 russh-sftp 2.4 搭配的最高版本；再往上 russh-sftp 就要求 3.x，
+# 而 3.x 相对 2.3 的迁移面更大。russh-keys 已并入 russh::keys，不再单独依赖。
+# ssh-key 必须跟随 russh 锁定的 0.7.0-rc.11，否则两套 ssh-key 会同时进依赖树。
+#
+# 这里关掉默认 feature：0.62 的默认含 aws-lc-rs，而 aws-lc-sys 在 Windows 上
+# 需要 NASM 才能编译，会把「装 NASM」变成每个 Windows 开发者的硬前置。改用
+# ring 作为加密后端，保留 flate2（与 0.48 默认一致）与 rsa（保留 rsa-sha2-256/512
+# 主机密钥能力）。
+russh = { version = "0.62", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "2.4"
 serialport = "4.9"
 async-trait = "0.1"
 anyhow = "1"
-ssh-key = { version = "0.6", features = ["ed25519"] }
+ssh-key = { version = "0.7.0-rc.11", features = ["ed25519"] }
+getrandom = { version = "0.4", features = ["sys_rng"] }
 dirs = "5"
 uuid = { workspace = true }
 

@@ -20,13 +20,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use async_trait::async_trait;
 use russh::client::{connect_stream, Config, Handler};
 use russh::keys::ssh_key;
 
 struct Accept;
 
-#[async_trait]
+// russh 0.62 的 Handler 改用 RPITIT 声明回调，不再使用 `#[async_trait]`。
 impl Handler for Accept {
     type Error = russh::Error;
     async fn check_server_key(

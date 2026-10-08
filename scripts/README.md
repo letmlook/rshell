@@ -9,6 +9,10 @@
 - `npm run verify`（底层 `bash scripts/verify.sh [--skip-install]`）：从仓库根目录运行前端类型检查、单元测试、构建、文档契约、bundle 体积检查、发布版本一致性检查、脚本测试，再依次执行 `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`。任一子命令失败立即返回非零退出码，不会被静默吞掉。
 - `npm run audit`（底层 `bash scripts/audit.sh`）：`npm audit --registry=https://registry.npmjs.org` 加 `cargo audit --file src-tauri/Cargo.lock`。`cargo-audit` 缺失时给出明确安装提示并以非零退出，不允许“未执行”冒充通过。
 
+`scripts/audit-ignored.txt` 是**唯一**的例外清单：`audit.sh` 把其中每个 ID 作为 `cargo audit --ignore` 传入，并逐条回显到 stderr，使 CI 日志能看到被豁免的告警。文件缺失会被当作仓库配置错误而非“没有例外”直接失败——否则删掉文件就等于悄悄关掉整道门禁。维护规则：只允许写上游没有可用修复的条目（凡有修复版本的一律靠升级依赖消除），每条必须写明原因与复查条件，其余任何新告警仍然非零退出。
+
+当前唯一例外：`RUSTSEC-2023-0071`（rsa 的 Marvin 时序攻击）。上游 RustCrypto/RSA 有意把 `patched` 留空——最新稳定版 0.9.10 与最新预发布 0.10.0-rc.18 均仍受影响；关闭 russh 默认的 `rsa` feature 会失去 rsa-sha2-256/512 主机密钥算法，导致仅提供 RSA 主机密钥的服务器无法连接。
+
 Cargo 命令一律通过 `RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1` 触发，避免 rustup 自动更新冲突；脚本永远不会打印或接受签名、notarytool 或会话凭据。
 
 ## 旧脚本保留范围
