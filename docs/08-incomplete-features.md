@@ -1,6 +1,6 @@
 # 当前功能与限制
 
-更新：2026-10-08（传输任务生命周期：临时文件 + 提交 + 清理 + 重试，R2-T2 一轮）。本文件替代历史未完成列表，区分实现范围与验收证据。
+更新：2026-10-11（托管密钥接入会话认证；SFTP 提交接入 posix-rename@openssh.com；R3-03 补回归测试）。本文件替代历史未完成列表，区分实现范围与验收证据。
 
 ## 术语：连接信息与标签会话
 
@@ -44,7 +44,7 @@ SSH 每个标签的输入与 resize 使用 10 秒端到端预算，包含核心�
 - 同一条连接信息可同时开多个标签会话（面板 id 带 `~n` 序号、标签带 `#n`，关掉中间窗口后编号自动补齐）；连接列表右键可「复制连接信息」用同一份配方建新条目。
 - SFTP 远程浏览、本地目录授权、单文件上传下载、新建目录、普通文件删除和真实队列。远程/本地文件列表支持右键菜单：本地列表给「上传到远程」，远程列表给「下载到本地/新建文件夹/删除/刷新」；多选普通文件可一次批量入队（目录与不安全名称自动剔除），单条失败不阻断其余文件，失败条目汇总提示。
 - Local/Dynamic SSH 隧道，旧 Remote 规则兼容拒绝。
-- 主机密钥确认与永久保存、SSH 密钥管理接口（仅为托管存储，不参与会话认证，见下文边界说明）。
+- 主机密钥确认与永久保存、SSH 密钥管理接口。托管私钥已接入会话认证：新建连接时选「托管密钥」，连接时后端按 `managed_key_id` 经 `KeyManager` 取私钥字节（见下文「凭据与密钥」节）。
 - 快速命令、触发器创建、删除、执行/开关与持久化。
 - Rhai 宿主发送、列会话、执行快速命令接口。
 - 主题、终端配色与事件订阅释放。
@@ -64,11 +64,11 @@ SSH 密码和密钥口令存放在 macOS 钥匙串（Keychain），会话 TOML �
 
 主机密钥请求以 `decision_id` 为键，而不是单一 current 请求。生命周期为：`Pending` → `DecidedTrustOnce`、`DecidedTrustAlways`、`DecidedReject`，或用户取消后的 `Cancelled`，协议等待超时后的 `Expired`，以及前端对已失效项的本地 `Dismissed`。每个请求独立注册、提交、取消和过期；一个请求的确认/拒绝不会接受或清除另一个请求。显式取消会发送 keyed `CancelHostKey` 并取消对应协议等待；后端取消/超时通过 `HostKeyDecisionStateChanged` 通知前端，未知或已过期 id 的迟到事件被丢弃。永久信任先以 CAS claim 保存到 trusted store，只有落盘成功才发送接受握手；落盘失败会释放请求回 `Pending`，保留错误并允许用户改选「信任一次」或取消，期间绝不发布 `Connected`。
 
-私钥保存在应用数据目录的 keys_dir（生成/导入时提供口令则以 OpenSSH 加密格式落盘），没有「关联到会话」入口，不参与会话认证。会话公钥认证使用会话自身凭据配置的外部私钥文件路径，口令经钥匙串提供。因此，在密钥管理面板生成或导入的私钥（含带口令加密的）目前无法在本应用内用于 SSH 连接；界面提示与该边界一致。
+私钥保存在应用数据目录的 keys_dir（生成/导入时提供口令则以 OpenSSH 加密格式落盘）。托管私钥与会话的关联通过 `AuthMethod::PublicKey` 的可选 `managed_key_id` 表达：新建连接「认证 → 托管密钥」选择后，连接时 `SessionService` 按 id 经 `KeyManager::get_private_key_data` 取私钥字节，协议层用 `russh::keys::decode_secret_key` 内存解码认证（与磁盘 `load_secret_key` 同一执行路径，loopback 服务器测试覆盖）；口令沿用会话自己的钥匙串槽位（`session:{id}:passphrase`，「更新凭据」弹窗补录）。私钥字节仍不过 IPC、不进 `SessionConfig`（`SshKeyInfo` 白名单测试不变）。密钥被删除后引用它的会话连接时报「no longer available; re-select a key」，不冒充可重试的连接失败。磁盘私钥路径模式（`key_path`）保持原语义，旧 TOML 不受影响。
 
 传输队列界面提供可见的「暂停/继续/取消/重试/删除」操作，分别调用 `PauseTransfer`/`ResumeTransfer`/`CancelTransfer`/`RetryTransfer`/`RemoveTransfer`。前三者通过按任务的 `watch` 控制通道驱动 staged lifecycle 拷贝循环；「重试」由专用的 `RetryTransfer` 命令入口（**不**复用 `EnqueueUpload`/`EnqueueDownload` 配 hidden flag），从零创建新任务 id 并强制使用 `Fail` 策略，让 staged lifecycle 提交前再检一次冲突；「删除」只把**终态**（完成/失败/已取消）条目移出队列列表，不删除本地或远端已传输的文件；活跃任务调用会返回 `InvalidState`，必须先取消。未知条目重复删除按幂等处理，不报错。失败 / 已取消的终态任务上额外显示「重试」按钮（仅这两个终态——「完成」不提供重试，避免「重看结果」误解）。面板标题栏另有队列管理菜单，可按「清除已完成/失败/已取消/全部已结束」批量移除，并显示各分组当前条数；批量逐条调用 `RemoveTransfer` 而非新增批量命令，以便部分失败可见（否则用户会以为已清空而实际仍有残留）。进行中的任务在任何分组里都不会被批量清除。
 
-R2-T2：上传与下载都跑「独占打开 staging temp → 字节拷贝 → 提交前再检查冲突 → 安全提交（rename）→ 失败/取消时清理 temp」这个完整生命周期。temp 文件路径形如 `<target>.partial-<task_uuid>`（同目录，便于跨平台 rename 都是同文件系统内操作），任务独占创建（O_EXCL / `OpenFlags::EXCLUDE`）。提交前再次检查目标是否存在——预检通过后目标出现会触发 `late_conflict` 并清理 temp、保留旧目标。取消与提交由 `cancel_decision: AtomicU8` 仲裁：commit 发送之前取消到达 → 取消胜出、commit 不发送、旧目标保留、temp 清理；commit 已在飞（已发出 rename） → commit 完成即收尾（取消意图被吞，因为目标已被替换）。「100% 字节进度」**不**代表提交成功——commit 失败时 `error_message` 与 `cleanup_status: "residue"`（含 temp 路径）一起返回给前端，告知用户残留临时文件的**确切位置**与清理失败原因，**不**静默吞掉。该行为由 staged lifecycle（`rshell-core/transfer/staged.rs`）的 13 条 RED-first 回归测试 + 服务层 retry 入口的 3 条测试覆盖。提交语义：当前走标准 `SSH_FXP_RENAME`（多数服务器在「newpath 已存在」时会替换，但 RFC 文本未强制），不能保证通用原子替换；真正原子替换需要 `posix-rename@openssh.com` 扩展，而 `russh-sftp 2.4` 的 `SftpSession` 未暴露 `extended()` 入口，本轮没找到安全的 raw handle 路径。详见 `docs/research/2026-10-08-sftp-staged-commit-report.md` 的 capability 调查结论。
+R2-T2：上传与下载都跑「独占打开 staging temp → 字节拷贝 → 提交前再检查冲突 → 安全提交（rename）→ 失败/取消时清理 temp」这个完整生命周期。temp 文件路径形如 `<target>.partial-<task_uuid>`（同目录，便于跨平台 rename 都是同文件系统内操作），任务独占创建（O_EXCL / `OpenFlags::EXCLUDE`）。提交前再次检查目标是否存在——预检通过后目标出现会触发 `late_conflict` 并清理 temp、保留旧目标。取消与提交由 `cancel_decision: AtomicU8` 仲裁：commit 发送之前取消到达 → 取消胜出、commit 不发送、旧目标保留、temp 清理；commit 已在飞（已发出 rename） → commit 完成即收尾（取消意图被吞，因为目标已被替换）。「100% 字节进度」**不**代表提交成功——commit 失败时 `error_message` 与 `cleanup_status: "residue"`（含 temp 路径）一起返回给前端，告知用户残留临时文件的**确切位置**与清理失败原因，**不**静默吞掉。该行为由 staged lifecycle（`rshell-core/transfer/staged.rs`）的 13 条 RED-first 回归测试 + 服务层 retry 入口的 3 条测试覆盖。提交语义：每次 staged 传输除数据通道外再开一条**专用提交通道**（独立 SFTP 会话，`russh_sftp::client::RawSftpSession`——高层 `SftpSession` 不暴露内部 raw 句柄，但 raw 类型本身是公开 API）。版本握手（SSH_FXP_VERSION）里服务器声明 `posix-rename@openssh.com` 时，提交走 `SSH_FXP_EXTENDED`（请求体为 oldpath/newpath 两个连续 SSH string），获得**协议保证的原子替换**；服务器以 `SSH_FX_OP_UNSUPPORTED` 拒绝（探测与实际行为不一致的兜底）或没有提交通道时，回退标准 `SSH_FXP_RENAME` 并如实报告 `standard_rename`。posix-rename 的其它失败（网络、权限）不回退直接报错——超时类失败语义是「结果未知」，盲目重试 rename 可能掩盖真实原因。提交通道打不开只降级不失败。提交策略经 `commit_strategy`（`posix_rename` / `standard_rename`）透传到前端。wire format 与应答映射有单测锁定；真实 OpenSSH 服务器上的行为验证仍属待验收（见「尚待真实环境验收」）。详见 `docs/research/2026-10-08-sftp-staged-commit-report.md` 的 capability 调查结论（其「未找到 raw handle 路径」的结论已被上述第二条通道方案取代）。
 
 远端文件面板默认打开登录用户的工作目录，而不是文件系统根 `/`：新增 `GetRemoteHomeDir` 命令，用 SFTP `realpath(".")` 解析（sftp 子系统启动时的当前目录即用户 home，远端无需额外支持 `~` 展开），解析失败回退 `/` 并在前端保持当前目录，不把远端面板打成空白。外部显式传入 `remotePath` 时不覆盖。
 
@@ -174,5 +174,7 @@ RDP 已删除。Remote Forward、FTP/FTPS、Windows ConPTY、截图、录屏、�
 自动检查、调试应用打包和基础 GUI 交互证据见 [macOS 验证](09-macos-validation.md)。未执行的 GUI 写操作、真实 SSH/SFTP 与隧道、物理串口、签名公证不能仅凭单元测试标记完成。Tag 发布流水线、Windows/Linux 产物与真实服务器场景同样不因存在配置文件而记为已验证。
 
 本轮（2026-10-04）新增的文件面板路径树、双向滚动、传输日志页、面板拖动高度、终端右键菜单与选中即复制、终端配色设置、终端断开态、多标签独立 pty、全局自定义弹窗与本地路径选择器，**仅由单元测试与构建检查覆盖，尚无 macOS 真实 GUI 人工验收记录**：路径树的懒加载与 SFTP 目录读取、右键粘贴在真实 WebView 中的剪贴板授权、拖动高度的手感与上下限、断线后终端重连、复制会话后钥匙串补录凭据、自定义弹窗在真实窗口中的焦点循环与遮罩点击，以及**两个标签各自跑不同命令**（每标签独立 pty）都需在真机走一遍。复制会话没有后端凭据复制命令这一点是设计边界，不是缺陷。
+
+本轮（2026-10-11）新增的「新建连接 → 托管密钥 / 外部私钥」认证 UI、托管密钥会话连接（含钥匙串口令补录与密钥被删后的重选提示）、SFTP posix-rename 提交策略展示，**同样仅由单元测试 / loopback 服务器测试与构建检查覆盖**：真实 GUI 里创建托管密钥连接、真实 OpenSSH 服务器上验证 `commit_strategy: "posix_rename"`（可对比 `~/.ssh/known_hosts` 之外的任何支持该扩展的服务端）均需真机走一遍；SFTP 下载并发吞吐的真实服务器对比数据仍待补（评估传输性能必须用 release 构建，见「传输吞吐」节）。
 
 本轮实现加固与自动化回归已完成，但不是全部真实环境验收完毕。没有服务器/设备证据的条目继续标待验证，不通过改写文档消除验收缺口。

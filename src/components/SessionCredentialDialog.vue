@@ -10,7 +10,11 @@ const store = useSessionsStore();
 const secret = ref("");
 const submitting = ref(false);
 const error = ref<string | null>(null);
-const label = computed(() => "PublicKey" in props.session.auth_method ? "新私钥口令" : "新密码");
+const label = computed(() => {
+  if (!("PublicKey" in props.session.auth_method)) return "新密码";
+  const publicKey = props.session.auth_method.PublicKey;
+  return publicKey.managed_key_id ? "托管密钥口令" : "新私钥口令";
+});
 
 function close() {
   secret.value = "";

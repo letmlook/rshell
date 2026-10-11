@@ -4,6 +4,7 @@ use crate::error::CoreError;
 use crate::event_bus::EventBus;
 use crate::script::trigger_engine::TriggerEngine;
 use crate::security::host_key_decision::HostKeyDecisionRegistry;
+use crate::security::key_manager::KeyManager;
 use crate::session::repository::{
     has_credential, set_presence, SessionRepository, SessionRepositoryError,
 };
@@ -77,6 +78,21 @@ fn validate_session_config(config: &SessionConfig) -> Result<(), CoreError> {
                 return Err(CoreError::InvalidState(
                     "Host and TCP port are required".into(),
                 ));
+            }
+            // 公钥认证必须给出密钥来源：托管密钥 id 或磁盘私钥路径，二者至少其一。
+            // 托管密钥模式允许 key_path 为空（前端不提供路径输入）。
+            if let AuthMethod::PublicKey {
+                key_path,
+                managed_key_id,
+                ..
+            } = &config.auth_method
+            {
+                if managed_key_id.is_none() && key_path.as_os_str().is_empty() {
+                    return Err(CoreError::InvalidState(
+                        "Public key authentication requires a managed key or a key file path"
+                            .into(),
+                    ));
+                }
             }
         }
         Protocol::Serial => {
@@ -280,6 +296,9 @@ pub struct SessionService {
     /// 设为 `None` 时所有写操作仅落内存（向后兼容旧测试场景）；
     /// Tauri 壳 `setup` 阶段必须 `Some(...)` 以满足设计 §4.5 完成判据。
     repository: Option<Arc<SessionRepository>>,
+    /// 密钥管理面板托管的私钥仓库。`Some` 时 `managed_key_id` 会话才能连接；
+    /// 为 `None`（旧测试场景）时引用托管密钥的会话在认证解析处报错。
+    key_manager: Option<Arc<KeyManager>>,
     /// R2-15：会话删除回调。壳层据此清理每会话资源（如 TerminalChannels 的
     /// 双态 sink 条目）。仅在删除时触发——断开不触发，断开后重连的终端面板
     /// 仍持有 Channel 句柄，清理会冻结其输出。
@@ -297,6 +316,55 @@ impl SessionService {
         };
         resolved_auth(config, secret)
     }
+
+    /// 托管密钥会话的认证解析：私钥字节取自 `KeyManager`，口令沿用本会话
+    /// 自己的钥匙串槽位（`session:{id}:passphrase`，与磁盘私钥模式一致——
+    /// 「更新凭据」弹窗补录的就是它）。
+    async fn resolve_managed_auth(
+        &self,
+        config: &SessionConfig,
+        key_id: Uuid,
+    ) -> Result<ResolvedAuthMethod, CoreError> {
+        let AuthMethod::PublicKey {
+            username,
+            has_passphrase,
+            ..
+        } = &config.auth_method
+        else {
+            return Err(CoreError::InvalidState(
+                "session is not configured for public key authentication".into(),
+            ));
+        };
+        let secret = match &self.repository {
+            Some(repo) => repo.credential(config).map_err(repository_error)?,
+            None => None,
+        };
+        if *has_passphrase && secret.is_none() {
+            return Err(CoreError::CredentialMissing(
+                "stored session credential is unavailable".into(),
+            ));
+        }
+        let key_manager = self
+            .key_manager
+            .as_ref()
+            .ok_or_else(|| CoreError::InvalidState("managed key store is unavailable".into()))?;
+        let key_data = key_manager
+            .get_private_key_data(key_id)
+            .await
+            .map_err(|_| {
+                // 密钥已被删除/密钥库不可用：明确指出需要重新选择密钥，
+                // 不冒充成可重试的连接失败。
+                CoreError::InvalidState(format!(
+                    "managed key {key_id} is no longer available; re-select a key for this session"
+                ))
+            })?;
+        Ok(ResolvedAuthMethod::ManagedPublicKey {
+            username: username.clone(),
+            key_id,
+            key_data,
+            passphrase: secret,
+        })
+    }
     /// 创建新的会话服务
     pub fn new(
         event_bus: Arc<EventBus>,
@@ -310,17 +378,20 @@ impl SessionService {
             trigger_engine,
             host_key_registry,
             None,
+            None,
         )
     }
 
     /// 带持久化仓库构造。
     /// 切片 1 起 Tauri 壳 `setup` 用此构造，单元测试维持 4 参版本。
+    /// `key_manager`：托管私钥仓库，`managed_key_id` 会话的认证材料来源。
     pub fn with_repository(
         event_bus: Arc<EventBus>,
         terminal_service: Arc<TerminalService>,
         trigger_engine: Arc<TriggerEngine>,
         host_key_registry: Arc<HostKeyDecisionRegistry>,
         repository: Option<Arc<SessionRepository>>,
+        key_manager: Option<Arc<KeyManager>>,
     ) -> Self {
         let mut restored = HashMap::new();
         let mut load_issues = Vec::new();
@@ -356,6 +427,7 @@ impl SessionService {
             trigger_engine,
             host_key_registry,
             repository,
+            key_manager,
             on_session_deleted: std::sync::RwLock::new(None),
         }
     }
@@ -512,7 +584,13 @@ impl SessionService {
         // 遇到未知 host key 时,SshHandler::check_server_key 会在 EventBus 上发
         // HostKeyMismatch { decision_id, ... } 然后同步 block_on 等 UI 端的
         // AppCommand::DecideHostKey。
-        let auth = self.resolve_auth(&config)?;
+        let auth = match &config.auth_method {
+            AuthMethod::PublicKey {
+                managed_key_id: Some(key_id),
+                ..
+            } => self.resolve_managed_auth(&config, *key_id).await?,
+            _ => self.resolve_auth(&config)?,
+        };
         let mut client = SshClient::new(config.clone(), auth);
         let sink: Arc<dyn rshell_protocol::ssh::HostKeyDecisionSink> =
             self.host_key_registry.clone();
@@ -1404,7 +1482,7 @@ mod tests {
     use crate::script::trigger_engine::TriggerEngine;
     use crate::security::host_key_decision::HostKeyDecisionRegistry;
     use crate::terminal::service::TerminalService;
-    use rshell_api::types::{AuthMethod, Protocol, SessionConfig};
+    use rshell_api::types::{AuthMethod, Protocol, SessionConfig, SshKeyType};
     use rshell_api::AppEvent;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1459,6 +1537,7 @@ mod tests {
             username: "user".into(),
             key_path: "/tmp/id_ed25519".into(),
             has_passphrase: true,
+            managed_key_id: None,
         };
         assert!(matches!(
             make_service().resolve_auth(&config),
@@ -1468,6 +1547,7 @@ mod tests {
             username: "user".into(),
             key_path: "/tmp/id_ed25519".into(),
             has_passphrase: false,
+            managed_key_id: None,
         };
         assert!(matches!(
             make_service().resolve_auth(&config),
@@ -1544,6 +1624,7 @@ mod tests {
             trigger_engine,
             registry,
             Some(repo),
+            None,
         );
         let mut cfg = make_config("save refusal", "example.test");
         cfg.auth_method = AuthMethod::Password {
@@ -1635,6 +1716,7 @@ mod tests {
             trigger_engine,
             registry.clone(),
             Some(repo),
+            None,
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2281,7 +2363,7 @@ mod tests {
         let ts = Arc::new(TerminalService::new(bus.clone()));
         let te = Arc::new(TriggerEngine::new(bus.clone()));
         let hk = Arc::new(HostKeyDecisionRegistry::new(bus.clone()));
-        SessionService::with_repository(bus, ts, te, hk, Some(repo))
+        SessionService::with_repository(bus, ts, te, hk, Some(repo), None)
     }
 
     #[tokio::test]
@@ -2853,5 +2935,147 @@ mod tests {
         let states = svc.sessions.read().await;
         assert!(states[&id].attempt.is_none());
         assert_eq!(states[&id].connection_state, ConnectionState::Disconnected);
+    }
+
+    // ── 托管密钥会话（managed_key_id）──
+    // 认证材料解析：私钥字节来自 KeyManager，口令沿用会话自己的钥匙串槽位。
+
+    #[tokio::test]
+    async fn managed_key_session_resolves_bytes_and_passphrase_from_key_manager() {
+        use crate::session::repository::tests::{set, MemoryCredentials};
+
+        let dir = tempfile::tempdir().unwrap();
+        let bus = Arc::new(EventBus::new());
+        let key_manager = Arc::new(KeyManager::new(dir.path().join("keys"), bus.clone()));
+        let info = key_manager
+            .generate_key("deploy", SshKeyType::ED25519, Some("key-pass"))
+            .await
+            .unwrap();
+
+        let credentials = Arc::new(MemoryCredentials::default());
+        let repo = Arc::new(SessionRepository::new(dir.path().into(), credentials));
+        let ts = Arc::new(TerminalService::new(bus.clone()));
+        let te = Arc::new(TriggerEngine::new(bus.clone()));
+        let hk = Arc::new(HostKeyDecisionRegistry::new(bus.clone()));
+        let svc =
+            SessionService::with_repository(bus, ts, te, hk, Some(repo.clone()), Some(key_manager));
+
+        let mut cfg = make_config("managed", "example.test");
+        cfg.auth_method = AuthMethod::PublicKey {
+            username: "user".into(),
+            key_path: String::new().into(),
+            has_passphrase: true,
+            managed_key_id: Some(info.id),
+        };
+        repo.save(&cfg, set("key-pass")).unwrap();
+
+        let resolved = svc.resolve_managed_auth(&cfg, info.id).await.unwrap();
+        let ResolvedAuthMethod::ManagedPublicKey {
+            username,
+            key_id,
+            key_data,
+            passphrase,
+        } = resolved
+        else {
+            panic!("必须是 ManagedPublicKey 变体");
+        };
+        assert_eq!(username, "user");
+        assert_eq!(key_id, info.id);
+        assert_eq!(passphrase.as_deref(), Some("key-pass"));
+        assert!(!key_data.is_empty(), "私钥字节必须从 KeyManager 取到");
+        assert!(String::from_utf8(key_data)
+            .unwrap()
+            .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+    }
+
+    #[tokio::test]
+    async fn managed_key_session_with_missing_key_demands_reselection() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = Arc::new(EventBus::new());
+        let key_manager = Arc::new(KeyManager::new(dir.path().join("keys"), bus.clone()));
+        let info = key_manager
+            .generate_key("doomed", SshKeyType::ED25519, None)
+            .await
+            .unwrap();
+        key_manager.delete_key(info.id).await.unwrap();
+
+        let ts = Arc::new(TerminalService::new(bus.clone()));
+        let te = Arc::new(TriggerEngine::new(bus.clone()));
+        let hk = Arc::new(HostKeyDecisionRegistry::new(bus.clone()));
+        let svc = SessionService::with_repository(bus, ts, te, hk, None, Some(key_manager));
+
+        let mut cfg = make_config("orphan", "example.test");
+        cfg.auth_method = AuthMethod::PublicKey {
+            username: "user".into(),
+            key_path: String::new().into(),
+            has_passphrase: false,
+            managed_key_id: Some(info.id),
+        };
+        assert!(
+            matches!(
+                svc.resolve_managed_auth(&cfg, info.id).await,
+                Err(CoreError::InvalidState(ref m)) if m.contains("no longer available")
+            ),
+            "必须明确指出密钥已不可用，需要重新选择"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_key_session_still_requires_passphrase_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = Arc::new(EventBus::new());
+        let key_manager = Arc::new(KeyManager::new(dir.path().join("keys"), bus.clone()));
+        let info = key_manager
+            .generate_key("locked", SshKeyType::ED25519, Some("real-pass"))
+            .await
+            .unwrap();
+
+        let ts = Arc::new(TerminalService::new(bus.clone()));
+        let te = Arc::new(TriggerEngine::new(bus.clone()));
+        let hk = Arc::new(HostKeyDecisionRegistry::new(bus.clone()));
+        let svc = SessionService::with_repository(bus, ts, te, hk, None, Some(key_manager));
+
+        let mut cfg = make_config("locked-session", "example.test");
+        cfg.auth_method = AuthMethod::PublicKey {
+            username: "user".into(),
+            key_path: String::new().into(),
+            has_passphrase: true,
+            managed_key_id: Some(info.id),
+        };
+        assert!(
+            matches!(
+                svc.resolve_managed_auth(&cfg, info.id).await,
+                Err(CoreError::CredentialMissing(_))
+            ),
+            "口令缺失沿用既有恢复类别（更新凭据入口）"
+        );
+    }
+
+    #[test]
+    fn public_key_auth_requires_a_key_source() {
+        let mut cfg = make_config("no-source", "example.test");
+        cfg.auth_method = AuthMethod::PublicKey {
+            username: "user".into(),
+            key_path: String::new().into(),
+            has_passphrase: false,
+            managed_key_id: None,
+        };
+        assert!(validate_session_config(&cfg).is_err());
+
+        cfg.auth_method = AuthMethod::PublicKey {
+            username: "user".into(),
+            key_path: String::new().into(),
+            has_passphrase: false,
+            managed_key_id: Some(Uuid::new_v4()),
+        };
+        assert!(validate_session_config(&cfg).is_ok());
+
+        cfg.auth_method = AuthMethod::PublicKey {
+            username: "user".into(),
+            key_path: "/tmp/id_ed25519".into(),
+            has_passphrase: false,
+            managed_key_id: None,
+        };
+        assert!(validate_session_config(&cfg).is_ok());
     }
 }

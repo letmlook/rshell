@@ -75,7 +75,15 @@ export type Protocol = "SSH" | "Telnet" | "Serial";
 
 export type AuthMethod =
   | { Password: { username: string; has_password: boolean } }
-  | { PublicKey: { username: string; key_path: PathBuf; has_passphrase: boolean } }
+  | {
+      PublicKey: {
+        username: string;
+        key_path: PathBuf;
+        has_passphrase: boolean;
+        /** 密钥管理面板托管的私钥 id；设置后连接走 KeyManager 取私钥，key_path 不参与认证 */
+        managed_key_id?: string;
+      };
+    }
   | { KeyboardInteractive: { username: string; has_password: boolean } };
 
 export interface SessionCredential {

@@ -110,7 +110,7 @@
 - **证据**：复核（HEAD 82304ca）逐条成立：`grep -rn "get_private_key_data" src-tauri --include="*.rs"` 仅 key_manager.rs:543 定义一处（整理员复核一致），测试模块（:553 起 10 个 PROB-09/10 配套测试）也无调用，「按 key_id 取钥单测」不存在；rshell-api/src/types.rs:41-45 AuthMethod::PublicKey 仅 key_path: PathBuf 无 key_id；session/service.rs:70-76 组装 ResolvedAuthMethod::PublicKey{key_path, passphrase}；client.rs:593 精确命中 russh_keys::load_secret_key(key_path, passphrase.as_deref())；grep src/ keyPath|privateKey 零命中（exit 1）；KeyManagerPanel.vue:6 注释原文「只出 SshKeyInfo, 私钥永不过 IPC」，组件仅 listKeys/generateSshKey/importPrivateKey/deleteSshKey，无「关联到会话」入口；IPC 密钥命令仅 GenerateSshKey/ImportPrivateKey/DeleteSshKey/ExportPublicKey，无私钥读取命令；docs/08-incomplete-features.md:11 原文无边界说明。唯一保留：手改磁盘会话 TOML 填 keys_dir 绝对路径 + Keychain 口令存在理论旁路，但应用内无 UI 支撑、非 KeyManager 消费路径，不影响「本应用内无法使用」结论。PROB-09/10 已修复前提属实（:198-199/:209/:224-225/:305-310/:416-435）；docs/10:307 暂缓项 2 同题且 :11 明言状态不变。
 - **修复方案**：接通消费路径（会话认证可选 KeyManager 密钥：按 key_id 经 get_private_key_data 取材并支持口令解密）；或在 docs/08 明示密钥管理当前仅为托管存储、不参与认证，避免误用。
 - **验收标准**：二选一：存在从 KeyManager 密钥发起认证的路径（至少单测覆盖按 key_id 取钥）；或 docs/08 明确能力边界且 UI 提示与之一致。
-- **状态**：已修复（验证方式：fmt/clippy/typecheck/npm test/cargo test 快速检查）
+- **状态**：已修复（验证方式：fmt/clippy/typecheck/npm test/cargo test 快速检查）。2026-10-11 补充：当时按第二选项（文档明示边界）关闭；消费路径现已真正接通——`AuthMethod::PublicKey` 增加可选 `managed_key_id`，`SessionService::resolve_managed_auth` 按 id 取私钥字节，协议层 `ManagedPublicKey` 用 `decode_secret_key` 内存解码；验收标准的第一选项达成：loopback 认证测试（`managed_private_key_authenticates_from_memory_bytes`）+ 服务层解析测试（字节来源/口令槽位/密钥缺失/口令缺失）+ TOML 往返测试。
 
 ### R2-09：rshell-protocol 的 uuid 在 [dependencies] 与 [dev-dependencies] 重复声明（第一轮暂缓项 1）
 

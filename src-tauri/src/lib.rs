@@ -89,12 +89,16 @@ pub fn run() {
                 "com.letmlook.rshell.credentials",
             ));
             let session_repository = Arc::new(SessionRepository::with_default_path(credentials));
+            // 密钥管理面板托管的私钥仓库：会话服务的 managed_key_id 认证依赖它，
+            // 必须在会话服务构造（含已保存会话恢复）之前就绪。
+            let key_manager = Arc::new(KeyManager::new(keys_dir, event_bus.clone()));
             let session_service = Arc::new(SessionService::with_repository(
                 event_bus.clone(),
                 terminal_service.clone(),
                 trigger_engine.clone(),
                 host_key_registry.clone(),
                 Some(session_repository),
+                Some(key_manager.clone()),
             ));
 
             // R2-15：会话删除后清理 TerminalChannels 的 sink 条目——否则
@@ -111,7 +115,6 @@ pub fn run() {
             });
 
             let transfer_service = Arc::new(TransferService::new(event_bus.clone()));
-            let key_manager = Arc::new(KeyManager::new(keys_dir, event_bus.clone()));
             let master_password = Arc::new(MasterPassword::new(event_bus.clone()));
             let tunnel_manager = Arc::new(
                 TunnelManager::new(event_bus.clone())

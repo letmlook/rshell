@@ -12,7 +12,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// OpenSSH 的 POSIX 语义 rename 扩展：服务器保证原子替换已存在的目标
+/// （普通 `SSH_FXP_RENAME` 的「目标已存在」行为 RFC 未强制）。
+const POSIX_RENAME_EXTENSION: &str = "posix-rename@openssh.com";
 
 /// 单次读写分块大小（64 KiB）
 const CHUNK_SIZE: usize = 64 * 1024;
@@ -253,6 +257,44 @@ pub fn staging_temp_path(target: &str, task_uuid: &str) -> String {
     }
 }
 
+/// `SSH_FXP_EXTENDED` 的扩展数据：两个连续的 SSH string（u32 大端长度 + 字节）。
+///
+/// OpenSSH 的 `posix-rename@openssh.com` 请求体就是 `oldpath` + `newpath`
+/// 两个 string（扩展名本身在 SSH_FXP_EXTENDED 包头里）。
+fn encode_posix_rename_data(old_path: &str, new_path: &str) -> Vec<u8> {
+    let mut data = Vec::with_capacity(8 + old_path.len() + new_path.len());
+    data.extend_from_slice(&(old_path.len() as u32).to_be_bytes());
+    data.extend_from_slice(old_path.as_bytes());
+    data.extend_from_slice(&(new_path.len() as u32).to_be_bytes());
+    data.extend_from_slice(new_path.as_bytes());
+    data
+}
+
+/// posix-rename 应答的三种结局。
+enum PosixRenameReply {
+    /// 服务器已原子替换目标
+    Applied,
+    /// 服务器不认识该扩展（SSH_FX_OP_UNSUPPORTED）——走标准 rename 兜底
+    Unsupported,
+    /// 其它失败：提交没有发生，如实上报
+    Failed(String),
+}
+
+/// 规范应答是 `SSH_FXP_STATUS`（Ok / OpUnsupported / 其它错误码）；
+/// `SSH_FXP_EXTENDED_REPLY` 不在 OpenSSH 的应答集合里，视为成功兜底。
+fn map_posix_rename_reply(packet: russh_sftp::protocol::Packet) -> PosixRenameReply {
+    use russh_sftp::protocol::{Packet, StatusCode};
+    match packet {
+        Packet::Status(status) => match status.status_code {
+            StatusCode::Ok => PosixRenameReply::Applied,
+            StatusCode::OpUnsupported => PosixRenameReply::Unsupported,
+            other => PosixRenameReply::Failed(format!("posix-rename rejected: {other:?}")),
+        },
+        Packet::ExtendedReply(_) => PosixRenameReply::Applied,
+        other => PosixRenameReply::Failed(format!("unexpected reply to posix-rename: {other:?}")),
+    }
+}
+
 /// SFTP 客户端
 ///
 /// 封装 russh_sftp::client::SftpSession，提供高层文件操作接口。
@@ -262,6 +304,12 @@ pub fn staging_temp_path(target: &str, task_uuid: &str) -> String {
 /// （russh-sftp 按请求 id 多路复用，并发请求是协议层支持的）。
 pub struct SftpClient {
     session: Arc<russh_sftp::client::SftpSession>,
+    /// 独立的提交通道（`RawSftpSession`）：提交只发一次 rename 请求，
+    /// 不值得挤占数据通道；`None` 表示没有可用提交通道，`safe_commit`
+    /// 回退到数据通道上的标准 rename。
+    commit_session: Option<Arc<russh_sftp::client::RawSftpSession>>,
+    /// 版本握手中服务器声明了 `posix-rename@openssh.com`。
+    posix_rename: bool,
 }
 
 impl SftpClient {
@@ -278,7 +326,49 @@ impl SftpClient {
         info!("SFTP session initialized");
         Ok(Self {
             session: Arc::new(session),
+            commit_session: None,
+            posix_rename: false,
         })
+    }
+
+    /// 带独立提交通道创建 SFTP 客户端。
+    ///
+    /// `commit_channel` 必须已请求 sftp 子系统。提交通道在版本握手时顺带
+    /// 探测 `posix-rename@openssh.com`（OpenSSH ≥4 在 SSH_FXP_VERSION 里
+    /// 声明该扩展）；握手失败或扩展缺失时静默降级为 `None`——提交路径
+    /// 随后走标准 rename，**不能**因为提交通道的问题让传输任务失败。
+    pub async fn new_with_commit_channel(
+        channel: russh::Channel<russh::client::Msg>,
+        commit_channel: Option<russh::Channel<russh::client::Msg>>,
+    ) -> Result<Self, ProtocolError> {
+        let mut client = Self::new(channel).await?;
+        match commit_channel {
+            Some(commit_channel) => {
+                let stream = commit_channel.into_stream();
+                let raw = russh_sftp::client::RawSftpSession::new_with_config(
+                    stream,
+                    russh_sftp::client::Config::default(),
+                );
+                match raw.init().await {
+                    Ok(version) => {
+                        client.posix_rename = version
+                            .extensions
+                            .get(POSIX_RENAME_EXTENSION)
+                            .is_some_and(|v| v == "1");
+                        client.commit_session = Some(Arc::new(raw));
+                        info!(
+                            posix_rename = client.posix_rename,
+                            "SFTP commit channel ready"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "SFTP commit channel init failed; commits fall back to standard rename");
+                    }
+                }
+            }
+            None => debug!("no dedicated SFTP commit channel; commits use standard rename"),
+        }
+        Ok(client)
     }
 
     /// 列出远程目录内容
@@ -546,18 +636,15 @@ impl SftpClient {
         self.session.metadata(path).await.is_ok()
     }
 
-    /// R2-T2：探测远端 SFTP 扩展，仅返回本轮提交语义相关的两条。
+    /// R2-T2：探测远端 SFTP 扩展，仅返回提交语义相关的能力。
     ///
-    /// `russh-sftp 2.4` 的 `SftpSession` 把 `RawSftpSession` 藏在私有字段里——
-    /// 没有公开 `extended()` 入口，所以本轮**没**法直接探测
-    /// `posix-rename@openssh.com`。详见研究文档 capability 调查。
-    ///
-    /// 保守策略：所有字段返回 `false`，提交路径走标准 `SSH_FXP_RENAME`；
-    /// 一旦后续能访问 raw handle，这里就能升级为真正的探测。
-    /// 此函数保留是为了**契约**：上层按「探测→决策→提交」三步走，
-    /// 未来升级时不改上层调用方。
+    /// 探测来源是提交通道的 SSH_FXP_VERSION 扩展声明（见
+    /// [`Self::new_with_commit_channel`]）；没有提交通道时一切降级为
+    /// `false`，提交走标准 rename。
     pub async fn probe_capabilities(&self) -> Result<SftpCapabilities, ProtocolError> {
-        Ok(SftpCapabilities::default())
+        Ok(SftpCapabilities {
+            posix_rename: self.posix_rename,
+        })
     }
 
     /// R2-T2：以「独占」方式打开/创建临时文件用于 staging。
@@ -593,21 +680,27 @@ impl SftpClient {
         }
     }
 
-    /// 给 `as_sink` 用：`SftpClient` 内部仅 `Arc<SftpSession>`，克隆代价低。
+    /// 给 `as_sink` 用：`SftpClient` 内部仅 `Arc` 字段，克隆代价低。
     fn clone_for_sink(&self) -> SftpClient {
         SftpClient {
             session: self.session.clone(),
+            commit_session: self.commit_session.clone(),
+            posix_rename: self.posix_rename,
         }
     }
 
     /// R2-T2：把临时文件提交到目标位置（rename），附带原子性信息。
     ///
-    /// 当前实现走标准 `SSH_FXP_RENAME`：OpenSSH 等主流服务器在「`newpath`
-    /// 已存在时」会替换（RFC 文本未强制），但**不**作为通用保证返回。
-    /// `CommitStrategy::StandardRename` 的语义就是「成功即生效，不普遍承诺
-    /// 原子性」——上游据实报告，由 `TransferTaskInfo` 透出。
+    /// 服务器声明了 `posix-rename@openssh.com` 时优先走该扩展——原子替换
+    /// 有协议级保证；服务器以 `SSH_FX_OP_UNSUPPORTED` 拒绝时（探测与实际
+    /// 行为不一致的兜底）或能力缺失时，回退标准 `SSH_FXP_RENAME` 并如实
+    /// 报告 `StandardRename`（OpenSSH 等主流服务器在「`newpath` 已存在时」
+    /// 会替换，RFC 文本未强制，不作为通用保证）。
     ///
-    /// 何时能升级到 `posix-rename@openssh.com`：见研究文档 capability 调查。
+    /// posix-rename 的**其它**失败（网络、权限）不回退直接报错：超时类失败
+    /// 的语义是「结果未知」，盲目录入标准 rename 可能撞上 temp 已被移走的
+    /// 二次错误，掩盖真实原因。
+    ///
     /// 调用前**必须**再次检查目标是否存在——本客户端把策略决定提前到
     /// 此处之外的位置，避免「先删后改」的脏路径（ADR-0002 明令禁止）。
     pub async fn safe_commit(
@@ -616,6 +709,35 @@ impl SftpClient {
         to: &str,
         _capabilities: SftpCapabilities,
     ) -> Result<CommitOutcome, ProtocolError> {
+        if self.posix_rename {
+            if let Some(commit) = &self.commit_session {
+                let data = encode_posix_rename_data(from, to);
+                let packet = commit
+                    .extended(POSIX_RENAME_EXTENSION, data)
+                    .await
+                    .map_err(|e| ProtocolError::TransferCommitFailed {
+                        path: to.to_string(),
+                        reason: format!("posix-rename failed: {e}"),
+                    })?;
+                match map_posix_rename_reply(packet) {
+                    PosixRenameReply::Applied => {
+                        return Ok(CommitOutcome {
+                            strategy: CommitStrategy::PosixRename,
+                        });
+                    }
+                    // 探测说支持、实际拒绝：按不支持处理，走标准 rename
+                    PosixRenameReply::Unsupported => {
+                        debug!("server rejected posix-rename; falling back to standard rename");
+                    }
+                    PosixRenameReply::Failed(reason) => {
+                        return Err(ProtocolError::TransferCommitFailed {
+                            path: to.to_string(),
+                            reason,
+                        });
+                    }
+                }
+            }
+        }
         self.session
             .rename(from, to)
             .await
@@ -1749,5 +1871,60 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, ProtocolError::TransferCancelled));
         assert!(writer.is_empty(), "未恢复前不得写入任何字节");
+    }
+
+    // ── posix-rename 提交扩展 ──
+    // 提交语义的线格式与应答映射必须锁死：posix-rename@openssh.com 的请求体
+    // 是「oldpath + newpath 两个连续 SSH string」，应答只有 STATUS（Ok /
+    // OpUnsupported / 其它错误码）。这里不依赖真实服务器。
+
+    #[test]
+    fn posix_rename_wire_format_matches_openssh_extension() {
+        let data = encode_posix_rename_data("/a/b.partial-1", "/a/b");
+        // 4 字节长度 + "…" + 4 字节长度 + "b"
+        assert_eq!(
+            data,
+            [
+                0, 0, 0, 14, b'/', b'a', b'/', b'b', b'.', b'p', b'a', b'r', b't', b'i', b'a',
+                b'l', b'-', b'1', 0, 0, 0, 4, b'/', b'a', b'/', b'b'
+            ]
+        );
+    }
+
+    #[test]
+    fn posix_rename_reply_maps_status_codes() {
+        use russh_sftp::protocol::{Packet, Status, StatusCode};
+        let ok = Packet::Status(Status {
+            id: 1,
+            status_code: StatusCode::Ok,
+            error_message: String::new(),
+            language_tag: String::new(),
+        });
+        assert!(matches!(
+            map_posix_rename_reply(ok),
+            PosixRenameReply::Applied
+        ));
+
+        let unsupported = Packet::Status(Status {
+            id: 1,
+            status_code: StatusCode::OpUnsupported,
+            error_message: String::new(),
+            language_tag: String::new(),
+        });
+        assert!(matches!(
+            map_posix_rename_reply(unsupported),
+            PosixRenameReply::Unsupported
+        ));
+
+        let denied = Packet::Status(Status {
+            id: 1,
+            status_code: StatusCode::PermissionDenied,
+            error_message: "no".into(),
+            language_tag: String::new(),
+        });
+        assert!(matches!(
+            map_posix_rename_reply(denied),
+            PosixRenameReply::Failed(_)
+        ));
     }
 }

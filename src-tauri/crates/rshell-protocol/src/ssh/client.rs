@@ -172,6 +172,9 @@ pub struct SshClient {
     /// 空闲 keepalive 探测间隔，默认 [`SSH_KEEPALIVE_INTERVAL`]。
     /// 测试可调小以压缩时间线。
     keepalive_interval: std::time::Duration,
+    /// direct-tcpip channel-open 的等待上限，默认 [`DIRECT_TCPIP_OPEN_TIMEOUT`]。
+    /// R3-03 回归测试调小以压缩时间线。
+    direct_tcpip_open_timeout: std::time::Duration,
 }
 
 impl Drop for SshClient {
@@ -195,6 +198,14 @@ pub enum ResolvedAuthMethod {
     PublicKey {
         username: String,
         key_path: PathBuf,
+        passphrase: Option<String>,
+    },
+    /// 密钥管理面板托管的私钥：认证材料以内存字节传递（每次连接临时解析），
+    /// 不落盘、不进 SessionConfig。`key_id` 仅供错误信息定位，连接结束后即弃。
+    ManagedPublicKey {
+        username: String,
+        key_id: Uuid,
+        key_data: Vec<u8>,
         passphrase: Option<String>,
     },
     KeyboardInteractive {
@@ -611,6 +622,7 @@ fn get_username(auth: &ResolvedAuthMethod) -> &str {
     match auth {
         ResolvedAuthMethod::Password { username, .. } => username,
         ResolvedAuthMethod::PublicKey { username, .. } => username,
+        ResolvedAuthMethod::ManagedPublicKey { username, .. } => username,
         ResolvedAuthMethod::KeyboardInteractive { username, .. } => username,
     }
 }
@@ -653,6 +665,7 @@ impl SshClient {
             recv_pending: VecDeque::new(),
             shell_output: Arc::new(Mutex::new(ShellOutput::default())),
             keepalive_interval: SSH_KEEPALIVE_INTERVAL,
+            direct_tcpip_open_timeout: DIRECT_TCPIP_OPEN_TIMEOUT,
         }
     }
 
@@ -765,28 +778,24 @@ impl SshClient {
                 // 加载私钥。russh-keys 已并入 russh::keys。
                 let key = russh::keys::load_secret_key(key_path, passphrase.as_deref())
                     .map_err(|e| ProtocolError::AuthFailed(format!("Failed to load key: {e}")))?;
-
-                // RSA 私钥必须显式带上哈希算法：传 None 会退回已被多数服务端
-                // 拒绝的 sha-rsa(SHA-1)。best_supported_rsa_hash 会与服务端协商。
-                let hash_alg = handle
-                    .best_supported_rsa_hash()
-                    .await
-                    .map_err(|e| ProtocolError::AuthFailed(e.to_string()))?
-                    .flatten();
-
-                let result = handle
-                    .authenticate_publickey(
-                        username,
-                        russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
-                    )
-                    .await
-                    .map_err(|e| ProtocolError::AuthFailed(e.to_string()))?;
-
-                if !result.success() {
-                    return Err(ProtocolError::AuthFailed(
-                        "Public key authentication failed".to_string(),
-                    ));
-                }
+                Self::authenticate_with_key(handle, username, key).await?;
+            }
+            ResolvedAuthMethod::ManagedPublicKey {
+                key_data,
+                passphrase,
+                ..
+            } => {
+                // 托管私钥以内存字节传递（OpenSSH PEM 是 ASCII 文本）。
+                // decode_secret_key 与 load_secret_key 返回同一 PrivateKey 类型，
+                // 认证路径与磁盘私钥完全一致。
+                let pem = std::str::from_utf8(key_data).map_err(|_| {
+                    ProtocolError::AuthFailed("Managed key is not valid UTF-8 PEM".into())
+                })?;
+                let key =
+                    russh::keys::decode_secret_key(pem, passphrase.as_deref()).map_err(|e| {
+                        ProtocolError::AuthFailed(format!("Failed to decode managed key: {e}"))
+                    })?;
+                Self::authenticate_with_key(handle, username, key).await?;
             }
             ResolvedAuthMethod::KeyboardInteractive { password, .. } => {
                 // 键盘交互认证
@@ -828,6 +837,37 @@ impl SshClient {
             }
         }
 
+        Ok(())
+    }
+
+    /// 公钥认证的共享执行路径（磁盘私钥与托管私钥在解码出 `PrivateKey` 后一致）。
+    ///
+    /// RSA 私钥必须显式带上哈希算法：传 None 会退回已被多数服务端
+    /// 拒绝的 sha-rsa(SHA-1)。best_supported_rsa_hash 会与服务端协商。
+    async fn authenticate_with_key(
+        handle: &mut russh::client::Handle<SshHandler>,
+        username: &str,
+        key: russh::keys::PrivateKey,
+    ) -> Result<(), ProtocolError> {
+        let hash_alg = handle
+            .best_supported_rsa_hash()
+            .await
+            .map_err(|e| ProtocolError::AuthFailed(e.to_string()))?
+            .flatten();
+
+        let result = handle
+            .authenticate_publickey(
+                username,
+                russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
+            )
+            .await
+            .map_err(|e| ProtocolError::AuthFailed(e.to_string()))?;
+
+        if !result.success() {
+            return Err(ProtocolError::AuthFailed(
+                "Public key authentication failed".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -1102,7 +1142,7 @@ impl SshClient {
             .as_ref()
             .ok_or(ProtocolError::ConnectionClosed)?;
         match tokio::time::timeout(
-            DIRECT_TCPIP_OPEN_TIMEOUT,
+            self.direct_tcpip_open_timeout,
             handle.channel_open_direct_tcpip(host, port, "127.0.0.1", 0),
         )
         .await
@@ -1112,8 +1152,9 @@ impl SshClient {
                 "direct-tcpip open failed: {e}"
             ))),
             Err(_) => Err(ProtocolError::ConnectionFailed(format!(
-                "direct-tcpip open to {host}:{port} timed out after {DIRECT_TCPIP_OPEN_TIMEOUT:?}; \
-                 the SSH peer did not answer the channel request"
+                "direct-tcpip open to {host}:{port} timed out after {0:?}; \
+                 the SSH peer did not answer the channel request",
+                self.direct_tcpip_open_timeout
             ))),
         }
     }
@@ -1269,6 +1310,7 @@ mod tests {
                 username: "alice".into(),
                 key_path: "/tmp/id_ed25519".into(),
                 has_passphrase: true,
+                managed_key_id: None,
             },
             serial_config: None,
         };
@@ -1634,11 +1676,51 @@ mod tests {
             username: "test".into(),
             key_path: path.clone(),
             has_passphrase: true,
+            managed_key_id: None,
         };
         client.auth = Some(ResolvedAuthMethod::PublicKey {
             username: "test".into(),
             key_path: path,
             passphrase: Some("key-passphrase".into()),
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.connect_ssh(Some(Arc::new(AcceptTestHost))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(client.auth.is_none());
+        client.disconnect_ssh().await.unwrap();
+        server.await.unwrap();
+    }
+
+    /// 托管密钥认证路径：与磁盘私钥同一把钥匙，但认证材料以内存字节传递
+    /// （KeyManager 托管，密钥从不以「会话可见」的方式出现在磁盘路径里）。
+    /// loopback 服务器只认这把公钥，认证成功即证明 decode_secret_key 的
+    /// 字节路径与 load_secret_key 等价。
+    #[tokio::test]
+    async fn managed_private_key_authenticates_from_memory_bytes() {
+        let key = ssh_key::PrivateKey::random(&mut os_rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let encrypted = key.encrypt(&mut os_rng(), "managed-passphrase").unwrap();
+        let pem = encrypted
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let key_id = Uuid::new_v4();
+        let (port, server) = auth_server(Some(key.public_key().clone())).await;
+        let mut client = password_client(port, "unused");
+        client.config.auth_method = AuthMethod::PublicKey {
+            username: "test".into(),
+            key_path: String::new().into(),
+            has_passphrase: true,
+            managed_key_id: Some(key_id),
+        };
+        client.auth = Some(ResolvedAuthMethod::ManagedPublicKey {
+            username: "test".into(),
+            key_id,
+            key_data: pem.into_bytes(),
+            passphrase: Some("managed-passphrase".into()),
         });
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2062,5 +2144,111 @@ mod tests {
                 .is_ok(),
             "dropping old transport must cancel actors rather than leave admitted input alive"
         );
+    }
+
+    /// R3-03 回归：对端接受 TCP 但**不回应** direct-tcpip channel-open。
+    ///
+    /// russh 服务端的 handler 在 `channel_open_direct_tcpip` 里永不返回，
+    /// 模拟「停滞/恶意服务端 + 包黑洞」场景。客户端必须：
+    /// 1. `open_direct_tcpip` 在超时上限内以错误收尾（而不是无限等待
+    ///    `wait_channel_confirmation`）；
+    /// 2. 随后 `disconnect_ssh` 仍能在有界时间内完成——隧道 accept 路径
+    ///    曾持 `SshClient` 读锁跨这次调用，超时不落地就会把整个会话
+    ///    （新标签、关闭、断开）锁死。
+    #[derive(Default)]
+    struct StallDirectTcpipServer;
+
+    impl russh::server::Handler for StallDirectTcpipServer {
+        type Error = russh::Error;
+        async fn auth_password(
+            &mut self,
+            user: &str,
+            password: &str,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if user == "test" && password == "test" {
+                russh::server::Auth::Accept
+            } else {
+                russh::server::Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                }
+            })
+        }
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+        // 停滞点：永远不 accept / 不 reject，让客户端等不到任何 channel-open 应答
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            _channel: russh::Channel<russh::server::Msg>,
+            _host_to_connect: &str,
+            _port_to_connect: u32,
+            _originator_address: &str,
+            _originator_port: u32,
+            _reply: russh::server::ChannelOpenHandle,
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_direct_tcpip_open_times_out_and_disconnect_stays_bounded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let config = russh::server::Config {
+                keys: vec![
+                    ssh_key::PrivateKey::random(&mut os_rng(), ssh_key::Algorithm::Ed25519)
+                        .unwrap(),
+                ],
+                auth_rejection_time: std::time::Duration::ZERO,
+                ..Default::default()
+            };
+            if let Ok(running) =
+                russh::server::run_stream(Arc::new(config), stream, StallDirectTcpipServer).await
+            {
+                let _ = running.await;
+            }
+        });
+
+        let mut client = password_client(port, "test");
+        // 生产默认 15s；测试调小以压缩时间线（超时值本身可配置即回归点之一）
+        client.direct_tcpip_open_timeout = std::time::Duration::from_millis(300);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.connect_ssh(Some(Arc::new(AcceptTestHost))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let result = client.open_direct_tcpip("127.0.0.1", 22).await;
+        let elapsed = started.elapsed();
+        let err = result.expect_err("对端不回应 channel-open 必须以超时收尾");
+        assert!(
+            format!("{err}").contains("timed out"),
+            "错误必须指明是 channel-open 超时: {err}"
+        );
+        assert!(elapsed >= std::time::Duration::from_millis(300));
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "超时必须在配置上限附近返回，实际 {elapsed:?}"
+        );
+
+        // 会话必须仍然可关：隧道 accept 曾持读锁跨 open_direct_tcpip，
+        // 这里若挂死即 R3-03 复现
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.disconnect_ssh())
+            .await
+            .expect("disconnect_ssh 必须在超时内完成")
+            .unwrap();
     }
 }

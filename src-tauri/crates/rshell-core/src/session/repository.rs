@@ -635,6 +635,7 @@ pub(crate) mod tests {
             username: "user".into(),
             key_path: "/tmp/key".into(),
             has_passphrase: true,
+            managed_key_id: None,
         };
         repo.save(&cfg, set("sample-secret-passphrase")).unwrap();
         assert!(credentials

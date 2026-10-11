@@ -829,23 +829,26 @@ impl TransferService {
 
         // 只在打开 SFTP 子通道时持有客户端读锁；SFTP 流独立于发送客户端，
         // 拷贝循环（含暂停挂起期间）不得阻塞会话断开等需要写锁的操作。
+        // 第二条通道专用于提交（posix-rename 扩展）：打不开只降级为
+        // 标准 rename，不让传输任务失败。
         let sftp_result = {
             let ssh = ssh_client.read().await;
-            ssh.open_sftp_channel().await.map_err(|e| {
-                ProtocolError::ProtocolError(format!("Failed to open SFTP channel: {e}"))
-            })
-        };
-        let channel = match sftp_result {
-            Ok(c) => c,
-            Err(e) => {
-                return StagedOutcome::Failed {
-                    stage: FailedStage::ExclusiveOpen,
-                    message: format!("{e}"),
-                    residue_path: None,
+            async {
+                let channel = ssh.open_sftp_channel().await.map_err(|e| {
+                    ProtocolError::ProtocolError(format!("Failed to open SFTP channel: {e}"))
+                })?;
+                let commit_channel = match ssh.open_sftp_channel().await {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        warn!(error = %e, "commit channel unavailable; falling back to standard rename");
+                        None
+                    }
                 };
+                SftpClient::new_with_commit_channel(channel, commit_channel).await
             }
+            .await
         };
-        let sftp = match SftpClient::new(channel).await {
+        let sftp = match sftp_result {
             Ok(c) => c,
             Err(e) => {
                 return StagedOutcome::Failed {

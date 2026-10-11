@@ -42,6 +42,11 @@ pub enum AuthMethod {
         username: String,
         key_path: PathBuf,
         has_passphrase: bool,
+        /// 密钥管理面板托管的私钥引用。`Some` 时连接经 `KeyManager`
+        /// 取私钥字节认证，`key_path` 不参与认证（可为空）。
+        /// 缺省/None 保持旧的磁盘私钥文件语义。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        managed_key_id: Option<Uuid>,
     },
     KeyboardInteractive {
         username: String,

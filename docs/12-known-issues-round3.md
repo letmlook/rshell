@@ -67,7 +67,7 @@
   **同时违反 CLAUDE.md**：「不要在等待远端输入时阻塞发送路径」。
 - **修复方案**：await 前释放守卫（clone `russh::client::Handle`，或在窄作用域内借用），并给 `open_direct_tcpip` 套 `tokio::time::timeout`。
 - **验收标准**：假服务端接受 TCP 但不回应 channel-open，断言 `open_direct_tcpip` 超时返回且 `open_terminal` / `disconnect_ssh` 在超时内不被阻塞。
-- **状态**：已修复，但**未补自动化回归测试**。修复方式是在协议层给 `open_direct_tcpip` 加 `DIRECT_TCPIP_OPEN_TIMEOUT`（15s）上限，使隧道路径持有的 `SshClient` 读锁有界；「对端接受 TCP 但不回应 channel-open」这一前提需要真实的 SSH 服务端或 loopback russh server 配合可注入的停滞行为，本轮未搭建，故此处只做静态保证。如实记录：该条目前靠超时兜底，**未经运行时验证**。
+- **状态**：已修复，回归测试已补（2026-10-11）。`rshell-protocol` 的 `stalled_direct_tcpip_open_times_out_and_disconnect_stays_bounded` 用 loopback russh 服务器在 `channel_open_direct_tcpip` 钩子里 `pending()` 永不返回，模拟「对端接受 TCP 但不回应 channel-open」：断言 `open_direct_tcpip` 按配置上限（测试压缩到 300ms，生产默认 15s）返回超时错误，且随后 `disconnect_ssh` 在有界时间内完成。超时值从 const 改为 `SshClient` 字段（默认不变），测试可注入。
 
 ### R3-04：下载「重命名」是任意本地路径写入——本地版漏了远端版已有的越界检查
 

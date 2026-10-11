@@ -24,6 +24,7 @@ enum StoredAuth {
         key_path: PathBuf,
         has_passphrase: Option<bool>,
         passphrase: Option<String>,
+        managed_key_id: Option<Uuid>,
     },
     KeyboardInteractive {
         username: String,
@@ -68,6 +69,7 @@ fn decode(content: &str) -> anyhow::Result<(SessionConfig, Option<CredentialUpda
             key_path,
             has_passphrase,
             passphrase,
+            managed_key_id,
         } => {
             let legacy = passphrase.is_some() || has_passphrase.is_none();
             (
@@ -77,6 +79,7 @@ fn decode(content: &str) -> anyhow::Result<(SessionConfig, Option<CredentialUpda
                     has_passphrase: passphrase
                         .as_ref()
                         .map_or(has_passphrase.unwrap_or(false), |s| !s.is_empty()),
+                    managed_key_id,
                 },
                 legacy,
                 passphrase,
@@ -374,5 +377,61 @@ mod tests {
             .replace("has_password = true\n", "");
         fs::write(store.session_path(config.id), content).unwrap();
         assert!(store.load_pending(config.id).is_err());
+    }
+
+    #[test]
+    fn managed_key_id_round_trips_through_toml() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+
+        let key_id = Uuid::new_v4();
+        let mut config = test_session_config();
+        config.auth_method = AuthMethod::PublicKey {
+            username: "root".to_string(),
+            key_path: std::path::PathBuf::new(),
+            has_passphrase: true,
+            managed_key_id: Some(key_id),
+        };
+        store.save(&config).unwrap();
+
+        let loaded = store.load(config.id).unwrap().unwrap();
+        match loaded.auth_method {
+            AuthMethod::PublicKey {
+                key_path,
+                has_passphrase,
+                managed_key_id,
+                ..
+            } => {
+                assert_eq!(managed_key_id, Some(key_id));
+                assert!(key_path.as_os_str().is_empty());
+                assert!(has_passphrase);
+            }
+            other => panic!("必须是 PublicKey：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_public_key_toml_without_managed_key_id_loads_as_none() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let id = Uuid::new_v4();
+        let content = format!(
+            "id = \"{id}\"\nname = \"legacy\"\nhost = \"h\"\nport = 22\nprotocol = \"SSH\"\n\n[auth_method.PublicKey]\nusername = \"root\"\nkey_path = \"/tmp/id_ed25519\"\nhas_passphrase = true\n"
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join(format!("{id}.toml")), content).unwrap();
+
+        let loaded = store.load(id).unwrap().unwrap();
+        match loaded.auth_method {
+            AuthMethod::PublicKey {
+                key_path,
+                managed_key_id,
+                ..
+            } => {
+                assert_eq!(managed_key_id, None, "旧格式必须保持磁盘私钥语义");
+                assert_eq!(key_path, std::path::PathBuf::from("/tmp/id_ed25519"));
+            }
+            other => panic!("必须是 PublicKey：{other:?}"),
+        }
     }
 }
