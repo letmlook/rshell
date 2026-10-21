@@ -63,7 +63,7 @@ describe("PathBar 自定义路径输入", () => {
     await input.trigger("keyup.enter");
 
     expect(wrapper.emitted("navigate")).toBeUndefined();
-    expect(wrapper.get('[data-test="fs-path-error"]').text()).toContain("超出已授权的根目录");
+    expect(wrapper.get('[data-test="fs-path-error"]').text()).toContain("超出当前本地目录");
   });
 
   // R3-10：原实现只做前缀字符串比较，`/home/user/../etc` 仍以 `/home/user/`
@@ -86,7 +86,7 @@ describe("PathBar 自定义路径输入", () => {
       expect(wrapper.emitted("navigate")?.[0]).toEqual([target]);
     } else {
       expect(wrapper.emitted("navigate")).toBeUndefined();
-      expect(wrapper.get('[data-test="fs-path-error"]').text()).toContain("超出已授权的根目录 /home/user");
+      expect(wrapper.get('[data-test="fs-path-error"]').text()).toContain("超出当前本地目录 /home/user");
     }
   });
 
@@ -130,7 +130,7 @@ describe("PathBar 自定义路径输入", () => {
     await input.trigger("keyup.enter");
 
     expect(wrapper.emitted("navigate")).toBeUndefined();
-    expect(wrapper.get('[data-test="fs-path-error"]').text()).toContain("超出已授权的根目录 C:\\data");
+    expect(wrapper.get('[data-test="fs-path-error"]').text()).toContain("超出当前本地目录 C:\\data");
   });
 
   it("Esc 取消编辑且不发出 navigate", async () => {

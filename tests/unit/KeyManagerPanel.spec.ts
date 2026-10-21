@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import ElementPlus from "element-plus";
 import KeyManagerPanel from "../../src/components/KeyManagerPanel.vue";
-import { deleteSshKey, importPrivateKey } from "../../src/ipc/client";
+import { deleteSshKey, exportPublicKey, importPrivateKey } from "../../src/ipc/client";
+import type { AppEvent } from "../../src/ipc/types";
 
 // 选文件走应用内路径选择器（utils/pathPicker），删除确认走 utils/dialog，
 // 都不再经过 tauri-plugin-dialog 的原生窗口。
@@ -12,13 +13,37 @@ const { pickLocalPath, confirmDialog } = vi.hoisted(() => ({
 }));
 vi.mock("../../src/utils/pathPicker", () => ({ pickLocalPath }));
 vi.mock("../../src/utils/dialog", () => ({ confirmDialog }));
+
+// 导出公钥的载荷走 PublicKeyExported 事件回来（命令本身返回 None），
+// 这里把事件流做成可控的：测试可以主动投递事件。
+const { subscribeAppEventsMock, handlers: eventHandlers } = vi.hoisted(() => {
+  const handlers: Array<(event: AppEvent) => void> = [];
+  return {
+    subscribeAppEventsMock: vi.fn((handler: (event: AppEvent) => void) => {
+      handlers.push(handler);
+      return Promise.resolve(() => {
+        const i = handlers.indexOf(handler);
+        if (i >= 0) handlers.splice(i, 1);
+      });
+    }),
+    handlers,
+  };
+});
+vi.mock("../../src/ipc/events", () => ({ subscribeAppEvents: subscribeAppEventsMock }));
+
 vi.mock("../../src/ipc/client", () => ({
   listKeys: vi.fn().mockResolvedValue([{ id: "key-1", name: "work", key_type: "ED25519", fingerprint: "SHA256:test", has_passphrase: false }]),
   generateSshKey: vi.fn(), importPrivateKey: vi.fn(), deleteSshKey: vi.fn(),
+  exportPublicKey: vi.fn(),
 }));
+
+const deliverEvent = (event: AppEvent) => {
+  for (const handler of [...eventHandlers]) handler(event);
+};
 
 afterEach(() => {
   vi.clearAllMocks();
+  eventHandlers.length = 0;
   document.body.innerHTML = "";
 });
 
@@ -47,6 +72,34 @@ describe("embedded key manager", () => {
     await wrapper.find(".el-dialog__footer button.el-button--primary").trigger("click");
     await flushPromises();
     expect(importPrivateKey).toHaveBeenCalledWith("/tmp/id_ed25519", "test-passphrase");
+    wrapper.unmount();
+  });
+
+  // 导出公钥此前没有任何界面入口：后端命令与 PublicKeyExported 事件都在，
+  // 但密钥面板没有按钮，用户拿不到自己的公钥（贴到服务器的 authorized_keys）。
+  it("exports the public key and shows it for copying", async () => {
+    const wrapper = mountPanel();
+    await flushPromises();
+
+    const exportButton = wrapper
+      .findAll("button")
+      .find((button) => button.text() === "导出公钥");
+    expect(exportButton, "导出公钥入口必须可达").toBeDefined();
+    await exportButton!.trigger("click");
+    await flushPromises();
+
+    expect(exportPublicKey).toHaveBeenCalledWith("key-1");
+
+    // 公钥通过 PublicKeyExported 事件回来（命令本身返回 None）
+    deliverEvent({
+      PublicKeyExported: {
+        key_id: "key-1",
+        public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample test",
+      },
+    });
+    await flushPromises();
+
+    expect(wrapper.find(".export-body").text()).toContain("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5");
     wrapper.unmount();
   });
 

@@ -8,7 +8,7 @@ use crate::event_bus::EventBus;
 use rshell_api::types::{QuickCommand, QuickCommandScope};
 use rshell_api::AppEvent;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -72,7 +72,7 @@ impl QuickCommandService {
         let items: Vec<_> = commands.values().cloned().collect();
         let bytes = serde_json::to_vec_pretty(&items)
             .map_err(|e| CoreError::StorageError(e.to_string()))?;
-        persist_json(path, &bytes)
+        crate::storage::persist_json(path, &bytes)
     }
 
     /// 创建快速命令
@@ -191,15 +191,6 @@ impl QuickCommandService {
 
         Ok(targets)
     }
-}
-
-pub(crate) fn persist_json(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| CoreError::StorageError(e.to_string()))?;
-    }
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, bytes).map_err(|e| CoreError::StorageError(e.to_string()))?;
-    std::fs::rename(&temporary, path).map_err(|e| CoreError::StorageError(e.to_string()))
 }
 
 #[cfg(test)]

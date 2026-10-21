@@ -73,7 +73,7 @@ describe("SessionList 右键菜单关闭", () => {
   // 菜单容器 @click.stop 阻断了冒泡，修复前这 8 项没有任何一项能让菜单消失
   const items = [
     "连接", "断开", "更新凭据", "打开 SFTP",
-    "打开标签", "新开标签", "复制连接信息", "删除连接",
+    "打开标签", "新开标签", "编辑连接", "复制连接信息", "删除连接",
   ];
 
   it.each(items)("点击「%s」后菜单从文档中消失", async (item) => {
@@ -123,5 +123,20 @@ describe("SessionList 右键菜单关闭", () => {
     await leaf.trigger("click");
     await flushPromises();
     expect(document.body.querySelector(".ctx-menu")).toBeNull();
+  });
+});
+
+// 连接信息此前没有编辑入口：右键菜单里没有「编辑连接」这一项。
+describe("SessionList 右键菜单：编辑连接", () => {
+  it("点击「编辑连接」发出 edit-session 意图", async () => {
+    const wrapper = await openMenu();
+    const target = button("编辑连接");
+    expect(target, "右键菜单必须有「编辑连接」入口").toBeDefined();
+    target!.click();
+    await flushPromises();
+
+    const emitted = wrapper.emitted("edit-session");
+    expect(emitted, "编辑连接必须发出 edit-session 事件").toBeDefined();
+    expect(emitted![0]).toEqual([session.id]);
   });
 });

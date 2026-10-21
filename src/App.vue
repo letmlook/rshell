@@ -29,6 +29,7 @@ import SessionCreateDialog from "./components/SessionCreateDialog.vue";
 import SessionCredentialDialog from "./components/SessionCredentialDialog.vue";
 import HostKeyMismatchDialog from "./components/HostKeyMismatchDialog.vue";
 import CustomTitleBar from "./components/CustomTitleBar.vue";
+import MasterPasswordLockOverlay from "./components/MasterPasswordLockOverlay.vue";
 import SidePanel, { type ToolSubview, type SettingsSubview } from "./components/SidePanel.vue";
 import StatusBar from "./components/StatusBar.vue";
 import DialogHost from "./components/dialogs/DialogHost.vue";
@@ -52,12 +53,41 @@ import { newUuid } from "./utils/uuid";
 import { useSessionsStore } from "./stores/sessions";
 import { useHostKeyStore } from "./stores/hostKey";
 import { useThemeStore } from "./stores/theme";
-import type { Uuid, SessionConfig } from "./ipc/types";
+import { useMasterPasswordStore } from "./stores/masterPassword";
+import { useFoldersStore } from "./stores/folders";
+import { isTextInputTarget, matchesHotkey, parseHotkey, type Hotkey } from "./utils/hotkey";
+import { matchAppShortcut } from "./utils/shortcuts";
+import { resolveQuickCommandTargets } from "./utils/quickCommand";
+import { executeQuickCommand, listQuickCommands } from "./ipc/client";
+import type { QuickCommand, Uuid, SessionConfig } from "./ipc/types";
 
 const store = useSessionsStore();
 const hostKeyStore = useHostKeyStore();
 const themeStore = useThemeStore();
+const masterPasswordStore = useMasterPasswordStore();
+const foldersStore = useFoldersStore();
+/** 绑定了热键的快速命令：热键命中时从这里取 */
+const quickCommands = ref<QuickCommand[]>([]);
+
+/**
+ * 预解析好的热键表。
+ *
+ * 终端里每按一次键都会走到热键匹配：若每次都重新 `parseHotkey` 拆分字符串，
+ * 就是「每个按键 × 每条命令」次字符串解析。这条路径在输入热路径上，
+ * 因此热键在命令列表变化时解析一次即可。
+ */
+const parsedHotkeys = computed(() => {
+  const table: Array<{ command: QuickCommand; hotkey: Hotkey }> = [];
+  for (const command of quickCommands.value) {
+    if (!command.hotkey) continue;
+    const hotkey = parseHotkey(command.hotkey);
+    if (hotkey) table.push({ command, hotkey });
+  }
+  return table;
+});
 const dialogVisible = ref(false);
+/** 打开「新建连接」时为 null；打开「编辑连接」时为被编辑的连接 id */
+const editSessionId = ref<Uuid | null>(null);
 const activeTerminal = ref<Uuid | null>(null);
 const activePanel = ref<PanelKind>("sessions");
 const requestedToolSubview = ref<ToolSubview>("quick-commands");
@@ -114,6 +144,11 @@ function actionLabel(action: TransferAction) {
 /** 任务名用于日志文案：优先用队列里的名字，查不到（已移出队列）就退回 ID */
 function transferName(taskId: string): string {
   return transferItems.value.find((row) => row.id === taskId)?.name ?? taskId;
+}
+
+/** 会话的可读标签：优先用会话名，退回短 id */
+function sessionLabel(sessionId: string): string {
+  return store.items.find((session) => session.id === sessionId)?.name ?? sessionId.slice(0, 8);
 }
 
 async function runTransferAction(taskId: string, action: TransferAction) {
@@ -409,6 +444,19 @@ async function selectSession(id: Uuid) {
 }
 
 function openNewSession() {
+  editSessionId.value = null;
+  dialogVisible.value = true;
+}
+
+/**
+ * 编辑已有连接。
+ *
+ * 连接信息（主机/端口/用户名/认证方式/名称）此前**没有任何编辑入口**：
+ * 后端 `UpdateSession` 完整支持，界面却只能用「更新凭据」改密码，
+ * 改主机名只能删掉重建（凭据随连接 id 走，一并丢掉）。
+ */
+function openEditSession(id: Uuid) {
+  editSessionId.value = id;
   dialogVisible.value = true;
 }
 
@@ -585,18 +633,63 @@ function terminalAction(action: TerminalAction) {
 // 复制粘贴用 Ctrl+Shift+C / Ctrl+Shift+V（Xterm.js 惯例）：裸 Ctrl+C 在终端里
 // 是 SIGINT，Ctrl+V 是 quoted-insert，都不能劫持成剪贴板操作。
 function onGlobalKeydown(e: KeyboardEvent) {
-  const accel = e.ctrlKey || e.metaKey;
-  if (accel && e.shiftKey && e.key.toLowerCase() === "c") {
+  // 应用接管的快捷键（唯一定义处 utils/shortcuts.ts）：
+  // 工具栏的「新建连接 (Ctrl+N)」等提示都以此为准。
+  const shortcut = matchAppShortcut(e);
+  if (shortcut) {
     e.preventDefault();
-    terminalAction("copy");
-  } else if (accel && e.shiftKey && e.key.toLowerCase() === "v") {
-    e.preventDefault();
-    terminalAction("paste");
-  } else if (accel && e.key.toLowerCase() === "f") {
-    e.preventDefault();
-    terminalAction("find");
-  } else if (e.key === "Escape") {
+    if (shortcut === "copy") terminalAction("copy");
+    else if (shortcut === "paste") terminalAction("paste");
+    else if (shortcut === "find") terminalAction("find");
+    else openNewSession();
+    return;
+  }
+  if (e.key === "Escape") {
+    // Escape 不属于应用快捷键：它要照常送到远端 shell（vim / readline 都要）
     terminalAction("closeFind");
+    return;
+  }
+  // 快速命令热键：应用自身的快捷键优先，剩下的才轮到用户绑定的热键
+  void triggerHotkeyCommand(e);
+}
+
+/**
+ * 触发绑定了热键的快速命令。
+ *
+ * 作用范围与面板里的「执行」按钮完全一致（共用 resolveQuickCommandTargets），
+ * 否则热键会把命令发到与按钮不同的会话上。
+ *
+ * 输入框里打字不算触发：那里的 Ctrl+Shift+1 只是文本。
+ */
+async function triggerHotkeyCommand(event: KeyboardEvent) {
+  if (isTextInputTarget(event.target)) return;
+  const table = parsedHotkeys.value;
+  if (table.length === 0) return;
+
+  const entry = table.find((item) => matchesHotkey(event, item.hotkey));
+  if (!entry) return;
+  const matched = entry.command;
+
+  const targets = resolveQuickCommandTargets(matched, {
+    items: store.items,
+    currentId: store.currentId,
+    connectionState: store.connectionState,
+  });
+  if (targets.length === 0) {
+    ElNotification.warning({
+      title: "快速命令未执行",
+      message: `「${matched.name}」没有可用的已连接目标会话`,
+    });
+    return;
+  }
+  event.preventDefault();
+  try {
+    await executeQuickCommand(matched.id, targets);
+  } catch (error) {
+    ElNotification.error({
+      title: "快速命令执行失败",
+      message: `${matched.name}：${ipcErrorMessage(error)}`,
+    });
   }
 }
 
@@ -619,6 +712,22 @@ onMounted(async () => {
   await themeStore.refresh();
   if (!mounted) return;
   await themeStore.subscribeEvents();
+  if (!mounted) return;
+  // 主密码状态必须**先于**界面可用：锁定态下遮罩要盖住整个工作区，
+  // 否则用户会先看到会话内容再被锁上。
+  await masterPasswordStore.refresh();
+  if (!mounted) return;
+  await masterPasswordStore.subscribeEvents();
+  if (!mounted) return;
+  await foldersStore.refresh();
+  if (!mounted) return;
+  await foldersStore.subscribeEvents();
+  if (!mounted) return;
+  try {
+    quickCommands.value = await listQuickCommands();
+  } catch (error) {
+    console.warn("[App] 快速命令列表拉取失败，热键暂不可用", error);
+  }
   if (!mounted) return;
   await refreshTransfers();
   if (!mounted) return;
@@ -647,7 +756,27 @@ onMounted(async () => {
       if (typeof event !== "string" && "ComposeSendFailed" in event) {
         ElNotification.error({
           title: "撰写发送失败",
-          message: `会话 ${event.ComposeSendFailed.session_id}：${event.ComposeSendFailed.error}`,
+          message: `会话 ${sessionLabel(event.ComposeSendFailed.session_id)}：${event.ComposeSendFailed.error}`,
+        });
+      }
+      if (event === "QuickCommandListChanged") {
+        // 热键绑定可能变了：重新拉一次列表
+        void listQuickCommands()
+          .then((items) => {
+            quickCommands.value = items;
+          })
+          .catch(() => undefined);
+      }
+      if (event === "FolderListChanged") {
+        // 删分组会把组内连接挪回「默认」，连接列表必须跟着刷新
+        void store.refresh();
+      }
+      if (typeof event !== "string" && "SyncInputSendFailed" in event) {
+        // 同步输入的目标失败通常发生在用户正盯着终端的时候，
+        // 面板可能不在视野内 —— 这里必须给出全局提示。
+        ElNotification.error({
+          title: "同步输入失败",
+          message: `会话 ${sessionLabel(event.SyncInputSendFailed.session_id)}：${event.SyncInputSendFailed.error}`,
         });
       }
     });
@@ -673,6 +802,8 @@ onBeforeUnmount(() => {
   store.disposeEvents();
   hostKeyStore.disposeEvents();
   themeStore.disposeEvents();
+  masterPasswordStore.disposeEvents();
+  foldersStore.disposeEvents();
 });
 </script>
 
@@ -741,6 +872,7 @@ onBeforeUnmount(() => {
         @open-terminal="onOpenTerminal"
         @open-terminal-window="openTabSession"
         @duplicate-session="duplicateSession"
+        @edit-session="openEditSession"
       />
 
       <main class="main-area">
@@ -816,7 +948,9 @@ onBeforeUnmount(() => {
 
     <SessionCreateDialog
       :visible="dialogVisible"
+      :edit-id="editSessionId"
       @close="dialogVisible = false"
+      @updated="(id) => selectSession(id)"
       @created="(id) => selectSession(id)"
     />
     <!-- 复制会话后为新条目补录凭据（凭据不随配置复制） -->
@@ -830,6 +964,8 @@ onBeforeUnmount(() => {
          不再出现 Element Plus 的 MessageBox 或操作系统原生窗口 -->
     <DialogHost />
     <PathPickerHost />
+    <!-- 主密码锁定遮罩：锁定态盖住整个工作区，必须输入主密码才能继续 -->
+    <MasterPasswordLockOverlay />
   </div>
 </template>
 

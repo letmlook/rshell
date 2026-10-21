@@ -14,6 +14,7 @@ use crate::security::host_key_manager::HostKeyManager;
 use crate::security::key_manager::KeyManager;
 use crate::security::master_password::MasterPassword;
 use crate::security::tunnel_manager::TunnelManager;
+use crate::session::folder_service::FolderService;
 use crate::session::service::SessionService;
 use crate::terminal::service::TerminalService;
 use crate::theme::ThemeManager;
@@ -42,6 +43,7 @@ pub struct Services {
     pub trigger_engine: Arc<TriggerEngine>,
     pub key_manager: Arc<KeyManager>,
     pub master_password: Arc<MasterPassword>,
+    pub folder_service: Arc<FolderService>,
     pub tunnel_manager: Arc<TunnelManager>,
     pub host_key_manager: Arc<HostKeyManager>,
     pub theme_manager: Arc<ThemeManager>,
@@ -89,6 +91,7 @@ pub struct CommandDispatcher {
     sync_input_service: Arc<SyncInputService>,
     key_manager: Arc<KeyManager>,
     master_password: Arc<MasterPassword>,
+    folder_service: Arc<FolderService>,
     tunnel_manager: Arc<TunnelManager>,
     host_key_manager: Arc<HostKeyManager>,
     theme_manager: Arc<ThemeManager>,
@@ -112,6 +115,7 @@ impl CommandDispatcher {
             trigger_engine,
             key_manager,
             master_password,
+            folder_service,
             tunnel_manager,
             host_key_manager,
             theme_manager,
@@ -153,6 +157,7 @@ impl CommandDispatcher {
             sync_input_service,
             key_manager,
             master_password,
+            folder_service,
             tunnel_manager,
             host_key_manager,
             theme_manager,
@@ -194,6 +199,13 @@ impl CommandDispatcher {
             // ===== 会话命令 =====
             AppCommand::ConnectSession { session_id } => {
                 self.session_service.connect(session_id).await?;
+                // 连接成功 → 更新该主机密钥的「上次连接时间」。
+                // `HostKeyEntry::last_seen` 说的是这件事，不更新它就等于字段撒谎。
+                if let Ok(config) = self.session_service.get_session_config(session_id).await {
+                    self.host_key_manager
+                        .update_last_seen(&config.host, config.port)
+                        .await;
+                }
                 Ok(CommandOutcome::None)
             }
             AppCommand::DisconnectSession { session_id } => {
@@ -223,6 +235,60 @@ impl CommandDispatcher {
                 Ok(CommandOutcome::None)
             }
 
+            // ===== 串口 =====
+            AppCommand::ListSerialPorts => {
+                let ports = rshell_protocol::serial::SerialConnection::list_ports()
+                    .await
+                    .map_err(|e| CoreError::ServiceError(e.to_string()))?;
+                Ok(CommandOutcome::SerialPorts(ports))
+            }
+
+            // ===== 连接分组 =====
+            AppCommand::ListFolders => {
+                let folders = self.folder_service.list_folders()?;
+                Ok(CommandOutcome::Folders(folders))
+            }
+            AppCommand::CreateFolder { name } => {
+                let id = self.folder_service.create_folder(&name)?;
+                Ok(CommandOutcome::FolderId(id))
+            }
+            AppCommand::RenameFolder { folder_id, name } => {
+                self.folder_service.rename_folder(folder_id, &name)?;
+                Ok(CommandOutcome::None)
+            }
+            AppCommand::DeleteFolder { folder_id } => {
+                // 删分组不删连接：组内的连接先回到「默认」（folder_id = None），
+                // 凭据保持不变（Keep）。
+                let sessions = self.session_service.list_sessions().await?;
+                for session in sessions {
+                    if session.folder_id != Some(folder_id) {
+                        continue;
+                    }
+                    let mut config = session;
+                    config.folder_id = None;
+                    let session_id = config.id;
+                    // 单条会话更新失败（比如它正在连接）不该让整个删除卡住：
+                    // 残留的 folder_id 会被前端按「分组已不存在」处理，落到「默认」组
+                    if let Err(error) = self
+                        .session_service
+                        .update_session_with_credential(
+                            config.id,
+                            config,
+                            rshell_api::types::CredentialUpdate::Keep,
+                        )
+                        .await
+                    {
+                        warn!(
+                            session_id = %session_id,
+                            %error,
+                            "Failed to detach session from deleted folder; it stays in the default group"
+                        );
+                    }
+                }
+                self.folder_service.delete_folder(folder_id)?;
+                Ok(CommandOutcome::None)
+            }
+
             // ===== 终端命令 =====
             // terminal_id 缺省 = 主 pty（连接建立时创建的首标签）；给了就是
             // 指定那个 pty，输出/输入/尺寸都按它隔离。
@@ -236,7 +302,7 @@ impl CommandDispatcher {
                     .await?;
                 if self.sync_input_service.is_sync_active()? {
                     self.sync_input_service
-                        .send_to_synced_sessions(&data, &self.session_service)
+                        .send_to_synced_sessions(session_id, &data, &self.session_service)
                         .await?;
                 }
                 Ok(CommandOutcome::None)
@@ -428,9 +494,13 @@ impl CommandDispatcher {
             }
 
             // ===== 撰写窗格 =====
-            AppCommand::SendComposeText { content, target } => {
+            AppCommand::SendComposeText {
+                content,
+                target,
+                active_session_id,
+            } => {
                 self.compose_service
-                    .send_text(&content, &target, &self.session_service, None)
+                    .send_text(&content, &target, &self.session_service, active_session_id)
                     .await?;
                 Ok(CommandOutcome::None)
             }
@@ -445,6 +515,10 @@ impl CommandDispatcher {
             AppCommand::ToggleSyncInput { session_ids } => {
                 self.sync_input_service.toggle_sync_input(session_ids)?;
                 Ok(CommandOutcome::None)
+            }
+            AppCommand::GetSyncInputSessions => {
+                let session_ids = self.sync_input_service.get_sync_sessions()?;
+                Ok(CommandOutcome::SyncSessions(session_ids))
             }
 
             // ===== 安全：密钥管理 =====
@@ -492,6 +566,20 @@ impl CommandDispatcher {
                     .change_password(&old_password, &new_password)
                     .await?;
                 Ok(CommandOutcome::None)
+            }
+            AppCommand::DisableMasterPassword { password } => {
+                self.master_password.disable(&password).await?;
+                Ok(CommandOutcome::None)
+            }
+            AppCommand::LockMasterPassword => {
+                self.master_password.lock().await;
+                Ok(CommandOutcome::None)
+            }
+            AppCommand::GetMasterPasswordState => {
+                let state = self.master_password.get_state().await;
+                Ok(CommandOutcome::MasterPasswordState(
+                    state.as_str().to_string(),
+                ))
             }
 
             // ===== 安全：主机密钥 =====
@@ -595,6 +683,10 @@ impl CommandDispatcher {
             AppCommand::DeleteHostKey { host, port } => {
                 self.host_key_manager.delete_host_key(&host, port).await?;
                 Ok(CommandOutcome::None)
+            }
+            AppCommand::ListHostKeys => {
+                let entries = self.host_key_manager.list_hosts().await;
+                Ok(CommandOutcome::HostKeys(entries))
             }
 
             // ===== 主题/配色方案 =====
@@ -819,6 +911,14 @@ impl CommandDispatcher {
     }
 
     /// 获取主密码管理器引用
+    pub fn session_service(&self) -> &Arc<SessionService> {
+        &self.session_service
+    }
+
+    pub fn folder_service(&self) -> &Arc<FolderService> {
+        &self.folder_service
+    }
+
     pub fn master_password(&self) -> &Arc<MasterPassword> {
         &self.master_password
     }
@@ -868,6 +968,10 @@ mod tests {
             trigger_engine,
             key_manager: Arc::new(KeyManager::new(dir.join("keys"), event_bus.clone())),
             master_password: Arc::new(MasterPassword::new(event_bus.clone())),
+            folder_service: Arc::new(FolderService::with_path(
+                event_bus.clone(),
+                dir.join("folders.json"),
+            )),
             tunnel_manager: Arc::new(TunnelManager::new(event_bus.clone())),
             host_key_manager: Arc::new(HostKeyManager::new(dir.join("known_hosts"))),
             theme_manager: Arc::new(ThemeManager::new(event_bus.clone())),
@@ -924,9 +1028,217 @@ mod tests {
             .dispatch(AppCommand::SendComposeText {
                 content: "hello".into(),
                 target: ComposeTarget::SelectedSessions(vec![Uuid::new_v4(), Uuid::new_v4()]),
+                active_session_id: None,
             })
             .await;
 
+        assert!(result.is_err());
+    }
+
+    /// `ComposeTarget::CurrentSession` 必须真的能解析出当前会话。
+    ///
+    /// 此前 dispatcher 把 `active_session_id` 写死为 `None`，于是
+    /// `CurrentSession` 永远走 `No active session` 分支——「发送到当前会话」
+    /// 这条路径从 IPC 进来即必然失败。带真实会话 id 时不应再报这条错。
+    #[tokio::test]
+    async fn send_compose_text_current_session_uses_active_session_id() {
+        use rshell_api::types::ComposeTarget;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+
+        // 会话不存在 → 失败原因应是「会话不存在」而不是「没有当前会话」
+        let result = dispatcher
+            .dispatch(AppCommand::SendComposeText {
+                content: "hello".into(),
+                target: ComposeTarget::CurrentSession,
+                active_session_id: Some(Uuid::new_v4()),
+            })
+            .await;
+
+        let error = result.expect_err("unreachable session must fail");
+        assert!(
+            !error.to_string().contains("No active session"),
+            "active_session_id must reach the compose service, got: {}",
+            error
+        );
+    }
+
+    /// 缺省 `active_session_id` 时 `CurrentSession` 依然不可用——
+    /// 锁死这条错误路径，前端漏传 id 时能看到真实原因而不是静默成功。
+    #[tokio::test]
+    async fn send_compose_text_current_session_without_id_reports_no_active_session() {
+        use rshell_api::types::ComposeTarget;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+
+        let result = dispatcher
+            .dispatch(AppCommand::SendComposeText {
+                content: "hello".into(),
+                target: ComposeTarget::CurrentSession,
+                active_session_id: None,
+            })
+            .await;
+
+        let error = result.expect_err("current session without id must fail");
+        assert!(
+            error.to_string().contains("No active session"),
+            "expected the no-active-session error, got: {}",
+            error
+        );
+    }
+
+    /// ListHostKeys 必须真的列出已信任的主机密钥。
+    ///
+    /// `DeleteHostKey` 单独存在时用户无从知道哪些条目可以删——known_hosts 是
+    /// 应用数据目录里的文件，用户不直接编辑它。
+    #[tokio::test]
+    async fn list_host_keys_returns_trusted_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+
+        // 先落一条信任记录
+        dispatcher
+            .host_key_manager()
+            .trust_host_key("10.0.0.1", 22, "ssh-ed25519", "SHA256:abc")
+            .await
+            .unwrap();
+
+        let outcome = dispatcher.dispatch(AppCommand::ListHostKeys).await.unwrap();
+        let CommandOutcome::HostKeys(entries) = outcome else {
+            panic!("expected HostKeys outcome");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host, "10.0.0.1");
+        assert_eq!(entries[0].port, 22);
+        assert_eq!(entries[0].fingerprint, "SHA256:abc");
+    }
+
+    /// 没有信任过任何主机时列表为空（不是报错，也不是残留旧数据）。
+    #[tokio::test]
+    async fn list_host_keys_is_empty_without_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+
+        let outcome = dispatcher.dispatch(AppCommand::ListHostKeys).await.unwrap();
+        let CommandOutcome::HostKeys(entries) = outcome else {
+            panic!("expected HostKeys outcome");
+        };
+        assert!(entries.is_empty());
+    }
+
+    /// 分组命令：列出 / 新建 / 重命名。
+    #[tokio::test]
+    async fn folder_commands_manage_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+
+        let outcome = dispatcher.dispatch(AppCommand::ListFolders).await.unwrap();
+        assert!(matches!(outcome, CommandOutcome::Folders(ref folders) if folders.is_empty()));
+
+        let outcome = dispatcher
+            .dispatch(AppCommand::CreateFolder {
+                name: "生产".into(),
+            })
+            .await
+            .unwrap();
+        let CommandOutcome::FolderId(id) = outcome else {
+            panic!("expected FolderId outcome");
+        };
+
+        let outcome = dispatcher.dispatch(AppCommand::ListFolders).await.unwrap();
+        let CommandOutcome::Folders(folders) = outcome else {
+            panic!("expected Folders outcome");
+        };
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].id, id);
+        assert_eq!(folders[0].name, "生产");
+
+        dispatcher
+            .dispatch(AppCommand::RenameFolder {
+                folder_id: id,
+                name: "生产环境".into(),
+            })
+            .await
+            .unwrap();
+        let outcome = dispatcher.dispatch(AppCommand::ListFolders).await.unwrap();
+        let CommandOutcome::Folders(folders) = outcome else {
+            panic!("expected Folders outcome");
+        };
+        assert_eq!(folders[0].name, "生产环境");
+    }
+
+    /// 删除分组必须把组内的连接挪回「默认」（folder_id = None），
+    /// **不能**连带删掉连接——连接是用户的数据，分组只是组织方式。
+    #[tokio::test]
+    async fn deleting_folder_moves_sessions_back_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+
+        let outcome = dispatcher
+            .dispatch(AppCommand::CreateFolder {
+                name: "生产".into(),
+            })
+            .await
+            .unwrap();
+        let CommandOutcome::FolderId(folder_id) = outcome else {
+            panic!("expected FolderId outcome");
+        };
+
+        // 建一条属于该分组的连接
+        let session_id = dispatcher
+            .session_service()
+            .create_session_with_credential(
+                rshell_api::types::SessionConfig {
+                    id: Uuid::new_v4(),
+                    name: "prod-host".into(),
+                    folder_id: Some(folder_id),
+                    host: "10.0.0.1".into(),
+                    port: 22,
+                    protocol: rshell_api::types::Protocol::SSH,
+                    auth_method: rshell_api::types::AuthMethod::Password {
+                        username: "alice".into(),
+                        has_password: false,
+                    },
+                    serial_config: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        dispatcher
+            .dispatch(AppCommand::DeleteFolder { folder_id })
+            .await
+            .unwrap();
+
+        // 连接还在，只是回到了「默认」
+        let sessions = dispatcher.session_service().list_sessions().await.unwrap();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "deleting a folder must not delete sessions"
+        );
+        assert_eq!(sessions[0].id, session_id);
+        assert_eq!(sessions[0].folder_id, None);
+
+        // 分组本身也没了
+        let outcome = dispatcher.dispatch(AppCommand::ListFolders).await.unwrap();
+        let CommandOutcome::Folders(folders) = outcome else {
+            panic!("expected Folders outcome");
+        };
+        assert!(folders.is_empty());
+    }
+
+    /// 空分组名必须被拒（否则界面会出现无法区分的空分组）。
+    #[tokio::test]
+    async fn create_folder_rejects_empty_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+        let result = dispatcher
+            .dispatch(AppCommand::CreateFolder { name: "   ".into() })
+            .await;
         assert!(result.is_err());
     }
 

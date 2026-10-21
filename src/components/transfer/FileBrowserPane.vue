@@ -33,7 +33,7 @@ const props = defineProps<{
   sessionId?: Uuid;
   path: string;
   rootPath?: string;
-  /** 本地模式：已授权的根目录，用于在路径栏上显示「更换」入口 */
+  /** 本地模式：用户选定的本地根目录，用于在路径栏上显示「更换」入口 */
   rootLabel?: string;
   /** 是否参与同步浏览(被反向 navigate) */
   externallyNavigated?: boolean;
@@ -56,6 +56,8 @@ const emit = defineEmits<{
 const entries = ref<FsEntry[]>([]);
 const loading = ref(false);
 const errorText = ref<string | null>(null);
+/** 导航历史保留条数上限 */
+const NAV_HISTORY_LIMIT = 100;
 const history = ref<string[]>([]);
 const historyIndex = ref(-1);
 const search = ref("");
@@ -155,7 +157,10 @@ function isEntryGone(e: unknown): boolean {
 function describeLoadError(e: unknown, path: string): string {
   const raw = String(e);
   if (/forbidden path|not allowed on the scope|scope/i.test(raw)) {
-    return `无权读取 ${path}：该目录尚未授权。请点击上方「本地：… · 更换」重新选择。`;
+    // capability 已是全局读写（`fs:read-all` + `**`），scope 不是这里的失败原因：
+    // 真正的拒绝来自操作系统（权限不足 / 路径不存在 / 挂载点不可用）。
+    // 旧的「尚未授权，请重新选择」建议会把人引向错误的操作。
+    return `无权读取 ${path}：系统拒绝了该目录的访问（路径可能已失效，或当前账户没有读权限）。可点上方「更换本地目录」另选一个目录。`;
   }
   return raw;
 }
@@ -205,6 +210,11 @@ async function load(path: string, pushHistory = true) {
       // 截断 forward 历史
       history.value = history.value.slice(0, historyIndex.value + 1);
       history.value.push(path);
+      // 导航历史留个上限：逐级浏览深层目录时它会一直涨，
+      // 「后退」还能一路退回几百层之前的目录，实用性也一起下降
+      if (history.value.length > NAV_HISTORY_LIMIT) {
+        history.value = history.value.slice(-NAV_HISTORY_LIMIT);
+      }
       historyIndex.value = history.value.length - 1;
     }
   } catch (e) {

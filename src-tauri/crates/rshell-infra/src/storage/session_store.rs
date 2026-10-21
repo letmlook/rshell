@@ -379,6 +379,30 @@ mod tests {
         assert!(store.load_pending(config.id).is_err());
     }
 
+    /// 分组（folder_id）必须随会话 TOML 往返：否则连接分组在重启后就没了，
+    /// 分组功能等于只在单次运行内有效。
+    #[test]
+    fn folder_id_round_trips_through_toml() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+
+        let folder_id = Uuid::new_v4();
+        let mut config = test_session_config();
+        config.folder_id = Some(folder_id);
+        store.save(&config).unwrap();
+
+        let loaded = store.load(config.id).unwrap().unwrap();
+        assert_eq!(loaded.folder_id, Some(folder_id));
+
+        // 未归组的连接仍然是 None
+        let mut plain = test_session_config();
+        plain.id = Uuid::new_v4();
+        plain.folder_id = None;
+        store.save(&plain).unwrap();
+        let loaded = store.load(plain.id).unwrap().unwrap();
+        assert_eq!(loaded.folder_id, None);
+    }
+
     #[test]
     fn managed_key_id_round_trips_through_toml() {
         let dir = tempdir().unwrap();

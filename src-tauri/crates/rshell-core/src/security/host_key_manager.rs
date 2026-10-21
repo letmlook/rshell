@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 use rshell_api::types::{HostKeyEntry, TrustLevel};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::error::CoreError;
@@ -39,25 +40,91 @@ enum Owned {
     Dropped,
 }
 
+/// known_hosts 的**附加元数据**（首次信任时间 / 上次连接时间）
+///
+/// known_hosts 文件本身必须保持 OpenSSH 标准格式（`<host> <keytype> <key>`），
+/// 才能与 `ssh-keygen` 等工具互操作——标准格式里没有时间戳的位置。
+/// 所以时间戳单独放在一个 sidecar 文件里：`<known_hosts>.meta.json`。
+///
+/// 不放 sidecar 的话，`first_seen` / `last_seen` 每次重启都会被重置成"现在"，
+/// 两个字段都在撒谎。
+type HostKeyMeta = HashMap<String, HostKeyTimestamps>;
+
+/// 单条主机密钥的时间戳
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HostKeyTimestamps {
+    first_seen: String,
+    last_seen: String,
+}
+
 /// 主机密钥管理器
 pub struct HostKeyManager {
     /// host:port -> HostKeyEntry
     entries: Arc<RwLock<HashMap<String, HostKeyEntry>>>,
     known_hosts_path: PathBuf,
+    /// 时间戳 sidecar 路径（`<known_hosts>.meta.json`）
+    meta_path: PathBuf,
 }
 
 impl HostKeyManager {
     /// 创建新的主机密钥管理器
     pub fn new(known_hosts_path: PathBuf) -> Self {
+        let meta_path = sidecar_path(&known_hosts_path);
         let manager = Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
             known_hosts_path,
+            meta_path,
         };
 
         // 加载 known_hosts 文件
         let _ = manager.load_known_hosts();
 
         manager
+    }
+
+    /// 读回 sidecar 里的时间戳
+    fn load_meta(&self) -> HostKeyMeta {
+        match std::fs::read_to_string(&self.meta_path) {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    warn!(path = %self.meta_path.display(), %error, "Host key metadata file is invalid; ignoring it");
+                    HostKeyMeta::new()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HostKeyMeta::new(),
+            Err(error) => {
+                warn!(path = %self.meta_path.display(), %error, "Could not read host key metadata");
+                HostKeyMeta::new()
+            }
+        }
+    }
+
+    /// 写回 sidecar（原子替换）
+    fn save_meta(&self, meta: &HostKeyMeta) -> Result<(), CoreError> {
+        let content = serde_json::to_string_pretty(meta).map_err(|e| {
+            CoreError::Internal(format!("Failed to serialize host key metadata: {e}"))
+        })?;
+        if let Some(parent) = self.meta_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut tmp = self.meta_path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
+            return Err(CoreError::Internal(format!(
+                "Failed to write host key metadata: {}",
+                e
+            )));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &self.meta_path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CoreError::Internal(format!(
+                "Failed to replace host key metadata: {}",
+                e
+            )));
+        }
+        Ok(())
     }
 
     /// 加载 known_hosts 文件（OpenSSH 标准格式）
@@ -71,6 +138,9 @@ impl HostKeyManager {
 
         let mut entries = HashMap::new();
         let now = Utc::now().to_rfc3339();
+        // 时间戳来自 sidecar：known_hosts 的 OpenSSH 标准格式里没有位置放它们，
+        // 不读 sidecar 的话每次重启 first_seen/last_seen 都会被重置成"现在"
+        let meta = self.load_meta();
 
         for line in content.lines() {
             let line = line.trim();
@@ -108,16 +178,22 @@ impl HostKeyManager {
             // 对 host_field 中的每个 host 模式，提取 host/port 并加入 entries
             for pattern in host_field.split(',') {
                 let (host, port) = parse_host_port(pattern, 22);
+                let map_key = map_key_of(pattern);
+                let timestamps = meta.get(&map_key);
                 entries.insert(
-                    map_key_of(pattern),
+                    map_key,
                     HostKeyEntry {
                         host,
                         port,
                         key_type: key_type.clone(),
                         fingerprint: fingerprint.clone(),
                         trust_level: TrustLevel::Trusted,
-                        first_seen: now.clone(),
-                        last_seen: now.clone(),
+                        first_seen: timestamps
+                            .map(|t| t.first_seen.clone())
+                            .unwrap_or_else(|| now.clone()),
+                        last_seen: timestamps
+                            .map(|t| t.last_seen.clone())
+                            .unwrap_or_else(|| now.clone()),
                     },
                 );
             }
@@ -322,7 +398,18 @@ impl HostKeyManager {
                 line: &line,
             }],
         )?;
-        entries.insert(key, entry);
+        entries.insert(key.clone(), entry.clone());
+
+        // 时间戳写进 sidecar（known_hosts 本体保持 OpenSSH 标准格式）
+        let mut meta = self.load_meta();
+        meta.insert(
+            key.clone(),
+            HostKeyTimestamps {
+                first_seen: entry.first_seen.clone(),
+                last_seen: entry.last_seen.clone(),
+            },
+        );
+        self.save_meta(&meta)?;
 
         info!("Host key trusted: {}:{}", host, port);
         Ok(())
@@ -336,6 +423,13 @@ impl HostKeyManager {
         let mut entries = self.entries.write().expect("host key lock poisoned");
         self.persist_known_hosts(&entries, &[Overlay::Remove { map_key: &key }])?;
         entries.remove(&key);
+
+        // sidecar 里同步删掉，别留下指向已删条目的时间戳
+        let mut meta = self.load_meta();
+        if meta.remove(&key).is_some() {
+            self.save_meta(&meta)?;
+        }
+
         info!("Host key deleted: {}:{}", host, port);
         Ok(())
     }
@@ -350,14 +444,46 @@ impl HostKeyManager {
             .collect()
     }
 
-    /// 更新最后访问时间
+    /// 更新最后连接时间
+    ///
+    /// 连接成功时调用：`HostKeyEntry::last_seen` 说的是「上次连上这台主机的
+    /// 时间」，不更新的话它永远等于首次信任时间——字段在撒谎。
+    ///
+    /// 与 trust/delete 一样先落盘再改内存：写失败时磁盘与内存保持一致，
+    /// 不会出现「内存显示刚连过、文件里还是旧时间」的分歧。写失败只记 warn
+    /// ——这只是一条辅助信息，不该让一次成功的连接变成失败。
     pub async fn update_last_seen(&self, host: &str, port: u16) {
         let key = format!("{}:{}", host, port);
+        let now = Utc::now().to_rfc3339();
         let mut entries = self.entries.write().expect("host key lock poisoned");
-        if let Some(entry) = entries.get_mut(&key) {
-            entry.last_seen = Utc::now().to_rfc3339();
+        let Some(entry) = entries.get_mut(&key) else {
+            // 这台主机没有信任条目（首次连接走的是决策链）：没什么可更新的
+            return;
+        };
+        entry.last_seen = now.clone();
+        let first_seen = entry.first_seen.clone();
+        drop(entries);
+
+        // 时间戳写 sidecar，不动 known_hosts 本体（保持 OpenSSH 标准格式）
+        let mut meta = self.load_meta();
+        meta.insert(
+            key,
+            HostKeyTimestamps {
+                first_seen,
+                last_seen: now,
+            },
+        );
+        if let Err(error) = self.save_meta(&meta) {
+            warn!(host = %host, port, %error, "Failed to persist host key last_seen");
         }
     }
+}
+
+/// sidecar 路径：`<known_hosts>.meta.json`
+fn sidecar_path(known_hosts_path: &std::path::Path) -> PathBuf {
+    let mut name = known_hosts_path.as_os_str().to_os_string();
+    name.push(".meta.json");
+    PathBuf::from(name)
 }
 
 /// host 模式 → 内存 map 的键（`host:port`）。
@@ -693,5 +819,39 @@ mod tests {
                 .contains("example.test ssh-ed25519 AAAAkey"),
             "删除写失败时磁盘记录必须原样保留"
         );
+    }
+
+    /// `last_seen` 说的是「上次连上这台主机的时间」：连接成功后必须更新，
+    /// 否则它永远等于首次信任时间，字段在撒谎。
+    #[tokio::test]
+    async fn update_last_seen_bumps_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let manager = HostKeyManager::new(path.clone());
+        manager
+            .trust_host_key("10.0.0.1", 22, "ssh-ed25519", "SHA256:abc")
+            .await
+            .unwrap();
+
+        let before = manager.list_hosts().await[0].last_seen.clone();
+        // 让两次更新落在不同的时刻
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        manager.update_last_seen("10.0.0.1", 22).await;
+
+        let after = manager.list_hosts().await[0].last_seen.clone();
+        assert_ne!(before, after, "last_seen must change after a connection");
+
+        // 必须落盘：重启后仍是新值
+        let restarted = HostKeyManager::new(path);
+        assert_eq!(restarted.list_hosts().await[0].last_seen, after);
+    }
+
+    /// 没有信任条目时更新是安全的空操作（首次连接走决策链，没有条目）。
+    #[tokio::test]
+    async fn update_last_seen_on_unknown_host_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = HostKeyManager::new(dir.path().join("known_hosts"));
+        manager.update_last_seen("10.0.0.9", 22).await;
+        assert!(manager.list_hosts().await.is_empty());
     }
 }

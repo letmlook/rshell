@@ -25,6 +25,7 @@ use rshell_core::security::host_key_manager::HostKeyManager;
 use rshell_core::security::key_manager::KeyManager;
 use rshell_core::security::master_password::MasterPassword;
 use rshell_core::security::tunnel_manager::TunnelManager;
+use rshell_core::session::folder_service::FolderService;
 use rshell_core::session::repository::SessionRepository;
 use rshell_core::session::service::SessionService;
 use rshell_core::terminal::service::TerminalService;
@@ -115,13 +116,26 @@ pub fn run() {
             });
 
             let transfer_service = Arc::new(TransferService::new(event_bus.clone()));
-            let master_password = Arc::new(MasterPassword::new(event_bus.clone()));
+            // 主密码持久化：盐与加密令牌落盘，派生密钥只在内存里。
+            // 启动时读到既有文件即进入 Locked 状态，需用户重新验证解锁。
+            let master_password = Arc::new(MasterPassword::with_path(
+                event_bus.clone(),
+                data_root.join("master_password.json"),
+            ));
+            // 连接分组：SessionConfig::folder_id 指向的实体，持久化在 folders.json
+            let folder_service = Arc::new(FolderService::with_path(
+                event_bus.clone(),
+                data_root.join("folders.json"),
+            ));
             let tunnel_manager = Arc::new(
                 TunnelManager::new(event_bus.clone())
                     .with_persistence(data_root.join("tunnels.toml")),
             );
             let host_key_manager = Arc::new(HostKeyManager::new(known_hosts_path));
-            let theme_manager = Arc::new(ThemeManager::new(event_bus.clone()));
+            let theme_manager = Arc::new(ThemeManager::with_persistence(
+                event_bus.clone(),
+                data_root.join("color_schemes.json"),
+            ));
 
             // SessionService restores saved sessions during construction.
 
@@ -134,6 +148,7 @@ pub fn run() {
                     trigger_engine: trigger_engine.clone(),
                     key_manager: key_manager.clone(),
                     master_password: master_password.clone(),
+                    folder_service: folder_service.clone(),
                     tunnel_manager: tunnel_manager.clone(),
                     host_key_manager: host_key_manager.clone(),
                     theme_manager: theme_manager.clone(),
@@ -193,11 +208,19 @@ pub fn run() {
             commands::list_transfers,
             commands::list_tunnels,
             commands::list_pending_tunnels,
+            commands::list_serial_ports,
+            commands::list_folders,
+            commands::create_folder,
+            commands::rename_folder,
+            commands::delete_folder,
             commands::generate_ssh_key,
             commands::import_private_key,
             commands::delete_ssh_key,
             commands::setup_master_password,
             commands::change_master_password,
+            commands::disable_master_password,
+            commands::lock_master_password,
+            commands::get_master_password_state,
             commands::trust_host_key,
             commands::execute_quick_command,
             commands::list_quick_commands,
@@ -217,8 +240,10 @@ pub fn run() {
             commands::list_plugins,
             commands::send_compose_text,
             commands::toggle_sync_input,
+            commands::get_sync_input_sessions,
             commands::export_public_key,
             commands::delete_host_key,
+            commands::list_host_keys,
             commands::import_color_scheme,
             commands::load_plugin,
             commands::unload_plugin,

@@ -25,9 +25,13 @@ import QuickCommandPanel from "./QuickCommandPanel.vue";
 import TriggerEditor from "./TriggerEditor.vue";
 import TunnelPanel from "./TunnelPanel.vue";
 import PluginPanel from "./PluginPanel.vue";
+import SecurityPanel from "./SecurityPanel.vue";
+import SyncInputPanel from "./SyncInputPanel.vue";
+import ComposePanel from "./ComposePanel.vue";
+import ScriptPanel from "./ScriptPanel.vue";
 
-export type ToolSubview = "quick-commands" | "triggers" | "tunnels";
-export type SettingsSubview = "theme" | "terminal" | "plugins";
+export type ToolSubview = "quick-commands" | "triggers" | "tunnels" | "sync" | "compose" | "script";
+export type SettingsSubview = "theme" | "terminal" | "plugins" | "security";
 
 const props = withDefaults(
   defineProps<{
@@ -125,11 +129,15 @@ function resetWidth() {
       <button data-testid="tools-quick-commands" :class="{ active: activeToolSubview === 'quick-commands' }" @click="activeToolSubview = 'quick-commands'">快速命令</button>
       <button data-testid="tools-triggers" :class="{ active: activeToolSubview === 'triggers' }" @click="activeToolSubview = 'triggers'">触发器</button>
       <button data-testid="tools-tunnels" :class="{ active: activeToolSubview === 'tunnels' }" @click="activeToolSubview = 'tunnels'">隧道</button>
+      <button data-testid="tools-sync" :class="{ active: activeToolSubview === 'sync' }" @click="activeToolSubview = 'sync'">同步输入</button>
+      <button data-testid="tools-compose" :class="{ active: activeToolSubview === 'compose' }" @click="activeToolSubview = 'compose'">撰写窗格</button>
+      <button data-testid="tools-script" :class="{ active: activeToolSubview === 'script' }" @click="activeToolSubview = 'script'">脚本</button>
     </nav>
     <nav v-else-if="active === 'settings'" class="subview-tabs" aria-label="设置面板">
       <button data-testid="settings-theme" :class="{ active: activeSettingsSubview === 'theme' }" @click="activeSettingsSubview = 'theme'">主题</button>
       <button data-testid="settings-terminal" :class="{ active: activeSettingsSubview === 'terminal' }" @click="activeSettingsSubview = 'terminal'">终端</button>
       <button data-testid="settings-plugins" :class="{ active: activeSettingsSubview === 'plugins' }" @click="activeSettingsSubview = 'plugins'">插件</button>
+      <button data-testid="settings-security" :class="{ active: activeSettingsSubview === 'security' }" @click="activeSettingsSubview = 'security'">安全</button>
     </nav>
 
     <div class="side-panel-body">
@@ -161,6 +169,18 @@ function resetWidth() {
         v-else-if="active === 'tools' && activeToolSubview === 'tunnels'"
         embedded
       />
+      <SyncInputPanel
+        v-else-if="active === 'tools' && activeToolSubview === 'sync'"
+        embedded
+      />
+      <ComposePanel
+        v-else-if="active === 'tools' && activeToolSubview === 'compose'"
+        embedded
+      />
+      <ScriptPanel
+        v-else-if="active === 'tools' && activeToolSubview === 'script'"
+        embedded
+      />
       <ThemePanel
         v-else-if="active === 'settings' && activeSettingsSubview === 'theme'"
         embedded
@@ -172,6 +192,9 @@ function resetWidth() {
       <PluginPanel
         v-else-if="active === 'settings' && activeSettingsSubview === 'plugins'"
         embedded
+      />
+      <SecurityPanel
+        v-else-if="active === 'settings' && activeSettingsSubview === 'security'"
       />
     </div>
 

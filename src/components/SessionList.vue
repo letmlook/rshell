@@ -6,13 +6,14 @@
  *   - 分组(folder,纯组织)
  *   - 主机节点 + 状态点(复用签名元素)
  *   - 右键菜单:连接 / 断开 / 在新标签打开 / 打开 SFTP / 在此打开终端 / 重命名 / 删除
- *   - 拖拽节点(占位实现,后端未启拖拽 API 时不影响 UI)
  *
- * 数据源:目前 sessions store 的 items 是扁平 list;我们用一个前端派生算法
- * 按 'group' 字段聚合成树,后端将来接入分组 API 后只需替换 buildTree。
+ * 分组来自真实的分组实体（`folder_id` → folders store），不再是悬空的
+ * `folder_id || "默认"`：此前界面上画着分组树，却没有任何地方能创建分组，
+ * 树里永远只有一个「默认」组。
  */
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useSessionsStore } from "../stores/sessions";
+import { DEFAULT_FOLDER_LABEL, useFoldersStore } from "../stores/folders";
 import type { Uuid } from "../ipc/types";
 import type { SessionConfig } from "../ipc/types";
 import SessionCredentialDialog from "./SessionCredentialDialog.vue";
@@ -27,19 +28,24 @@ const emit = defineEmits<{
   (e: "open-terminal-window", id: Uuid): void;
   /** 复制会话：用同一份连接信息建新条目 */
   (e: "duplicate-session", id: Uuid): void;
+  (e: "edit-session", id: Uuid): void;
   (e: "new-session"): void;
 }>();
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
 
 const store = useSessionsStore();
+const folders = useFoldersStore();
 const credentialSession = ref<SessionConfig | null>(null);
+/** 新建分组的输入框 */
+const newFolderName = ref("");
 
 interface TreeNode {
   id: string;
   label: string;
   type: "group" | "session";
-  group?: string;
+  /** 分组 id；「默认」分组为 null */
+  folderId?: Uuid | null;
   children?: TreeNode[];
   session?: SessionConfig;
 }
@@ -48,19 +54,45 @@ const groups = computed<TreeNode[]>(() => {
   const filtered = filteredSessions.value;
   const map = new Map<string, TreeNode>();
   for (const s of filtered) {
-    const g = s.folder_id || "默认";
-    if (!map.has(g)) {
-      map.set(g, { id: `g:${g}`, label: g, type: "group", group: g, children: [] });
+    // folder_id 指向已删除的分组时归到「默认」：分组被删后连接不会消失
+    const folderId = s.folder_id && folders.byId.has(s.folder_id) ? s.folder_id : null;
+    const key = folderId ?? "__default__";
+    if (!map.has(key)) {
+      map.set(key, {
+        id: `g:${key}`,
+        label: folderId ? folders.nameOf(folderId) : DEFAULT_FOLDER_LABEL,
+        type: "group",
+        folderId,
+        children: [],
+      });
     }
-    map.get(g)!.children!.push({
+    map.get(key)!.children!.push({
       id: s.id,
       label: s.name,
       type: "session",
-      group: g,
+      folderId,
       session: s,
     });
   }
-  return Array.from(map.values());
+
+  // 空分组也要列出来：分组头挂着「删除」按钮，不显示就等于用户永远删不掉
+  // 自己刚建的空分组。「默认」分组是隐式的，空了就不显示。
+  for (const folder of folders.items ?? []) {
+    const key = folder.id;
+    if (map.has(key)) continue;
+    map.set(key, {
+      id: `g:${key}`,
+      label: folder.name,
+      type: "group",
+      folderId: folder.id,
+      children: [],
+    });
+  }
+
+  return Array.from(map.values()).filter(
+    (group) =>
+      (group.children?.length ?? 0) > 0 || group.folderId !== null,
+  );
 });
 
 const filteredSessions = computed(() => {
@@ -165,6 +197,34 @@ function retryConnection(id: Uuid) {
 function ctxDuplicate(s: SessionConfig) {
   emit("duplicate-session", s.id);
 }
+/** 编辑连接信息：主机/端口/用户名/认证方式/名称等都能改 */
+function ctxEdit(s: SessionConfig) {
+  emit("edit-session", s.id);
+}
+/** 新建分组 */
+async function createFolder() {
+  const name = newFolderName.value.trim();
+  if (!name) return;
+  const id = await folders.create(name);
+  if (id) newFolderName.value = "";
+}
+
+/** 删除分组：组内的连接回到「默认」，不会被删除 */
+async function removeFolder(folderId: Uuid | null | undefined) {
+  if (!folderId) return;
+  const name = folders.nameOf(folderId);
+  const count = store.items.filter((item) => item.folder_id === folderId).length;
+  const ok = await confirmDialog({
+    title: "删除分组",
+    message: `删除分组「${name}」？`,
+    detail: count > 0 ? `组内的 ${count} 条连接会回到「默认」，连接本身不会被删除。` : undefined,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!ok) return;
+  await folders.remove(folderId);
+}
+
 async function ctxDelete(s: SessionConfig) {
   // 应用内确认窗替代 tauri-plugin-dialog 的 confirm()：不弹操作系统窗口
   const ok = await confirmDialog({
@@ -178,6 +238,12 @@ async function ctxDelete(s: SessionConfig) {
   // 失败原因由 sessions store 写入 store.error，列表顶部已有展示位
   await store.delete?.(s.id).catch(console.warn);
 }
+
+onMounted(() => {
+  // 分组列表要跟着面板一起就位：否则树里只有「默认」组，
+  // 直到别处（应用启动 / 分组事件）碰巧刷新过
+  void folders.refresh();
+});
 
 // 面板按侧栏当前面板条件卸载：兜底 window 监听不能比组件活得久
 onBeforeUnmount(() => {
@@ -221,6 +287,26 @@ onBeforeUnmount(() => {
     </div>
     <SessionCredentialDialog v-if="credentialSession" :session="credentialSession" @close="credentialSession = null" />
 
+    <div class="folder-creator">
+      <el-input
+        v-model="newFolderName"
+        size="small"
+        placeholder="新建分组名"
+        class="folder-name"
+        data-test="folder-name"
+        @keyup.enter="createFolder"
+      />
+      <el-button
+        size="small"
+        :disabled="!newFolderName.trim()"
+        data-test="folder-create"
+        @click="createFolder"
+      >
+        新建分组
+      </el-button>
+    </div>
+    <p v-if="folders.error" class="error" data-test="folder-error">{{ folders.error }}</p>
+
     <div v-if="groups.length === 0" class="empty">
       <p>暂无连接</p>
     </div>
@@ -235,6 +321,16 @@ onBeforeUnmount(() => {
             <path d="M2 4.5 V12.5 H14 V6 H8 L6.5 4.5 Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
           </svg>
           <span>{{ g.label }}</span>
+          <button
+            v-if="g.folderId"
+            class="group-delete"
+            title="删除分组"
+            aria-label="删除分组"
+            :data-test="`group-delete-${g.folderId}`"
+            @click.stop="removeFolder(g.folderId)"
+          >
+            ×
+          </button>
         </div>
         <ul class="children">
           <li
@@ -297,6 +393,13 @@ onBeforeUnmount(() => {
         新开标签
       </button>
       <div class="ctx-sep" />
+      <button
+        class="ctx-item"
+        data-test="ctx-edit"
+        @click="runMenuItem(ctxEdit)"
+      >
+        编辑连接
+      </button>
       <button
         class="ctx-item"
         data-test="ctx-duplicate"
@@ -376,6 +479,24 @@ h3 {
 .group {
   margin-bottom: var(--rs-s-1);
 }
+.folder-creator {
+  display: flex;
+  gap: 6px;
+  padding: 6px 8px;
+}
+.folder-creator .folder-name { flex: 1; min-width: 0; }
+.group-delete {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--rs-fg-muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  border-radius: 3px;
+}
+.group-delete:hover { color: var(--rs-p-danger); background: var(--rs-bg-surface-hover); }
 .group-label {
   display: flex;
   align-items: center;

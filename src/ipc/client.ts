@@ -8,6 +8,8 @@ import type {
   AppCommand,
   ConflictPolicy,
   ConnectionState,
+  Folder,
+  HostKeyEntry,
   PathBuf,
   PortForwardRule,
   PluginInfo,
@@ -229,6 +231,27 @@ export const restoreTunnel = (session_id: Uuid, rule: PortForwardRule) =>
 export const suspendTunnel = (tunnel_id: Uuid) => call({ SuspendTunnel: { tunnel_id } });
 export const resumeTunnel = (tunnel_id: Uuid) => call({ ResumeTunnel: { tunnel_id } });
 
+// ===== 串口 =====
+
+/**
+ * 列出当前系统可用的串口设备。
+ *
+ * 用户不该靠手打 `/dev/cu.usbserial-XXXX`——插拔一次名字就变。
+ */
+export const listSerialPorts = () => call<string[]>({ ListSerialPorts: null });
+
+// ===== 连接分组 =====
+
+/** 列出全部分组（按名称排序） */
+export const listFolders = () => call<Folder[]>({ ListFolders: null });
+/** 新建分组，返回新分组 id */
+export const createFolder = (name: string) => call<Uuid>({ CreateFolder: { name } });
+/** 重命名分组 */
+export const renameFolder = (folder_id: Uuid, name: string) =>
+  call({ RenameFolder: { folder_id, name } });
+/** 删除分组：组内的连接回到「默认」，不会被删除 */
+export const deleteFolder = (folder_id: Uuid) => call({ DeleteFolder: { folder_id } });
+
 // ===== 快速命令 =====
 
 export const executeQuickCommand = (command_id: Uuid, target_sessions: Uuid[]) =>
@@ -248,8 +271,25 @@ export const listTriggers = () => call<Trigger[]>({ ListTriggers: null });
 
 // ===== 撰写窗格 =====
 
-export const sendComposeText = (content: string, target: ComposeTarget) =>
-  call({ SendComposeText: { content, target } });
+/**
+ * 发送撰写窗格文本到目标会话。
+ *
+ * `activeSessionId` 只在 target 为 `CurrentSession` 时有意义：后端用它把
+ * 「当前会话」解析成真实会话 id，缺省时该目标会以 `No active session` 报错
+ * （此前 dispatcher 把这个参数写死为 None，导致「发送到当前会话」永远失败）。
+ */
+export const sendComposeText = (
+  content: string,
+  target: ComposeTarget,
+  activeSessionId?: Uuid | null,
+) =>
+  call({
+    SendComposeText: {
+      content,
+      target,
+      active_session_id: activeSessionId ?? null,
+    },
+  });
 
 // ===== 脚本 =====
 
@@ -258,8 +298,16 @@ export const executeScript = (code: string, session_id: Uuid) =>
 
 // ===== 同步输入 =====
 
+/**
+ * 设置同步输入会话组。传空数组表示关闭同步输入。
+ *
+ * 开启后，任意终端的输入会**同时**发到这组会话（源会话本身不重复发送）。
+ */
 export const toggleSyncInput = (session_ids: Uuid[]) =>
   call({ ToggleSyncInput: { session_ids } });
+/** 查询当前同步输入会话组；空数组表示未开启 */
+export const getSyncInputSessions = () =>
+  call<Uuid[]>({ GetSyncInputSessions: null });
 
 // ===== 密钥管理 =====
 
@@ -273,6 +321,12 @@ export const exportPublicKey = (key_id: Uuid) => call({ ExportPublicKey: { key_i
 export const listKeys = () => call<unknown[]>({ ListKeys: null });
 
 // ===== 主密码 =====
+//
+// 主密码只用于应用锁定/验证，不是凭据保险库，也不加密钥匙串。
+// 派生密钥永不落盘：后端持久化的只有盐与加密后的验证令牌，
+// 因此重启后状态是 Locked，必须重新验证才能解锁。
+
+export type MasterPasswordState = "NotSet" | "Locked" | "Unlocked";
 
 export const setupMasterPassword = (password: string) =>
   call({ SetupMasterPassword: { password } });
@@ -281,6 +335,13 @@ export const verifyMasterPassword = (password: string) =>
   call<boolean>({ VerifyMasterPassword: { password } });
 export const changeMasterPassword = (old_password: string, new_password: string) =>
   call({ ChangeMasterPassword: { old_password, new_password } });
+/** 停用主密码：必须提供当前密码，后端据此校验后才删除持久化文件 */
+export const disableMasterPassword = (password: string) =>
+  call({ DisableMasterPassword: { password } });
+/** 立即锁定：清除内存中的派生密钥，需重新验证解锁 */
+export const lockMasterPassword = () => call({ LockMasterPassword: null });
+export const getMasterPasswordState = () =>
+  call<MasterPasswordState>({ GetMasterPasswordState: null });
 
 // ===== 主机密钥 =====
 
@@ -301,6 +362,8 @@ export const cancelHostKey = (decision_id: Uuid) =>
   call({ CancelHostKey: { decision_id } });
 export const deleteHostKey = (host: string, port: number) =>
   call({ DeleteHostKey: { host, port } });
+/** 列出已信任的主机密钥；删除前必须先能看到条目 */
+export const listHostKeys = () => call<HostKeyEntry[]>({ ListHostKeys: null });
 
 // ===== 主题 =====
 

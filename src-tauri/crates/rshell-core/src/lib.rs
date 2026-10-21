@@ -16,6 +16,7 @@ pub mod event_bus;
 pub mod script;
 pub mod security;
 pub mod session;
+pub mod storage;
 pub mod terminal;
 pub mod theme;
 pub mod transfer;

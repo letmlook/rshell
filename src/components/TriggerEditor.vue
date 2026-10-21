@@ -3,12 +3,23 @@
  * TriggerEditor —— 切片 7.3
  *
  * 触发器列表和动作编辑；远端输出匹配后由后端执行动作。
+ *
+ * 后端的 `TriggerCondition` 有两种（正则匹配 / 精确匹配）、`TriggerAction`
+ * 有四种（发送文本 / 显示通知 / 断开连接 / 记录到文件），四种动作都已实现
+ * （`rshell-core/src/session/service.rs`）。此前界面只能创建「正则 + 发送文本」
+ * 一种，其余三种动作没有任何入口——已实现的能力等于没有。现在创建表单覆盖
+ * 全部组合。
+ *
+ * 条件标签按**实际行为**命名：后端的 `ExactMatch` 实现为「输出片段包含该文本」
+ * （输出是任意分片，等值比较几乎不会命中），因此界面叫「包含文本」而不是
+ * 「精确匹配」，免得用户以为只有整段相等才会触发。
  */
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { listTriggers, createTrigger, deleteTrigger, toggleTrigger } from "../ipc/client";
 import { subscribeAppEvents } from "../ipc/events";
-import type { Trigger, Uuid } from "../ipc/types";
+import type { Trigger, TriggerAction, TriggerCondition, Uuid } from "../ipc/types";
 import { confirmDialog } from "../utils/dialog";
+import { pickLocalPath } from "../utils/pathPicker";
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
 
@@ -20,12 +31,23 @@ function triggerPattern(t: Trigger): string {
 }
 
 const items = ref<Trigger[]>([]);
+/** 触发器名称：此前恒等于匹配条件，列表里「名称」与「正则」两列内容重复 */
+const newName = ref("");
 const newPattern = ref("");
 const newText = ref("");
 const loading = ref(false);
 const error = ref<string | null>(null);
 let unlisten: (() => void) | null = null;
 let active = false;
+
+/** 创建表单的类别选择 */
+type ConditionKind = "regex" | "exact";
+type ActionKind = "send" | "notify" | "disconnect" | "log";
+
+const newCondition = ref<ConditionKind>("regex");
+const newAction = ref<ActionKind>("send");
+/** 「记录到文件」用的绝对路径 */
+const newLogPath = ref("");
 
 async function refresh() {
   loading.value = true;
@@ -40,18 +62,72 @@ async function refresh() {
 }
 
 async function add() {
-  if (!newPattern.value || !newText.value) { error.value = "正则和发送文本均不能为空"; return; }
-  try { await createTrigger({
-    id: crypto.randomUUID() as Uuid,
-    name: newPattern.value,
-    enabled: true,
-    condition: { RegexAppear: newPattern.value },
-    action: { SendText: newText.value },
-  });
-  } catch (e) { error.value = String(e); return; }
+  if (!newPattern.value.trim()) {
+    error.value = "匹配条件不能为空";
+    return;
+  }
+  // 名称可留空：留空时回落为匹配条件（与旧行为一致），填了才单独命名
+
+  // 断开连接不需要参数；「记录到文件」的参数是路径而不是文本
+  if (
+    (newAction.value === "send" || newAction.value === "notify") &&
+    !newText.value.trim()
+  ) {
+    error.value = "动作内容不能为空";
+    return;
+  }
+  if (newAction.value === "log" && !newLogPath.value.trim()) {
+    error.value = "请选择要写入的日志文件";
+    return;
+  }
+
+  const condition: TriggerCondition =
+    newCondition.value === "regex"
+      ? { RegexAppear: newPattern.value.trim() }
+      : { ExactMatch: newPattern.value.trim() };
+
+  let action: TriggerAction;
+  switch (newAction.value) {
+    case "send":
+      action = { SendText: newText.value };
+      break;
+    case "notify":
+      action = { ShowNotification: newText.value };
+      break;
+    case "disconnect":
+      action = "Disconnect";
+      break;
+    case "log":
+      action = { LogToFile: newLogPath.value.trim() };
+      break;
+  }
+
+  try {
+    await createTrigger({
+      id: crypto.randomUUID() as Uuid,
+      name: newName.value.trim() || newPattern.value.trim(),
+      enabled: true,
+      condition,
+      action,
+    });
+  } catch (e) {
+    error.value = String(e);
+    return;
+  }
   newPattern.value = "";
   newText.value = "";
+  newLogPath.value = "";
   await refresh();
+}
+
+/** 为「记录到文件」选一个日志文件（应用内路径选择器） */
+async function pickLogFile() {
+  const path = await pickLocalPath({
+    mode: "file",
+    title: "选择触发器日志文件",
+    accept: (name) => name.endsWith(".log") || name.endsWith(".txt"),
+  });
+  if (path) newLogPath.value = path;
 }
 
 async function toggle(t: Trigger) {
@@ -78,16 +154,16 @@ async function remove(t: Trigger) {
 }
 
 function actionLabel(t: Trigger): string {
-  if (t.action === "Disconnect") return "disconnect";
+  if (t.action === "Disconnect") return "断开连接";
   const a = t.action as {
     SendText?: string;
     ShowNotification?: string;
     Disconnect?: unknown;
     LogToFile?: string;
   };
-  if (a.SendText !== undefined) return `send_text(${a.SendText.length} chars)`;
-  if (a.ShowNotification !== undefined) return `notify: ${a.ShowNotification}`;
-  if (a.LogToFile) return `log_to_file: ${a.LogToFile}`;
+  if (a.SendText !== undefined) return `发送文本（${a.SendText.length} 字符）`;
+  if (a.ShowNotification !== undefined) return `通知：${a.ShowNotification}`;
+  if (a.LogToFile) return `记录到文件：${a.LogToFile}`;
   return "(none)";
 }
 
@@ -95,11 +171,17 @@ onMounted(async () => {
   active = true;
   await refresh();
   if (!active) return;
-  const stop = await subscribeAppEvents((event) => { if (event === "TriggerListChanged") void refresh(); });
+  const stop = await subscribeAppEvents((event) => {
+    if (event === "TriggerListChanged") void refresh();
+  });
   if (active) unlisten = stop;
   else stop();
 });
-onBeforeUnmount(() => { active = false; unlisten?.(); unlisten = null; });
+onBeforeUnmount(() => {
+  active = false;
+  unlisten?.();
+  unlisten = null;
+});
 </script>
 
 <template>
@@ -108,16 +190,60 @@ onBeforeUnmount(() => { active = false; unlisten?.(); unlisten = null; });
       <h3>触发器 ({{ items.length }})</h3>
       <el-button size="small" :loading="loading" @click="refresh">刷新</el-button>
     </header>
-    <p v-if="error" class="error">{{ error }}</p>
+    <p v-if="error" class="error" role="alert">{{ error }}</p>
     <el-form inline size="small" class="add-form" @submit.prevent="add">
-      <el-form-item label="正则">
-        <el-input v-model="newPattern" placeholder="^\\$" style="width: 120px" />
+      <el-form-item label="名称">
+        <el-input
+          v-model="newName"
+          placeholder="触发器名称"
+          style="width: 130px"
+          data-test="trigger-name"
+        />
       </el-form-item>
-      <el-form-item label="动作(发送文本)">
-        <el-input v-model="newText" placeholder="clear" style="width: 140px" />
+      <el-form-item label="匹配">
+        <el-select v-model="newCondition" style="width: 110px" data-test="trigger-condition">
+          <el-option label="正则" value="regex" />
+          <el-option label="包含文本" value="exact" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="条件">
+        <el-input
+          v-model="newPattern"
+          :placeholder="newCondition === 'regex' ? '^\\$' : '登录成功'"
+          style="width: 140px"
+          data-test="trigger-pattern"
+        />
+      </el-form-item>
+      <el-form-item label="动作">
+        <el-select v-model="newAction" style="width: 130px" data-test="trigger-action">
+          <el-option label="发送文本" value="send" />
+          <el-option label="显示通知" value="notify" />
+          <el-option label="断开连接" value="disconnect" />
+          <el-option label="记录到文件" value="log" />
+        </el-select>
+      </el-form-item>
+      <el-form-item
+        v-if="newAction === 'send' || newAction === 'notify'"
+        label="内容"
+      >
+        <el-input
+          v-model="newText"
+          :placeholder="newAction === 'notify' ? '登录成功' : 'clear'"
+          style="width: 160px"
+          data-test="trigger-text"
+        />
+      </el-form-item>
+      <el-form-item v-if="newAction === 'log'" label="日志文件">
+        <el-input
+          v-model="newLogPath"
+          placeholder="绝对路径"
+          style="width: 220px"
+          data-test="trigger-log-path"
+        />
+        <el-button size="small" @click="pickLogFile">选择…</el-button>
       </el-form-item>
       <el-form-item>
-        <el-button type="primary" native-type="submit">添加</el-button>
+        <el-button type="primary" native-type="submit" data-test="trigger-add">添加</el-button>
       </el-form-item>
     </el-form>
     <el-table :data="items" stripe size="small" empty-text="暂无触发器">
@@ -154,5 +280,9 @@ h3 {
 }
 .add-form {
   margin-bottom: 12px;
+}
+.error {
+  color: var(--el-color-danger);
+  font-size: 12px;
 }
 </style>

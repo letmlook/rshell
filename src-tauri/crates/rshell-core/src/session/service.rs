@@ -164,6 +164,57 @@ fn repository_error(error: SessionRepositoryError) -> CoreError {
     }
 }
 
+/// 在**复用**的 SFTP 会话上执行一次远端操作
+///
+/// 浏览目录是高频操作：每次新开通道 = 一次 SSH 通道开启 + 一次版本握手，
+/// 服务端还要为每条通道 fork 一个 sftp 进程。复用一条通道把这些开销摊掉。
+///
+/// `retry_on_error`：
+/// - `true`（只读操作：列目录 / 取 home / 取元信息）——失败时丢弃缓存的会话、
+///   重开一条再试一次。缓存的会话可能已被服务端关掉，不重试就会变成永久失败。
+/// - `false`（写操作：建目录 / 删文件）——**不重试**：删除可能已在服务端生效
+///   只是响应丢了，重试会报「文件不存在」这种假失败。写操作失败时同样丢弃
+///   缓存，让下一次操作拿到新会话。
+async fn with_sftp<T, F, Fut>(
+    client: &SshClientHandle,
+    retry_on_error: bool,
+    op: F,
+) -> Result<T, CoreError>
+where
+    F: Fn(Arc<SftpClient>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, rshell_protocol::ProtocolError>>,
+{
+    // 建会话（开通道 + 版本握手）时短暂持有 SshClient 的读锁；拿到
+    // `Arc<SftpClient>` 后立刻放锁 —— 真正的 SFTP I/O 不在锁里，
+    // 否则列一个慢目录会把同会话的 resize 一起堵住。
+    let sftp = {
+        let ssh = client.read().await;
+        ssh.sftp_session().await
+    }
+    .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+    match op(sftp).await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            // 缓存的会话可能已被服务端关掉：丢弃它，下次重新开
+            {
+                let ssh = client.read().await;
+                ssh.invalidate_sftp().await;
+            }
+            if !retry_on_error {
+                return Err(CoreError::ServiceError(error.to_string()));
+            }
+            let sftp = {
+                let ssh = client.read().await;
+                ssh.sftp_session().await
+            }
+            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+            op(sftp)
+                .await
+                .map_err(|e| CoreError::ServiceError(e.to_string()))
+        }
+    }
+}
+
 /// Destructive SFTP operations accept only an absolute, unambiguous non-root path.
 pub(crate) fn validate_remote_mutation_path(path: &str) -> Result<(), CoreError> {
     if !path.starts_with('/')
@@ -652,9 +703,6 @@ impl SessionService {
                             host: config.host.clone(),
                             port: config.port,
                             state: ConnectionState::Connected,
-                            bytes_sent: 0,
-                            bytes_received: 0,
-                            latency_ms: None,
                         });
                     }
                 }
@@ -669,9 +717,6 @@ impl SessionService {
                             host: config.host.clone(),
                             port: config.port,
                             state: ConnectionState::Connected,
-                            bytes_sent: 0,
-                            bytes_received: 0,
-                            latency_ms: None,
                         }),
                     });
                 drop(publication);
@@ -830,9 +875,6 @@ impl SessionService {
             host: config.host.clone(),
             port: config.port,
             state: ConnectionState::Connected,
-            bytes_sent: 0,
-            bytes_received: 0,
-            latency_ms: None,
         };
         let (tx, mut rx) = mpsc::channel::<ProtocolRequest>(32);
         let publication = self.lifecycle.lock().await;
@@ -1387,21 +1429,12 @@ impl SessionService {
         path: &str,
     ) -> Result<Vec<RemoteFileEntry>, CoreError> {
         let client = self.get_ssh_client(session_id).await?;
-        let ssh = client.read().await;
-
-        let channel = ssh
-            .open_sftp_channel()
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-
-        let sftp = SftpClient::new(channel)
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-
-        let entries = sftp
-            .list_dir(path)
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
+        let entries = with_sftp(
+            &client,
+            true,
+            |sftp| async move { sftp.list_dir(path).await },
+        )
+        .await?;
 
         // 切片 2.2：RemoteDirListed 事件已删除 —— 数据通过 CommandOutcome::RemoteDir
         // 由 BrowseRemoteDir 薄壳直接返回（设计 §3.3）。
@@ -1411,17 +1444,7 @@ impl SessionService {
     /// 远端用户的工作目录（登录后默认所在目录）
     pub async fn remote_home_dir(&self, session_id: Uuid) -> Result<String, CoreError> {
         let client = self.get_ssh_client(session_id).await?;
-        let ssh = client.read().await;
-        let channel = ssh
-            .open_sftp_channel()
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        let sftp = SftpClient::new(channel)
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        sftp.home_dir()
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))
+        with_sftp(&client, true, |sftp| async move { sftp.home_dir().await }).await
     }
 
     pub async fn create_remote_directory(
@@ -1431,48 +1454,49 @@ impl SessionService {
     ) -> Result<(), CoreError> {
         validate_remote_mutation_path(path)?;
         let client = self.get_ssh_client(session_id).await?;
-        let ssh = client.read().await;
-        let channel = ssh
-            .open_sftp_channel()
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        let sftp = SftpClient::new(channel)
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        sftp.create_dir(path)
-            .await
-            .map_err(|e| CoreError::ServiceError(e.to_string()))
+        // 写操作不重试：建目录可能已生效，重试会报「已存在」这种假失败
+        with_sftp(
+            &client,
+            false,
+            |sftp| async move { sftp.create_dir(path).await },
+        )
+        .await
     }
 
     pub async fn delete_remote_entry(&self, session_id: Uuid, path: &str) -> Result<(), CoreError> {
         validate_remote_mutation_path(path)?;
         let client = self.get_ssh_client(session_id).await?;
-        let ssh = client.read().await;
-        let channel = ssh
-            .open_sftp_channel()
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        let sftp = SftpClient::new(channel)
-            .await
-            .map_err(|e| CoreError::ConnectionError(e.to_string()))?;
-        let entry = sftp
-            .metadata(path)
-            .await
-            .map_err(|e| CoreError::ServiceError(e.to_string()))?;
+        // 元信息是只读的，可以重试；删除本身不重试（可能已生效）
+        let entry = with_sftp(
+            &client,
+            true,
+            |sftp| async move { sftp.metadata(path).await },
+        )
+        .await?;
         if entry.file_type != FileType::File {
             return Err(CoreError::InvalidState(
                 "Only regular remote files can be deleted".into(),
             ));
         }
-        sftp.remove_file(path)
-            .await
-            .map_err(|e| CoreError::ServiceError(e.to_string()))
+        with_sftp(&client, false, |sftp| async move {
+            sftp.remove_file(path).await
+        })
+        .await
     }
 
     /// 列出所有会话
     pub async fn list_sessions(&self) -> Result<Vec<SessionConfig>, CoreError> {
         let sessions = self.sessions.read().await;
         Ok(sessions.values().map(|s| s.config.clone()).collect())
+    }
+
+    /// 取单条连接的配置
+    pub async fn get_session_config(&self, id: Uuid) -> Result<SessionConfig, CoreError> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(&id)
+            .map(|state| state.config.clone())
+            .ok_or_else(|| CoreError::NotFound(format!("Session {id} not found")))
     }
 }
 
@@ -2012,6 +2036,10 @@ mod tests {
             )),
             master_password: Arc::new(crate::security::master_password::MasterPassword::new(
                 bus.clone(),
+            )),
+            folder_service: Arc::new(crate::session::folder_service::FolderService::with_path(
+                bus.clone(),
+                path.join("folders.json"),
             )),
             tunnel_manager: Arc::new(crate::security::tunnel_manager::TunnelManager::new(
                 bus.clone(),

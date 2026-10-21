@@ -26,7 +26,7 @@ const props = defineProps<{
   /** 远程必填；本地忽略 */
   sessionId?: Uuid;
   path: string;
-  /** 本地模式已授权的根目录：树以它为根，且输入不得越界 */
+  /** 本地模式的根目录（传输工作区里用户选定的本地目录）：树以它为根，输入不得越界 */
   rootPath?: string;
 }>();
 
@@ -124,7 +124,8 @@ function touch() {
 function describeListError(e: unknown, path: string): string {
   const raw = String(e);
   if (/forbidden path|not allowed on the scope|scope/i.test(raw)) {
-    return `无权读取 ${path}：该目录尚未授权。`;
+    // 全局读写已是既定能力，scope 不是失败原因——见 FileBrowserPane 的同名说明
+    return `无权读取 ${path}：系统拒绝了该目录的访问（路径可能已失效，或当前账户没有读权限）。`;
   }
   if (/请先连接/.test(raw)) return raw;
   return `${path}：${raw}`;
@@ -343,13 +344,13 @@ function commitEdit() {
     inputError.value = "请输入绝对路径（如 /var/log 或 D:\\data）";
     return;
   }
-  // 本地只允许在已授权根目录内导航：越界直接说明原因，不静默丢弃输入。
+  // 本地只允许在当前本地目录内导航：越界直接说明原因，不静默丢弃输入。
   // 判定用共享的 isWithinRoot（词法消解 `.` / `..` 后逐段比较），
   // 与 FileBrowserPane.navigateTo 同一份实现，两个入口不会对 `..` 或
   // Windows 根给出相反结论。
   if (props.mode === "local" && props.rootPath) {
     if (!isWithinRoot(target, props.rootPath)) {
-      inputError.value = `路径超出已授权的根目录 ${props.rootPath}`;
+      inputError.value = `路径超出当前本地目录 ${props.rootPath}`;
       return;
     }
   }

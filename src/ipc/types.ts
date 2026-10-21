@@ -104,15 +104,6 @@ export interface ConnectionInfo {
   host: string;
   port: number;
   state: ConnectionState;
-  bytes_sent: number;
-  bytes_received: number;
-  latency_ms: number | null;
-}
-
-export interface SessionInfo {
-  id: Uuid;
-  config: SessionConfig;
-  state: ConnectionState;
 }
 
 export interface SessionLoadIssue {
@@ -202,26 +193,15 @@ export interface PendingTunnelInfo {
 
 export type TunnelState = "Active" | "Suspended" | { Error: string };
 
-// ===== 终端相关 =====
-
-export interface TerminalConfig {
-  terminal_type: string;
-  encoding: string;
-  scrollback_lines: number;
-  auto_wrap: boolean;
-  cursor_style: CursorStyle;
-  cursor_blink: boolean;
-}
-
-export type CursorStyle = "Block" | "Underline" | "Bar";
-
 // 切片 2.2 删除：TerminalBufferSnapshot / CellView / CellFlag —
 // 设计 §2.2 alacritty 缓冲净删除,xterm.js 自渲染,前端不再需要快照与单元格结构。
 
-export interface SearchMatch {
-  row: number;
-  col: number;
-  length: number;
+// ===== 连接分组相关 =====
+
+/** 连接分组（文件夹）：SessionConfig.folder_id 指向的实体 */
+export interface Folder {
+  id: Uuid;
+  name: string;
 }
 
 // ===== 快速命令相关 =====
@@ -370,12 +350,6 @@ export interface SerialConfig {
 export type SerialParity = "None" | "Even" | "Odd";
 export type SerialFlowControl = "None" | "Software" | "Hardware";
 
-export interface TelnetConfig {
-  host: string;
-  port: number;
-  terminal_type: string;
-}
-
 // ===== 插件 =====
 
 export interface PluginInfo {
@@ -388,6 +362,8 @@ export interface PluginInfo {
   state: PluginState;
   extensions: string[];
   permissions: string[];
+  /** 扫描/加载失败的原因；正常插件为 null */
+  error?: string | null;
 }
 
 export type PluginType = "Builtin" | "Wasm" | "DynamicLib";
@@ -430,6 +406,13 @@ export type AppCommand =
   | { CloseTunnel: { tunnel_id: Uuid } }
   | { ListPendingTunnels: null }
   | { RestoreTunnel: { session_id: Uuid; rule: PortForwardRule } }
+  // 串口
+  | { ListSerialPorts: null }
+  // 连接分组
+  | { ListFolders: null }
+  | { CreateFolder: { name: string } }
+  | { RenameFolder: { folder_id: Uuid; name: string } }
+  | { DeleteFolder: { folder_id: Uuid } }
   // 快速命令
   | { ExecuteQuickCommand: { command_id: Uuid; target_sessions: Uuid[] } }
   | { CreateQuickCommand: { command: QuickCommand } }
@@ -439,11 +422,19 @@ export type AppCommand =
   | { DeleteTrigger: { trigger_id: Uuid } }
   | { ToggleTrigger: { trigger_id: Uuid } }
   // 撰写窗格
-  | { SendComposeText: { content: string; target: ComposeTarget } }
+  | {
+      SendComposeText: {
+        content: string;
+        target: ComposeTarget;
+        /** ComposeTarget.CurrentSession 解析用的当前会话 id；缺省则该目标不可用 */
+        active_session_id?: string | null;
+      };
+    }
   // 脚本
   | { ExecuteScript: { code: string; session_id: Uuid } }
   // 同步输入
   | { ToggleSyncInput: { session_ids: Uuid[] } }
+  | { GetSyncInputSessions: null }
   // 密钥管理
   | { GenerateSshKey: { name: string; key_type: SshKeyType; passphrase: string | null } }
   | { ImportPrivateKey: { path: PathBuf; passphrase: string | null } }
@@ -453,6 +444,9 @@ export type AppCommand =
   | { SetupMasterPassword: { password: string } }
   | { VerifyMasterPassword: { password: string } }
   | { ChangeMasterPassword: { old_password: string; new_password: string } }
+  | { DisableMasterPassword: { password: string } }
+  | { LockMasterPassword: null }
+  | { GetMasterPasswordState: null }
   // 主机密钥
   | {
       TrustHostKey: {
@@ -466,6 +460,7 @@ export type AppCommand =
   | { DecideHostKey: { decision_id: Uuid; accept: boolean; permanent: boolean } }
   | { CancelHostKey: { decision_id: Uuid } }
   | { DeleteHostKey: { host: string; port: number } }
+  | { ListHostKeys: null }
   // 隧道
   | { SuspendTunnel: { tunnel_id: Uuid } }
   | { ResumeTunnel: { tunnel_id: Uuid } }
@@ -509,6 +504,7 @@ export type AppEvent =
   // 会话
   | "SessionListChanged"
   | { SessionUpdated: { session_id: Uuid } }
+  | "FolderListChanged"
   // 传输
   | {
       TransferProgress: {
@@ -557,6 +553,7 @@ export type AppEvent =
   | { TriggerActionFailed: { trigger_id: Uuid; session_id: Uuid; error: string } }
   | { ScriptFinished: { session_id: Uuid; result: ScriptResult } }
   | { SyncInputSessionsChanged: { session_ids: Uuid[] } }
+  | { SyncInputSendFailed: { session_id: Uuid; error: string } }
   // 撰写窗格：部分目标会话发送失败（全部失败时 invoke 直接报错，不发此事件）
   | { ComposeSendFailed: { session_id: Uuid; error: string } }
   // 密钥

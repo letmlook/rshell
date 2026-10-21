@@ -69,7 +69,11 @@ export const useThemeStore = defineStore("theme", () => {
     if (unlisten) return;
     const generation = ++subscriptionGeneration;
     const stop = await subscribeAppEvents((event) => {
-      if (typeof event === "string") return;
+      if (typeof event === "string") {
+        // 无负载事件是字符串：导入/卸载方案后方案列表变了，重新拉一次
+        if (event === "ColorSchemeListChanged") void refresh();
+        return;
+      }
       if ("ThemeChanged" in event) {
         currentTheme.value = event.ThemeChanged.theme.name;
         applyColors(event.ThemeChanged.theme.colors);

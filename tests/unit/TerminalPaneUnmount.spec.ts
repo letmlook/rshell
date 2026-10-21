@@ -60,6 +60,10 @@ vi.mock("@xterm/addon-search", () => ({
     findPrevious() {
       return false;
     }
+    // 终端用它显示匹配计数
+    onDidChangeResults() {
+      return { dispose() {} };
+    }
   },
 }));
 vi.mock("@xterm/addon-webgl", () => ({ WebglAddon: class { onContextLoss() {} } }));

@@ -1,7 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
+import { computed, defineComponent, h, inject, provide, ref, type Ref } from "vue";
 import TunnelPanel from "../../src/components/TunnelPanel.vue";
-import { listTunnels, listPendingTunnels, createTunnel } from "../../src/ipc/client";
+import {
+  listTunnels,
+  listPendingTunnels,
+  createTunnel,
+  suspendTunnel,
+  resumeTunnel,
+  restoreTunnel,
+} from "../../src/ipc/client";
 import type { ActiveTunnelInfo, AppEvent } from "../../src/ipc/types";
 
 const { subscribeAppEventsMock, handlers: eventHandlers } = vi.hoisted(() => {
@@ -26,6 +34,24 @@ vi.mock("../../src/ipc/client", () => ({
   listPendingTunnels: vi.fn().mockResolvedValue({ rules: [], unsupported: [] }),
   createTunnel: vi.fn(),
   closeTunnel: vi.fn(),
+  suspendTunnel: vi.fn(),
+  resumeTunnel: vi.fn(),
+  restoreTunnel: vi.fn(),
+}));
+
+// 面板的「连接」下拉来自会话 store：这里用假 store 顶掉，
+// 避免测试去依赖真实的 Pinia 安装与会话列表 IPC。
+vi.mock("../../src/stores/sessions", () => ({
+  useSessionsStore: () => ({
+    items: [
+      { id: "session-1", name: "alpha", host: "10.0.0.1", port: 22 },
+      { id: "session-2", name: "beta", host: "10.0.0.2", port: 22 },
+    ],
+    currentId: "session-1",
+    current: null,
+    connectionState: new Map(),
+    refresh: vi.fn().mockResolvedValue(undefined),
+  }),
 }));
 vi.mock("../../src/ipc/events", () => ({ subscribeAppEvents: subscribeAppEventsMock }));
 
@@ -53,15 +79,37 @@ describe("TunnelPanel", () => {
       props: ["label", "value"],
       template: '<option :value="value">{{ label }}</option>',
     },
-    "el-select": { template: "<select><slot /></select>" },
+    "el-select": {
+      props: ["modelValue"],
+      emits: ["update:modelValue"],
+      template:
+        '<select :value="modelValue" @change="$emit(\'update:modelValue\', $event.target.value)"><slot /></select>',
+    },
     "el-form-item": shell,
     "el-form": shell,
     "el-input": { template: "<input />" },
     "el-empty": { template: "<div />" },
-    // FileBrowserPane.spec.ts 同款：列桩不渲染 #default（避免无 row 上下文的
-    // 渲染错误），行数据由 el-table 桩序列化进文本供断言状态列内容
-    "el-table-column": { template: "<div />" },
-    "el-table": { props: ["data"], template: "<div data-testid='rows'>{{ JSON.stringify(data) }}<slot /></div>" },
+    // 行内的操作按钮必须真的渲染出来，否则「挂起/恢复」这类入口无法测试。
+    // el-table 把行数据 provide 给列桩，列桩按行渲染 #default({ row })。
+    "el-table-column": defineComponent({
+      name: "el-table-column",
+      setup(_props, { slots }) {
+        const rows = inject<Ref<unknown[]>>("rs-rows", ref([]));
+        return () => h("div", rows.value.map((row) => slots.default?.({ row })));
+      },
+    }),
+    "el-table": defineComponent({
+      name: "el-table",
+      props: ["data"],
+      setup(props, { slots }) {
+        provide("rs-rows", computed(() => (props.data ?? []) as unknown[]));
+        return () =>
+          h("div", { "data-testid": "rows" }, [
+            h("pre", JSON.stringify(props.data)),
+            slots.default?.(),
+          ]);
+      },
+    }),
   };
 
   beforeEach(() => {
@@ -72,8 +120,23 @@ describe("TunnelPanel", () => {
 
   it("offers only forwarding modes backed by SSH", () => {
     const wrapper = mount(TunnelPanel, { global: { stubs } });
-    const choices = wrapper.findAll("option").map((option) => option.attributes("value"));
+    const choices = wrapper
+      .get('[data-test="tunnel-type"]')
+      .findAll("option")
+      .map((option) => option.attributes("value"));
     expect(choices).toEqual(["Local", "Dynamic"]);
+    wrapper.unmount();
+  });
+
+  // 连接选择器此前是裸 uuid 输入框：用户得自己抄 id。
+  // 现在是从连接列表里选，选项与真实连接一一对应。
+  it("picks the session from the connection list instead of a raw uuid field", () => {
+    const wrapper = mount(TunnelPanel, { global: { stubs } });
+    const options = wrapper
+      .get('[data-test="tunnel-session"]')
+      .findAll("option")
+      .map((option) => option.attributes("value"));
+    expect(options).toEqual(["session-1", "session-2"]);
     wrapper.unmount();
   });
 
@@ -113,6 +176,86 @@ describe("TunnelPanel", () => {
     expect(eventHandlers.length).toBe(0);
   });
 
+  // 挂起/恢复此前没有界面入口：后端 R3-02 把「假挂起」修成了真实现，
+  // 但界面只有「关闭」，用户根本够不到这两个能力。
+  it("suspends an active tunnel", async () => {
+    vi.mocked(listTunnels).mockResolvedValue([activeTunnel]);
+    const wrapper = mount(TunnelPanel, { global: { stubs } });
+    await flushPromises();
+
+    const suspend = wrapper.findAll('[data-test="tunnel-suspend"]').find(
+      (button) => button.attributes("disabled") === undefined,
+    );
+    expect(suspend, "运行中的隧道必须可以挂起").toBeDefined();
+    await suspend!.trigger("click");
+    await flushPromises();
+
+    expect(suspendTunnel).toHaveBeenCalledWith("tunnel-1");
+    wrapper.unmount();
+  });
+
+  it("resumes a suspended tunnel and only offers resume in that state", async () => {
+    vi.mocked(listTunnels).mockResolvedValue([
+      { ...activeTunnel, state: "Suspended" as const },
+    ]);
+    const wrapper = mount(TunnelPanel, { global: { stubs } });
+    await flushPromises();
+
+    const resume = wrapper.findAll('[data-test="tunnel-resume"]').find(
+      (button) => button.attributes("disabled") === undefined,
+    );
+    expect(resume, "挂起的隧道必须可以恢复").toBeDefined();
+    await resume!.trigger("click");
+    await flushPromises();
+
+    expect(resumeTunnel).toHaveBeenCalledWith("tunnel-1");
+    wrapper.unmount();
+  });
+
+  it("shows the error reason of a broken tunnel instead of a bare variant name", async () => {
+    vi.mocked(listTunnels).mockResolvedValue([
+      { ...activeTunnel, state: { Error: "session disconnected" } },
+    ]);
+    const wrapper = mount(TunnelPanel, { global: { stubs } });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("session disconnected");
+    wrapper.unmount();
+  });
+
+  // 重启后不自动抢占端口：可恢复的规则被记在 tunnels.toml 里。
+  // 此前界面只显示被跳过的旧规则，可恢复的规则从不显示 —— 用户没有任何入口。
+  it("lists restorable pending rules and restores one on request", async () => {
+    vi.mocked(listPendingTunnels).mockResolvedValue({
+      rules: [
+        [
+          "session-1",
+          {
+            bind_address: "127.0.0.1",
+            bind_port: 8080,
+            remote_host: "localhost",
+            remote_port: 80,
+            direction: "Local",
+            allow_non_loopback: false,
+          },
+        ],
+      ],
+      unsupported: [],
+    });
+    const wrapper = mount(TunnelPanel, { global: { stubs } });
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="tunnel-pending"]').text()).toContain("127.0.0.1:8080");
+    await wrapper.get('[data-test="tunnel-restore"]').trigger("click");
+    await flushPromises();
+
+    expect(restoreTunnel).toHaveBeenCalledWith(
+      "session-1",
+      expect.objectContaining({ bind_port: 8080 }),
+    );
+    wrapper.unmount();
+  });
+
   it("also refreshes on TunnelStateChanged and releases the subscription on unmount", async () => {
     vi.mocked(listTunnels).mockResolvedValue([activeTunnel]);
     const wrapper = mount(TunnelPanel, { global: { stubs } });
@@ -148,7 +291,12 @@ describe("TunnelPanel 监听地址校验", () => {
       emits: ["update:modelValue"],
       template: '<input :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" />',
     },
-    "el-select": { template: "<select><slot /></select>" },
+    "el-select": {
+      props: ["modelValue"],
+      emits: ["update:modelValue"],
+      template:
+        '<select :value="modelValue" @change="$emit(\'update:modelValue\', $event.target.value)"><slot /></select>',
+    },
     "el-option": { props: ["label", "value"], template: '<option :value="value">{{ label }}</option>' },
     "el-button": { template: "<button><slot /></button>" },
     "el-empty": { template: "<div />" },
@@ -166,8 +314,8 @@ describe("TunnelPanel 监听地址校验", () => {
   async function submitBind(bind: string) {
     const wrapper = mount(TunnelPanel, { global: { stubs } });
     await flushPromises();
-    // 会话 ID 也要有，否则 add() 会先因「请先在主视图选择会话」返回
-    await wrapper.get('[data-test="item-会话 ID"]').get("input").setValue("session-1");
+    // 连接也要有，否则 add() 会先因「请先在主视图选择会话」返回
+    await wrapper.get('[data-test="tunnel-session"]').setValue("session-1");
     await wrapper.get('[data-test="item-监听"]').get("input").setValue(bind);
     await wrapper.get("form").trigger("submit");
     await flushPromises();

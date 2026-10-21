@@ -36,7 +36,8 @@ import { ipcErrorMessage, closeTerminal, openTerminal, sendInput, resizeTerminal
 import type { Uuid } from "../ipc/types";
 import { useThemeStore } from "../stores/theme";
 import { useSessionsStore } from "../stores/sessions";
-import { copyOnSelect } from "../utils/terminalPrefs";
+import { copyOnSelect, terminalAppearance } from "../utils/terminalPrefs";
+import { matchAppShortcut } from "../utils/shortcuts";
 
 const themeStore = useThemeStore();
 const sessionsStore = useSessionsStore();
@@ -61,6 +62,11 @@ const props = withDefaults(
 const containerRef = ref<HTMLDivElement | null>(null);
 const searchBarVisible = ref(false);
 const searchTerm = ref("");
+/** 匹配计数：当前第几个 / 共几个（-1 = 超过阈值无法定位） */
+const searchIndex = ref(-1);
+const searchCount = ref(0);
+/** 区分大小写 */
+const searchCaseSensitive = ref(false);
 /** attach_terminal 失败信息；非空时面板内渲染错误状态条（PROB-13，不再空白终端） */
 const attachError = ref<string | null>(null);
 let term: Terminal | null = null;
@@ -298,19 +304,21 @@ function onTerminalTheme(event: Event) {
 
 function findNext() {
   if (search && searchTerm.value) {
-    search.findNext(searchTerm.value);
+    search.findNext(searchTerm.value, { caseSensitive: searchCaseSensitive.value });
   }
 }
 
 function findPrev() {
   if (search && searchTerm.value) {
-    search.findPrevious(searchTerm.value);
+    search.findPrevious(searchTerm.value, { caseSensitive: searchCaseSensitive.value });
   }
 }
 
 function closeSearch() {
   searchBarVisible.value = false;
   if (search) search.clearDecorations();
+  searchIndex.value = -1;
+  searchCount.value = 0;
 }
 
 /**
@@ -473,14 +481,30 @@ async function retryAttach() {
   }
 }
 
+// 外观偏好（字号/字体/光标/回滚行数）改了要**立即**作用到已打开的终端，
+// 不必关掉重开：xterm 的这几项都能在运行时改。
+watch(
+  terminalAppearance,
+  (appearance) => {
+    if (!term) return;
+    term.options.fontFamily = appearance.fontFamily;
+    term.options.fontSize = appearance.fontSize;
+    term.options.cursorStyle = appearance.cursorStyle;
+    term.options.cursorBlink = appearance.cursorBlink;
+    term.options.scrollback = appearance.scrollback;
+  },
+);
+
 onMounted(async () => {
   if (!containerRef.value) return;
 
+  const appearance = terminalAppearance.value;
   term = new Terminal({
-    fontFamily: 'JetBrains Mono, Menlo, Consolas, "DejaVu Sans Mono", monospace',
-    fontSize: 13,
-    cursorBlink: true,
-    scrollback: 10000,
+    fontFamily: appearance.fontFamily,
+    fontSize: appearance.fontSize,
+    cursorStyle: appearance.cursorStyle,
+    cursorBlink: appearance.cursorBlink,
+    scrollback: appearance.scrollback,
     theme: themeStore.terminalTheme ?? readXtermThemeFromCssVars(),
   });
   // 未连接时先禁输入，等真实 connected 事件再放开
@@ -492,6 +516,10 @@ onMounted(async () => {
   // Ctrl+Backspace 保留 xterm 默认的 \x7f（部分 shell 用它删除前一个词）。
   term.attachCustomKeyEventHandler((event) => {
     if (event.type !== "keydown") return true;
+    // 应用接管的快捷键不送给远端 shell：否则「Ctrl+F 打开查找」的同时
+    // 还会往 shell 里塞一个 0x06（readline 的 forward-char）。
+    // 事件仍会冒泡到 window，App.vue 那边照常处理。
+    if (matchAppShortcut(event)) return false;
     if (event.key !== "Backspace" || event.ctrlKey || event.metaKey || event.altKey) {
       return true;
     }
@@ -509,6 +537,11 @@ onMounted(async () => {
   // 搜索 addon(切片 2.4)：findNext/findPrevious 在搜索栏 UI 触发
   search = new SearchAddon();
   term.loadAddon(search);
+  // 匹配计数：没有它用户不知道「有没有命中」与「当前在第几个」
+  search.onDidChangeResults((event) => {
+    searchIndex.value = event.resultIndex;
+    searchCount.value = event.resultCount;
+  });
 
   // WebGL addon + onContextLoss 兜底（设计 §9 #3）
   try {
@@ -706,6 +739,20 @@ onBeforeUnmount(() => {
         <el-button @click="findPrev">上</el-button>
         <el-button @click="findNext">下</el-button>
       </el-button-group>
+      <span class="search-count" data-test="term-search-count">
+        <template v-if="!searchTerm">—</template>
+        <template v-else-if="searchCount === 0">无匹配</template>
+        <template v-else-if="searchIndex < 0">{{ searchCount }}+</template>
+        <template v-else>{{ searchIndex + 1 }}/{{ searchCount }}</template>
+      </span>
+      <el-tooltip content="区分大小写" placement="top">
+        <el-switch
+          v-model="searchCaseSensitive"
+          size="small"
+          data-test="term-search-case"
+          aria-label="区分大小写"
+        />
+      </el-tooltip>
       <el-button size="small" @click="closeSearch">关闭</el-button>
     </div>
 
@@ -779,6 +826,12 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
+.search-count {
+  min-width: 52px;
+  font-size: 11px;
+  color: var(--rs-fg-muted);
+  text-align: center;
+}
 .search-bar {
   position: absolute;
   top: 36px;

@@ -46,6 +46,8 @@ pub enum AppEvent {
     SessionListChanged,
     /// 指定会话更新
     SessionUpdated { session_id: Uuid },
+    /// 连接分组列表改变（前端需重新拉取）
+    FolderListChanged,
 
     // ===== 传输进度 =====
     /// 传输进度更新
@@ -120,6 +122,11 @@ pub enum AppEvent {
     },
     /// 同步输入会话列表变化
     SyncInputSessionsChanged { session_ids: Vec<Uuid> },
+    /// 同步输入向某个目标会话发送失败
+    ///
+    /// 源会话的输入已成功送达；这里只报告**其它**目标会话的失败，
+    /// 让用户知道同步不是全量成功，而不是静默吞掉。
+    SyncInputSendFailed { session_id: Uuid, error: String },
     /// 撰写窗格发送到某个目标会话失败
     ///
     /// 仅在部分失败（invoke 本身成功）时逐个发布，供 UI 弹出可见失败提示；

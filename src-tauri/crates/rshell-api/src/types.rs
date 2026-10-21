@@ -93,9 +93,6 @@ pub struct ConnectionInfo {
     pub host: String,
     pub port: u16,
     pub state: ConnectionState,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub latency_ms: Option<u64>,
 }
 
 // ===== 文件传输相关 =====
@@ -260,52 +257,18 @@ pub enum TunnelState {
     Error(String),
 }
 
-// ===== 终端相关 =====
+// ===== 连接分组 =====
 
-/// 终端配置
+/// 连接分组（文件夹）
+///
+/// `SessionConfig::folder_id` 指向这个实体。此前它只是个悬空的
+/// `Option<Uuid>`：没有任何地方创建分组，界面上的分组树因此永远只有一个
+/// 「默认」组。分组是可复用的连接配方的一部分（见 docs/08 的术语定义），
+/// 所以这里给出真正的实体与存储。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TerminalConfig {
-    /// 终端类型（xterm-256color, vt100 等）
-    pub terminal_type: String,
-    /// 编码（UTF-8, GBK 等）
-    pub encoding: String,
-    /// 回滚行数
-    pub scrollback_lines: u32,
-    /// 自动换行
-    pub auto_wrap: bool,
-    /// 光标样式
-    pub cursor_style: CursorStyle,
-    /// 光标闪烁
-    pub cursor_blink: bool,
-}
-
-impl Default for TerminalConfig {
-    fn default() -> Self {
-        Self {
-            terminal_type: "xterm-256color".to_string(),
-            encoding: "UTF-8".to_string(),
-            scrollback_lines: 10000,
-            auto_wrap: true,
-            cursor_style: CursorStyle::Block,
-            cursor_blink: true,
-        }
-    }
-}
-
-/// 光标样式
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum CursorStyle {
-    Block,
-    Underline,
-    Bar,
-}
-
-/// 搜索结果
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchMatch {
-    pub row: usize,
-    pub col: usize,
-    pub length: usize,
+pub struct Folder {
+    pub id: Uuid,
+    pub name: String,
 }
 
 // ===== 快速命令相关 =====
@@ -579,14 +542,6 @@ pub enum SerialFlowControl {
     Hardware,
 }
 
-/// Telnet 配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TelnetConfig {
-    pub host: String,
-    pub port: u16,
-    pub terminal_type: String,
-}
-
 // ===== 插件系统 =====
 
 /// 插件信息
@@ -601,6 +556,12 @@ pub struct PluginInfo {
     pub state: PluginState,
     pub extensions: Vec<String>,
     pub permissions: Vec<String>,
+    /// 扫描/加载失败的原因；正常插件为 None。
+    ///
+    /// 扫描时被拒的插件目录（清单解析失败、目录名与清单 name 不一致）会以
+    /// `state = Error` 的条目出现在列表里，原因写在这里——用户扫描后不能只看到
+    /// 「没有插件」。
+    pub error: Option<String>,
 }
 
 /// 插件类型
@@ -622,14 +583,6 @@ pub enum PluginState {
 }
 
 // ===== 会话信息 =====
-
-/// 会话信息（会话列表中使用）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionInfo {
-    pub id: Uuid,
-    pub config: SessionConfig,
-    pub state: ConnectionState,
-}
 
 /// 传输方向（API 层）
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -41,6 +41,12 @@ pub struct PluginLoader {
     discovered: Arc<RwLock<HashMap<String, PluginManifest>>>,
     /// 已加载的插件
     loaded: Arc<RwLock<HashMap<String, LoadedPlugin>>>,
+    /// 扫描时被拒绝的插件目录 → 原因
+    ///
+    /// 清单解析失败或「目录名 ≠ 清单 name」的插件此前只记一条 warn 日志就跳过，
+    /// 用户扫描插件只看到「没有插件」，完全不知道自己的目录被拒了。这里记下来
+    /// 交给界面如实展示。
+    scan_issues: Arc<RwLock<HashMap<String, String>>>,
     sandbox: Arc<WasmSandbox>,
 }
 
@@ -50,6 +56,7 @@ impl PluginLoader {
         Self {
             plugins_dir,
             discovered: Arc::new(RwLock::new(HashMap::new())),
+            scan_issues: Arc::new(RwLock::new(HashMap::new())),
             loaded: Arc::new(RwLock::new(HashMap::new())),
             sandbox: Arc::new(
                 WasmSandbox::new(SandboxConfig::default())
@@ -69,6 +76,7 @@ impl PluginLoader {
 
         let entries = std::fs::read_dir(&self.plugins_dir)?;
         let mut discovered_now = HashMap::new();
+        let mut issues_now: HashMap<String, String> = HashMap::new();
 
         for entry in entries {
             let entry = entry?;
@@ -82,7 +90,19 @@ impl PluginLoader {
                             if path.file_name().and_then(|name| name.to_str())
                                 != Some(manifest.name.as_str())
                             {
+                                let dir_name = path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("<未命名目录>")
+                                    .to_string();
                                 warn!("Plugin directory and manifest name differ: {:?}", path);
+                                issues_now.insert(
+                                    dir_name.clone(),
+                                    format!(
+                                        "目录名「{dir_name}」与清单里的 name「{}」不一致——清单的 name 必须与目录名相同",
+                                        manifest.name
+                                    ),
+                                );
                                 continue;
                             }
                             info!("Discovered plugin: {} v{}", manifest.name, manifest.version);
@@ -91,6 +111,15 @@ impl PluginLoader {
                         }
                         Err(e) => {
                             warn!("Failed to parse manifest at {:?}: {}", manifest_path, e);
+                            let dir_name = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("<未命名目录>")
+                                .to_string();
+                            issues_now.insert(
+                                dir_name.clone(),
+                                format!("清单 plugin.toml 解析失败：{e}"),
+                            );
                         }
                     }
                 }
@@ -98,6 +127,7 @@ impl PluginLoader {
         }
 
         *self.discovered.write().await = discovered_now;
+        *self.scan_issues.write().await = issues_now;
 
         Ok(manifests)
     }
@@ -230,9 +260,30 @@ impl PluginLoader {
                     state,
                     extensions,
                     permissions,
+                    error: None,
                 }
             })
             .collect();
+        // 被拒的插件目录也要出现在列表里：用户扫描后只看得到「没有插件」，
+        // 完全不知道自己的目录被拒了。状态标成 Error，原因写进 error 字段。
+        {
+            let issues = self.scan_issues.read().await;
+            for (dir_name, reason) in issues.iter() {
+                plugins.push(rshell_api::types::PluginInfo {
+                    id: dir_name.clone(),
+                    name: dir_name.clone(),
+                    version: String::new(),
+                    author: String::new(),
+                    description: String::new(),
+                    plugin_type: rshell_api::types::PluginType::Wasm,
+                    state: rshell_api::types::PluginState::Error,
+                    extensions: Vec::new(),
+                    permissions: Vec::new(),
+                    error: Some(reason.clone()),
+                });
+            }
+        }
+
         plugins.sort_by(|a, b| a.id.cmp(&b.id));
         plugins
     }
@@ -293,6 +344,83 @@ min_rshell_version = "0.1.0"
             loader.list_plugins().await[0].state,
             rshell_api::types::PluginState::Discovered
         );
+    }
+
+    /// 清单解析失败 / 目录名与清单 name 不一致的插件，必须以 Error 状态出现在
+    /// 列表里并带上原因——此前只记一条 warn 日志就跳过，用户扫描插件只看到
+    /// 「没有插件」，完全不知道自己的目录被拒了。
+    #[tokio::test]
+    async fn rejected_plugin_directories_are_reported_with_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1) 清单解析失败
+        let broken = dir.path().join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        std::fs::write(broken.join("plugin.toml"), "this is not valid toml =").unwrap();
+
+        // 2) 目录名与清单 name 不一致
+        let mismatched = dir.path().join("dir-name");
+        std::fs::create_dir(&mismatched).unwrap();
+        std::fs::write(
+            mismatched.join("plugin.toml"),
+            r#"
+name = "other-name"
+version = "1.0.0"
+author = "test"
+description = "mismatched"
+plugin_type = "Wasm"
+extensions = []
+permissions = []
+min_rshell_version = "0.1.0"
+"#,
+        )
+        .unwrap();
+
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader.scan_plugins().await.unwrap();
+
+        let plugins = loader.list_plugins().await;
+        assert_eq!(plugins.len(), 2, "两个被拒的目录都要出现在列表里");
+        for plugin in &plugins {
+            assert_eq!(plugin.state, rshell_api::types::PluginState::Error);
+            let reason = plugin.error.as_deref().expect("必须有失败原因");
+            assert!(!reason.is_empty());
+        }
+        let reasons: Vec<String> = plugins.iter().map(|p| p.error.clone().unwrap()).collect();
+        assert!(
+            reasons.iter().any(|r| r.contains("解析失败")),
+            "{reasons:?}"
+        );
+        assert!(reasons.iter().any(|r| r.contains("不一致")), "{reasons:?}");
+    }
+
+    /// 正常插件不带失败原因。
+    #[tokio::test]
+    async fn healthy_plugin_has_no_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("ok");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.toml"),
+            r#"
+name = "ok"
+version = "1.0.0"
+author = "test"
+description = "fine"
+plugin_type = "Wasm"
+extensions = []
+permissions = []
+min_rshell_version = "0.1.0"
+"#,
+        )
+        .unwrap();
+
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader.scan_plugins().await.unwrap();
+        let plugins = loader.list_plugins().await;
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].state, rshell_api::types::PluginState::Discovered);
+        assert!(plugins[0].error.is_none());
     }
 
     #[tokio::test]

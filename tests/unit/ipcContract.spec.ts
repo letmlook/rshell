@@ -287,6 +287,7 @@ describe("IPC 参数键契约（PROB-01）", () => {
 
 const eventsRsSource = readFileSync("src-tauri/crates/rshell-api/src/events.rs", "utf8");
 const outcomeRsSource = readFileSync("src-tauri/crates/rshell-api/src/outcome.rs", "utf8");
+const commandsRsSource = readFileSync("src-tauri/crates/rshell-api/src/commands.rs", "utf8");
 const typesTsSource = readFileSync("src/ipc/types.ts", "utf8");
 
 /** 解析 Rust 枚举顶层变体名（变体位于 4 空格缩进；字段/属性在更深缩进） */
@@ -302,6 +303,34 @@ function parseRustEnumVariants(enumSource: string, enumName: string): string[] {
     const m = line.match(/^ {4}([A-Z][A-Za-z0-9]*)\s*(?:,|\{|\(|$)/);
     if (m) names.push(m[1]);
   }
+  return names;
+}
+
+/**
+ * 解析 types.ts 的 AppCommand union 变体名（单键对象变体）
+ *
+ * 与 AppEvent 的解析同构：AppCommand 全是「单键对象」变体，没有字符串变体。
+ */
+function parseTsAppCommandVariants(typesSource: string): string[] {
+  const start = typesSource.indexOf("export type AppCommand");
+  if (start < 0) throw new Error("AppCommand not found in types.ts");
+  let depth = 0;
+  let end = -1;
+  for (let i = start; i < typesSource.length; i++) {
+    const ch = typesSource[i];
+    if (ch === "{" || ch === "(") depth++;
+    else if (ch === "}" || ch === ")") depth--;
+    else if (ch === ";" && depth === 0) {
+      end = i;
+      break;
+    }
+  }
+  if (end < 0) throw new Error("AppCommand union not terminated");
+  const body = typesSource.slice(start, end);
+  const names: string[] = [];
+  const re = /\|\s*\{\s*([A-Z][A-Za-z0-9]*)\s*:/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) names.push(m[1]);
   return names;
 }
 
@@ -377,14 +406,8 @@ const listenerFileCounts = new Map<string, number>(
  */
 const EVENT_LISTENER_WHITELIST = new Set([
   "SessionUpdated", // 单会话元数据更新提示，前端经 SessionListChanged 全量刷新已覆盖
-  "ScriptFinished", // 脚本结果随命令返回值展示，无需事件分支
-  "SyncInputSessionsChanged", // 同步输入集合变化，UI 尚未消费（helper toggleSyncInput 同为未接线）
   "SshKeyListChanged", // 密钥面板刷新由自身操作触发，无跨面板消费需求
   "SshKeyGenerated", // 同上
-  "PublicKeyExported", // exportPublicKey helper 未接线（同 helper 白名单）
-  "MasterPasswordChanged", // 主密码状态由启动校验命令返回值决定
-  "MasterPasswordVerified", // 同上
-  "ColorSchemeListChanged", // 配色方案列表由 listThemes 返回值驱动
   "PluginListUpdated", // 插件面板刷新由自身操作触发
   "PluginStateChanged", // 同上
   "PluginLoadFailed", // 加载失败经命令错误路径展示
@@ -409,6 +432,12 @@ const OUTCOME_RETURN_MAP: Record<string, { helper: string; typeText: string }> =
   },
   Transfers: { helper: "listTransfers", typeText: "TransferTaskInfo[]" },
   Verified: { helper: "verifyMasterPassword", typeText: "boolean" },
+  MasterPasswordState: { helper: "getMasterPasswordState", typeText: "MasterPasswordState" },
+  SyncSessions: { helper: "getSyncInputSessions", typeText: "Uuid[]" },
+  HostKeys: { helper: "listHostKeys", typeText: "HostKeyEntry[]" },
+  Folders: { helper: "listFolders", typeText: "Folder[]" },
+  SerialPorts: { helper: "listSerialPorts", typeText: "string[]" },
+  FolderId: { helper: "createFolder", typeText: "Uuid" },
   TaskId: { helper: "retryTransfer", typeText: "Uuid" },
 };
 
@@ -463,20 +492,38 @@ const OUTCOME_WHITELIST = new Set([
  * 任一 helper 接线后必须从此处移除。
  */
 const HELPER_WHITELIST = new Set([
-  "restoreTunnel", // 隧道磁盘恢复尚未接入 UI
-  "suspendTunnel", // 隧道挂起/恢复尚未接入 UI
-  "resumeTunnel",
-  "sendComposeText", // 撰写窗格尚未接入后端命令
-  "executeScript", // Rhai 宿主执行尚未接入 UI（docs/08：没有完整脚本编辑器）
-  "toggleSyncInput", // 同步输入开关尚未接后端
-  "exportPublicKey", // 后端命令存在，无 UI 入口（R2-10 CommandOutcome::PublicKey 同源）
-  "setupMasterPassword", // 主密码设置流程尚未接入 UI
-  "verifyMasterPassword", // 主密码验证流程尚未接入 UI（后端启动校验在用）
-  "changeMasterPassword", // 主密码修改流程尚未接入 UI
   "trustHostKey", // 永久信任由后端 decide_host_key 持久化路径完成
-  "deleteHostKey", // 已保存主机密钥的删除入口尚未接入 UI
-  "importColorScheme", // 配色方案导入尚未接入 UI
 ]);
+
+// 后端命令存在、前端却连调用入口都没有 —— 能力既用不了也测不到。
+// 这一层此前没有契约保护：helper 的白名单只保证「有 helper 的有调用方」，
+// 反过来（Rust 有命令、TS 没有对应变体）没人管。
+describe("IPC 命令契约", () => {
+  const rustAppCommandVariants = parseRustEnumVariants(commandsRsSource, "AppCommand");
+  const tsAppCommandVariants = parseTsAppCommandVariants(typesTsSource);
+
+  it("解析器没有失效（变体数量落在合理区间）", () => {
+    // 解析器若因格式变化而返回空数组，下面两条断言会平凡通过——
+    // 这里给个下界，确保「对齐」是真的在比变体集
+    expect(rustAppCommandVariants.length).toBeGreaterThan(50);
+    expect(tsAppCommandVariants.length).toBeGreaterThan(50);
+  });
+
+  it("commands.rs 与 types.ts 的 AppCommand 变体集逐一对齐", () => {
+    const rustOnly = rustAppCommandVariants.filter(
+      (n) => !tsAppCommandVariants.includes(n),
+    );
+    const tsOnly = tsAppCommandVariants.filter((n) => !rustAppCommandVariants.includes(n));
+    expect({ rustOnly, tsOnly }).toEqual({ rustOnly: [], tsOnly: [] });
+  });
+
+  it("每个命令变体在 client.ts 都有对应的 helper", () => {
+    const missing = rustAppCommandVariants.filter(
+      (n) => !new RegExp(`\\{\\s*${n}\\s*:`).test(clientSource),
+    );
+    expect(missing).toEqual([]);
+  });
+});
 
 describe("IPC 事件契约（R2-10/R2-11）", () => {
   it("events.rs 与 types.ts 的 AppEvent 变体集逐一对齐", () => {

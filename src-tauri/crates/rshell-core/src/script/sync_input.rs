@@ -8,7 +8,7 @@ use crate::event_bus::EventBus;
 use crate::session::service::SessionService;
 use rshell_api::AppEvent;
 use std::sync::{Arc, RwLock};
-use tracing::{debug, info};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// 同步输入服务
@@ -63,8 +63,16 @@ impl SyncInputService {
     }
 
     /// 发送数据到所有同步输入会话
+    ///
+    /// `source_session_id` 是发起本次输入的会话：它**必须被排除**，否则源会话
+    /// 自己在同步列表里时，输入会先由 `SendInput` 直接发一次、再由这里发第二次，
+    /// 远端收到双份字节。
+    ///
+    /// 单个目标发送失败不阻断其余目标，但会为每个失败会话发布
+    /// `SyncInputSendFailed` 事件——静默丢弃会让用户以为同步成功。
     pub async fn send_to_synced_sessions(
         &self,
+        source_session_id: Uuid,
         data: &[u8],
         session_service: &SessionService,
     ) -> Result<(), CoreError> {
@@ -76,14 +84,30 @@ impl SyncInputService {
             sync.clone()
         };
 
-        for session_id in &sessions {
-            if let Err(e) = session_service.send_data(*session_id, None, data).await {
-                debug!(session_id = %session_id, error = %e, "Failed to send to synced session");
+        for session_id in sync_targets(source_session_id, &sessions) {
+            if let Err(e) = session_service.send_data(session_id, None, data).await {
+                warn!(session_id = %session_id, error = %e, "Failed to send to synced session");
+                self.event_bus.publish(AppEvent::SyncInputSendFailed {
+                    session_id,
+                    error: e.to_string(),
+                });
             }
         }
 
         Ok(())
     }
+}
+
+/// 同步目标集合：排除源会话
+///
+/// 源会话的输入已由调用方（`SendInput`）直接发送过一次，若它也在同步列表里，
+/// 会被这里再发一次——远端收到双份字节。过滤放在纯函数里，便于单测锁定。
+fn sync_targets(source_session_id: Uuid, sessions: &[Uuid]) -> Vec<Uuid> {
+    sessions
+        .iter()
+        .copied()
+        .filter(|id| *id != source_session_id)
+        .collect()
 }
 
 #[cfg(test)]
@@ -129,5 +153,34 @@ mod tests {
         svc.toggle_sync_input(vec![Uuid::new_v4()]).unwrap();
         svc.toggle_sync_input(vec![]).unwrap();
         assert_eq!(*got.lock().unwrap(), 2);
+    }
+
+    /// 源会话在同步列表里时不能收到第二份输入。
+    ///
+    /// 此前 `send_to_synced_sessions` 把列表里的每个会话都发一遍，包括源会话
+    /// 自己——而源会话的输入已经由 `SendInput` 直接发送过一次，远端因此收到
+    /// 双份字节（回车会被执行两次）。
+    #[test]
+    fn source_session_is_excluded_from_sync_targets() {
+        let source = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let targets = sync_targets(source, &[source, other]);
+        assert_eq!(targets, vec![other]);
+    }
+
+    #[test]
+    fn sync_targets_keeps_every_other_session() {
+        let source = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let targets = sync_targets(source, &[source, a, b]);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.contains(&a) && targets.contains(&b));
+        assert!(!targets.contains(&source));
+    }
+
+    #[test]
+    fn sync_targets_of_empty_group_is_empty() {
+        assert!(sync_targets(Uuid::new_v4(), &[]).is_empty());
     }
 }

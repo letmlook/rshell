@@ -7,13 +7,15 @@ import { listTransfers, pauseTransfer, resumeTransfer } from "../../src/ipc/clie
 import TransferPanel from "../../src/components/TransferPanel.vue";
 import ElementPlus from "element-plus";
 
-const { listTransfersMock, pauseTransferMock, resumeTransferMock, cancelTransferMock, removeTransferMock, sessionsStoreMock } = vi.hoisted(() => ({
+const { listTransfersMock, pauseTransferMock, resumeTransferMock, cancelTransferMock, removeTransferMock, sessionsStoreMock, listQuickCommandsMock, executeQuickCommandMock } = vi.hoisted(() => ({
   listTransfersMock: vi.fn().mockResolvedValue([]),
   pauseTransferMock: vi.fn().mockResolvedValue(undefined),
   resumeTransferMock: vi.fn().mockResolvedValue(undefined),
   cancelTransferMock: vi.fn().mockResolvedValue(undefined),
   removeTransferMock: vi.fn().mockResolvedValue(undefined),
   sessionsStoreMock: { store: null as { items: Array<{ id: string; name?: string }>; connectionState: Map<string, string>; duplicate: ReturnType<typeof vi.fn>; connect: ReturnType<typeof vi.fn>; [key: string]: unknown } | null },
+  listQuickCommandsMock: vi.fn().mockResolvedValue([]),
+  executeQuickCommandMock: vi.fn().mockResolvedValue(undefined),
 }));
 
 // PROB-02：dockview-vue 真实实现不渲染插槽，面板只能经 ready 事件给出的
@@ -77,12 +79,37 @@ vi.mock("../../src/stores/hostKey", () => ({
 vi.mock("../../src/stores/theme", () => ({
   useThemeStore: () => ({ refresh: vi.fn().mockResolvedValue(undefined), subscribeEvents: vi.fn().mockResolvedValue(undefined), disposeEvents: vi.fn() }),
 }));
+// 分组 store：应用启动时拉一次分组列表并订阅 FolderListChanged。
+vi.mock("../../src/stores/folders", () => ({
+  useFoldersStore: () => ({
+    items: [],
+    loading: false,
+    error: null as string | null,
+    byId: new Map(),
+    refresh: vi.fn().mockResolvedValue(undefined),
+    subscribeEvents: vi.fn().mockResolvedValue(undefined),
+    disposeEvents: vi.fn(),
+  }),
+}));
+// 主密码 store：应用启动时先查状态再订阅事件，锁定态由遮罩呈现。
+vi.mock("../../src/stores/masterPassword", () => ({
+  useMasterPasswordStore: () => ({
+    state: "NotSet",
+    isLocked: false,
+    refresh: vi.fn().mockResolvedValue(undefined),
+    subscribeEvents: vi.fn().mockResolvedValue(undefined),
+    disposeEvents: vi.fn(),
+  }),
+}));
 vi.mock("../../src/ipc/client", () => ({
   listTransfers: listTransfersMock,
   pauseTransfer: pauseTransferMock,
   resumeTransfer: resumeTransferMock,
   cancelTransfer: cancelTransferMock,
   removeTransfer: removeTransferMock,
+  listQuickCommands: listQuickCommandsMock,
+  executeQuickCommand: executeQuickCommandMock,
+  ipcErrorMessage: (e: unknown) => (e instanceof Error ? e.message : String(e)),
 }));
 vi.mock("../../src/ipc/events", () => ({ subscribeAppEvents: vi.fn().mockResolvedValue(vi.fn()) }));
 
@@ -122,11 +149,43 @@ describe("App layout", () => {
     TerminalPane: { name: "TerminalPane", template: "<div data-testid='terminal-pane' />" },
     TransferWorkspace: { name: "TransferWorkspace", template: "<div data-testid='transfer-workspace' />" },
     TransferPanel: { name: "TransferPanel", template: "<div data-testid='transfer-panel' />" },
-    SessionCreateDialog: { name: "SessionCreateDialog", template: "<div />" },
+    SessionCreateDialog: {
+      name: "SessionCreateDialog",
+      props: ["visible", "editId"],
+      template: '<div data-test="session-create-dialog" v-if="visible" />',
+    },
     HostKeyMismatchDialog: { name: "HostKeyMismatchDialog", template: "<div />" },
     TransferQueue: { name: "TransferQueue", template: "<div />" },
     "el-button": { template: "<button />" },
   };
+
+  // 工具栏的 title 写着「新建连接 (Ctrl+N)」，此前按了没反应——
+  // 全局处理器里根本没有这个快捷键。
+  it("opens the new connection dialog on Ctrl+N", async () => {
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    await flushPromises();
+    expect(wrapper.find('[data-test="session-create-dialog"]').exists()).toBe(false);
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { ctrlKey: true, key: "n" }));
+    await flushPromises();
+    expect(wrapper.find('[data-test="session-create-dialog"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("does not open the new connection dialog on Ctrl+N while typing in a field", async () => {
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    await flushPromises();
+
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { ctrlKey: true, key: "n", bubbles: true }),
+    );
+    await flushPromises();
+    expect(wrapper.find('[data-test="session-create-dialog"]').exists()).toBe(false);
+    input.remove();
+    wrapper.unmount();
+  });
 
   it("opens and hides the mounted sidebar without destroying its subtree", async () => {
     const wrapper = mount(App, { global: { stubs: childStubs } });
@@ -492,6 +551,63 @@ describe("App layout", () => {
     expect(seen.map((e) => e.action)).toEqual(["copy", "paste"]);
 
     window.removeEventListener("rshell:terminal-action", handler);
+    wrapper.unmount();
+  });
+
+  // 快速命令热键：后端存了 hotkey 字段却从无实现，绑了也永远不会触发。
+  it("triggers a quick command bound to a hotkey", async () => {
+    executeQuickCommandMock.mockClear();
+    listQuickCommandsMock.mockResolvedValue([
+      {
+        id: "quick-1",
+        name: "uptime",
+        command: "uptime",
+        send_enter: true,
+        description: "",
+        scope: "AllSessions",
+        hotkey: "Ctrl+Shift+1",
+        group: null,
+      },
+    ]);
+    sessionsStoreMock.store!.items = [{ id: "session-a", name: "alpha" }];
+    sessionsStoreMock.store!.connectionState.set("session-a", "connected");
+
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    await flushPromises();
+
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { ctrlKey: true, shiftKey: true, key: "1" }),
+    );
+    await flushPromises();
+
+    expect(executeQuickCommandMock).toHaveBeenCalledWith("quick-1", ["session-a"]);
+    wrapper.unmount();
+  });
+
+  it("does not trigger a quick command when the hotkey does not match exactly", async () => {
+    executeQuickCommandMock.mockClear();
+    listQuickCommandsMock.mockResolvedValue([
+      {
+        id: "quick-1",
+        name: "uptime",
+        command: "uptime",
+        send_enter: true,
+        description: "",
+        scope: "AllSessions",
+        hotkey: "Ctrl+Shift+1",
+        group: null,
+      },
+    ]);
+    sessionsStoreMock.store!.items = [{ id: "session-a", name: "alpha" }];
+    sessionsStoreMock.store!.connectionState.set("session-a", "connected");
+
+    const wrapper = mount(App, { global: { stubs: childStubs } });
+    await flushPromises();
+
+    // 少一个修饰键不算命中
+    window.dispatchEvent(new KeyboardEvent("keydown", { ctrlKey: true, key: "1" }));
+    await flushPromises();
+    expect(executeQuickCommandMock).not.toHaveBeenCalled();
     wrapper.unmount();
   });
 

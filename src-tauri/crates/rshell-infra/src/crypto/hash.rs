@@ -60,9 +60,36 @@ pub fn verify_key(password: &str, salt: &[u8], iterations: u32, expected: &[u8; 
     ring::constant_time::verify_slices_are_equal(&derived, expected).is_ok()
 }
 
-/// 十六进制编码
-fn hex_encode(data: &[u8]) -> String {
+/// 十六进制编码（公开：主密码持久化文件用 hex 承载盐与令牌）
+pub fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// 十六进制解码
+///
+/// 奇数长度或非 hex 字符一律报错，不做静默截断——持久化文件被篡改时
+/// 必须显式失败，不能解出错误的长度后继续用。
+pub fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
+    if !text.len().is_multiple_of(2) {
+        return Err(format!("hex string has odd length: {}", text.len()));
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let hi = hex_val(pair[0])?;
+        let lo = hex_val(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_val(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        other => Err(format!("invalid hex character: {}", other as char)),
+    }
 }
 
 /// Base64 编码（标准，无填充）

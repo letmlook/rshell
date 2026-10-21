@@ -102,7 +102,7 @@ impl TriggerEngine {
         let items: Vec<_> = triggers.values().cloned().collect();
         let bytes = serde_json::to_vec_pretty(&items)
             .map_err(|e| CoreError::StorageError(e.to_string()))?;
-        crate::script::quick_command::persist_json(path, &bytes)
+        crate::storage::persist_json(path, &bytes)
     }
 
     /// 创建触发器

@@ -6,7 +6,14 @@
  */
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
-import type { CoreErrorKind, SessionConfig, SessionCredential, SessionLoadIssue, Uuid } from "../ipc/types";
+import type {
+  CoreErrorKind,
+  CredentialUpdate,
+  SessionConfig,
+  SessionCredential,
+  SessionLoadIssue,
+  Uuid,
+} from "../ipc/types";
 import {
   listSessions,
   createSession,
@@ -67,8 +74,9 @@ export const useSessionsStore = defineStore("sessions", () => {
     error.value = null;
     try {
       const [sessions, issues] = await Promise.all([listSessions(), listSessionLoadIssues()]);
-      items.value = sessions;
-      loadIssues.value = issues;
+      // 后端异常返回不能把 store 变成不可迭代 —— 界面会整块崩掉
+      items.value = Array.isArray(sessions) ? sessions : [];
+      loadIssues.value = Array.isArray(issues) ? issues : [];
     } catch (e) {
       error.value = String(e);
     } finally {
@@ -98,6 +106,25 @@ export const useSessionsStore = defineStore("sessions", () => {
     const config = items.value.find((session) => session.id === id);
     if (!config) throw new Error("会话不存在，请刷新后重试");
     await updateSession(id, config, { Set: credential });
+    await refresh();
+  }
+
+  /**
+   * 修改连接信息（主机/端口/用户名/认证方式/名称…）。
+   *
+   * `credential` 决定钥匙串里那条凭据怎么处理：
+   * - `Keep`：保持现有凭据（编辑主机名这类改动不该动密码）
+   * - `Set`：换成新凭据
+   * - `Clear`：删除凭据
+   *
+   * 后端会按这个选择改写配置里的「凭据是否存在」标记，前端不必自己推断。
+   */
+  async function update(
+    id: Uuid,
+    config: SessionConfig,
+    credential: CredentialUpdate,
+  ) {
+    await updateSession(id, config, credential);
     await refresh();
   }
 
@@ -246,6 +273,7 @@ export const useSessionsStore = defineStore("sessions", () => {
     retryingLoad,
     retryLoad,
     updateCredential,
+    update,
     duplicate,
     refresh,
     create,

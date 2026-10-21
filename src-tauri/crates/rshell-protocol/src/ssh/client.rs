@@ -48,6 +48,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::ssh::sftp::SftpClient;
 use crate::{Connection, ProtocolError};
 
 #[path = "requests.rs"]
@@ -169,6 +170,13 @@ pub struct SshClient {
     recv_pending: VecDeque<u8>,
     /// 发送数据的通道（供 Handler 使用）
     shell_output: Arc<Mutex<ShellOutput>>,
+    /// 复用的 SFTP 会话（浏览目录 / 建目录 / 删文件共用一条通道）
+    ///
+    /// 每次浏览都新开通道意味着：一次 SSH 通道开启 + 一次 SSH_FXP_VERSION
+    /// 握手，服务端还要为每条通道 fork 一个 sftp 子进程。目录树浏览是高频操作，
+    /// 这些开销叠加在每次点击上（跨网时尤其明显）。
+    /// `SftpClient` 的方法都是 `&self`，底层会话本就设计为并发共享。
+    sftp_cache: SessionCache<SftpClient>,
     /// 空闲 keepalive 探测间隔，默认 [`SSH_KEEPALIVE_INTERVAL`]。
     /// 测试可调小以压缩时间线。
     keepalive_interval: std::time::Duration,
@@ -280,6 +288,54 @@ impl Drop for DecisionWaitGuard {
         if self.armed {
             self.sink.cancel_decision(self.decision_id);
         }
+    }
+}
+
+/// 一次创建、多次复用的会话缓存
+///
+/// 语义（对应「远端浏览复用 SFTP 通道」）：
+/// - 第一次 `get_or_init` 调 `init` 建会话；
+/// - 之后每次都拿到**同一个** `Arc`，不重建；
+/// - `invalidate` 丢弃它，下次 `get_or_init` 重新建。
+///
+/// 之所以独立成泛型：会话的具体类型（SFTP）需要真实服务器才能建，
+/// 而「建一次、用多次、可作废」的语义本身可以脱离服务器验证。
+pub(crate) struct SessionCache<T> {
+    slot: tokio::sync::Mutex<Option<Arc<T>>>,
+}
+
+impl<T> SessionCache<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            slot: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// 拿到缓存的会话；没有就建一个
+    pub(crate) async fn get_or_init<E, F, Fut>(&self, init: F) -> Result<Arc<T>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Arc<T>, E>>,
+    {
+        let mut slot = self.slot.lock().await;
+        if let Some(existing) = slot.as_ref() {
+            return Ok(existing.clone());
+        }
+        let created = init().await?;
+        *slot = Some(created.clone());
+        Ok(created)
+    }
+
+    /// 丢弃缓存的会话（作废后下次会重新建）
+    pub(crate) async fn invalidate(&self) {
+        let mut slot = self.slot.lock().await;
+        *slot = None;
+    }
+
+    /// 当前是否已有缓存（仅测试用）
+    #[cfg(test)]
+    pub(crate) async fn is_cached(&self) -> bool {
+        self.slot.lock().await.is_some()
     }
 }
 
@@ -664,6 +720,7 @@ impl SshClient {
             data_rx: None,
             recv_pending: VecDeque::new(),
             shell_output: Arc::new(Mutex::new(ShellOutput::default())),
+            sftp_cache: SessionCache::new(),
             keepalive_interval: SSH_KEEPALIVE_INTERVAL,
             direct_tcpip_open_timeout: DIRECT_TCPIP_OPEN_TIMEOUT,
         }
@@ -1094,6 +1151,28 @@ impl SshClient {
     }
 
     /// 打开一个新的 SFTP 通道
+    /// 取得这条连接上的 SFTP 会话（首次调用时开一条，之后复用）
+    ///
+    /// 复用而非每次新开：浏览目录是高频操作，每点一次就新开一条通道 +
+    /// 重做一次版本握手，在跨网链路上是实打实的点击延迟，服务端也要为每条
+    /// 通道 fork 一个 sftp 进程。
+    ///
+    /// 缓存的会话一旦失效（服务端关掉通道），`invalidate_sftp` 会把它丢掉，
+    /// 下次调用重新开一条 —— 不会因为缓存而把「能自愈」变成「永久失败」。
+    pub async fn sftp_session(&self) -> Result<Arc<SftpClient>, ProtocolError> {
+        self.sftp_cache
+            .get_or_init(|| async {
+                let channel = self.open_sftp_channel().await?;
+                Ok(Arc::new(SftpClient::new(channel).await?))
+            })
+            .await
+    }
+
+    /// 丢弃缓存的 SFTP 会话（出错后调用，让下一次重新开通道）
+    pub async fn invalidate_sftp(&self) {
+        self.sftp_cache.invalidate().await;
+    }
+
     pub async fn open_sftp_channel(
         &self,
     ) -> Result<russh::Channel<russh::client::Msg>, ProtocolError> {
@@ -1435,6 +1514,59 @@ mod tests {
             session.data(channel, data.to_vec())?;
             Ok(())
         }
+    }
+
+    /// 会话缓存的语义：建一次、用多次、可作废后重建。
+    ///
+    /// 「远端浏览复用 SFTP 通道」的正确性全靠这三条；把它抽成泛型后，
+    /// 语义可以脱离真实 SFTP 服务器验证。
+    #[tokio::test]
+    async fn session_cache_creates_once_and_reuses_until_invalidated() {
+        let cache = SessionCache::<u32>::new();
+        let mut created = 0u32;
+
+        let first: Arc<u32> = cache
+            .get_or_init(|| async {
+                created += 1;
+                Ok::<Arc<u32>, &str>(Arc::new(created))
+            })
+            .await
+            .unwrap();
+        let second: Arc<u32> = cache
+            .get_or_init(|| async {
+                created += 1;
+                Ok::<Arc<u32>, &str>(Arc::new(created))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(created, 1, "第二次取用不得重建会话");
+        assert!(Arc::ptr_eq(&first, &second), "两次拿到的必须是同一个会话");
+        assert!(cache.is_cached().await);
+
+        // 作废后重新建：这是「缓存的会话被服务端关掉」时的自愈路径
+        cache.invalidate().await;
+        assert!(!cache.is_cached().await);
+        let third: Arc<u32> = cache
+            .get_or_init(|| async {
+                created += 1;
+                Ok::<Arc<u32>, &str>(Arc::new(created))
+            })
+            .await
+            .unwrap();
+        assert_eq!(created, 2, "作废后必须重新建会话");
+        assert!(!Arc::ptr_eq(&first, &third));
+    }
+
+    /// 初始化失败不留缓存：下次调用要重新试，而不是拿到一个坏会话。
+    #[tokio::test]
+    async fn session_cache_does_not_cache_a_failed_init() {
+        let cache = SessionCache::<u32>::new();
+        let result: Result<Arc<u32>, &str> = cache
+            .get_or_init(|| async { Err("channel open failed") })
+            .await;
+        assert!(result.is_err());
+        assert!(!cache.is_cached().await);
     }
 
     #[tokio::test]

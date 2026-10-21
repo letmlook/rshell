@@ -3,19 +3,40 @@
  * TunnelPanel —— 切片 8
  *
  * 本地端口转发与动态 SOCKS5 隧道管理。
+ *
+ * 覆盖后端已实现但此前没有入口的三件事：
+ * - 挂起 / 恢复隧道（suspend / resume）：挂起会撤销已建立的转发连接并停止接受新连接。
+ * - 待定隧道的恢复：应用重启后不抢占端口，只把用户意图记在 tunnels.toml 里，
+ *   由用户在这里显式恢复（此前界面只显示被跳过的旧规则，可恢复的规则从不显示）。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import { listTunnels, listPendingTunnels, createTunnel, closeTunnel } from "../ipc/client";
+import {
+  listTunnels,
+  listPendingTunnels,
+  createTunnel,
+  closeTunnel,
+  suspendTunnel,
+  resumeTunnel,
+  restoreTunnel,
+} from "../ipc/client";
+import { ipcErrorMessage } from "../ipc/client";
 import { subscribeAppEvents } from "../ipc/events";
-import type { Uuid, PortForwardRule, ActiveTunnelInfo } from "../ipc/types";
+import type { Uuid, PortForwardRule, ActiveTunnelInfo, TunnelState } from "../ipc/types";
 import { confirmDialog } from "../utils/dialog";
+import { useSessionsStore } from "../stores/sessions";
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
+
+const sessions = useSessionsStore();
 
 const items = ref<ActiveTunnelInfo[]>([]);
 const loading = ref(false);
 const error = ref<string | null>(null);
 const unsupported = ref<string[]>([]);
+/** 待恢复的隧道规则：[会话 id, 规则] */
+const pending = ref<Array<[Uuid, PortForwardRule]>>([]);
+/** 正在执行动作的隧道 id，避免重复点击 */
+const pendingIds = ref<Set<Uuid>>(new Set());
 
 // 事件订阅的生命周期（与 QuickCommandPanel 同款）：异步订阅完成可能晚于
 // unmount，用 active 门闩保证晚到的订阅被立即释放。
@@ -27,19 +48,34 @@ const draftSession = ref<Uuid | null>(null);
 const draftBind = ref("127.0.0.1:8080");
 const draftTarget = ref("localhost:80");
 
+/** 可选会话：只有真实存在的连接信息才能建隧道 */
+const selectableSessions = computed(() => sessions.items);
+
 async function refresh() {
   loading.value = true;
   try {
-    const [active, pending] = await Promise.all([listTunnels(), listPendingTunnels()]);
-    items.value = active;
-    unsupported.value = pending.unsupported.map(
+    const [activeTunnels, pendingInfo] = await Promise.all([
+      listTunnels(),
+      listPendingTunnels(),
+    ]);
+    items.value = activeTunnels;
+    pending.value = pendingInfo.rules;
+    unsupported.value = pendingInfo.unsupported.map(
       (rule) => `${rule.session_id}: ${rule.reason}`,
     );
+    error.value = null;
   } catch (e) {
-    error.value = String(e);
+    error.value = ipcErrorMessage(e);
   } finally {
     loading.value = false;
   }
+}
+
+function markPending(id: Uuid, on: boolean) {
+  const next = new Set(pendingIds.value);
+  if (on) next.add(id);
+  else next.delete(id);
+  pendingIds.value = next;
 }
 
 function parseEndpoint(ep: string): { host: string; port: number } {
@@ -115,19 +151,112 @@ async function add() {
   }
   try {
     await createTunnel(draftSession.value, rule);
+    error.value = null;
     await refresh();
   } catch (e) {
-    error.value = String(e);
+    error.value = ipcErrorMessage(e);
   }
 }
 
 async function remove(id: Uuid) {
+  const confirmed = await confirmDialog({
+    title: "关闭隧道",
+    message: "关闭后监听端口立即释放，已建立的转发连接会被撤销。",
+    confirmText: "关闭",
+    danger: true,
+  });
+  if (!confirmed) return;
+  markPending(id, true);
   try {
     await closeTunnel(id);
+    error.value = null;
     await refresh();
   } catch (e) {
-    error.value = String(e);
+    error.value = ipcErrorMessage(e);
+  } finally {
+    markPending(id, false);
   }
+}
+
+/** 挂起：撤销已建立的转发连接并停止接受新连接 */
+async function suspend(id: Uuid) {
+  markPending(id, true);
+  try {
+    await suspendTunnel(id);
+    error.value = null;
+    await refresh();
+  } catch (e) {
+    error.value = ipcErrorMessage(e);
+  } finally {
+    markPending(id, false);
+  }
+}
+
+/** 恢复挂起的隧道（后端会换新的取消通道，避免恢复出来即处于已取消状态） */
+async function resume(id: Uuid) {
+  markPending(id, true);
+  try {
+    await resumeTunnel(id);
+    error.value = null;
+    await refresh();
+  } catch (e) {
+    error.value = ipcErrorMessage(e);
+  } finally {
+    markPending(id, false);
+  }
+}
+
+/**
+ * 恢复重启前记录的待定隧道。
+ *
+ * 后端要求该会话当前已连接（要拿到 SSH 连接才能建转发），未连接时直接报错，
+ * 这里把真实原因透出来，不假装已恢复。
+ */
+async function restore(sessionId: Uuid, rule: PortForwardRule) {
+  markPending(sessionId, true);
+  try {
+    await restoreTunnel(sessionId, rule);
+    error.value = null;
+    await refresh();
+  } catch (e) {
+    error.value = ipcErrorMessage(e);
+  } finally {
+    markPending(sessionId, false);
+  }
+}
+
+function sessionName(id: Uuid): string {
+  return sessions.items.find((s) => s.id === id)?.name ?? id.slice(0, 8);
+}
+
+function ruleLabel(rule: PortForwardRule): string {
+  const direction = rule.direction === "Dynamic" ? "Dynamic" : "Local";
+  const target =
+    rule.direction === "Dynamic"
+      ? "SOCKS5"
+      : `${rule.remote_host}:${rule.remote_port}`;
+  return `${direction} ${rule.bind_address}:${rule.bind_port} → ${target}`;
+}
+
+/** 隧道状态的真实文案：Error 变体要显示原因，不能只显示 "0" */
+function stateLabel(state: TunnelState): string {
+  if (typeof state === "string") {
+    return state === "Active" ? "运行中" : state === "Suspended" ? "已挂起" : state;
+  }
+  if (state && typeof state === "object" && "Error" in state) {
+    return `错误：${state.Error}`;
+  }
+  return "—";
+}
+
+/** 只有挂起态可以恢复 */
+function canResume(state: TunnelState): boolean {
+  return state === "Suspended";
+}
+
+/** 只有运行态可以挂起 */
+function canSuspend(state: TunnelState): boolean {
+  return state === "Active";
 }
 
 // R2-04：后端在会话断开时会把该会话隧道置 Error 并逐条发布
@@ -135,6 +264,7 @@ async function remove(id: Uuid) {
 // 面板打开期间不订阅这两个事件，状态列会一直停留旧的 Active 文案，直到手点刷新。
 onMounted(async () => {
   active = true;
+  await sessions.refresh();
   await refresh();
   if (!active) return;
   const stop = await subscribeAppEvents((event) => {
@@ -168,40 +298,91 @@ onBeforeUnmount(() => {
 
     <el-form inline size="small" class="add-form" @submit.prevent="add">
       <el-form-item label="类型">
-        <el-select v-model="draftType" style="width: 110px">
+        <el-select v-model="draftType" style="width: 110px" data-test="tunnel-type">
           <el-option label="Local" value="Local" />
           <el-option label="Dynamic" value="Dynamic" />
         </el-select>
       </el-form-item>
-      <el-form-item label="会话 ID">
-        <el-input v-model="draftSession" placeholder="uuid" style="width: 180px" />
+      <el-form-item label="连接">
+        <el-select
+          v-model="draftSession"
+          placeholder="选择连接信息"
+          style="width: 180px"
+          filterable
+          data-test="tunnel-session"
+        >
+          <el-option
+            v-for="session in selectableSessions"
+            :key="session.id"
+            :label="session.name"
+            :value="session.id"
+          />
+        </el-select>
       </el-form-item>
       <el-form-item label="监听">
-        <el-input v-model="draftBind" placeholder="host:port" style="width: 140px" />
+        <el-input v-model="draftBind" placeholder="host:port" style="width: 140px" data-test="tunnel-bind" />
         <p v-if="bindError" class="error" role="alert" data-test="tunnel-bind-error">{{ bindError }}</p>
       </el-form-item>
       <el-form-item v-if="draftType !== 'Dynamic'" label="目标">
-        <el-input v-model="draftTarget" placeholder="host:port" style="width: 140px" />
+        <el-input v-model="draftTarget" placeholder="host:port" style="width: 140px" data-test="tunnel-target" />
       </el-form-item>
       <el-form-item>
-        <el-button type="primary" native-type="submit">新建</el-button>
+        <el-button type="primary" native-type="submit" data-test="tunnel-add">新建</el-button>
       </el-form-item>
     </el-form>
 
     <p v-if="nonLoopbackBind" class="warn">
       监听地址不是回环地址：创建时将要求二次确认，隧道将暴露给局域网（SOCKS5 代理无认证）。
     </p>
+
+    <section v-if="pending.length" class="pending-block" data-test="tunnel-pending">
+      <h4>待恢复的隧道 ({{ pending.length }})</h4>
+      <p class="hint">
+        应用重启后不自动抢占端口，这些规则来自上次的记录。恢复需要对应连接已建立 SSH 连接。
+      </p>
+      <ul class="pending-list">
+        <li v-for="[sessionId, rule] in pending" :key="`${sessionId}-${rule.bind_address}-${rule.bind_port}`">
+          <span class="pending-label">{{ ruleLabel(rule) }}</span>
+          <span class="pending-session">{{ sessionName(sessionId) }}</span>
+          <el-button
+            size="small"
+            :loading="pendingIds.has(sessionId)"
+            data-test="tunnel-restore"
+            @click="restore(sessionId, rule)"
+          >
+            恢复
+          </el-button>
+        </li>
+      </ul>
+    </section>
+
     <el-empty v-if="items.length === 0" description="暂无隧道" />
     <el-table v-else :data="items" stripe size="small">
       <el-table-column prop="id" label="Tunnel ID" width="120" />
-      <el-table-column label="状态" width="100">
+      <el-table-column label="状态" min-width="120">
         <template #default="{ row }">
-          {{ typeof row.state === "string" ? row.state : Object.keys(row.state || {})[0] || "—" }}
+          {{ stateLabel(row.state) }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="80">
+      <el-table-column label="操作" width="190">
         <template #default="{ row }">
-          <el-button size="small" type="danger" @click="remove(row.id)">关闭</el-button>
+          <el-button
+            size="small"
+            :disabled="!canSuspend(row.state) || pendingIds.has(row.id)"
+            data-test="tunnel-suspend"
+            @click="suspend(row.id)"
+          >
+            挂起
+          </el-button>
+          <el-button
+            size="small"
+            :disabled="!canResume(row.state) || pendingIds.has(row.id)"
+            data-test="tunnel-resume"
+            @click="resume(row.id)"
+          >
+            恢复
+          </el-button>
+          <el-button size="small" type="danger" data-test="tunnel-close" @click="remove(row.id)">关闭</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -237,5 +418,45 @@ h3 {
 .warn {
   color: var(--el-color-warning);
   font-size: 12px;
+}
+.pending-block {
+  margin-bottom: 14px;
+  padding: 8px 10px;
+  border: 1px solid var(--rs-border);
+  border-radius: 6px;
+  background: var(--rs-bg-surface);
+}
+.pending-block h4 {
+  margin: 0 0 4px;
+  font-size: 12px;
+}
+.pending-block .hint {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--rs-fg-muted);
+  line-height: 1.5;
+}
+.pending-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.pending-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+}
+.pending-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pending-session {
+  color: var(--rs-fg-muted);
+  font-size: 11px;
 }
 </style>

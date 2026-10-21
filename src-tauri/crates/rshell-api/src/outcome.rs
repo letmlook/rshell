@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::{
-    ActiveTunnelInfo, PendingTunnelInfo, PluginInfo, QuickCommand, RemoteFileEntry, SessionConfig,
-    SessionLoadIssue, SshKeyInfo, ThemeInfo, TransferTaskInfo, Trigger,
+    ActiveTunnelInfo, Folder, HostKeyEntry, PendingTunnelInfo, PluginInfo, QuickCommand,
+    RemoteFileEntry, SessionConfig, SessionLoadIssue, SshKeyInfo, ThemeInfo, TransferTaskInfo,
+    Trigger,
 };
 
 /// 读命令返回结构化数据;写命令返回 `None`。
@@ -54,6 +55,18 @@ pub enum CommandOutcome {
     PublicKey(String),
     /// 响应 `VerifyMasterPassword`
     Verified(bool),
+    /// 响应 `GetMasterPasswordState` —— `NotSet` / `Locked` / `Unlocked`
+    MasterPasswordState(String),
+    /// 响应 `GetSyncInputSessions` —— 当前同步输入会话组，空数组表示未开启
+    SyncSessions(Vec<Uuid>),
+    /// 响应 `ListHostKeys` —— 已信任的主机密钥条目
+    HostKeys(Vec<HostKeyEntry>),
+    /// 响应 `ListFolders` —— 全部分组
+    Folders(Vec<Folder>),
+    /// 响应 `ListSerialPorts` —— 当前系统可用的串口设备
+    SerialPorts(Vec<String>),
+    /// 响应 `CreateFolder` —— 新分组 id
+    FolderId(Uuid),
     /// R2-T2：响应 `RetryTransfer` —— 新任务的 id，前端据此监听后续事件。
     TaskId(Uuid),
 }
@@ -79,6 +92,12 @@ impl CommandOutcome {
             Self::Transfers(_) => "transfers",
             Self::PublicKey(_) => "public_key",
             Self::Verified(_) => "verified",
+            Self::MasterPasswordState(_) => "master_password_state",
+            Self::SyncSessions(_) => "sync_sessions",
+            Self::HostKeys(_) => "host_keys",
+            Self::Folders(_) => "folders",
+            Self::SerialPorts(_) => "serial_ports",
+            Self::FolderId(_) => "folder_id",
             Self::TaskId(_) => "task_id",
         }
     }

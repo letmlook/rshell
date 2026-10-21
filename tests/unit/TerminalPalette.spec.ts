@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
+import ElementPlus from "element-plus";
 import TerminalPane from "../../src/components/TerminalPane.vue";
 import { useThemeStore } from "../../src/stores/theme";
 
@@ -34,7 +35,21 @@ vi.mock("@xterm/xterm", () => ({ Terminal: class {
   paste(text: string) { pasteMock(text); }
 } }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
-vi.mock("@xterm/addon-search", () => ({ SearchAddon: class { clearDecorations() {} } }));
+// SearchAddon 桩要提供 onDidChangeResults（终端用它显示匹配计数）
+const { searchResultsHandlers } = vi.hoisted(() => ({
+  searchResultsHandlers: [] as Array<(e: { resultIndex: number; resultCount: number }) => void>,
+}));
+vi.mock("@xterm/addon-search", () => ({
+  SearchAddon: class {
+    clearDecorations() {}
+    findNext() { return true; }
+    findPrevious() { return true; }
+    onDidChangeResults(handler: (e: { resultIndex: number; resultCount: number }) => void) {
+      searchResultsHandlers.push(handler);
+      return { dispose() {} };
+    }
+  },
+}));
 vi.mock("@xterm/addon-webgl", () => ({ WebglAddon: class { onContextLoss() {} } }));
 vi.mock("@tauri-apps/api/core", () => ({ Channel: class {}, invoke: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../../src/ipc/client", () => ({ sendInput: sendInputMock, resizeTerminal: vi.fn(), listThemes: vi.fn(), setAppTheme: vi.fn(), setTerminalColorScheme: vi.fn() }));
@@ -182,3 +197,46 @@ describe("TerminalPane 右键粘贴", () => {
 
     wrapper.unmount();
   });
+
+// 搜索栏此前没有匹配计数：用户不知道「有没有命中」与「当前在第几个」。
+it("shows the search match count and updates it with the results", async () => {
+  vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  searchResultsHandlers.length = 0;
+
+  // 搜索栏要用 el-input：这一条挂上真实 ElementPlus 才能输入搜索词
+  const pane = mount(TerminalPane, {
+    props: { sessionId: "session-1" },
+    global: { plugins: [pinia, ElementPlus] },
+  });
+  await flushPromises();
+
+  window.dispatchEvent(new CustomEvent("rshell:terminal-action", { detail: { sessionId: "session-1", action: "find" } }));
+  await flushPromises();
+
+  const count = pane.find('[data-test="term-search-count"]');
+  expect(count.exists()).toBe(true);
+  // 还没输入搜索词：显示占位符而不是「无匹配」
+  expect(count.text()).toContain("—");
+
+  // 输入搜索词
+  await pane.get(".search-bar input.el-input__inner").setValue("error");
+  await flushPromises();
+
+  // 后端 addon 回报 3 个匹配、当前在第 2 个
+  for (const handler of searchResultsHandlers) {
+    handler({ resultIndex: 1, resultCount: 3 });
+  }
+  await flushPromises();
+  expect(pane.get('[data-test="term-search-count"]').text()).toContain("2/3");
+
+  // 0 匹配要说「无匹配」，不能显示 0/0
+  for (const handler of searchResultsHandlers) {
+    handler({ resultIndex: -1, resultCount: 0 });
+  }
+  await flushPromises();
+  expect(pane.get('[data-test="term-search-count"]').text()).toContain("无匹配");
+
+  pane.unmount();
+});

@@ -163,6 +163,29 @@ pub enum AppCommand {
         rule: PortForwardRule,
     },
 
+    // ===== 串口 =====
+    /// 列出当前系统可用的串口设备
+    ///
+    /// 用户不该靠手打 `/dev/cu.usbserial-XXXX`——插拔一次名字就变。
+    ListSerialPorts,
+
+    // ===== 连接分组 =====
+    /// 列出全部分组
+    ListFolders,
+    /// 新建分组，返回新分组 id
+    CreateFolder {
+        name: String,
+    },
+    /// 重命名分组
+    RenameFolder {
+        folder_id: Uuid,
+        name: String,
+    },
+    /// 删除分组（组内的连接回到「默认」，不会被删除）
+    DeleteFolder {
+        folder_id: Uuid,
+    },
+
     // ===== 快速命令 =====
     /// 执行快速命令
     ExecuteQuickCommand {
@@ -194,9 +217,14 @@ pub enum AppCommand {
 
     // ===== 撰写窗格 =====
     /// 发送撰写窗格文本
+    ///
+    /// `active_session_id` 供 `ComposeTarget::CurrentSession` 解析当前会话。
+    /// 缺省为 None 时该目标无法解析（ComposeService 以 `No active session` 报错），
+    /// 因此前端在选择「当前会话」时必须带上真实会话 id。
     SendComposeText {
         content: String,
         target: ComposeTarget,
+        active_session_id: Option<Uuid>,
     },
 
     // ===== 脚本 =====
@@ -211,6 +239,8 @@ pub enum AppCommand {
     ToggleSyncInput {
         session_ids: Vec<Uuid>,
     },
+    /// 查询当前同步输入会话组（空数组 = 未开启）
+    GetSyncInputSessions,
 
     // ===== 安全：密钥管理 =====
     /// 生成 SSH 密钥对
@@ -247,6 +277,14 @@ pub enum AppCommand {
         old_password: String,
         new_password: String,
     },
+    /// 停用主密码（必须提供当前密码）
+    DisableMasterPassword {
+        password: String,
+    },
+    /// 立即锁定应用（清除内存中的派生密钥）
+    LockMasterPassword,
+    /// 查询主密码状态：NotSet / Locked / Unlocked
+    GetMasterPasswordState,
 
     // ===== 安全：主机密钥 =====
     /// 信任主机密钥（在 HostKeyMismatch 后用户选择接受）
@@ -280,6 +318,12 @@ pub enum AppCommand {
         host: String,
         port: u16,
     },
+
+    /// 列出已信任的主机密钥
+    ///
+    /// `DeleteHostKey` 单独存在时用户无从知道哪些条目可以删——known_hosts
+    /// 是应用自己的数据目录里的文件，用户不直接编辑它。
+    ListHostKeys,
 
     // ===== 安全：隧道管理 =====
     /// 暂停隧道

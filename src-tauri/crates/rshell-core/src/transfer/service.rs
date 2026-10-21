@@ -1318,27 +1318,6 @@ impl TransferService {
         }
     }
 
-    /// 更新传输进度
-    ///
-    /// 抽成关联函数 `apply_progress` 是为了让 execute_transfer 里的
-    /// forwarder 任务只持有 `tasks` / `event_bus` 的克隆即可复用同一逻辑。
-    pub async fn update_progress(
-        &self,
-        task_id: Uuid,
-        bytes_transferred: u64,
-        total_bytes: u64,
-    ) -> Result<(), CoreError> {
-        Self::apply_progress(
-            &self.tasks,
-            &self.event_bus,
-            task_id,
-            bytes_transferred,
-            total_bytes,
-        )
-        .await;
-        Ok(())
-    }
-
     /// 更新进度并广播：写任务表（含速度计算）+ 发布 `TransferProgress`
     async fn apply_progress(
         tasks: &Arc<RwLock<HashMap<Uuid, TransferTask>>>,

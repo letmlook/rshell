@@ -190,7 +190,7 @@ impl TelnetConnection {
                 }
             },
             TelnetCommand::SB => {
-                // 子协商 - 简化处理
+                // 子协商内容由 process_data 的 SB 分支单独处理
                 debug!("Telnet: Subnegotiation for option {}", option);
             }
             _ => {
@@ -199,6 +199,43 @@ impl TelnetConnection {
         }
 
         Ok(response)
+    }
+
+    /// 处理子协商内容（`IAC SB <option> <payload> IAC SE` 的中间部分）
+    ///
+    /// 客户端对 `DO TERMINAL-TYPE` 回了 `WILL TERMINAL-TYPE`，就必须真的把
+    /// 终端类型发出去：服务器发 `SB TERMINAL-TYPE SEND` 时应答
+    /// `SB TERMINAL-TYPE IS <type>`（RFC 1091）。此前子协商被整段丢弃，
+    /// 客户端答应了却从不发送——服务器可能一直等，或按错误的终端类型渲染。
+    async fn handle_subnegotiation(
+        &mut self,
+        option: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ProtocolError> {
+        if option == TelnetOption::TerminalType as u8 {
+            // SEND = 1：服务器要终端类型
+            if payload.first() == Some(&1) {
+                // RFC 1091：子协商载荷以 IS(0) 开头 —— 它是载荷里的字节，
+                // 不是一条 Telnet 命令。
+                const TERMINAL_TYPE_IS: u8 = 0;
+                let mut response = vec![
+                    TelnetCommand::IAC as u8,
+                    TelnetCommand::SB as u8,
+                    TelnetOption::TerminalType as u8,
+                    TERMINAL_TYPE_IS,
+                ];
+                response.extend_from_slice(self.terminal_type.as_bytes());
+                response.extend_from_slice(&[TelnetCommand::IAC as u8, TelnetCommand::SE as u8]);
+                debug!("Telnet: sending terminal type ({})", self.terminal_type);
+                return Ok(response);
+            }
+        }
+        debug!(
+            "Telnet: ignoring subnegotiation for option {} ({} bytes)",
+            option,
+            payload.len()
+        );
+        Ok(Vec::new())
     }
 
     /// 把尚未解析完的字节留到下一次调用处理（跨 TCP 分片）。
@@ -286,21 +323,34 @@ impl TelnetConnection {
                         }
                     }
                     x if x == TelnetCommand::SB as u8 => {
-                        // 跳过子协商直到 SE。
+                        // 跳过子协商直到 SE，并把子协商内容取出来。
                         // R3-07：扫描窗口必须有界——未闭合的子协商会让缓冲
                         // 一直累积，无界扫描等于每次调用都重扫全部历史数据。
                         let scan_end = data.len().min(i.saturating_add(MAX_PENDING_BYTES));
                         let mut completed = false;
+                        let sub_start = i;
                         while i < scan_end {
                             if data[i] == TelnetCommand::IAC as u8
                                 && i + 1 < scan_end
                                 && data[i + 1] == TelnetCommand::SE as u8
                             {
-                                i += 2;
                                 completed = true;
                                 break;
                             }
                             i += 1;
+                        }
+                        if completed {
+                            // 子协商内容（不含结尾的 IAC SE）要交给协议层处理：
+                            // 服务器问终端类型（TERMINAL-TYPE SEND）时必须应答，
+                            // 否则客户端答应了 WILL TERMINAL-TYPE 却从不真发，
+                            // 是一次「说了要做却没做」的假承诺。
+                            if sub_start < i {
+                                let option = data[sub_start];
+                                let payload = &data[sub_start + 1..i];
+                                let resp = self.handle_subnegotiation(option, payload).await?;
+                                response.extend(resp);
+                            }
+                            i += 2;
                         }
                         if !completed {
                             if scan_end < data.len() {
@@ -521,6 +571,68 @@ mod tests {
             b"A"
         );
         assert!(connection.pending_bytes.is_empty());
+    }
+
+    /// 客户端答应了 `WILL TERMINAL-TYPE` 就必须真的把终端类型发出去。
+    ///
+    /// 此前子协商内容被整段丢弃：服务器问 `SB TERMINAL-TYPE SEND` 时，
+    /// 客户端从不应答——一次「说了要做却没做」的假承诺。
+    #[tokio::test]
+    async fn terminal_type_send_is_answered_with_the_configured_type() {
+        let mut connection = TelnetConnection::new("example", 23);
+        connection.set_terminal_type("xterm-256color");
+
+        // SB TERMINAL-TYPE SEND
+        let response = connection
+            .handle_subnegotiation(TelnetOption::TerminalType as u8, &[1])
+            .await
+            .unwrap();
+
+        let mut expected = vec![
+            TelnetCommand::IAC as u8,
+            TelnetCommand::SB as u8,
+            TelnetOption::TerminalType as u8,
+            0, // IS
+        ];
+        expected.extend_from_slice(b"xterm-256color");
+        expected.extend_from_slice(&[TelnetCommand::IAC as u8, TelnetCommand::SE as u8]);
+        assert_eq!(response, expected);
+    }
+
+    /// 自定义终端类型也要如实发出去（set_terminal_type 不是摆设）。
+    #[tokio::test]
+    async fn terminal_type_response_follows_set_terminal_type() {
+        let mut connection = TelnetConnection::new("example", 23);
+        connection.set_terminal_type("vt100");
+
+        let response = connection
+            .handle_subnegotiation(TelnetOption::TerminalType as u8, &[1])
+            .await
+            .unwrap();
+        assert!(
+            response.windows(5).any(|w| w == b"vt100"),
+            "应答里必须含设置的终端类型：{response:?}"
+        );
+    }
+
+    /// 其它子协商不当作终端类型请求处理，也不产生噪音响应。
+    #[tokio::test]
+    async fn unrelated_subnegotiation_is_ignored() {
+        let mut connection = TelnetConnection::new("example", 23);
+
+        // SB NAWS（服务器偶尔会发窗口尺寸）
+        let response = connection
+            .handle_subnegotiation(TelnetOption::WindowSize as u8, &[0, 80, 0, 24])
+            .await
+            .unwrap();
+        assert!(response.is_empty());
+
+        // TERMINAL-TYPE 但不是 SEND
+        let response = connection
+            .handle_subnegotiation(TelnetOption::TerminalType as u8, &[0])
+            .await
+            .unwrap();
+        assert!(response.is_empty());
     }
 
     /// R3-07 回归：对端只发 `IAC SB <opt>` 而不发 `IAC SE` 时，暂存缓冲

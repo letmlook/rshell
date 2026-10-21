@@ -13,6 +13,9 @@ const props = defineProps<{
 
 const store = useSessionsStore();
 
+/** 版本号由 vite 从 package.json 注入（见 vite.config.ts 的 define） */
+const appVersion = __APP_VERSION__;
+
 const statusText = computed(() => {
   const id = store.currentId;
   if (!id) return "disconnected";
@@ -49,7 +52,7 @@ const protocolLabel = computed(() => {
     <span class="status-item">{{ protocolLabel }}</span>
     <span class="status-sep" aria-hidden="true">·</span>
     <span class="spacer" />
-    <span class="status-item muted">RShell v0.1.0</span>
+    <span class="status-item muted">RShell v{{ appVersion }}</span>
   </footer>
 </template>
 

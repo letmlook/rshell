@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
+import { readFileSync } from "node:fs";
 
 // Vite config tailored for Tauri:
 // - server.port 51820 must match tauri.conf.json devUrl
@@ -11,6 +12,14 @@ import vue from "@vitejs/plugin-vue";
 //   500 KiB threshold enforced by scripts/check-build-output.mjs
 export default defineConfig({
   plugins: [vue()],
+  // 版本号从 package.json 注入：状态栏原先硬编码 "v0.1.0"，
+  // 发布检查只比对 package.json / tauri.conf.json / Cargo.toml 三处，
+  // 版本一升，界面就变成一句假话。
+  define: {
+    __APP_VERSION__: JSON.stringify(
+      JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version,
+    ),
+  },
   clearScreen: false,
   server: {
     port: 51820,

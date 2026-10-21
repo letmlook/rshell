@@ -26,6 +26,15 @@ const TERMINAL_STATES = new Set([
   "dismissed",
 ]);
 
+/**
+ * 已处理请求的保留条数上限。
+ *
+ * 这份 history 只写不读（界面不展示它），却是每处理一个主机密钥请求就往里塞
+ * 一条。长期使用下它是纯粹的无界增长：既占内存，又没有任何价值。
+ * 留一个小的上限，既保住诊断价值，又不让它无限长。
+ */
+const HISTORY_LIMIT = 50;
+
 export const useHostKeyStore = defineStore("hostKey", () => {
   const requests = ref<Map<string, HostKeyRequest>>(new Map());
   // `current` is retained as the dialog's selected request for compatibility;
@@ -47,7 +56,12 @@ export const useHostKeyStore = defineStore("hostKey", () => {
     if (!request) return false;
     requests.value.delete(id);
     requests.value = new Map(requests.value);
-    if (recordHistory) history.value.push(request);
+    if (recordHistory) {
+      history.value.push(request);
+      if (history.value.length > HISTORY_LIMIT) {
+        history.value = history.value.slice(-HISTORY_LIMIT);
+      }
+    }
     if (errorDecisionId.value === id) {
       errorDecisionId.value = null;
       error.value = null;

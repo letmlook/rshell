@@ -151,3 +151,25 @@ describe("hostKey store", () => {
     expect(store.error).toBeNull();
   });
 });
+
+// 已处理请求的 history 只写不读，却是每处理一个请求就塞一条 —— 长期使用下
+// 是纯粹的无界增长。留一个上限，既保住诊断价值又不让它无限长。
+describe("hostKey store 的 history 上限", () => {
+  beforeEach(async () => {
+    setActivePinia(createPinia());
+    handlers.length = 0;
+    decideHostKey.mockReset();
+    decideHostKey.mockResolvedValue(undefined);
+    await useHostKeyStore().subscribeEvents();
+  });
+
+  it("处理超过上限的请求后，history 不再增长", async () => {
+    const store = useHostKeyStore();
+    for (let i = 0; i < 80; i++) {
+      const id = `00000000-0000-0000-0000-${String(i).padStart(12, "0")}`;
+      handlers.at(-1)!(mismatch(id));
+      await store.trustPermanent(id);
+    }
+    expect(store.history.length).toBeLessThanOrEqual(50);
+  });
+});

@@ -18,8 +18,9 @@
 //! - `send_input` / `resize_terminal` / `attach_terminal`
 
 use rshell_api::types::{
-    ComposeTarget, ConflictPolicy, CredentialUpdate, PluginInfo, RemoteFileEntry, SessionConfig,
-    SessionCredential, SessionLoadIssue, TerminalColorScheme, TransferTaskInfo,
+    ComposeTarget, ConflictPolicy, CredentialUpdate, Folder, HostKeyEntry, PluginInfo,
+    RemoteFileEntry, SessionConfig, SessionCredential, SessionLoadIssue, TerminalColorScheme,
+    TransferTaskInfo,
 };
 use rshell_api::{AppCommand, CommandOutcome};
 use tauri::ipc::Channel;
@@ -551,6 +552,48 @@ pub async fn change_master_password(
     Ok(())
 }
 
+/// 停用主密码：必须提供当前密码，删除持久化文件并回到 NotSet
+#[tauri::command(rename_all = "snake_case")]
+pub async fn disable_master_password(
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::DisableMasterPassword { password })
+        .await
+        .map_err(IpcError::from)?;
+    Ok(())
+}
+
+/// 立即锁定应用：清除内存中的派生密钥
+#[tauri::command(rename_all = "snake_case")]
+pub async fn lock_master_password(state: State<'_, AppState>) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::LockMasterPassword)
+        .await
+        .map_err(IpcError::from)?;
+    Ok(())
+}
+
+/// 查询主密码状态：NotSet / Locked / Unlocked
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_master_password_state(state: State<'_, AppState>) -> Result<String, IpcError> {
+    let outcome = state
+        .dispatcher
+        .dispatch(AppCommand::GetMasterPasswordState)
+        .await
+        .map_err(IpcError::from)?;
+    match outcome {
+        CommandOutcome::MasterPasswordState(s) => Ok(s),
+        other => Err(IpcError::outcome_mismatch(
+            "MasterPasswordState",
+            other.kind(),
+        )),
+    }
+}
+
 // trust_host_key —— 仅 decision=TrustPermanent 走 host_key_manager.trust_host_key
 // 持久化;Reject/TrustOnce 由 dispatcher 显式报错、不落盘(PROB-06)
 #[tauri::command(rename_all = "snake_case")]
@@ -571,6 +614,52 @@ pub async fn trust_host_key(
             public_key_blob,
             decision,
         })
+        .await
+        .map_err(IpcError::from)?;
+    Ok(())
+}
+
+// ===== 串口薄壳 =====
+
+/// 列出当前系统可用的串口设备
+#[tauri::command(rename_all = "snake_case")]
+pub async fn list_serial_ports(state: State<'_, AppState>) -> Result<Vec<String>, IpcError> {
+    let outcome = state
+        .dispatcher
+        .dispatch(AppCommand::ListSerialPorts)
+        .await
+        .map_err(IpcError::from)?;
+    match outcome {
+        CommandOutcome::SerialPorts(ports) => Ok(ports),
+        other => Err(IpcError::outcome_mismatch("SerialPorts", other.kind())),
+    }
+}
+
+// ===== 连接分组薄壳 =====
+// 分组命令放在这里：与快速命令/触发器同类（都是「组织类」的小实体）。
+cmd!(list_folders() -> Folders(Vec<Folder>) = AppCommand::ListFolders);
+cmd!(create_folder(name: String) -> FolderId(Uuid) = AppCommand::CreateFolder { name });
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn rename_folder(
+    folder_id: Uuid,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::RenameFolder { folder_id, name })
+        .await
+        .map_err(IpcError::from)?;
+    Ok(())
+}
+
+/// 删除分组：组内的连接回到「默认」，不会被删除
+#[tauri::command(rename_all = "snake_case")]
+pub async fn delete_folder(folder_id: Uuid, state: State<'_, AppState>) -> Result<(), IpcError> {
+    state
+        .dispatcher
+        .dispatch(AppCommand::DeleteFolder { folder_id })
         .await
         .map_err(IpcError::from)?;
     Ok(())
@@ -740,11 +829,16 @@ cmd!(list_plugins() -> Plugins(Vec<PluginInfo>) = AppCommand::ListPlugins);
 pub async fn send_compose_text(
     content: String,
     target: ComposeTarget,
+    active_session_id: Option<Uuid>,
     state: State<'_, AppState>,
 ) -> Result<(), IpcError> {
     state
         .dispatcher
-        .dispatch(AppCommand::SendComposeText { content, target })
+        .dispatch(AppCommand::SendComposeText {
+            content,
+            target,
+            active_session_id,
+        })
         .await
         .map_err(IpcError::from)?;
     Ok(())
@@ -761,6 +855,20 @@ pub async fn toggle_sync_input(
         .await
         .map_err(IpcError::from)?;
     Ok(())
+}
+
+/// 查询当前同步输入会话组；空数组表示未开启
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_sync_input_sessions(state: State<'_, AppState>) -> Result<Vec<Uuid>, IpcError> {
+    let outcome = state
+        .dispatcher
+        .dispatch(AppCommand::GetSyncInputSessions)
+        .await
+        .map_err(IpcError::from)?;
+    match outcome {
+        CommandOutcome::SyncSessions(ids) => Ok(ids),
+        other => Err(IpcError::outcome_mismatch("SyncSessions", other.kind())),
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -785,6 +893,20 @@ pub async fn delete_host_key(
         .await
         .map_err(IpcError::from)?;
     Ok(())
+}
+
+/// 列出已信任的主机密钥
+#[tauri::command(rename_all = "snake_case")]
+pub async fn list_host_keys(state: State<'_, AppState>) -> Result<Vec<HostKeyEntry>, IpcError> {
+    let outcome = state
+        .dispatcher
+        .dispatch(AppCommand::ListHostKeys)
+        .await
+        .map_err(IpcError::from)?;
+    match outcome {
+        CommandOutcome::HostKeys(entries) => Ok(entries),
+        other => Err(IpcError::outcome_mismatch("HostKeys", other.kind())),
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]

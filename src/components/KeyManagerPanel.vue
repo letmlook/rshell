@@ -12,13 +12,15 @@
  * 认证 → 托管密钥」参与会话认证——连接时后端经 KeyManager 取私钥字节，
  * 口令沿用会话自己的钥匙串槽位。私钥本体仍永不过 IPC（只出 SshKeyInfo）。
  */
-import { onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import {
   listKeys,
   generateSshKey,
   importPrivateKey,
   deleteSshKey,
+  exportPublicKey,
 } from "../ipc/client";
+import { subscribeAppEvents } from "../ipc/events";
 import type { SshKeyType, Uuid } from "../ipc/types";
 import { confirmDialog } from "../utils/dialog";
 import { pickLocalPath } from "../utils/pathPicker";
@@ -39,6 +41,8 @@ interface KeyRow {
   key_type: string;
   fingerprint: string;
   has_passphrase: boolean;
+  /** 公钥本体（可安全展示，用于复制到 authorized_keys） */
+  public_key_blob?: string;
 }
 
 const keys = ref<KeyRow[]>([]);
@@ -48,6 +52,14 @@ const generating = ref(false);
 const genName = ref("");
 const genType = ref<SshKeyType>("ED25519");
 const genPassphrase = ref("");
+/** 导出的公钥（后端通过 PublicKeyExported 事件回传，不是命令返回值） */
+const exported = ref<{ name: string; publicKey: string } | null>(null);
+const exportError = ref<string | null>(null);
+
+let unlisten: (() => void) | null = null;
+let subscribed = false;
+/** 点击导出时的密钥名：PublicKeyExported 事件只带 key_id 与公钥 */
+let pendingExportName = "";
 
 // 生成类型下拉:与后端 SshKeyType(src-tauri/crates/rshell-api/src/types.rs:354)逐一对齐,
 // value 由 SshKeyType 类型约束 —— 出现后端不存在的变体(如 "RSA"/"ECDSA")会直接编译报错,
@@ -146,7 +158,61 @@ async function remove(id: Uuid) {
   }
 }
 
-onMounted(refresh);
+/**
+ * 导出公钥。
+ *
+ * 后端 `ExportPublicKey` 命令本身返回 None，公钥通过 `PublicKeyExported`
+ * 事件回传（命令 → 事件 → 界面），这里等事件到达再开窗体。
+ * 私钥本体永不过 IPC，导出的只有公钥。
+ */
+async function exportKey(id: Uuid) {
+  exportError.value = null;
+  const name = keys.value.find((key) => key.id === id)?.name ?? id;
+  try {
+    await exportPublicKey(id);
+    // 命令只返回 None，公钥随 PublicKeyExported 事件回来；
+    // 事件里没有名称，这里先记下点击时的名称，事件到达后用上。
+    pendingExportName = name;
+  } catch (e) {
+    exportError.value = String(e);
+  }
+}
+
+/** 把公钥写入系统剪贴板 */
+async function copyExported() {
+  if (!exported.value) return;
+  try {
+    await navigator.clipboard.writeText(exported.value.publicKey);
+  } catch (e) {
+    exportError.value = `复制失败：${String(e)}`;
+  }
+}
+
+onMounted(async () => {
+  await refresh();
+  if (subscribed) return;
+  const stop = await subscribeAppEvents((event) => {
+    if (typeof event === "string") return;
+    if ("PublicKeyExported" in event) {
+      const { key_id, public_key } = event.PublicKeyExported;
+      exported.value = {
+        name:
+          keys.value.find((key) => key.id === key_id)?.name ??
+          pendingExportName ??
+          key_id,
+        publicKey: public_key,
+      };
+      exportError.value = null;
+    }
+  });
+  subscribed = true;
+  unlisten = stop;
+});
+
+onBeforeUnmount(() => {
+  unlisten?.();
+  unlisten = null;
+});
 </script>
 
 <template>
@@ -198,12 +264,35 @@ onMounted(refresh);
           {{ row.has_passphrase ? "✓" : "—" }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="80">
+      <el-table-column label="操作" width="140">
         <template #default="{ row }">
+          <el-button
+            size="small"
+            :data-test="`key-export-${row.id}`"
+            @click="exportKey(row.id)"
+          >
+            导出公钥
+          </el-button>
           <el-button size="small" type="danger" @click="remove(row.id)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
+
+    <p v-if="exportError" class="error" data-test="key-export-error">{{ exportError }}</p>
+
+    <el-dialog
+      :model-value="exported !== null"
+      title="导出公钥"
+      width="560px"
+      @close="exported = null"
+    >
+      <p class="export-name">{{ exported?.name }}</p>
+      <pre class="export-body">{{ exported?.publicKey }}</pre>
+      <template #footer>
+        <el-button @click="exported = null">关闭</el-button>
+        <el-button type="primary" data-test="key-export-copy" @click="copyExported">复制</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog
       :model-value="importState !== null"
@@ -263,5 +352,24 @@ h3 {
 .error {
   color: var(--el-color-danger);
   font-size: 12px;
+}
+.export-name {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.export-body {
+  margin: 0;
+  padding: 8px;
+  max-height: 220px;
+  overflow: auto;
+  font-family: monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--rs-bg-surface, #1b1b20);
+  border: 1px solid var(--rs-border, #2c2c33);
+  border-radius: 6px;
 }
 </style>

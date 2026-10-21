@@ -35,6 +35,7 @@ describe("session credential recovery", () => {
     invoke.mockImplementation(async (command: string) => {
       if (command === "list_sessions") return retried ? [session] : [];
       if (command === "list_session_load_issues") return retried ? [] : [{ session_id: "legacy-id", message: "Could not load or migrate saved session" }];
+      if (command === "list_folders") return [];
       if (command === "retry_session_load") { retried = true; return; }
       throw new Error(`Unexpected command ${command}`);
     });
@@ -60,6 +61,7 @@ describe("session credential recovery", () => {
     invoke.mockImplementation(async (command: string) => {
       if (command === "list_sessions") return [config];
       if (command === "list_session_load_issues") return [];
+      if (command === "list_folders") return [];
       if (command === "update_session") return;
       throw new Error(`Unexpected command ${command}`);
     });
@@ -85,7 +87,7 @@ describe("session credential recovery", () => {
     button("更新凭据")!.click();
     await flushPromises();
     expect(document.body.querySelector<HTMLInputElement>('input[type="password"]')!.value).toBe("");
-    expect(invoke.mock.calls.every(([command]) => ["list_sessions", "list_session_load_issues", "update_session"].includes(command))).toBe(true);
+    expect(invoke.mock.calls.every(([command]) => ["list_sessions", "list_session_load_issues", "list_folders", "update_session"].includes(command))).toBe(true);
   });
 
   it("keeps a failed credential save visible and preserves the entered value until dismissal", async () => {
