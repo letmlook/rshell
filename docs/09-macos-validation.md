@@ -281,3 +281,143 @@ Task 1 之前的 baseline commit 为 `86c6ac0`；本轮最终 HEAD 为 `a50245e`
 - Windows DPAPI / Linux Secret Service 的真实平台适配
 
 完整计划与对应 spec 参见 [`docs/superpowers/specs/2026-10-08-reliability-improvement-design.md`](superpowers/specs/2026-10-08-reliability-improvement-design.md) 与 [`docs/superpowers/plans/2026-10-08-reliability-recovery.md`](superpowers/plans/2026-10-08-reliability-recovery.md)。
+
+## 2026-10-21（续）：长期运行的资源与热路径优化
+
+前一段补的是「功能没实现」，这一段换维度审计**长期运行的资源占用与热路径**：
+
+- **远端浏览每次新开一条 SFTP 通道**：浏览目录 / 取 home / 取元信息各自新开通道并重做 `SSH_FXP_VERSION` 握手，服务端还要为每条通道 fork 一个 sftp 进程。现改为复用同一条会话（`SessionCache`，泛型 + 单测锁定「建一次、用多次、可作废」语义），只读操作失败时丢弃缓存重开再试一次，写操作不重试（可能已生效，重试会报假失败）。同时把 SFTP 的 I/O 移出 `SshClient` 的锁范围——列慢目录不再堵住同会话的 resize。
+- **热键在每次按键时重新解析**：终端里每按一次键都会走热键匹配，此前每个按键 × 每条命令都要拆一次热键字符串。现改为命令列表变化时预解析一次（`parsedHotkeys` computed）。
+- **两处无界增长的数组**：主机密钥 store 的 `history`（只写不读，每处理一个请求塞一条）与文件面板的导航历史（逐级浏览时一直涨，「后退」能一路退回几百层）。现分别加上限（50 / 100 条）。
+
+## 2026-10-21：补齐「后端已实现、界面无入口」的九项功能
+
+### 范围
+
+对「后端命令与事件齐备、但界面上没有任何入口」的功能做一次系统审计，逐项补齐界面并修掉审计中暴露的两处后端缺陷：
+
+| 功能 | 此前状态 | 本轮改动 |
+|---|---|---|
+| 主密码 | `setup/verify/change` 三个命令在，状态**只在内存**，无 lock/state 命令，零界面 | 持久化（盐 + 加密令牌落盘，派生密钥不落盘）、`DisableMasterPassword`/`LockMasterPassword`/`GetMasterPasswordState` 三个新命令、「设置 → 安全」面板与应用锁遮罩 |
+| 同步输入 | `SyncInputService` 真实，零界面 | 「工具 → 同步输入」面板 + `GetSyncInputSessions` 查询命令 |
+| 撰写窗格 | `ComposeService` 真实，零界面；`CurrentSession` 目标因 dispatcher 写死 `None` **必然失败** | 「工具 → 撰写窗格」面板；命令契约新增 `active_session_id` |
+| 隧道挂起/恢复 | 后端 R3-02 已把「假挂起」修成真实现，界面只有「关闭」 | 每行「挂起 / 恢复」按钮 |
+| 待定隧道恢复 | `listPendingTunnels().rules` 从不展示，`restoreTunnel` 零调用 | 「待恢复的隧道」区块 + 「恢复」按钮；会话选择从裸 uuid 输入框改为连接列表下拉 |
+| 已信任主机密钥 | `delete_host_key` 在，零界面；用户无从知道能删什么 | 新增 `list_host_keys` 命令 + 「设置 → 安全」面板的列表与删除 |
+| SSH 公钥导出 | `export_public_key` + `PublicKeyExported` 事件都在，零界面 | 密钥面板每行「导出公钥」，事件回传后可复制 |
+| 终端配色导入 | `import_color_scheme` 在，零界面；且只写内存，重启即失 | 「设置 → 终端 → 导入…」+ 导入的方案写入持久化文件 |
+| Rhai 脚本执行 | `execute_script` 在，零界面 | 「工具 → 脚本」面板，附宿主函数与能力边界清单 |
+
+同步修掉的两处后端缺陷：
+
+- **撰写窗格的「当前会话」目标必然失败**：`command_dispatcher.rs` 把 `ComposeService::send_text` 的 `active_session` 参数写死为 `None`，`ComposeTarget::CurrentSession` 因此永远走 `No active session` 分支。命令契约新增 `active_session_id` 字段并由前端传真实会话 id。
+- **同步输入把字节发两遍**：`SendInput` 先直接发给源会话，随后 `send_to_synced_sessions` 又把同一份数据发给同步组里的每个会话——源会话若在组内即收到双份字节（回车被执行两次）。现在广播时排除源会话（`sync_targets` 纯函数，有单测锁定）。
+
+### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `npm run typecheck` | exit 0 |
+| `npm test` | Test Files **44 passed (44)**、Tests **366 passed (366)**（本轮前：38 文件 / 316 用例） |
+| `npm run build` | 通过（见下） |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo test --workspace` | exit 0 |
+| `npm run check:docs` | 通过（14 份现行文档） |
+
+**前端用例增量**：38 文件 / 316 → **44 文件 / 366**（+50）。新增文件 `tests/unit/MasterPassword.spec.ts`、`tests/unit/SyncInputPanel.spec.ts`、`tests/unit/ComposePanel.spec.ts`、`tests/unit/HostKeyPanel.spec.ts`、`tests/unit/ScriptPanel.spec.ts`、`tests/unit/colorScheme.spec.ts`；`tests/unit/TunnelPanel.spec.ts` 增加挂起/恢复/待定恢复/错误状态四个用例。
+
+**Rust 用例增量**：rshell-core 219 → **236**（+17，含主密码持久化 11 项、配色方案持久化 4 项、同步输入目标过滤 3 项、撰写窗格目标解析 2 项、主机密钥列举 2 项）。
+
+契约测试 `tests/unit/ipcContract.spec.ts` 的两份白名单同步收口：`HELPER_WHITELIST` 里 12 个「尚未接入 UI」的 helper 已全部接通，只剩 `trustHostKey`（永久信任走 `decide_host_key` 路径）；`EVENT_LISTENER_WHITELIST` 里 5 个「0 监听」事件已各有消费方（`ScriptFinished` / `SyncInputSessionsChanged` / `PublicKeyExported` / `MasterPasswordChanged` / `MasterPasswordVerified` / `ColorSchemeListChanged`）。
+
+### 关键能力的诚实边界
+
+- **主密码是应用层锁，不是凭据保险库**：它只挡这台机器上的操作入口，不断开已建立的 SSH 连接，也不保护钥匙串里的凭据；界面与文档都如实标注了这一点。忘记密码的恢复路径是手动删除 `master_password.json`，界面不提供一键重置（否则锁等于没有）。
+- **主密码持久化的是盐与加密令牌，不是派生密钥**：重启后状态是 `Locked`，必须重新验证解锁。只把状态放内存的话「设置主密码」跨重启即失效，属于静默假成功——这条是本轮把该功能判为「实现不完整」的核心依据。
+- **同步输入的会话组只在内存**：重启后自动关闭，这是刻意选择（会话连接本身不跨进程恢复，跨进程的同步组没有意义）。
+- **撰写窗格的三种目标**：全部失败时 invoke 直接报错，部分失败时逐个会话列出原因；目标为空也报错，不假装已发送。
+- **配色方案的「导入」落盘、「选择」不落盘**：导入的自定义方案写入 `color_schemes.json`，重启后仍在列表里；当前选用哪个方案不承诺跨进程恢复（沿用既有边界）。
+
+### 仍待真实环境验收
+
+本轮新增的九项界面入口**全部只有单元测试与构建检查覆盖**，没有 macOS 真实 GUI 人工验收记录：
+
+- 主密码：设置 → 锁定 → 重启 → 解锁的完整闭环，遮罩在真实 WebView 中的焦点与遮罩层行为
+- 同步输入：多个真实 SSH 会话上的广播，源会话确实只收到一份
+- 撰写窗格：三种目标在真实会话上的投递与部分失败提示
+- 隧道挂起后已建立的转发连接确实被撤销，恢复后新连接可用
+- 待定隧道在重启后于界面列出并可恢复
+- 主机密钥列表与删除
+- SSH 公钥导出的复制与粘贴到 `authorized_keys`
+- 配色方案导入后重启仍在列表里
+- Rhai 脚本运行器的真实执行与输出
+
+签名与公证、外部 SSH 服务、物理串口仍按 CLAUDE.md 标记为未验证。
+
+### 第二轮：补齐触发器完整动作与连接信息编辑（2026-10-21 续）
+
+#### 范围
+
+第一轮补的是「后端命令在、界面无入口」的功能。第二轮转向**后端枚举有多个变体、界面只能创建其中一个**以及**后端命令完整、界面只有一半用法**的两类缺口：
+
+- **触发器**：后端 `TriggerCondition` 有正则匹配与精确匹配两种，`TriggerAction` 有发送文本、显示通知、断开连接、记录到文件四种，四种动作在 `rshell-core/src/session/service.rs` 均已实现；界面此前只能创建「正则 + 发送文本」一种，其余三种动作没有任何入口。现创建表单覆盖全部组合，「记录到文件」的路径用应用内文件选择器选取并要求绝对路径。
+- **连接信息编辑**：后端 `UpdateSession` 完整支持改配置，凭据可选 `Keep` / `Set` / `Clear`；界面此前只能用「更新凭据」改密码，改主机名只能删掉重建（凭据随连接 id 走，一并丢掉）。现连接列表右键有「编辑连接」，编辑时密码与口令留空表示保持现有凭据。
+- **键盘交互认证**：后端 `AuthMethod::KeyboardInteractive` 与 SSH 客户端的交互式认证流程早已实现，但界面只有密码 / 托管密钥 / 外部私钥三种认证方式，该能力无法使用。现补第四种认证方式。
+- **快速命令的「选定会话」范围**：后端 `QuickCommandScope::SelectedSessions` 已实现，创建表单此前只给当前会话 / 所有已连接会话两种。
+- **终端外观设置**：字号、字体预设、光标样式/闪烁、滚动回滚行数此前在 `TerminalPane` 里写死，`TerminalConfig`/`CursorStyle` 类型声明了同样字段却从未接线。现接到「设置 → 终端」，已打开的终端通过 watch 立即生效；偏好存 localStorage（与「选中即复制」同机制）。
+- **两侧零引用的类型与恒零字段**：`TerminalConfig`/`CursorStyle`/`SearchMatch`/`TelnetConfig`/`SessionInfo` 在 Rust 与 TS 两侧都是 0 引用；`ConnectionInfo` 的 `bytes_sent`/`bytes_received`/`latency_ms` 始终是 0/None 且界面从不消费。前者两侧一并删除，后者三个字段一并删除——类型镜像恢复一一对应，不再声明不存在的能力。
+- **快速命令的分组与说明**：`QuickCommand.group` / `description` 此前恒为 `null` / 空串，界面无处可设。现补创建表单的分组与说明输入，面板按分组名聚合命令。
+- **触发器命名**：触发器的 `name` 此前恒等于匹配条件，列表里「名称」与「正则」两列内容重复。现可单独命名（留空则回落为匹配条件，不新增错误路径）。
+- **状态栏的硬编码版本号**：状态栏原写着 `RShell v0.1.0`，而发布检查只比对 package.json / tauri.conf.json / Cargo.toml 三处——版本一升，界面就变成一句假话。现由 vite 从 package.json 注入 `__APP_VERSION__`，版本号与发布产物同源。
+- **命令契约护栏**：契约测试此前只保证「有 helper 的有调用方」，反向（Rust 有命令、TS 连变体都没有）没人管——后端能力既用不了也测不到。现补「commands.rs 与 types.ts 的 AppCommand 变体集逐一对齐」+「每个命令变体在 client.ts 都有对应 helper」两条断言，并给解析器加变体数量下界，防止解析器失效后平凡通过。
+- **空分组不可见**：分组树曾过滤掉没有连接的分组，而分组头正是删除按钮的载体——用户新建的空分组在界面上根本不出现，等于永远删不掉。现空分组照常列出。
+- **store 对异常 IPC 响应的健壮性**：会话与分组 store 直接把 IPC 返回值赋给 `items`，后端异常返回（非数组）会让它变成不可迭代，界面整块崩掉。现两处都做数组校验。
+- **串口设备枚举**：`SerialConnection::list_ports()` 一直存在于协议层却从未经 IPC 暴露，界面让用户手打 `/dev/cu.usbserial-XXXX`——插拔一次名字就变。现补 `ListSerialPorts` 命令与下拉选择（可手工输入兜底，枚举失败时说明原因）。
+- **Telnet 终端类型子协商**：客户端对 `DO TERMINAL-TYPE` 回 `WILL TERMINAL-TYPE`，服务器随后发 `SB TERMINAL-TYPE SEND` 时必须回 `SB TERMINAL-TYPE IS <类型>`（RFC 1091）。此前子协商内容被整段丢弃——客户端答应了却从不真发，服务器可能一直等或按错误类型渲染。现实现应答并补 3 项单测（含自定义类型如实发出、其它子协商不误判）。
+- **插件扫描的静默拒绝**：清单解析失败、或目录名与清单 `name` 不一致的插件目录，扫描时只记一条 warn 日志就跳过——用户扫描插件只看到「没有插件」，不知道自己��目录被拒了。现以 `state = Error` 的条目出现在列表里，`PluginInfo` 新增 `error` 字段承载原因（Rust + TS 两侧同步）。
+- **插件面板的能力可见性**：`PluginInfo.permissions` / `extensions` 一直经 IPC 传到前端却从不展示，用户加载一个声明了网络访问的插件只看得到「已加载」。现展示清单声明的权限（翻成中文说法）与扩展点，并明确说明「已加载」只表示模块编译并登记成功——宿主不向 WASM guest 提供任何宿主能力，声明的权限不会生效。这与沙箱「allow_network 尚未实现，必须报错而不是被忽略」的立场一致。
+- **应用级快捷键**：工具栏的 title 写着「新建连接 (Ctrl+N)」，但全局处理器里根本没有这个快捷键——按了没反应，是虚假提示。同时应用接管的键会**漏给远端 shell**（xterm 在目标阶段先处理，窗口处理器的 `preventDefault` 太晚，Ctrl+F 照样送出 0x06）。现抽出 `utils/shortcuts.ts` 作唯一定义处：窗口处理器据此决定做什么，终端据此决定吞不吞该键。Escape 仍照常送远端。
+- **文件面板的权限提示**：capability 早已改为全局读写（`fs:read-all` + `**`），但界面仍按旧的「逐目录授权」模型给出「该目录尚未授权，请重新选择」的建议——scope 根本不是失败原因，真正的拒绝来自操作系统。新文案说明真实原因并指向「更换本地目录」；越界提示也从「超出已授权的根目录」改成「超出当前本地目录」（那是用户选定的传输目录，不是权限根）。
+- **终端搜索的匹配计数**：搜索栏此前只有输入框与上/下一个按钮，用户不知道有没有命中、当前在第几个。现显示「当前/总数」（无匹配明说「无匹配」）并可切换「区分大小写」。
+- **会话分组的持久化**：新增 `folder_id_round_trips_through_toml` 回归测试，锁定「分组随会话 TOML 往返」——否则连接分组重启后就丢了，功能等于只在单次运行内有效。
+- **主机密钥的「上次连接时间」**：`first_seen`/`last_seen` 此前只在内存里，且 known_hosts 的 OpenSSH 标准格式没有放时间戳的位置，导致每次重启都被重置成「现在」——两个字段都在撒谎。现改为写 sidecar（`<known_hosts>.meta.json`），连接成功后更新，并在「设置 → 安全」的主机密钥面板里显示。
+- **快速命令热键**：`QuickCommand.hotkey` 字段被存储、被持久化，但此前**没有任何实现**——没有热键捕获、没有注册、也没有界面入口，绑了也永远不会触发。现补 `utils/hotkey.ts`（解析与匹配，纯函数）、创建表单的热键输入与校验，以及全局 keydown 处理器里的触发逻辑（作用范围与「执行」按钮共用同一套解析）。
+- **连接分组**：`SessionConfig::folder_id` 一直是个指向不存在实体的悬空 `Option<Uuid>`——后端没有任何分组实体与存储，界面上却画着分组树，于是树里永远只有一个「默认」组。现补 `Folder` 实体、`folders.json` 持久化与 `ListFolders`/`CreateFolder`/`RenameFolder`/`DeleteFolder` 四个命令，连接列表按真实分组建树，可新建/删除分组，新建与编辑连接时可选择所属分组。删除分组时组内连接回到「默认」而不是被删掉。
+
+顺带移除主密码的 `encrypt_data` / `decrypt_data`：两者零消费方，且与「主密码不是凭据保险库」的契约冲突——留着等于一个「看起来能加密凭据、实际没有」的假能力。
+
+#### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `npm run typecheck` | exit 0 |
+| `npm test` | Test Files **49 passed (49)**、Tests **440 passed (440)**（第一轮结束时：44 文件 / 366 用例；本轮基线 38 文件 / 316 用例） |
+| `npm run check:docs` | 通过（14 份现行文档） |
+
+新增前端用例：触发器动作/条件覆盖 8 项、连接编辑模式 4 项、右键菜单「编辑连接」1 项、键盘交互认证 1 项、快速命令作用范围与热键 7 项（新建 `tests/unit/QuickCommandPanel.spec.ts`）、连接分组 8 项（新建 `tests/unit/Folders.spec.ts`）、热键解析与匹配 12 项（新建 `tests/unit/hotkey.spec.ts`）、全局热键触发 2 项（AppLayout）、终端外观 6 项（TerminalSettings）、快速命令分组与说明 3 项、触发器命名 2 项、会话分组 TOML 往返 1 项（rshell-infra）、搜索匹配计数 1 项、快捷键判据 6 项（新建 `tests/unit/shortcuts.spec.ts`）、Ctrl+N 开新建对话框 2 项（AppLayout）、插件能力可见性 3 项（新建 `tests/unit/PluginPanel.spec.ts`）、串口设备枚举 2 项、空分组可见性 1 项、命令契约护栏 3 项、主机密钥 history 上限 1 项。Rust 侧新增 2 项（SFTP 会话缓存语义）。Rust 侧新增 28 项（分组服务 9 项 + 分组命令 3 项 + 主机密钥时间戳 2 项 + 其余特性合计）。
+
+#### 仍待真实环境验收
+
+编辑连接后能否正常连接、保留的凭据是否仍可用、「记录到文件」触发器是否真的落盘（绝对路径、只追加不覆盖）、四种触发器动作在真实远端输出下的触发时机、键盘交互认证在真实服务器上的应答流程、分组的增删改与连接归组在真实界面上的表现、快速命令热键在真实窗口里的捕获与冲突表现、终端外观改动在真实 WebView 中的即时生效、主机密钥「上次连接时间」在真实连接后是否正确刷新，均需真机确认。
+
+### 2026-10-21：原生应用启动（首次真机运行证据）
+
+在此之前的记录里，原生启动一直是「手工步骤」。本轮第一次在 macOS 上**真正跑起来**：
+
+```bash
+cd src-tauri && RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1 cargo build --bin rshell
+RUST_BACKTRACE=1 RUST_LOG=info ./src-tauri/target/debug/rshell
+```
+
+| 观察项 | 结果 |
+|---|---|
+| 启动日志 | `RShell Tauri shell started (slice 1.1); data_root = /Users/letmlook/Library/Application Support/rshell` |
+| 进程状态 | 持续运行 2 分 10 秒，`STAT=S`（事件循环空闲，GUI 应用的正常状态），RSS 约 112 MB |
+| 崩溃 / panic | 无。日志里除启动行外无任何 ERROR/WARN |
+| 退出 | SIGTERM 后正常退出，无残留进程 |
+| 数据目录 | 启动后**未新增**文件——`folders.json` / `color_schemes.json` / `master_password.json` 都是用到才写（惰性创建），与设计一致 |
+
+这一条覆盖的是**启动路径**：本轮新增的 `MasterPassword::with_path` / `FolderService::with_path` / `ThemeManager::with_persistence` 都跑在启动装配里，它们在真实进程里读文件、持锁、初始化，没有出现单元测试覆盖不到的崩溃。
+
+**边界（必须说清）**：本次只证明了「应用能启动、事件循环稳定、启动装配不崩」。**界面渲染、交互、真实 SSH/SFTP 连接仍未经真机验证**——截图受系统录屏权限限制无法取得，窗口内的一切仍只有单元测试与构建检查覆盖。外部 SSH 服务、物理串口、签名与公证同样未验证。

@@ -14,6 +14,24 @@
 
 业务逻辑归 `rshell-core`；协议 I/O 归 `rshell-protocol`；Tauri 层只做初始化、参数转换、错误映射和路由。xterm.js 负责终端渲染。
 
+### 未实现功能清单在哪里
+
+`tests/unit/ipcContract.spec.ts` 的两份白名单就是现成的待办清单：
+
+- `HELPER_WHITELIST`：`src/ipc/client.ts` 里「已导出但 src/ 内零调用方」的 helper，每个都注明了为什么还没接线（例：`trustHostKey` 走 `decide_host_key` 路径，不另开入口）。接通一个就删一条。
+- `EVENT_LISTENER_WHITELIST`：后端有发布点、前端却没有消费方的 `AppEvent` 变体。同样是接通一个删一条。
+
+契约测试会在两侧增删变体、helper 改名或漏掉一方时立即失败——改 IPC 契约后必须一起更新它。
+
+「后端已实现但界面无入口」的功能不只在这两份白名单里。审计时按这几类扫：
+
+- **后端枚举的多个变体，界面只接上一个**：触发器的四种动作与两种条件、快速命令的三种作用范围、认证方式的四种（密码 / 托管密钥 / 外部私钥 / 键盘交互）、`AppCommand` 的四种触发条件等。两侧都要能产生。
+- **字段声明了但恒为空**：`QuickCommand.group`/`description` 曾恒为 `null`/空串、`ConnectionInfo` 的字节与延迟字段恒为 0、`HostKeyEntry.first_seen`/`last_seen` 每次重启被重置。字段要么真的被填，要么删掉——不能留着一个永远为假的字段。
+- **两侧零引用的类型**：Rust 与 TS 同时没有使用方的类型，是在声明不存在的能力。
+- **虚假提示**：界面写着但做不到的事（工具栏 title 里的快捷键）、给错原因的提示（scope 早已全局化却还在说「尚未授权」）、只答应不兑现的协议行为（Telnet 回了 `WILL TERMINAL-TYPE` 却不真发终端类型）。
+
+契约测试只覆盖其中一部分：`HELPER_WHITELIST` / `EVENT_LISTENER_WHITELIST` 管「有实现无消费」，`OUTCOME_RETURN_MAP` 管返回值标注，「IPC 命令契约」组管 Rust 命令变体与 TS 变体的逐一对齐。其余几类目前靠人工审计——新增能力时记得同步看一遍。
+
 ## 生命周期
 
 SSH 输出接收器独立于发送客户端锁。Telnet/Serial 由会话服务持有连接任务，通过请求通道接收发送、resize 和断开操作。不要在等待远端输入时阻塞发送路径。
