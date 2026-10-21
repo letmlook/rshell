@@ -618,6 +618,121 @@ impl Connection for TelnetConnection {
 mod tests {
     use super::*;
 
+    // ===== 真实 telnetd 端到端验收（需外部服务器，默认不跑） =====
+
+    /// 真实 GNU inetutils telnetd 上的 NAWS 端到端验收。
+    ///
+    /// 单元测试只能证明「我们发出的字节长这样」；这里连一台**真的** telnetd，
+    /// 让它把我们上报的窗口尺寸应用到 pty 上，再在会话里跑 `stty size` 把
+    /// **服务端看到的**尺寸读回来 —— 只有这样才能证明：
+    /// 1. 方向对：我们发 `IAC WILL NAWS`、服务端回 `IAC DO NAWS`（RFC 1073）；
+    /// 2. 时序对：协商完成前发生的 resize 会在协商成功后补发（`last_size` 补发）；
+    /// 3. 帧格式对：宽高各 2 字节、大端，服务端能解析出正确的行列。
+    ///
+    /// 环境变量：`RSHELL_REAL_HOST`、`RSHELL_REAL_TELNET_PORT`。
+    #[tokio::test]
+    #[ignore = "需要真实 telnetd（multipass 实例）与 RSHELL_REAL_* 环境变量，不进 CI"]
+    async fn real_telnetd_applies_our_window_size() {
+        let host = std::env::var("RSHELL_REAL_HOST").unwrap_or_default();
+        assert!(!host.is_empty(), "缺少 RSHELL_REAL_HOST");
+        let port: u16 = std::env::var("RSHELL_REAL_TELNET_PORT")
+            .unwrap_or_else(|_| "2323".to_string())
+            .parse()
+            .expect("RSHELL_REAL_TELNET_PORT 必须是端口号");
+        let user = std::env::var("RSHELL_REAL_USER").unwrap_or_else(|_| "ubuntu".to_string());
+        let pass = std::env::var("RSHELL_REAL_PASS").unwrap_or_default();
+        assert!(!pass.is_empty(), "缺少 RSHELL_REAL_PASS");
+
+        let mut conn = TelnetConnection::new(&host, port);
+        conn.connect().await.expect("连接 telnetd 失败");
+
+        // 故意在**读到协商应答之前**就 resize：协商是异步的，真实链路下
+        // 「先 resize 后协商完成」是常态。协商完成的那一刻应把尺寸补发出去。
+        conn.resize(120, 40).await.expect("resize 失败");
+
+        // 读一次：协商应答（DO NAWS）在这一轮里被处理，尺寸随之补发。
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = String::new();
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), conn.recv(&mut buf))
+                .await
+            {
+                Ok(Ok(n)) => {
+                    seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    // 协商应答已处理完
+                    if conn.naws_enabled {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => panic!("读取 telnet 输出失败: {e}"),
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            conn.naws_enabled,
+            "服务端未回 DO NAWS（方向仍不对）。已收到: {seen:?}"
+        );
+
+        // 给服务端一点时间把尺寸应用到 pty
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // 走完登录：telnetd 的 pty 在登录**之前**就建好了，登录后再问尺寸
+        let mut transcript = String::new();
+        wait_for(&mut conn, &mut buf, &mut transcript, "login:", 20).await;
+        conn.send(format!("{user}\n").as_bytes())
+            .await
+            .expect("发送用户名失败");
+        wait_for(&mut conn, &mut buf, &mut transcript, "assword:", 20).await;
+        conn.send(format!("{pass}\n").as_bytes())
+            .await
+            .expect("发送口令失败");
+        wait_for(&mut conn, &mut buf, &mut transcript, "$", 20).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // 在会话里问服务端自己看到的 pty 尺寸
+        conn.send(b"stty size\n").await.expect("发送命令失败");
+        let mut output = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !output.contains("40 120") {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), conn.recv(&mut buf))
+                .await
+            {
+                Ok(Ok(n)) => output.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Ok(Err(e)) => panic!("读取 telnet 输出失败: {e}"),
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            output.contains("40 120"),
+            "服务端的 pty 尺寸没有随 NAWS 更新（期望 40 120）。输出: {output:?}"
+        );
+        conn.disconnect().await.ok();
+    }
+
+    /// 读到 `needle` 出现为止（把中间输出追加进 `transcript`）。
+    async fn wait_for(
+        conn: &mut TelnetConnection,
+        buf: &mut [u8],
+        transcript: &mut String,
+        needle: &str,
+        timeout_secs: u64,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        while std::time::Instant::now() < deadline {
+            if transcript.contains(needle) {
+                return;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(500), conn.recv(buf)).await
+            {
+                Ok(Ok(n)) => transcript.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Ok(Err(e)) => panic!("读取 telnet 输出失败: {e}"),
+                Err(_) => continue,
+            }
+        }
+        panic!("等待 {needle:?} 超时。已收到: {transcript:?}");
+    }
+
     #[tokio::test]
     async fn recv_preserves_output_larger_than_callers_buffer() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

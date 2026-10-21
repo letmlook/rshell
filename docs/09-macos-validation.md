@@ -501,6 +501,76 @@ NAWS 协商 7 项（含重写的既有 resize 用例与新增的负确认用例�
 OpenSSH 上的 `posix-rename` 原子替换；并发传输闸门在真实并发下的排队表现；
 孤儿临时文件回收在真实远端目录上的实际删除范围；主密码 600k 迭代下的解锁耗时与退避表现。
 
+> 上述五项已在下一节（2026-10-22 的 multipass Linux 真机验收）里**逐项验证完毕**；
+> 剩下的只有物理串口与签名公证。
+
+### 2026-10-22：multipass Linux 真机验收（补上「仍待真实环境验收」的五项）
+
+用 multipass 起了一台真的 Linux 服务器，把上一节列为「仍待真机确认」的五项逐项跑通。
+客户端代码仍是 macOS 上编译的那份，**服务端是真正的 Linux**（这五项考的都是服务端行为：
+选项协商、扩展声明、通道额度、远端目录删除语义）。
+
+#### 环境
+
+| 项 | 值 |
+|---|---|
+| 虚拟化 | multipass 1.16.4+mac |
+| 镜像 | Ubuntu 24.04 LTS（`noble`），2 vCPU / 2 GB / 8 GB |
+| 实例 | `rshell-test`，`192.168.252.2` |
+| SSH 服务端 | OpenSSH 9.6p1 Ubuntu-3ubuntu13.20，`MaxSessions 10` |
+| Telnet 服务端 | GNU inetutils telnetd（经 socat 监听 2323） |
+| 认证 | 主机公钥（cloud-init 注入 `ssh_authorized_keys`）+ telnet 口令（仅环境变量） |
+
+复现步骤（凭据只经环境变量，不进仓库）：
+
+```bash
+multipass launch 24.04 --name rshell-test --cloud-init <(printf 'ssh_authorized_keys:\n  - %s\n' "$(cat ~/.ssh/id_ed25519.pub)")
+multipass exec rshell-test -- sudo apt-get install -y inetutils-telnetd socat
+multipass exec rshell-test -- sudo nohup socat TCP-LISTEN:2323,reuseaddr,fork EXEC:/usr/sbin/telnetd &
+multipass exec rshell-test -- sudo chpasswd   # 给 telnet 登录设口令
+
+export RSHELL_REAL_HOST=192.168.252.2 RSHELL_REAL_SSH_PORT=22 RSHELL_REAL_TELNET_PORT=2323
+export RSHELL_REAL_USER=ubuntu RSHELL_REAL_KEY=~/.ssh/id_ed25519
+export RSHELL_REAL_PASS='<telnet 口令>' RSHELL_REAL_PATH=/home/ubuntu/rshell-test
+
+cargo test -p rshell-protocol --lib -- --ignored --nocapture
+cargo test -p rshell-core --lib -- --ignored --nocapture
+```
+
+#### 验收结果
+
+| # | 用例 | 验证的声明 | 结果 |
+|---|---|---|---|
+| 1 | `real_telnetd_applies_our_window_size` | NAWS 方向、时序与帧格式 | **通过**：真实 telnetd 对我们的 `IAC WILL NAWS` 回 `IAC DO NAWS`；协商完成前发生的 resize 在协商成功后补发；会话里 `stty size` 读回服务端 pty 为 `40 120` |
+| 2 | `real_openssh_commits_with_posix_rename` | 惰性提交通道 + `posix-rename` 原子替换 | **通过**：真实 OpenSSH 声明了该扩展，提交策略为 `posix_rename`，已存在的目标被原子替换，temp 无残留 |
+| 3 | `real_openssh_channel_budget_is_bounded_and_fails_fast` | 通道额度是真实存在的约束 | **通过**：实测该服务器只允许 **9** 条会话通道，第 10 条明确失败（`Failed to open channel (ConnectFailed)`）而不是挂住 |
+| 4 | `real_upload_reclaims_only_our_own_orphan_temps` | 孤儿回收只删自己的东西 | **通过**：远端目录里摆四种诱饵 —— 超龄的 `<目标名>.partial-<uuid>` **被回收**；`<别的目标名>.partial-<uuid>`、`<目标名>.partial-backup`（非 uuid 形态）、`<目标名>.partial-<uuid>`（是个**目录**）**全部保留** |
+| 5 | `real_concurrent_uploads_all_succeed_within_the_channel_budget` | 并发闸门让「排队」替代「失败」 | **通过**：同一会话 12 个并发 2 MiB 上传全部成功 |
+
+用例 5 做了**反证**：把 `MAX_CONCURRENT_TRANSFERS_PER_SESSION` 临时从 3 放开到 12 后，
+同样的 12 并发里有 **4 个**失败，报错正是 `Failed to open SFTP channel: ... Failed to open
+channel (ConnectFailed)`（服务端额度）。恢复为 3 后全部通过——说明闸门是**真正起作用**的，
+且这条用例能抓住回归。
+
+#### 新增用例
+
+5 条真机用例全部 `#[ignore]` 门控（凭据只从环境变量读），与仓库既有的
+`tests/sftp_bench.rs` / `tests/transport_bench.rs` 同一范式；`cargo test --workspace`
+不受影响（414 项通过、0 失败）。
+
+| 文件 | 用例 |
+|---|---|
+| `rshell-protocol/src/telnet/mod.rs` | `real_telnetd_applies_our_window_size` |
+| `rshell-protocol/src/ssh/sftp.rs` | `real_openssh_commits_with_posix_rename`、`real_openssh_channel_budget_is_bounded_and_fails_fast` |
+| `rshell-core/src/transfer/service.rs` | `real_upload_reclaims_only_our_own_orphan_temps`、`real_concurrent_uploads_all_succeed_within_the_channel_budget` |
+
+#### 仍未验证
+
+- **客户端未在 Linux 上原生编译运行**：跑的是 macOS 编译出的测试二进制，服务端是 Linux。
+  协议行为（选项协商、扩展声明、通道额度、远端删除语义）已完全由真实 Linux 服务端验证；
+  但「代码在 Linux 上编译并运行」本身没有验证。
+- **物理串口**、**签名与公证**、**Windows** 仍未验证。
+
 ### 2026-10-21：原生应用启动（首次真机运行证据）
 
 在此之前的记录里，原生启动一直是「手工步骤」。本轮第一次在 macOS 上**真正跑起来**：

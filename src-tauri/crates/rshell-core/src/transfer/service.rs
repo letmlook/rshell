@@ -3056,6 +3056,348 @@ mod tests {
         assert!(t.finished_at.is_some(), "取消后必须记录终态时间");
     }
 
+    // ===== 真实 OpenSSH 服务器上的回收安全性验收（需外部服务器，默认不跑） =====
+
+    /// 真实服务器上的孤儿临时文件回收验收。
+    ///
+    /// 回收是**删除**操作，必须在真机证明它只删自己的东西。远端目录里摆四种
+    /// 诱饵，跑一次真实上传后逐个核对：
+    /// - `<目标名>.partial-<uuid>`（超龄）→ 必须被回收；
+    /// - `<别的目标名>.partial-<uuid>`（超龄）→ 必须**保留**（不是本次目标的）；
+    /// - `<目标名>.partial-backup`（不是 uuid 形态）→ 必须**保留**；
+    /// - `<目标名>.partial-<uuid>`（是个**目录**）→ 必须**保留**。
+    ///
+    /// 环境变量：`RSHELL_REAL_HOST`、`RSHELL_REAL_SSH_PORT`、`RSHELL_REAL_USER`、
+    /// `RSHELL_REAL_KEY`、`RSHELL_REAL_PATH`。
+    #[tokio::test]
+    #[ignore = "需要真实 SSH 服务器与 RSHELL_REAL_* 环境变量，不进 CI"]
+    async fn real_upload_reclaims_only_our_own_orphan_temps() {
+        use rshell_protocol::ssh::client::{
+            HostKeyDecision, HostKeyDecisionRequest, HostKeyDecisionSink, ResolvedAuthMethod,
+            SshClient,
+        };
+
+        struct AcceptAnyHost;
+        impl HostKeyDecisionSink for AcceptAnyHost {
+            fn register_decision(&self) -> (Uuid, tokio::sync::oneshot::Receiver<HostKeyDecision>) {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tx.send(HostKeyDecision {
+                    fingerprint: String::new(),
+                    key_blob: String::new(),
+                    accept: true,
+                    permanent: false,
+                })
+                .unwrap();
+                (Uuid::new_v4(), rx)
+            }
+            fn publish_request(&self, _: HostKeyDecisionRequest) {}
+            fn cancel_decision(&self, _: Uuid) {}
+            fn expire_decision(&self, _: Uuid) {}
+        }
+
+        let host = std::env::var("RSHELL_REAL_HOST").unwrap_or_default();
+        assert!(!host.is_empty(), "缺少 RSHELL_REAL_HOST");
+        let port: u16 = std::env::var("RSHELL_REAL_SSH_PORT")
+            .unwrap_or_else(|_| "22".to_string())
+            .parse()
+            .expect("端口非法");
+        let user = std::env::var("RSHELL_REAL_USER").unwrap_or_else(|_| "ubuntu".to_string());
+        let key = std::env::var("RSHELL_REAL_KEY")
+            .unwrap_or_else(|_| std::env::var("HOME").unwrap_or_default() + "/.ssh/id_ed25519");
+        let work_dir = std::env::var("RSHELL_REAL_PATH")
+            .unwrap_or_else(|_| "/home/ubuntu/rshell-test".to_string());
+
+        let mut client = SshClient::new(
+            rshell_api::types::SessionConfig {
+                id: Uuid::new_v4(),
+                name: "real".into(),
+                folder_id: None,
+                host: host.clone(),
+                port,
+                protocol: rshell_api::types::Protocol::SSH,
+                auth_method: rshell_api::types::AuthMethod::PublicKey {
+                    username: user.clone(),
+                    key_path: std::path::PathBuf::from(&key),
+                    has_passphrase: false,
+                    managed_key_id: None,
+                },
+                serial_config: None,
+            },
+            ResolvedAuthMethod::PublicKey {
+                username: user.clone(),
+                key_path: std::path::PathBuf::from(&key),
+                passphrase: None,
+            },
+        );
+        client
+            .connect_ssh(Some(Arc::new(AcceptAnyHost)))
+            .await
+            .expect("连接真实 SSH 服务器失败");
+        let client = Arc::new(tokio::sync::RwLock::new(client));
+
+        // 准备远端诱饵
+        let sftp = {
+            let ssh = client.read().await;
+            ssh.sftp_session().await.expect("开 SFTP 会话失败")
+        };
+        let target_name = format!("payload-{}.bin", Uuid::new_v4());
+        let target = format!("{work_dir}/{target_name}");
+        let orphan = format!("{target}.partial-{}", Uuid::new_v4());
+        let other_stem = format!(
+            "{work_dir}/other-{}.bin.partial-{}",
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        );
+        let not_uuid = format!("{target}.partial-backup");
+        let dir_like_temp = format!("{target}.partial-{}", Uuid::new_v4());
+
+        for path in [&orphan, &other_stem, &not_uuid] {
+            let sink = sftp.as_sink();
+            let mut w = sink.exclusive_open_write(path).await.expect("建诱饵失败");
+            tokio::io::AsyncWriteExt::write_all(&mut w, b"decoy")
+                .await
+                .expect("写诱饵失败");
+        }
+        // 一个「名字像临时文件的目录」——回收绝不能删目录
+        let _ = sftp.remove_dir(&dir_like_temp).await;
+        {
+            let ssh = client.read().await;
+            let _ = ssh.open_sftp_channel().await;
+        }
+        std::process::Command::new("ssh")
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-i",
+                &key,
+                &format!("{user}@{host}"),
+                &format!("mkdir -p {dir_like_temp} && touch -d '3 days ago' {orphan} {other_stem}"),
+            ])
+            .status()
+            .expect("调用 ssh 回退 mtime 失败");
+        // 目录用同样的方式回退时间，确保它不会因为「够老」而被误判
+        std::process::Command::new("ssh")
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-i",
+                &key,
+                &format!("{user}@{host}"),
+                &format!("touch -d '3 days ago' {dir_like_temp}"),
+            ])
+            .status()
+            .expect("调用 ssh 回退 mtime 失败");
+
+        // 真实上传
+        let svc = Arc::new(make_service());
+        let provider_client = client.clone();
+        svc.set_ssh_client_provider(Arc::new(move |_session_id: Uuid| {
+            let handle = provider_client.clone();
+            Box::pin(async move { Ok(handle) })
+                as Pin<Box<dyn Future<Output = Result<SshClientHandle, CoreError>> + Send>>
+        }));
+
+        let dir = tempfile::tempdir().expect("临时目录");
+        let local = dir.path().join("source.bin");
+        tokio::fs::write(&local, b"payload-bytes")
+            .await
+            .expect("写本地文件");
+
+        let session_id = Uuid::new_v4();
+        let task_id = svc
+            .enqueue_upload(local, target.clone(), session_id, ConflictPolicy::Fail)
+            .await
+            .expect("入队失败");
+
+        // 等任务进入终态
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let state = loop {
+            let task = svc.get_task(task_id).await.expect("任务消失");
+            if task.state.is_terminal() {
+                break task.state;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("上传任务未在 60s 内结束");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        assert_eq!(state, TransferTaskState::Completed, "上传未完成");
+
+        // 核对：只有「本次目标的超龄孤儿」被回收
+        assert!(!sftp.exists(&orphan).await, "超龄孤儿未被回收: {orphan}");
+        assert!(
+            sftp.exists(&other_stem).await,
+            "别的目标的临时文件被误删: {other_stem}"
+        );
+        assert!(
+            sftp.exists(&not_uuid).await,
+            "名字不是 uuid 形态的文件被误删: {not_uuid}"
+        );
+        assert!(
+            sftp.exists(&dir_like_temp).await,
+            "名字像临时文件的目录被误删: {dir_like_temp}"
+        );
+        assert!(sftp.exists(&target).await, "上传目标不存在");
+
+        // 清理
+        for path in [&other_stem, &not_uuid, &target] {
+            sftp.remove_file(path).await.ok();
+        }
+        sftp.remove_dir(&dir_like_temp).await.ok();
+    }
+
+    /// 真实服务器上的并发上传验收（验证 L3 的通道预算修复）。
+    ///
+    /// 实测这台 OpenSSH（`MaxSessions 10`）只允许 **9** 条会话通道。
+    /// 修复前：每个传输任务常驻 2 条通道（数据 + 提交）且**没有闸门**，
+    /// 6 个并发任务 = 12 条 > 9 → 靠后的任务被服务端拒绝 channel-open 直接失败。
+    /// 修复后：提交通道惰性开启（稳态 1 条/任务）+ 每会话闸门（上限 3）
+    /// → 峰值 ≤ 3 数据 + 3 提交 = 6 条，全部任务都应成功。
+    ///
+    /// 用 2 MiB 载荷让传输**真正重叠**（小文件会在前一个结束前就完成，
+    /// 根本撞不到额度上限，测不出东西）。
+    #[tokio::test]
+    #[ignore = "需要真实 SSH 服务器与 RSHELL_REAL_* 环境变量，不进 CI"]
+    async fn real_concurrent_uploads_all_succeed_within_the_channel_budget() {
+        use rshell_protocol::ssh::client::{
+            HostKeyDecision, HostKeyDecisionRequest, HostKeyDecisionSink, ResolvedAuthMethod,
+            SshClient,
+        };
+
+        struct AcceptAnyHost;
+        impl HostKeyDecisionSink for AcceptAnyHost {
+            fn register_decision(&self) -> (Uuid, tokio::sync::oneshot::Receiver<HostKeyDecision>) {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tx.send(HostKeyDecision {
+                    fingerprint: String::new(),
+                    key_blob: String::new(),
+                    accept: true,
+                    permanent: false,
+                })
+                .unwrap();
+                (Uuid::new_v4(), rx)
+            }
+            fn publish_request(&self, _: HostKeyDecisionRequest) {}
+            fn cancel_decision(&self, _: Uuid) {}
+            fn expire_decision(&self, _: Uuid) {}
+        }
+
+        let host = std::env::var("RSHELL_REAL_HOST").unwrap_or_default();
+        assert!(!host.is_empty(), "缺少 RSHELL_REAL_HOST");
+        let port: u16 = std::env::var("RSHELL_REAL_SSH_PORT")
+            .unwrap_or_else(|_| "22".to_string())
+            .parse()
+            .expect("端口非法");
+        let user = std::env::var("RSHELL_REAL_USER").unwrap_or_else(|_| "ubuntu".to_string());
+        let key = std::env::var("RSHELL_REAL_KEY")
+            .unwrap_or_else(|_| std::env::var("HOME").unwrap_or_default() + "/.ssh/id_ed25519");
+        let work_dir = std::env::var("RSHELL_REAL_PATH")
+            .unwrap_or_else(|_| "/home/ubuntu/rshell-test".to_string());
+
+        let mut client = SshClient::new(
+            rshell_api::types::SessionConfig {
+                id: Uuid::new_v4(),
+                name: "real".into(),
+                folder_id: None,
+                host: host.clone(),
+                port,
+                protocol: rshell_api::types::Protocol::SSH,
+                auth_method: rshell_api::types::AuthMethod::PublicKey {
+                    username: user.clone(),
+                    key_path: std::path::PathBuf::from(&key),
+                    has_passphrase: false,
+                    managed_key_id: None,
+                },
+                serial_config: None,
+            },
+            ResolvedAuthMethod::PublicKey {
+                username: user.clone(),
+                key_path: std::path::PathBuf::from(&key),
+                passphrase: None,
+            },
+        );
+        client
+            .connect_ssh(Some(Arc::new(AcceptAnyHost)))
+            .await
+            .expect("连接真实 SSH 服务器失败");
+        let client = Arc::new(tokio::sync::RwLock::new(client));
+
+        const CONCURRENCY: usize = 12;
+        const PAYLOAD: usize = 2 * 1024 * 1024;
+
+        let svc = Arc::new(make_service());
+        let provider_client = client.clone();
+        svc.set_ssh_client_provider(Arc::new(move |_session_id: Uuid| {
+            let handle = provider_client.clone();
+            Box::pin(async move { Ok(handle) })
+                as Pin<Box<dyn Future<Output = Result<SshClientHandle, CoreError>> + Send>>
+        }));
+
+        // 同一个 session_id = 同一条 SSH 连接 = 同一个通道额度。
+        // 闸门正是按 session_id 分组的；这里必须共用一个，否则测的其实是
+        // 「多条连接各自的额度」（那是无限额的，与本用例要验的东西无关）。
+        let session_id = Uuid::new_v4();
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut task_ids = Vec::new();
+        for i in 0..CONCURRENCY {
+            let local = dir.path().join(format!("src-{i}.bin"));
+            tokio::fs::write(&local, vec![(i % 251) as u8; PAYLOAD])
+                .await
+                .expect("写本地文件");
+            let remote = format!("{work_dir}/conc-{}-{}.bin", Uuid::new_v4(), i);
+            let id = svc
+                .enqueue_upload(local, remote, session_id, ConflictPolicy::Fail)
+                .await
+                .expect("入队失败");
+            task_ids.push(id);
+        }
+
+        // 等全部任务进入终态
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut done = Vec::new();
+        while done.len() < task_ids.len() {
+            for id in &task_ids {
+                if done.contains(id) {
+                    continue;
+                }
+                if let Some(task) = svc.get_task(*id).await {
+                    if task.state.is_terminal() {
+                        done.push(*id);
+                    }
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "并发上传未在 120s 内全部结束：完成 {}/{}",
+                    done.len(),
+                    task_ids.len()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        let mut failures = Vec::new();
+        for id in &task_ids {
+            let task = svc.get_task(*id).await.expect("任务消失");
+            if task.state != TransferTaskState::Completed {
+                failures.push(format!(
+                    "{id}: {:?} — {}",
+                    task.state,
+                    task.error_message.clone().unwrap_or_default()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "并发上传在服务端通道额度下失败：\n{}",
+            failures.join("\n")
+        );
+    }
+
     // ===== R2-01：provider await 窗口内的取消/暂停不得丢失 =====
 
     use rshell_api::types::{AuthMethod, Protocol as ApiProtocol, SessionConfig};

@@ -1180,6 +1180,8 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::sync::{Arc, Mutex};
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
 
     /// 记录进度帧的共享 sink
     type ProgressLog = Arc<Mutex<Vec<(u64, u64)>>>;
@@ -1958,6 +1960,201 @@ mod tests {
     }
 
     // ── posix-rename 提交扩展 ──
+    // ===== 真实 OpenSSH 服务器端到端验收（需外部服务器，默认不跑） =====
+
+    /// 真实服务器上的连接辅助：密钥认证 + 接受主机密钥（不落盘 known_hosts）。
+    struct AcceptAnyHost;
+
+    impl crate::ssh::client::HostKeyDecisionSink for AcceptAnyHost {
+        fn register_decision(
+            &self,
+        ) -> (Uuid, oneshot::Receiver<crate::ssh::client::HostKeyDecision>) {
+            let (tx, rx) = oneshot::channel();
+            tx.send(crate::ssh::client::HostKeyDecision {
+                fingerprint: String::new(),
+                key_blob: String::new(),
+                accept: true,
+                permanent: false,
+            })
+            .unwrap();
+            (Uuid::new_v4(), rx)
+        }
+        fn publish_request(&self, _: crate::ssh::client::HostKeyDecisionRequest) {}
+        fn cancel_decision(&self, _: Uuid) {}
+        fn expire_decision(&self, _: Uuid) {}
+    }
+
+    /// 连上真实服务器并返回（客户端句柄, 远端工作目录）。
+    ///
+    /// 环境变量：`RSHELL_REAL_HOST`、`RSHELL_REAL_SSH_PORT`、`RSHELL_REAL_USER`、
+    /// `RSHELL_REAL_KEY`（私钥路径）、`RSHELL_REAL_PATH`（远端工作目录）。
+    async fn connect_real_server() -> (
+        Arc<tokio::sync::RwLock<crate::ssh::client::SshClient>>,
+        String,
+    ) {
+        let host = std::env::var("RSHELL_REAL_HOST").unwrap_or_default();
+        assert!(!host.is_empty(), "缺少 RSHELL_REAL_HOST");
+        let port: u16 = std::env::var("RSHELL_REAL_SSH_PORT")
+            .unwrap_or_else(|_| "22".to_string())
+            .parse()
+            .expect("端口非法");
+        let user = std::env::var("RSHELL_REAL_USER").unwrap_or_else(|_| "ubuntu".to_string());
+        let key = std::env::var("RSHELL_REAL_KEY")
+            .unwrap_or_else(|_| std::env::var("HOME").unwrap_or_default() + "/.ssh/id_ed25519");
+        let work_dir = std::env::var("RSHELL_REAL_PATH")
+            .unwrap_or_else(|_| "/home/ubuntu/rshell-test".to_string());
+
+        let mut client = crate::ssh::client::SshClient::new(
+            rshell_api::types::SessionConfig {
+                id: Uuid::new_v4(),
+                name: "real".into(),
+                folder_id: None,
+                host: host.clone(),
+                port,
+                protocol: rshell_api::types::Protocol::SSH,
+                auth_method: rshell_api::types::AuthMethod::PublicKey {
+                    username: user.clone(),
+                    key_path: std::path::PathBuf::from(&key),
+                    has_passphrase: false,
+                    managed_key_id: None,
+                },
+                serial_config: None,
+            },
+            crate::ssh::client::ResolvedAuthMethod::PublicKey {
+                username: user,
+                key_path: std::path::PathBuf::from(&key),
+                passphrase: None,
+            },
+        );
+        client
+            .connect_ssh(Some(Arc::new(AcceptAnyHost)))
+            .await
+            .expect("连接真实 SSH 服务器失败");
+        (Arc::new(tokio::sync::RwLock::new(client)), work_dir)
+    }
+
+    /// 真实 OpenSSH 上的原子提交验收。
+    ///
+    /// 单元测试只能证明「我们发的字节对不对」；这里让真的 OpenSSH 收下
+    /// `posix-rename@openssh.com` 的 EXTENDED 请求，验证：
+    /// 1. 服务器在 SSH_FXP_VERSION 里**声明**了该扩展（否则只能降级标准 rename）；
+    /// 2. 提交走的是**惰性提交通道**（提交那一刻才开的第二条通道）也照样成功；
+    /// 3. 已存在的目标被**原子替换**成新内容，且不留下 temp 残留。
+    #[tokio::test]
+    #[ignore = "需要真实 SSH 服务器与 RSHELL_REAL_* 环境变量，不进 CI"]
+    async fn real_openssh_commits_with_posix_rename() {
+        let (client, work_dir) = connect_real_server().await;
+
+        // 数据通道
+        let channel = {
+            let ssh = client.read().await;
+            ssh.open_sftp_channel().await.expect("开 SFTP 通道失败")
+        };
+        let sftp = SftpClient::new(channel).await.expect("SFTP 初始化失败");
+
+        // 惰性提交通道：与 core 传输服务同款 —— 提交那一刻才开第二条通道。
+        let opener: SftpChannelOpener = {
+            let handle = client.clone();
+            Arc::new(move || {
+                let handle = handle.clone();
+                Box::pin(async move {
+                    let ssh = handle.read().await;
+                    ssh.open_sftp_channel().await
+                })
+            })
+        };
+        let sftp = sftp.with_commit_opener(opener);
+
+        let target = format!("{work_dir}/commit-target.bin");
+        let temp = format!("{target}.partial-{}", Uuid::new_v4());
+
+        // 目标已有旧内容
+        {
+            let sink = sftp.as_sink();
+            let mut w = sink
+                .exclusive_open_write(&target)
+                .await
+                .expect("建目标失败");
+            tokio::io::AsyncWriteExt::write_all(&mut w, b"old-content")
+                .await
+                .expect("写旧内容失败");
+        }
+
+        // 写 temp 后提交
+        {
+            let sink = sftp.as_sink();
+            let mut w = sink
+                .exclusive_open_write(&temp)
+                .await
+                .expect("建 temp 失败");
+            tokio::io::AsyncWriteExt::write_all(&mut w, b"new-content")
+                .await
+                .expect("写新内容失败");
+        }
+        let outcome = sftp.safe_commit(&temp, &target).await.expect("提交失败");
+        assert_eq!(
+            outcome.strategy,
+            CommitStrategy::PosixRename,
+            "真实 OpenSSH 未走 posix-rename 原子替换"
+        );
+
+        // 目标内容必须已被替换
+        let sink = sftp.as_sink();
+        let mut reader = sink.open_read(&target).await.expect("读目标失败");
+        let mut got = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut got)
+            .await
+            .expect("读目标内容失败");
+        assert_eq!(got, b"new-content", "目标没有被原子替换");
+
+        // temp 必须已被 rename 掉，不留残留
+        assert!(!sftp.exists(&temp).await, "提交后 temp 仍有残留：{temp}");
+
+        sftp.remove_file(&target).await.ok();
+        let mut ssh = client.write().await;
+        let _ = ssh.disconnect_ssh().await;
+    }
+
+    /// 真实服务器上的通道额度验收。
+    ///
+    /// L3 的前提是「每个传输任务独占 2 条 SSH 通道，可能撞 MaxSessions」。
+    /// 这里量一量真实 OpenSSH 在 `MaxSessions 10` 下能开多少条会话通道：
+    /// - 至少要能开 2 条（数据通道 + 惰性提交通道同时在飞）；
+    /// - 超过服务端额度时必须**明确失败**，而不是挂住。
+    #[tokio::test]
+    #[ignore = "需要真实 SSH 服务器与 RSHELL_REAL_* 环境变量，不进 CI"]
+    async fn real_openssh_channel_budget_is_bounded_and_fails_fast() {
+        let (client, _work_dir) = connect_real_server().await;
+
+        let mut opened = 0usize;
+        let mut failure = None;
+        for _ in 0..24 {
+            let result = {
+                let ssh = client.read().await;
+                ssh.open_sftp_channel().await
+            };
+            match result {
+                Ok(_channel) => opened += 1,
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        println!("真实服务器允许的会话通道数: {opened}，首个失败: {failure:?}");
+        assert!(
+            opened >= 2,
+            "至少要能同时开 2 条（数据 + 提交通道），实际 {opened}"
+        );
+        assert!(
+            failure.is_some(),
+            "服务端应当限制通道数，但连开 24 条都没失败（额度上限未生效）"
+        );
+
+        let mut ssh = client.write().await;
+        let _ = ssh.disconnect_ssh().await;
+    }
+
     // 提交语义的线格式与应答映射必须锁死：posix-rename@openssh.com 的请求体
     // 是「oldpath + newpath 两个连续 SSH string」，应答只有 STATUS（Ok /
     // OpUnsupported / 其它错误码）。这里不依赖真实服务器。
