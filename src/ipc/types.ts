@@ -162,14 +162,20 @@ export interface TransferTaskInfo {
   /** 当前传输速度（字节/秒），仅 Transferring 状态有值 */
   speed_bps: number;
   error_message: string | null;
-  /** R2-T2：staging temp 路径（远端 / 本地侧）。活跃任务为 null；
-   * 终态下若 cleanup 失败则 temp 仍存在 —— 此字段告诉用户残留位置。 */
-  temp_path: string | null;
-  /** R2-T2：终态下的清理结果（`"cleaned"` / `"residue"`）。活跃任务为 null。 */
-  cleanup_status: string | null;
-  /** R2-T2：终态下的提交策略（`"posix_rename"` / `"standard_rename"`）。
-   * 仅 Completed 终态有值；前端据此告诉用户「这次拿到了原子替换保证吗」。 */
-  commit_strategy: string | null;
+  /* R2-T2：staging temp 路径（远端 / 本地侧）。活跃任务为 null；
+   * 终态下若 cleanup 失败则 temp 仍存在 —— 此字段告诉用户残留位置。
+   *
+   * 可选（`?`）而非必填 `string | null`：Rust 侧带 `skip_serializing_if =
+   * "Option::is_none"`，字段为 None 时**键直接不存在**（运行时是 undefined，
+   * 不是 null）。声明成必填会让新写的消费方用 `=== null` 判断时误判。 */
+  temp_path?: string | null;
+  /* R2-T2：终态下的清理结果（`"cleaned"` / `"residue"`）。活跃任务为 null。
+   * 同上：Rust 侧可能省略该键。 */
+  cleanup_status?: string | null;
+  /* R2-T2：终态下的提交策略（`"posix_rename"` / `"standard_rename"`）。
+   * 仅 Completed 终态有值；前端据此告诉用户「这次拿到了原子替换保证吗」。
+   * 同上：Rust 侧可能省略该键。 */
+  commit_strategy?: string | null;
 }
 
 // ===== 隧道相关 =====

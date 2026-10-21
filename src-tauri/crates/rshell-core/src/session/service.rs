@@ -71,6 +71,35 @@ where
         .unwrap_or(Err(CoreError::TerminalRecoveryRequired))
 }
 
+/// Telnet/Serial 协议请求的挂钟上限。
+///
+/// SSH 路径由 `terminal_request` 兜底（10s），协议路径此前**完全没有**上限：
+/// 协议任务把 `connection.send()` 内联在 `select!` 分支里，远端不读 stdin 时
+/// socket 缓冲填满 → `write_all` 永久阻塞 → 协议任务不再轮询请求通道 → 排队的
+/// 请求（包括 Disconnect）永远得不到处理 → 等待应答的一方永久挂起。
+///
+/// 预算用尽时按「协议链路已不可用」处理：报错而不是假装成功。断开路径会
+/// 放弃这次优雅关闭（状态已改为 Disconnected），发送/调整尺寸路径则让前端
+/// 看到真实错误。
+const PROTOCOL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 带挂钟上限的协议请求（发送 + 应答）。
+///
+/// 超时不是「失败」，而是「这条协议链路已经卡住」——错误文案要能让人知道
+/// 远端没有响应，而不是把它当成普通的连接错误。
+async fn protocol_request<F>(request: F) -> Result<(), CoreError>
+where
+    F: std::future::Future<Output = Result<(), CoreError>>,
+{
+    match tokio::time::timeout(PROTOCOL_REQUEST_TIMEOUT, request).await {
+        Ok(result) => result,
+        Err(_) => Err(CoreError::ConnectionError(format!(
+            "Protocol request timed out after {}s; the remote endpoint is not responding",
+            PROTOCOL_REQUEST_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 fn validate_session_config(config: &SessionConfig) -> Result<(), CoreError> {
     match config.protocol {
         Protocol::SSH | Protocol::Telnet => {
@@ -184,9 +213,14 @@ where
     F: Fn(Arc<SftpClient>) -> Fut,
     Fut: std::future::Future<Output = Result<T, rshell_protocol::ProtocolError>>,
 {
-    // 建会话（开通道 + 版本握手）时短暂持有 SshClient 的读锁；拿到
+    // 建会话（开通道 + 版本握手）时持有 SshClient 的读锁；拿到
     // `Arc<SftpClient>` 后立刻放锁 —— 真正的 SFTP I/O 不在锁里，
     // 否则列一个慢目录会把同会话的 resize 一起堵住。
+    //
+    // 锁的持有时间有**硬上限**：开通道受 `SFTP_CHANNEL_OPEN_TIMEOUT`（15s）
+    // 约束，版本握手受 `SFTP_VERSION_HANDSHAKE_TIMEOUT`（15s）约束，两者都
+    // 失败即返回，不会无限期占着读锁。tokio RwLock 写优先：一旦有写者在等
+    // （开/关标签、断开），后续读者也一起堵——所以这段必须是有界的。
     let sftp = {
         let ssh = client.read().await;
         ssh.sftp_session().await
@@ -1023,13 +1057,34 @@ impl SessionService {
         };
         if let Some(sender) = sender {
             let (reply_tx, reply_rx) = oneshot::channel();
-            sender
-                .send(ProtocolRequest::Disconnect(reply_tx))
-                .await
-                .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
-            reply_rx
-                .await
-                .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))??;
+            // 断开也必须在预算内收尾：协议任务可能正卡在一次 `connection.send()`
+            // 上（远端不读 stdin），排队的 Disconnect 永远不会被处理。等到预算
+            // 用尽就放弃这次优雅关闭 —— 状态已经在上面改成 Disconnected 并
+            // 广播了，不能让 IPC 永远不返回（按钮一直转圈、无法真正断开）。
+            //
+            // 但「协议连接已经没了」（应答通道关闭）是**真实错误**，照实上报：
+            // 那说明连接确实已经断掉，不是「关得慢一点」。
+            match tokio::time::timeout(PROTOCOL_REQUEST_TIMEOUT, async {
+                sender
+                    .send(ProtocolRequest::Disconnect(reply_tx))
+                    .await
+                    .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
+                reply_rx
+                    .await
+                    .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?
+            })
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    warn!(
+                        session_id = %session_id,
+                        timeout_secs = PROTOCOL_REQUEST_TIMEOUT.as_secs(),
+                        "Protocol disconnect did not complete within the budget; \
+                         the session is already marked Disconnected"
+                    );
+                }
+            }
             return Ok(());
         }
 
@@ -1083,36 +1138,45 @@ impl SessionService {
         };
         if let Some(sender) = sender {
             let (reply_tx, reply_rx) = oneshot::channel();
-            sender
-                .send(ProtocolRequest::Send(data.to_vec(), reply_tx))
-                .await
-                .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
-            return reply_rx
-                .await
-                .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
-        }
-        // 先在锁内克隆出 client 句柄，立刻释放 connections guard，避免跨 await 持锁
-        let client = {
-            let connections = self.connections.read().await;
-            connections
-                .get(&session_id)
-                .map(|c| c.client.clone())
-                .ok_or_else(|| {
-                    CoreError::NotFound(format!("Connection {} not found", session_id))
-                })?
-        };
-        terminal_request(async {
-            let client = client.read().await;
-            if let Some(id) = terminal_id {
-                client
-                    .send_data_to(id, data)
+            // 发送 + 应答都必须在预算内完成：Telnet/Serial 的协议任务把
+            // `connection.send()` 内联在 select! 分支里，远端不读 stdin 时
+            // socket 缓冲填满 → write_all 永久阻塞 → 协议任务不再轮询 rx →
+            // 排队的 Disconnect 永远得不到处理。没有这道上限，等待应答的一方
+            // （尤其是断开路径）会永久挂起。
+            protocol_request(async {
+                sender
+                    .send(ProtocolRequest::Send(data.to_vec(), reply_tx))
                     .await
-                    .map_err(terminal_io_error)
-            } else {
-                client.send_data(data).await.map_err(terminal_io_error)
-            }
-        })
-        .await
+                    .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
+                reply_rx
+                    .await
+                    .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?
+            })
+            .await
+        } else {
+            // 先在锁内克隆出 client 句柄，立刻释放 connections guard，避免跨 await 持锁
+            let client = {
+                let connections = self.connections.read().await;
+                connections
+                    .get(&session_id)
+                    .map(|c| c.client.clone())
+                    .ok_or_else(|| {
+                        CoreError::NotFound(format!("Connection {} not found", session_id))
+                    })?
+            };
+            terminal_request(async {
+                let client = client.read().await;
+                if let Some(id) = terminal_id {
+                    client
+                        .send_data_to(id, data)
+                        .await
+                        .map_err(terminal_io_error)
+                } else {
+                    client.send_data(data).await.map_err(terminal_io_error)
+                }
+            })
+            .await
+        }
     }
 
     /// 调整终端大小
@@ -1132,13 +1196,16 @@ impl SessionService {
         };
         if let Some(sender) = sender {
             let (reply_tx, reply_rx) = oneshot::channel();
-            sender
-                .send(ProtocolRequest::Resize(cols as u16, rows as u16, reply_tx))
-                .await
-                .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
-            return reply_rx
-                .await
-                .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
+            return protocol_request(async {
+                sender
+                    .send(ProtocolRequest::Resize(cols as u16, rows as u16, reply_tx))
+                    .await
+                    .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?;
+                reply_rx
+                    .await
+                    .map_err(|_| CoreError::ConnectionError("Protocol connection closed".into()))?
+            })
+            .await;
         }
         let client = {
             let connections = self.connections.read().await;
@@ -1517,6 +1584,57 @@ mod tests {
             assert!(validate_remote_mutation_path(path).is_err(), "{path}");
         }
         assert!(validate_remote_mutation_path("/home/user/file.txt").is_ok());
+    }
+
+    /// 回归：协议请求（Telnet/Serial）必须有挂钟上限。
+    ///
+    /// 协议任务把 `connection.send()` 内联在 select! 分支里，远端不读 stdin 时
+    /// socket 缓冲填满 → write_all 永久阻塞 → 协议任务不再轮询请求通道 → 排队的
+    /// Disconnect 永远得不到处理 → 等待应答的一方（断开路径）永久挂起，IPC 永不
+    /// 返回，而会话状态已被发布为 Disconnected —— 界面与真实状态分叉。
+    ///
+    /// 这里用「收下请求但从不回话」的通道精确模拟：请求被接收但应答永不到达，
+    /// 等待方必须靠预算收尾而不是永远挂着。
+    #[tokio::test(start_paused = true)]
+    async fn stalled_protocol_request_times_out_instead_of_hanging() {
+        let svc = make_service();
+        let session_id = Uuid::new_v4();
+
+        // 收下请求但从不回应：模拟协议任务卡在 send 上、请求通道不再被轮询。
+        let (tx, mut rx) = mpsc::channel::<ProtocolRequest>(32);
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                match request {
+                    ProtocolRequest::Send(_, reply) => {
+                        // 丢弃 reply：应答永不到达
+                        std::mem::forget(reply);
+                    }
+                    ProtocolRequest::Resize(_, _, reply) => std::mem::forget(reply),
+                    ProtocolRequest::Disconnect(reply) => std::mem::forget(reply),
+                }
+            }
+        });
+        svc.protocol_connections
+            .write()
+            .await
+            .insert(session_id, tx);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(PROTOCOL_REQUEST_TIMEOUT.as_secs() + 5),
+            svc.send_data(session_id, None, b"hello"),
+        )
+        .await
+        .expect("send_data must not hang forever");
+
+        assert!(
+            result.is_err(),
+            "协议请求超时必须报错，不能静默成功（远端根本没回应）"
+        );
+        let error = result.expect_err("stalled request must fail");
+        assert!(
+            error.to_string().contains("timed out"),
+            "错误文案要说明是超时而不是普通连接错误: {error}"
+        );
     }
 
     fn make_service() -> SessionService {
@@ -2055,7 +2173,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatcher_resizes_live_telnet_and_remembers_preconnect_size() {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let svc = Arc::new(make_service());
         let dir = tempfile::tempdir().unwrap();
         let dispatcher = make_dispatcher(svc.clone(), dir.path());
@@ -2075,9 +2193,33 @@ mod tests {
             .unwrap();
         svc.connect(id).await.unwrap();
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut initial = [0; 15];
-        socket.read_exact(&mut initial).await.unwrap();
-        assert_eq!(&initial[6..], &[255, 250, 31, 0, 90, 0, 30, 255, 240]);
+
+        // 客户端先发两条协商：DO SGA + WILL NAWS（RFC 1073 §2：客户端用 WILL 提议）。
+        let mut negotiation = [0; 6];
+        socket.read_exact(&mut negotiation).await.unwrap();
+        assert_eq!(&negotiation[0..3], &[255, 253, 3], "DO SUPPRESS-GO-AHEAD");
+        assert_eq!(&negotiation[3..6], &[255, 251, 31], "WILL NAWS");
+
+        // 服务端回 DO NAWS（RFC 1073 §6 例 1：服务端建议 → 客户端回 WILL 并开始上报尺寸）。
+        // 协商完成前客户端不发 NAWS 帧 —— 未启用的选项用了子协商，对端会直接丢弃。
+        socket.write_all(&[255, 253, 31]).await.unwrap();
+
+        // 客户端回 WILL NAWS，并把**协商前**记下的 90x30 补发出来。
+        let mut flushed = [0; 12];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            socket.read_exact(&mut flushed),
+        )
+        .await
+        .expect("NAWS negotiation did not complete")
+        .unwrap();
+        assert_eq!(&flushed[0..3], &[255, 251, 31], "WILL NAWS");
+        assert_eq!(
+            &flushed[3..],
+            &[255, 250, 31, 0, 90, 0, 30, 255, 240],
+            "协商完成后必须补发协商前的尺寸"
+        );
+
         dispatcher
             .dispatch(rshell_api::AppCommand::ResizeTerminal {
                 session_id: id,

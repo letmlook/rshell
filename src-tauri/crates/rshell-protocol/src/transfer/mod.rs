@@ -8,7 +8,5 @@
 
 pub mod local_sink;
 
-pub use crate::ssh::sftp::{
-    CommitOutcome, CommitStrategy, RemoteSink, SftpCapabilities, TransferSink,
-};
+pub use crate::ssh::sftp::{CommitOutcome, CommitStrategy, RemoteSink, TransferSink};
 pub use local_sink::LocalSink;

@@ -68,6 +68,59 @@ impl std::fmt::Debug for SessionCredential {
     }
 }
 
+/// 敏感字符串（口令 / 口令短语）的包装类型。
+///
+/// **存在的理由**：口令类的字段散落在 `AppCommand` 的多个变体里，每个都用裸
+/// `String`。裸 `String` 的 `Debug` 是明文，一旦被 `#[instrument(fields(..))]`
+/// 或 `{:?}` 记录就进了日志（真实事故：主密码与私钥口令以明文进 tracing span）。
+///
+/// 用这个类型把「敏感」标注在**类型**上，而不是靠每个字段作者记得手写脱敏：
+/// - `Debug` 恒为 `<redacted>`，派生 `Debug` 的容器（枚举、struct）自动安全；
+/// - `#[serde(transparent)]` —— 线上格式仍是普通 JSON 字符串，前端契约不变；
+/// - `Deref<Target = str>` —— 调用方照常把它当 `&str` 用（`&password` 传 `&str`
+///   参数靠 deref coercion 自动成立），`Option<Secret>` 也能照常用 `as_deref()`。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// 构造敏感字符串。
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// 取出明文。**只在真正需要使用凭据的边界调用**（例如喂给 KDF 或解密）。
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::ops::Deref for Secret {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<String> for Secret {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
 /// 更新会话凭据时的显式意图。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CredentialUpdate {

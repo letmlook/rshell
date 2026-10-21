@@ -21,7 +21,7 @@ import {
   exportPublicKey,
 } from "../ipc/client";
 import { subscribeAppEvents } from "../ipc/events";
-import type { SshKeyType, Uuid } from "../ipc/types";
+import type { SshKeyInfo, SshKeyType, Uuid } from "../ipc/types";
 import { confirmDialog } from "../utils/dialog";
 import { pickLocalPath } from "../utils/pathPicker";
 
@@ -35,17 +35,10 @@ function isLikelyKeyFile(name: string): boolean {
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
 
-interface KeyRow {
-  id: Uuid;
-  name: string;
-  key_type: string;
-  fingerprint: string;
-  has_passphrase: boolean;
-  /** 公钥本体（可安全展示，用于复制到 authorized_keys） */
-  public_key_blob?: string;
-}
-
-const keys = ref<KeyRow[]>([]);
+// 密钥行直接用 IPC 契约里的 `SshKeyInfo`（src/ipc/types.ts）：
+// 后端 `ListKeys` 返回的就是它，本地再声明一份 `KeyRow` 只能靠 `as unknown as`
+// 强转 —— Rust 侧改字段名时不会编译报错，只会在运行时拿到 undefined。
+const keys = ref<SshKeyInfo[]>([]);
 const loading = ref(false);
 const error = ref<string | null>(null);
 const generating = ref(false);
@@ -57,7 +50,19 @@ const exported = ref<{ name: string; publicKey: string } | null>(null);
 const exportError = ref<string | null>(null);
 
 let unlisten: (() => void) | null = null;
-let subscribed = false;
+/**
+ * 组件是否仍然存活。
+ *
+ * `onMounted` 是 async 的（内含 refresh / subscribeAppEvents 两次 await）。
+ * 用户在往返窗口内切走面板 → 组件卸载 → `onBeforeUnmount` 已经跑过 →
+ * 后续 resolve 的 `subscribeAppEvents` 把 unlisten 赋给一个已销毁的实例，
+ * `stop()` 永不执行 → Tauri 事件通道上留下常驻监听器，回调持有已销毁组件的
+ * ref；每次切面板泄漏一个。
+ *
+ * 闩锁模式与 `QuickCommandPanel` / `TriggerEditor` 一致：await 之后检查
+ * `active`，不活就立刻 `stop()`。
+ */
+let active = false;
 /** 点击导出时的密钥名：PublicKeyExported 事件只带 key_id 与公钥 */
 let pendingExportName = "";
 
@@ -82,7 +87,7 @@ async function refresh() {
   loading.value = true;
   error.value = null;
   try {
-    keys.value = (await listKeys()) as unknown as KeyRow[];
+    keys.value = await listKeys();
   } catch (e) {
     error.value = String(e);
   } finally {
@@ -189,8 +194,9 @@ async function copyExported() {
 }
 
 onMounted(async () => {
+  active = true;
   await refresh();
-  if (subscribed) return;
+  if (!active) return;
   const stop = await subscribeAppEvents((event) => {
     if (typeof event === "string") return;
     if ("PublicKeyExported" in event) {
@@ -205,11 +211,13 @@ onMounted(async () => {
       exportError.value = null;
     }
   });
-  subscribed = true;
-  unlisten = stop;
+  // 组件可能已在 await 期间被卸载：这时立刻退订，否则监听器会永久留下。
+  if (active) unlisten = stop;
+  else stop();
 });
 
 onBeforeUnmount(() => {
+  active = false;
   unlisten?.();
   unlisten = null;
 });

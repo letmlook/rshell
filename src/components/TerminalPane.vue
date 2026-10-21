@@ -36,11 +36,13 @@ import { ipcErrorMessage, closeTerminal, openTerminal, sendInput, resizeTerminal
 import type { Uuid } from "../ipc/types";
 import { useThemeStore } from "../stores/theme";
 import { useSessionsStore } from "../stores/sessions";
+import { useMasterPasswordStore } from "../stores/masterPassword";
 import { copyOnSelect, terminalAppearance } from "../utils/terminalPrefs";
 import { matchAppShortcut } from "../utils/shortcuts";
 
 const themeStore = useThemeStore();
 const sessionsStore = useSessionsStore();
+const masterPasswordStore = useMasterPasswordStore();
 
 const props = withDefaults(
   defineProps<{
@@ -73,6 +75,24 @@ let term: Terminal | null = null;
 let fit: FitAddon | null = null;
 let search: SearchAddon | null = null;
 let channel: Channel<number[]> | null = null;
+/**
+ * 当前 channel 已成功注册到后端的 (session, terminal) 键。
+ *
+ * 同一个 JS Channel 对象**不能** attach 两次：Tauri 每次反序列化 Channel 都会
+ * 新建一个 Rust 侧句柄、且**各自从 0 开始的 index 计数器**（tauri 的
+ * `channel_on`）。两个句柄共用同一个 JS 回调 id，于是它们的 index 序列互相
+ * 交错（0,0,1,1,…），而 JS 侧只有一个顺序守卫 —— 后到的那些永远排不上队，
+ * 全部堆进 `_pendingMessages` 且永不排空。屏幕看着正常（多出来的那份被吞掉），
+ * 但会话产生过的**每一字节输出都被无限期留在 WebView 内存里**。
+ *
+ * 触发路径：主 pty 的面板在握手完成前就挂载 → `onMounted` attach 一次 →
+ * 握手完成后 `connectionState` 变 "connected" → watcher 再 attach 一次，
+ * 两次传的是同一个 channel 对象。
+ *
+ * 所以这里记住已注册的键，重复 attach 直接跳过（attach 本身是幂等的：
+ * 通道注册在 (session, terminal) 上，跨断开/重连都保持有效）。
+ */
+let attachedKey: string | null = null;
 let detachSizeObserver: (() => void) | null = null;
 /**
  * R3-06：卸载闩锁。
@@ -185,6 +205,9 @@ async function writeClipboard(text: string): Promise<boolean> {
 
 async function copySelection() {
   if (!term) return;
+  // 锁定态：不得把远端输出读进剪贴板（锁的语义是「防止他人操作这台机器
+  // 上的会话」）。App.vue 的全局快捷键已拦，这里是直接调用的兜底。
+  if (masterPasswordStore.isLocked) return;
   const text = term.getSelection();
   if (!text) {
     ElMessage.info("终端没有选中内容");
@@ -195,6 +218,8 @@ async function copySelection() {
 
 async function pasteClipboard() {
   if (!term) return;
+  // 锁定态：不得把剪贴板内容送进远端会话（等于替别人执行命令）。
+  if (masterPasswordStore.isLocked) return;
   let text: string;
   try {
     text = await navigator.clipboard.readText();
@@ -403,6 +428,12 @@ function noteIoFailure(what: string, e: unknown) {
 function submitInput(data: string) {
   const sid = props.sessionId;
   if (!sid || !isConnected.value) return;
+  // 锁定态：终端不得向远端发送任何输入。
+  //
+  // 遮罩只盖住界面，xterm 的键盘处理仍在跑：焦点若落回终端（Tab 导航、
+  // 或用户直接点终端区域），按键会照常走 onData → sendInput。锁的语义是
+  // 「防止他人操作这台机器上的会话」，所以这一层也必须拦。
+  if (masterPasswordStore.isLocked) return;
   const generation = ioGeneration;
   sendInput(sid, new TextEncoder().encode(data), ptyId.value ?? undefined)
     .then(() => { if (generation === ioGeneration && !unmounted) noteIoSuccess(); })
@@ -449,11 +480,24 @@ async function ensurePty(cols: number, rows: number): Promise<boolean> {
 /**
  * attach_terminal：把字节流 Channel 注册到后端（幂等，可重试）。
  * 失败时置 attachError 供面板内错误状态条展示，成功则清除。返回是否成功。
+ *
+ * 幂等由 `attachedKey` 保证：同一个 (session, terminal) 只注册一次。
+ * 重复注册会让 Tauri 在后端造出第二个 Rust 侧 Channel 句柄（各自的 index
+ * 计数器），把输出字节无限期滞留在 JS 的 `_pendingMessages` 里（见 attachedKey
+ * 的注释）。通道注册跨断开/重连保持有效，所以重连时也不必重复 attach。
  */
 async function attachTerminal(): Promise<boolean> {
   if (!term || !channel) return false;
   const tid = ptyId.value;
   if (!tid) return false;
+  const key = `${props.sessionId}:${tid}`;
+  if (attachedKey === key) {
+    // 已注册：跳过 invoke，只同步一次状态。
+    if (unmounted) return false;
+    attachError.value = null;
+    terminalReady.value = props.connectionState === "connected";
+    return true;
+  }
   try {
     await invoke("attach_terminal", {
       session_id: props.sessionId,
@@ -462,11 +506,13 @@ async function attachTerminal(): Promise<boolean> {
     });
     // R3-06：卸载后不再写状态，避免把错误条挂到已销毁的面板上。
     if (unmounted) return false;
+    attachedKey = key;
     attachError.value = null;
     terminalReady.value = props.connectionState === "connected";
     return true;
   } catch (e) {
     if (unmounted) return false;
+    // 失败不记 key：用户点「重试附加」时必须真的再发一次。
     terminalReady.value = false;
     attachError.value = ipcErrorMessage(e);
     console.error("[TerminalPane] attach_terminal failed", e);

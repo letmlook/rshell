@@ -80,6 +80,17 @@ const HOST_KEY_DECISION_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// 不响应的对端就能把该会话的所有写操作（新标签、关闭、断开）永久堵死。
 const DIRECT_TCPIP_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// SFTP 通道开启 + 子系统请求的等待上限。
+///
+/// 与 `DIRECT_TCPIP_OPEN_TIMEOUT` 同源的问题、不同的路径：russh 的
+/// `channel_open_session` → `wait_channel_confirmation` 与 `request_subsystem`
+/// 都是无上限的 `recv().await` 循环。对端接受 TCP 但不回应（黑洞、僵死
+/// 服务端、或恶意对端）时，调用方的 `SshClient` 读锁会被永久占住。
+///
+/// tokio RwLock 写优先：一旦有写者（开/关标签、断开）在等，后续读者
+/// （`send_data`/`resize`/SFTP 浏览）也一起堵 —— 整条会话的输入都失去响应。
+const SFTP_CHANNEL_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 构建 russh 传输层配置：启用空闲 keepalive，不设 inactivity_timeout。
 ///
 /// 窗口与包长保持 russh 默认值（2 MiB / 32 KiB）。曾试过放大到 16 MiB /
@@ -183,6 +194,8 @@ pub struct SshClient {
     /// direct-tcpip channel-open 的等待上限，默认 [`DIRECT_TCPIP_OPEN_TIMEOUT`]。
     /// R3-03 回归测试调小以压缩时间线。
     direct_tcpip_open_timeout: std::time::Duration,
+    /// SFTP 通道开启的等待上限，默认 [`SFTP_CHANNEL_OPEN_TIMEOUT`]。
+    sftp_channel_open_timeout: std::time::Duration,
 }
 
 impl Drop for SshClient {
@@ -723,6 +736,7 @@ impl SshClient {
             sftp_cache: SessionCache::new(),
             keepalive_interval: SSH_KEEPALIVE_INTERVAL,
             direct_tcpip_open_timeout: DIRECT_TCPIP_OPEN_TIMEOUT,
+            sftp_channel_open_timeout: SFTP_CHANNEL_OPEN_TIMEOUT,
         }
     }
 
@@ -1181,17 +1195,48 @@ impl SshClient {
             .as_ref()
             .ok_or(ProtocolError::ConnectionClosed)?;
 
-        let channel = handle.channel_open_session().await.map_err(|e| {
+        // 开通道与子系统请求都要有上限。
+        //
+        // russh 的 `channel_open_session` → `wait_channel_confirmation` 是
+        // `receiver.recv().await` 循环、**自身没有超时**；`request_subsystem`
+        // 同样如此。对端接受 TCP 但不回应 channel-open（或不回 SFTP 版本握手）
+        // 时，这里会永久挂住。
+        //
+        // 调用方（`SessionService::with_sftp`、传输服务）在这期间持有
+        // `SshClient` **读锁**：tokio RwLock 写优先 → 后续的写者（开标签、
+        // 关闭标签、断开）全部排队，一旦有写者在等，后续读者也一起堵 ——
+        // 整条会话的输入都会失去响应。所以这道上限不是「锦上添花」，它是
+        // 这条路径唯一的兜底。
+        let channel = tokio::time::timeout(
+            self.sftp_channel_open_timeout,
+            handle.channel_open_session(),
+        )
+        .await
+        .map_err(|_| {
+            ProtocolError::ConnectionFailed(format!(
+                "SFTP channel open timed out after {}s; the server accepted the connection but never confirmed the channel",
+                self.sftp_channel_open_timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| {
             ProtocolError::ConnectionFailed(format!("SFTP channel open failed: {}", e))
         })?;
 
         // 请求 sftp 子系统
-        channel
-            .request_subsystem(false, "sftp")
-            .await
-            .map_err(|e| {
-                ProtocolError::ProtocolError(format!("SFTP subsystem request failed: {}", e))
-            })?;
+        tokio::time::timeout(
+            self.sftp_channel_open_timeout,
+            channel.request_subsystem(false, "sftp"),
+        )
+        .await
+        .map_err(|_| {
+            ProtocolError::ProtocolError(format!(
+                "SFTP subsystem request timed out after {}s",
+                self.sftp_channel_open_timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| {
+            ProtocolError::ProtocolError(format!("SFTP subsystem request failed: {}", e))
+        })?;
 
         Ok(channel)
     }

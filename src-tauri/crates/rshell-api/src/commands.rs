@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::{
-    ComposeTarget, CredentialUpdate, PortForwardRule, QuickCommand, SessionConfig,
+    ComposeTarget, CredentialUpdate, PortForwardRule, QuickCommand, Secret, SessionConfig,
     SessionCredential, SshKeyType, TerminalColorScheme, Trigger, TrustHostKeyDecision,
 };
 
@@ -247,12 +247,14 @@ pub enum AppCommand {
     GenerateSshKey {
         name: String,
         key_type: SshKeyType,
-        passphrase: Option<String>,
+        /// 私钥口令。敏感：Debug 输出恒为 `<redacted>`，不会进日志。
+        passphrase: Option<Secret>,
     },
     /// 导入私钥
     ImportPrivateKey {
         path: std::path::PathBuf,
-        passphrase: Option<String>,
+        /// 私钥口令。敏感：Debug 输出恒为 `<redacted>`，不会进日志。
+        passphrase: Option<Secret>,
     },
     /// 删除密钥
     DeleteSshKey {
@@ -266,20 +268,25 @@ pub enum AppCommand {
     // ===== 安全：主密码 =====
     /// 设置主密码
     SetupMasterPassword {
-        password: String,
+        /// 主密码。敏感：Debug 输出恒为 `<redacted>`，不会进日志。
+        password: Secret,
     },
     /// 验证主密码
     VerifyMasterPassword {
-        password: String,
+        /// 主密码。敏感：Debug 输出恒为 `<redacted>`，不会进日志。
+        password: Secret,
     },
     /// 修改主密码
     ChangeMasterPassword {
-        old_password: String,
-        new_password: String,
+        /// 旧主密码。敏感：Debug 输出恒为 `<redacted>`，不会进日志。
+        old_password: Secret,
+        /// 新主密码。敏感：Debug 输出恒为 `<redacted>`，不会进日志。
+        new_password: Secret,
     },
     /// 停用主密码（必须提供当前密码）
     DisableMasterPassword {
-        password: String,
+        /// 当前主密码。敏感：Debug 输出恒为 `<redacted>`，不会进日志。
+        password: Secret,
     },
     /// 立即锁定应用（清除内存中的派生密钥）
     LockMasterPassword,
@@ -382,4 +389,91 @@ pub enum AppCommand {
     ListQuickCommands,
     /// 拉取当前主题和配色方案 (含可用列表)
     ListThemes,
+}
+
+impl AppCommand {
+    /// 变体名（与前端 `src/ipc/client.ts` 的 PascalCase → snake_case 约定同源）。
+    ///
+    /// **存在的理由**：命令分发处的 `#[instrument]` 曾把整条命令用 `Debug` 记进
+    /// span —— 裸 `String` 口令于是以明文进日志。改成只记变体名后，日志既能
+    /// 看出「调了哪条命令」，又不可能带出任何负载内容（口令、终端输入、
+    /// 脚本源码、撰写文本都可能含凭据）。
+    ///
+    /// 穷尽匹配：新增变体时编译器强制补齐，漏了就是编译错误而不是静默失守。
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            AppCommand::ConnectSession { .. } => "ConnectSession",
+            AppCommand::DisconnectSession { .. } => "DisconnectSession",
+            AppCommand::CreateSession { .. } => "CreateSession",
+            AppCommand::UpdateSession { .. } => "UpdateSession",
+            AppCommand::DeleteSession { .. } => "DeleteSession",
+            AppCommand::SendInput { .. } => "SendInput",
+            AppCommand::ResizeTerminal { .. } => "ResizeTerminal",
+            AppCommand::OpenTerminal { .. } => "OpenTerminal",
+            AppCommand::CloseTerminal { .. } => "CloseTerminal",
+            AppCommand::EnqueueUpload { .. } => "EnqueueUpload",
+            AppCommand::EnqueueDownload { .. } => "EnqueueDownload",
+            AppCommand::PauseTransfer { .. } => "PauseTransfer",
+            AppCommand::ResumeTransfer { .. } => "ResumeTransfer",
+            AppCommand::CancelTransfer { .. } => "CancelTransfer",
+            AppCommand::RemoveTransfer { .. } => "RemoveTransfer",
+            AppCommand::RetryTransfer { .. } => "RetryTransfer",
+            AppCommand::BrowseRemoteDir { .. } => "BrowseRemoteDir",
+            AppCommand::GetRemoteHomeDir { .. } => "GetRemoteHomeDir",
+            AppCommand::CreateRemoteDirectory { .. } => "CreateRemoteDirectory",
+            AppCommand::DeleteRemoteEntry { .. } => "DeleteRemoteEntry",
+            AppCommand::ListTransfers => "ListTransfers",
+            AppCommand::CreateTunnel { .. } => "CreateTunnel",
+            AppCommand::CloseTunnel { .. } => "CloseTunnel",
+            AppCommand::ListPendingTunnels => "ListPendingTunnels",
+            AppCommand::RestoreTunnel { .. } => "RestoreTunnel",
+            AppCommand::ListSerialPorts => "ListSerialPorts",
+            AppCommand::ListFolders => "ListFolders",
+            AppCommand::CreateFolder { .. } => "CreateFolder",
+            AppCommand::RenameFolder { .. } => "RenameFolder",
+            AppCommand::DeleteFolder { .. } => "DeleteFolder",
+            AppCommand::ExecuteQuickCommand { .. } => "ExecuteQuickCommand",
+            AppCommand::CreateQuickCommand { .. } => "CreateQuickCommand",
+            AppCommand::DeleteQuickCommand { .. } => "DeleteQuickCommand",
+            AppCommand::CreateTrigger { .. } => "CreateTrigger",
+            AppCommand::DeleteTrigger { .. } => "DeleteTrigger",
+            AppCommand::ToggleTrigger { .. } => "ToggleTrigger",
+            AppCommand::SendComposeText { .. } => "SendComposeText",
+            AppCommand::ExecuteScript { .. } => "ExecuteScript",
+            AppCommand::ToggleSyncInput { .. } => "ToggleSyncInput",
+            AppCommand::GetSyncInputSessions => "GetSyncInputSessions",
+            AppCommand::GenerateSshKey { .. } => "GenerateSshKey",
+            AppCommand::ImportPrivateKey { .. } => "ImportPrivateKey",
+            AppCommand::DeleteSshKey { .. } => "DeleteSshKey",
+            AppCommand::ExportPublicKey { .. } => "ExportPublicKey",
+            AppCommand::SetupMasterPassword { .. } => "SetupMasterPassword",
+            AppCommand::VerifyMasterPassword { .. } => "VerifyMasterPassword",
+            AppCommand::ChangeMasterPassword { .. } => "ChangeMasterPassword",
+            AppCommand::DisableMasterPassword { .. } => "DisableMasterPassword",
+            AppCommand::LockMasterPassword => "LockMasterPassword",
+            AppCommand::GetMasterPasswordState => "GetMasterPasswordState",
+            AppCommand::TrustHostKey { .. } => "TrustHostKey",
+            AppCommand::CancelHostKey { .. } => "CancelHostKey",
+            AppCommand::DecideHostKey { .. } => "DecideHostKey",
+            AppCommand::DeleteHostKey { .. } => "DeleteHostKey",
+            AppCommand::ListHostKeys => "ListHostKeys",
+            AppCommand::SuspendTunnel { .. } => "SuspendTunnel",
+            AppCommand::ResumeTunnel { .. } => "ResumeTunnel",
+            AppCommand::SetAppTheme { .. } => "SetAppTheme",
+            AppCommand::SetTerminalColorScheme { .. } => "SetTerminalColorScheme",
+            AppCommand::ImportColorScheme { .. } => "ImportColorScheme",
+            AppCommand::ScanPlugins => "ScanPlugins",
+            AppCommand::LoadPlugin { .. } => "LoadPlugin",
+            AppCommand::UnloadPlugin { .. } => "UnloadPlugin",
+            AppCommand::ListSessions => "ListSessions",
+            AppCommand::ListSessionLoadIssues => "ListSessionLoadIssues",
+            AppCommand::RetrySessionLoad => "RetrySessionLoad",
+            AppCommand::ListTunnels => "ListTunnels",
+            AppCommand::ListKeys => "ListKeys",
+            AppCommand::ListPlugins => "ListPlugins",
+            AppCommand::ListTriggers => "ListTriggers",
+            AppCommand::ListQuickCommands => "ListQuickCommands",
+            AppCommand::ListThemes => "ListThemes",
+        }
+    }
 }

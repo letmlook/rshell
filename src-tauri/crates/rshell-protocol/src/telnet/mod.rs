@@ -76,6 +76,16 @@ pub struct TelnetConnection {
     suppress_go_ahead: bool,
     /// 是否启用了 Echo（服务器端回显）
     server_echo: bool,
+    /// NAWS（RFC 1073）协商是否成功 —— 服务端已同意接收我们的窗口尺寸。
+    ///
+    /// 只有协商成功后才发 `IAC SB NAWS` 子协商：未协商就发，对端按 RFC 854
+    /// 「未启用的选项不应使用子协商」丢弃，表现为「窗口尺寸永远不生效」。
+    naws_enabled: bool,
+    /// 最近一次请求的窗口尺寸。
+    ///
+    /// 连接建立时通常**先** resize 再完成协商（握手是异步的），所以协商成功的
+    /// 那一刻要把这个尺寸补发出去，否则服务端拿到的仍是它的默认值。
+    last_size: Option<(u16, u16)>,
     pending_bytes: Vec<u8>,
 }
 
@@ -90,6 +100,8 @@ impl TelnetConnection {
             state: TelnetState::Disconnected,
             suppress_go_ahead: false,
             server_echo: false,
+            naws_enabled: false,
+            last_size: None,
             pending_bytes: Vec::new(),
         }
     }
@@ -124,6 +136,20 @@ impl TelnetConnection {
     }
 
     /// 处理接收到的 Telnet 命令
+    ///
+    /// NAWS（RFC 1073）的方向性是这个方法里最容易搞错的地方：
+    /// - RFC 1073 §2：**客户端**用 `IAC WILL NAWS` 表示「我建议用 NAWS」，
+    ///   **服务端**用 `IAC DO NAWS` 表示「我也同意」。两个 RFC 示例
+    ///   （§6 例 1、例 2）都是 `WILL` ↔ `DO` 这一对。
+    /// - 旧实现反着来：连接建立时发 `IAC DO NAWS`（这是服务端该发的动词），
+    ///   收到 `DO`/`WILL` 时又分别回 `WONT`/`DONT` —— 无论服务端怎么回，
+    ///   协商都必然失败。
+    ///
+    /// 现在按 RFC 的方向处理：
+    /// - 收到 `DO NAWS`（服务端建议）→ 回 `WILL NAWS`（客户端同意），
+    ///   协商成功；
+    /// - 收到 `WILL NAWS`（客户端侧的对端也提议）→ 回 `DO NAWS`，
+    ///   同样进入协商成功状态。
     async fn handle_command(
         &mut self,
         cmd: TelnetCommand,
@@ -151,6 +177,21 @@ impl TelnetConnection {
                             TelnetOption::TerminalType as u8,
                         ]);
                         debug!("Telnet: Agreed to Terminal Type");
+                    }
+                    x if x == TelnetOption::WindowSize as u8 => {
+                        // RFC 1073 §6 例 1：服务端 DO NAWS，客户端回 WILL NAWS。
+                        response.extend_from_slice(&[
+                            TelnetCommand::IAC as u8,
+                            TelnetCommand::WILL as u8,
+                            TelnetOption::WindowSize as u8,
+                        ]);
+                        self.naws_enabled = true;
+                        debug!("Telnet: NAWS negotiated (server DO -> client WILL)");
+                        // 协商成功即刻补发当前尺寸：握手是异步的，建立连接时
+                        // 的 resize 往往发生在协商完成之前。
+                        if let Some((cols, rows)) = self.last_size {
+                            response.extend_from_slice(&Self::naws_frame(cols, rows));
+                        }
                     }
                     _ => {
                         // 拒绝其他选项
@@ -181,6 +222,22 @@ impl TelnetConnection {
                     ]);
                     debug!("Telnet: Accepted server Suppress Go Ahead");
                 }
+                x if x == TelnetOption::WindowSize as u8 => {
+                    // 对端也想给我们发它的窗口尺寸。我们**不消费**对端的尺寸
+                    // （我们才是客户端：尺寸由本端终端决定，发给远端），所以
+                    // 按 RFC 854 回 `DONT NAWS` 拒绝，而不是回 `DO NAWS` 之后
+                    // 再把对方发来的 `SB NAWS` 整段丢弃 —— 那正是「只答应不
+                    // 兑现」。
+                    //
+                    // 注意这**不**影响我们自己的上报方向：`naws_enabled` 描述的
+                    // 是「我们能否向对端发 SB NAWS」，它由对端的 `DO NAWS` 决定。
+                    response.extend_from_slice(&[
+                        TelnetCommand::IAC as u8,
+                        TelnetCommand::DONT as u8,
+                        TelnetOption::WindowSize as u8,
+                    ]);
+                    debug!("Telnet: refused the peer's inbound window size (DONT NAWS)");
+                }
                 _ => {
                     response.extend_from_slice(&[
                         TelnetCommand::IAC as u8,
@@ -189,6 +246,29 @@ impl TelnetConnection {
                     ]);
                 }
             },
+            // 对端拒绝 NAWS：关闭尺寸上报，之后的 resize 不再发子协商。
+            // RFC 1073 §2 明确服务端可以在已接受后发 DON'T NAWS 禁止继续上报。
+            //
+            // RFC 854 要求闭合协商：收到 `DONT X` 回 `WONT X`，收到 `WONT X`
+            // 回 `DONT X`。不回的话对端的协商状态停在半开，可能反复重发拒绝。
+            TelnetCommand::DONT if option == TelnetOption::WindowSize as u8 => {
+                self.naws_enabled = false;
+                response.extend_from_slice(&[
+                    TelnetCommand::IAC as u8,
+                    TelnetCommand::WONT as u8,
+                    TelnetOption::WindowSize as u8,
+                ]);
+                debug!("Telnet: NAWS refused by peer (DONT); window size reporting disabled");
+            }
+            TelnetCommand::WONT if option == TelnetOption::WindowSize as u8 => {
+                self.naws_enabled = false;
+                response.extend_from_slice(&[
+                    TelnetCommand::IAC as u8,
+                    TelnetCommand::DONT as u8,
+                    TelnetOption::WindowSize as u8,
+                ]);
+                debug!("Telnet: NAWS refused by peer (WONT); window size reporting disabled");
+            }
             TelnetCommand::SB => {
                 // 子协商内容由 process_data 的 SB 分支单独处理
                 debug!("Telnet: Subnegotiation for option {}", option);
@@ -199,6 +279,23 @@ impl TelnetConnection {
         }
 
         Ok(response)
+    }
+
+    /// NAWS 子协商帧：`IAC SB NAWS <cols_hi> <cols_lo> <rows_hi> <rows_lo> IAC SE`
+    ///
+    /// RFC 1073 §2：宽高各 2 字节，Internet 标准字节序（网络序，大端）。
+    fn naws_frame(cols: u16, rows: u16) -> Vec<u8> {
+        vec![
+            TelnetCommand::IAC as u8,
+            TelnetCommand::SB as u8,
+            TelnetOption::WindowSize as u8,
+            (cols >> 8) as u8,
+            cols as u8,
+            (rows >> 8) as u8,
+            rows as u8,
+            TelnetCommand::IAC as u8,
+            TelnetCommand::SE as u8,
+        ]
     }
 
     /// 处理子协商内容（`IAC SB <option> <payload> IAC SE` 的中间部分）
@@ -409,10 +506,15 @@ impl Connection for TelnetConnection {
         self.stream = Some(stream);
         self.state = TelnetState::Connected;
 
-        // 主动请求 Suppress Go Ahead 与 Window Size (NAWS, RFC 1073)
+        // 主动协商 Suppress Go Ahead (RFC 858) 与 Window Size (NAWS, RFC 1073)。
+        //
+        // NAWS 的动词方向必须按 RFC 1073 §2：选项由**客户端**上报尺寸，
+        // 所以客户端发 `WILL NAWS`（我提议用 NAWS），服务端回 `DO NAWS`（同意）。
+        // 旧实现发的是 `IAC DO NAWS` —— 那是服务端该用的动词，等于反过来
+        // 要求服务端上报自己的尺寸，协商必然不成立。
         self.send_command(TelnetCommand::DO, Some(TelnetOption::SuppressGoAhead))
             .await?;
-        self.send_command(TelnetCommand::DO, Some(TelnetOption::WindowSize))
+        self.send_command(TelnetCommand::WILL, Some(TelnetOption::WindowSize))
             .await?;
 
         info!(
@@ -484,26 +586,27 @@ impl Connection for TelnetConnection {
     }
 
     async fn resize(&mut self, cols: u16, rows: u16) -> Result<(), ProtocolError> {
-        // NAWS (RFC 1073): IAC SB NAWS <16-bit cols> <16-bit rows> IAC SE
-        // 16-bit 字段以 big-endian 传输。
-        // 如果服务器没启用 NAWS,字节序列会被忽略,这是 RFC 允许的 graceful 行为。
+        // 记住尺寸：协商尚未完成时先存着，协商成功那一刻补发（见 handle_command）。
+        self.last_size = Some((cols, rows));
+
+        // 只有 NAWS 协商成功后才发子协商帧。未协商就发，对端按 RFC 854
+        // 「未启用的选项不应使用子协商」丢弃 —— 命令返回成功但尺寸永不生效。
+        if !self.naws_enabled {
+            debug!(
+                "Telnet: NAWS not negotiated yet; window size {}x{} deferred",
+                cols, rows
+            );
+            return Ok(());
+        }
+
         let stream = match self.stream.as_mut() {
             Some(s) => s,
             None => return Ok(()), // 未连接,resize 静默忽略
         };
-        let payload = [
-            TelnetCommand::IAC as u8,
-            TelnetCommand::SB as u8,
-            TelnetOption::WindowSize as u8,
-            (cols >> 8) as u8,
-            cols as u8,
-            (rows >> 8) as u8,
-            rows as u8,
-            TelnetCommand::IAC as u8,
-            TelnetCommand::SE as u8,
-        ];
+        // NAWS (RFC 1073): IAC SB NAWS <16-bit cols> <16-bit rows> IAC SE
+        // 16-bit 字段以 big-endian 传输。
         stream
-            .write_all(&payload)
+            .write_all(&Self::naws_frame(cols, rows))
             .await
             .map_err(|e| ProtocolError::ProtocolError(format!("Failed to send NAWS: {}", e)))?;
         debug!("Telnet: NAWS sent ({}x{})", cols, rows);
@@ -548,6 +651,218 @@ mod tests {
         let mut c = TelnetConnection::new("h", 23);
         c.set_terminal_type("vt100");
         assert_eq!(c.terminal_type, "vt100");
+    }
+
+    // ===== NAWS (RFC 1073) 协商 =====
+    //
+    // 旧实现的两个方向都反了：连接时发 `IAC DO NAWS`（服务端才该发的动词），
+    // 收到 DO/WILL 时又分别回 WONT/DONT —— 无论服务端怎么回，协商都失败，
+    // 远端窗口尺寸永不生效（vim/top/less 全屏程序错行）。
+
+    /// RFC 1073 §2：客户端用 `IAC WILL NAWS` 提议用 NAWS。
+    #[tokio::test]
+    async fn connect_proposes_naws_with_will() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut connection = TelnetConnection::new("127.0.0.1", port);
+        // 先连后 accept：connect 是 future，不 poll 它就永远不会发起连接，
+        // accept() 会一直等下去。
+        connection.connect().await.unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+
+        // connect() 发两条协商：DO SGA（3 字节）+ WILL NAWS（3 字节）
+        let mut buf = [0u8; 6];
+        socket.read_exact(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[0..3],
+            &[
+                TelnetCommand::IAC as u8,
+                TelnetCommand::DO as u8,
+                TelnetOption::SuppressGoAhead as u8
+            ],
+            "Suppress Go Ahead 仍按原样协商"
+        );
+        assert_eq!(
+            &buf[3..6],
+            &[
+                TelnetCommand::IAC as u8,
+                TelnetCommand::WILL as u8,
+                TelnetOption::WindowSize as u8
+            ],
+            "client must propose NAWS with WILL (RFC 1073 §2)"
+        );
+    }
+
+    /// RFC 1073 §6 例 1：服务端 `DO NAWS` → 客户端回 `WILL NAWS`，协商成功。
+    #[tokio::test]
+    async fn server_do_naws_is_answered_with_will_and_enables_reporting() {
+        let mut c = TelnetConnection::new("h", 23);
+        assert!(!c.naws_enabled);
+        let response = c
+            .handle_command(TelnetCommand::DO, TelnetOption::WindowSize as u8)
+            .await
+            .unwrap();
+        assert_eq!(
+            response,
+            vec![
+                TelnetCommand::IAC as u8,
+                TelnetCommand::WILL as u8,
+                TelnetOption::WindowSize as u8
+            ],
+            "server DO NAWS must be answered with WILL NAWS"
+        );
+        assert!(c.naws_enabled, "NAWS must be enabled after agreement");
+    }
+
+    /// RFC 1073 §6 例 2 的镜像：对方也用 WILL 提议 → 回 DO 表示接受。
+    #[tokio::test]
+    async fn peer_will_naws_is_refused_without_enabling_reporting() {
+        let mut c = TelnetConnection::new("h", 23);
+        let response = c
+            .handle_command(TelnetCommand::WILL, TelnetOption::WindowSize as u8)
+            .await
+            .unwrap();
+        assert_eq!(
+            response,
+            vec![
+                TelnetCommand::IAC as u8,
+                TelnetCommand::DONT as u8,
+                TelnetOption::WindowSize as u8
+            ],
+            "对端要给我们发窗口尺寸时必须拒绝（DONT）——回 DO 之后再丢弃子协商 \
+             就是「只答应不兑现」"
+        );
+        assert!(
+            !c.naws_enabled,
+            "拒绝对端的上报方向不影响我们自己的上报状态"
+        );
+    }
+
+    /// RFC 854：收到 DONT NAWS 回 WONT NAWS，收到 WONT NAWS 回 DONT NAWS ——
+    /// 闭合协商，否则对端状态停在半开、可能反复重发拒绝。
+    #[tokio::test]
+    async fn refusal_is_closed_with_a_negative_acknowledgement() {
+        let mut c = TelnetConnection::new("h", 23);
+        let response = c
+            .handle_command(TelnetCommand::DONT, TelnetOption::WindowSize as u8)
+            .await
+            .unwrap();
+        assert_eq!(
+            response,
+            vec![
+                TelnetCommand::IAC as u8,
+                TelnetCommand::WONT as u8,
+                TelnetOption::WindowSize as u8
+            ],
+            "DONT NAWS 必须回 WONT NAWS"
+        );
+        assert!(!c.naws_enabled);
+
+        let mut c = TelnetConnection::new("h", 23);
+        let response = c
+            .handle_command(TelnetCommand::WONT, TelnetOption::WindowSize as u8)
+            .await
+            .unwrap();
+        assert_eq!(
+            response,
+            vec![
+                TelnetCommand::IAC as u8,
+                TelnetCommand::DONT as u8,
+                TelnetOption::WindowSize as u8
+            ],
+            "WONT NAWS 必须回 DONT NAWS"
+        );
+        assert!(!c.naws_enabled);
+    }
+
+    /// 协商未完成时不得发 NAWS 子协商帧：未启用的选项用了子协商，
+    /// 对端按 RFC 854 直接丢弃 —— 命令返回成功但尺寸永不生效。
+    #[tokio::test]
+    async fn resize_before_negotiation_defers_instead_of_sending() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut connection = TelnetConnection::new("127.0.0.1", port);
+        // 先连后 accept（connect 是 future，不 poll 就不会发起连接）。
+        connection.connect().await.unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        // 吃掉连接建立时的两条协商（DO SGA + WILL NAWS）
+        let mut negotiation = [0u8; 6];
+        socket.read_exact(&mut negotiation).await.unwrap();
+
+        connection.resize(120, 40).await.unwrap();
+        assert_eq!(connection.last_size, Some((120, 40)));
+        assert!(!connection.naws_enabled);
+
+        // 未协商 → 不应有任何 NAWS 子协商帧写出去。
+        // 用超时而不是「读到报错」：对端不回应时 read 会一直挂着。
+        let mut frame = [0u8; 9];
+        let received = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            socket.read_exact(&mut frame),
+        )
+        .await;
+        assert!(
+            received.is_err(),
+            "协商完成前不得发出 NAWS 子协商帧，实际收到: {frame:?}"
+        );
+    }
+
+    /// 协商完成后要把**已经记住**的尺寸补发出去：握手是异步的，
+    /// 建立连接时的 resize 早于协商完成。
+    #[tokio::test]
+    async fn negotiated_naws_flushes_the_deferred_size() {
+        let mut c = TelnetConnection::new("h", 23);
+        c.last_size = Some((120, 40));
+        let response = c
+            .handle_command(TelnetCommand::DO, TelnetOption::WindowSize as u8)
+            .await
+            .unwrap();
+        // WILL NAWS 之后紧跟 SB NAWS 帧（120x40，大端）
+        let mut expected = vec![
+            TelnetCommand::IAC as u8,
+            TelnetCommand::WILL as u8,
+            TelnetOption::WindowSize as u8,
+        ];
+        expected.extend_from_slice(&TelnetConnection::naws_frame(120, 40));
+        assert_eq!(response, expected);
+    }
+
+    /// 对端拒绝 NAWS（DONT/WONT）后不得再发子协商帧。
+    #[tokio::test]
+    async fn refusal_disables_naws_reporting() {
+        let mut c = TelnetConnection::new("h", 23);
+        c.handle_command(TelnetCommand::DO, TelnetOption::WindowSize as u8)
+            .await
+            .unwrap();
+        assert!(c.naws_enabled);
+
+        c.handle_command(TelnetCommand::DONT, TelnetOption::WindowSize as u8)
+            .await
+            .unwrap();
+        assert!(!c.naws_enabled, "DONT NAWS must disable reporting");
+
+        c.handle_command(TelnetCommand::DO, TelnetOption::WindowSize as u8)
+            .await
+            .unwrap();
+        c.handle_command(TelnetCommand::WONT, TelnetOption::WindowSize as u8)
+            .await
+            .unwrap();
+        assert!(!c.naws_enabled, "WONT NAWS must disable reporting");
+    }
+
+    /// NAWS 帧的字节布局：宽高各 2 字节大端。
+    #[test]
+    fn naws_frame_uses_big_endian_dimensions() {
+        let frame = TelnetConnection::naws_frame(300, 24);
+        assert_eq!(
+            frame,
+            vec![
+                255, 250, 31, // IAC SB NAWS
+                0x01, 0x2C, // width 300 = 0x012C，大端
+                0x00, 0x18, // height 24 = 0x0018，大端
+                255, 240, // IAC SE
+            ]
+        );
     }
 
     #[tokio::test]

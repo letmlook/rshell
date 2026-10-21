@@ -633,6 +633,16 @@ function terminalAction(action: TerminalAction) {
 // 复制粘贴用 Ctrl+Shift+C / Ctrl+Shift+V（Xterm.js 惯例）：裸 Ctrl+C 在终端里
 // 是 SIGINT，Ctrl+V 是 quoted-insert，都不能劫持成剪贴板操作。
 function onGlobalKeydown(e: KeyboardEvent) {
+  // 锁定态：应用级快捷键一律不响应。
+  //
+  // 遮罩只盖住界面，**挡不住 window 级键盘监听**：焦点落在遮罩的「解锁」
+  // 按钮上时（Tab 一下就能到），`matchAppShortcut` 只排除 input/textarea/select，
+  // <button> 不算文本输入 → Ctrl+Shift+V 会被判成「粘贴」→ 剪贴板内容被
+  // 写进**仍然连接着的**远端会话（等于替别人执行命令），Ctrl+Shift+C 则能
+  // 把远端输出读进剪贴板。这与锁的既定语义（「防止他人直接操作这台机器上
+  // 的会话」）直接冲突。
+  if (masterPasswordStore.isLocked) return;
+
   // 应用接管的快捷键（唯一定义处 utils/shortcuts.ts）：
   // 工具栏的「新建连接 (Ctrl+N)」等提示都以此为准。
   const shortcut = matchAppShortcut(e);
@@ -662,6 +672,8 @@ function onGlobalKeydown(e: KeyboardEvent) {
  * 输入框里打字不算触发：那里的 Ctrl+Shift+1 只是文本。
  */
 async function triggerHotkeyCommand(event: KeyboardEvent) {
+  // 锁定态：热键不得向远端会话发命令（与 onGlobalKeydown 的锁定拦截同理）。
+  if (masterPasswordStore.isLocked) return;
   if (isTextInputTarget(event.target)) return;
   const table = parsedHotkeys.value;
   if (table.length === 0) return;

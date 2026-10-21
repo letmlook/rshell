@@ -7,7 +7,7 @@
 //! 任何新增敏感字段都会让本测试失败。
 
 use rshell_api::types::{
-    CredentialUpdate, SessionConfig, SessionCredential, SshKeyInfo, SshKeyType,
+    CredentialUpdate, Secret, SessionConfig, SessionCredential, SshKeyInfo, SshKeyType,
 };
 use rshell_api::AppCommand;
 use uuid::Uuid;
@@ -161,4 +161,103 @@ fn credential_bearing_commands_redact_secrets_in_debug_output() {
             "credential leaked through command Debug: {debug}"
         );
     }
+}
+
+/// 全部**含密命令**的 Debug 都不带明文。
+///
+/// 旧用例只覆盖 `CreateSession`/`UpdateSession` 两种命令，恰好漏掉主密码与
+/// 私钥口令那 6 个变体 —— 它们的 `password`/`passphrase` 曾是裸 `String`，
+/// `#[instrument(fields(command = ?command))]` 会把明文写进 tracing span。
+/// 现在这些字段是 `Secret`（Debug 恒为 `<redacted>`），本用例把覆盖面补齐，
+/// 任何新增的含密变体也必须在这里登记。
+#[test]
+fn every_credential_bearing_command_redacts_its_secret() {
+    let secret = "distinctive-secret-for-all-credential-commands";
+    let commands = [
+        (
+            "SetupMasterPassword",
+            AppCommand::SetupMasterPassword {
+                password: Secret::new(secret),
+            },
+        ),
+        (
+            "VerifyMasterPassword",
+            AppCommand::VerifyMasterPassword {
+                password: Secret::new(secret),
+            },
+        ),
+        (
+            "ChangeMasterPassword",
+            AppCommand::ChangeMasterPassword {
+                old_password: Secret::new(secret),
+                new_password: Secret::new(secret),
+            },
+        ),
+        (
+            "DisableMasterPassword",
+            AppCommand::DisableMasterPassword {
+                password: Secret::new(secret),
+            },
+        ),
+        (
+            "GenerateSshKey",
+            AppCommand::GenerateSshKey {
+                name: "k".into(),
+                key_type: SshKeyType::ED25519,
+                passphrase: Some(Secret::new(secret)),
+            },
+        ),
+        (
+            "ImportPrivateKey",
+            AppCommand::ImportPrivateKey {
+                path: std::path::PathBuf::from("/tmp/id_ed25519"),
+                passphrase: Some(Secret::new(secret)),
+            },
+        ),
+    ];
+    for (name, command) in commands {
+        let debug = format!("{command:?}");
+        assert!(debug.contains(name), "{name} 变体名丢了: {debug}");
+        assert!(
+            debug.contains("<redacted>"),
+            "{name} 的口令未被脱敏: {debug}"
+        );
+        assert!(
+            !debug.contains(secret),
+            "{name} 的口令经 Debug 泄漏: {debug}"
+        );
+    }
+}
+
+/// 命令分发处的日志只记**变体名**，不记负载 —— 负载里可能有终端输入、
+/// 脚本源码、撰写文本，它们都可能含凭据。
+#[test]
+fn command_variant_name_carries_no_payload() {
+    let secret = "distinctive-secret-for-variant-name";
+    let command = AppCommand::SetupMasterPassword {
+        password: Secret::new(secret),
+    };
+    let name = command.variant_name();
+    assert_eq!(name, "SetupMasterPassword");
+    assert!(!name.contains(secret));
+
+    // 变体名必须覆盖到每一个命令变体：这里抽样断言几类代表性变体，
+    // 完整覆盖由 `variant_name` 的穷尽匹配在编译期保证。
+    assert_eq!(
+        AppCommand::SendInput {
+            session_id: Uuid::nil(),
+            terminal_id: None,
+            data: b"sudo -S hunter2".to_vec(),
+        }
+        .variant_name(),
+        "SendInput"
+    );
+    assert_eq!(
+        AppCommand::ExecuteScript {
+            code: "rshell_log(\"hunter2\")".into(),
+            session_id: Uuid::nil(),
+        }
+        .variant_name(),
+        "ExecuteScript"
+    );
 }

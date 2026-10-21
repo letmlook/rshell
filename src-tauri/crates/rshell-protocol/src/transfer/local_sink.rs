@@ -15,7 +15,7 @@
 //!   但本地 rename 实际上比 SFTP 标准 rename 更靠谱。
 //! - `try_remove`：「不存在」一律视为成功，与 SFTP 实现对齐。
 
-use super::super::ssh::sftp::{CommitOutcome, CommitStrategy, SftpCapabilities, TransferSink};
+use super::super::ssh::sftp::{CommitOutcome, CommitStrategy, TransferSink};
 use crate::ProtocolError;
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -66,16 +66,11 @@ impl TransferSink for LocalSink {
         Ok(Box::new(file))
     }
 
-    async fn safe_commit(
-        &self,
-        from: &str,
-        to: &str,
-        _caps: SftpCapabilities,
-    ) -> Result<CommitOutcome, ProtocolError> {
+    async fn safe_commit(&self, from: &str, to: &str) -> Result<CommitOutcome, ProtocolError> {
         // 本地 `std::fs::rename` 在所有目标平台（macOS / Linux / Windows）
         // 上均为「原子替换」语义，且成功即可生效——比 SFTP 标准
-        // `SSH_FXP_RENAME` 更靠谱。但 capability 探测接口仍走同一路径，
-        // 因此继续返回 `StandardRename`，由「能力来源」区分。
+        // `SSH_FXP_RENAME` 更靠谱。但它不是 SFTP 的 `posix-rename` 扩展，
+        // 因此如实报告 `StandardRename`，不谎称 `PosixRename`。
         tokio::fs::rename(from, to)
             .await
             .map_err(|e| ProtocolError::TransferCommitFailed {

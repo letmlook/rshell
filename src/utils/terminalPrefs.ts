@@ -67,10 +67,10 @@ export function setCopyOnSelect(value: boolean): boolean {
 // ===== 终端外观 =====
 
 /**
- * 终端外观偏好：字号、字体、光标样式、滚动回���行数。
+ * 终端外观偏好：字号、字体、光标样式、滚动回退行数。
  *
  * 这些值此前在 TerminalPane 里写死（13px / 固定字体栈 / block 光标 / 10000 行），
- * 而 `TerminalConfig` 类型早已声明了同样���字段却从未接线——类型在承诺一个
+ * 而 `TerminalConfig` 类型早已声明了同样的字段却从未接线——类型在承诺一个
  * 并不存在的能力。这里把声明接上：面板可改、已打开的终端立即生效。
  *
  * 与「选中即复制」同理存 localStorage：纯 UI 偏好，走 IPC 只会拖慢首屏。

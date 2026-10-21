@@ -32,6 +32,7 @@ import type {
   SessionCredential,
   SessionLoadIssue,
   IpcErrorKind,
+  SshKeyInfo,
 } from "./types";
 
 // ===== 通用 helper =====
@@ -318,7 +319,7 @@ export const importPrivateKey = (path: PathBuf, passphrase: string | null) =>
 export const deleteSshKey = (key_id: Uuid) => call({ DeleteSshKey: { key_id } });
 export const exportPublicKey = (key_id: Uuid) => call({ ExportPublicKey: { key_id } });
 // 切片 3 修正：ListKeys 直接返回数组（切片 2.2 死循环修复后契约对齐）
-export const listKeys = () => call<unknown[]>({ ListKeys: null });
+export const listKeys = () => call<SshKeyInfo[]>({ ListKeys: null });
 
 // ===== 主密码 =====
 //

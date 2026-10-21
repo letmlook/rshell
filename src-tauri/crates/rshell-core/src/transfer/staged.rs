@@ -114,6 +114,12 @@ pub struct UploadRequest<'a> {
 pub struct DownloadRequest<'a> {
     pub source: Box<dyn AsyncRead + Unpin + Send>,
     pub source_total: u64,
+    /// 并发区间读取器。
+    ///
+    /// SFTP 的 READ 是请求/响应协议（单 `f_read` 槽），单句柄串行读的吞吐上限
+    /// 是 `CHUNK_SIZE / RTT`；拆成多个区间并发读才能提上去。给了它就走并发
+    /// 路径（大文件），`None` 时退回串行（小文件或后端不支持随机读）。
+    pub range_fetcher: Option<Arc<dyn rshell_protocol::ssh::sftp::RangeFetcher>>,
     pub target: std::path::PathBuf,
     pub temp_path: std::path::PathBuf,
     pub conflict: ConflictPolicy,
@@ -207,9 +213,8 @@ pub async fn run_staged_upload(mut req: UploadRequest<'_>) -> StagedOutcome {
         };
     }
 
-    // 5) 提交 —— capabilities 探测目前固定返回 default；保留接口以备后续升级
-    let caps = rshell_protocol::ssh::sftp::SftpCapabilities::default();
-    let commit = match req.sink.safe_commit(&temp_path, &target, caps).await {
+    // 5) 提交 —— 提交语义（原子替换 / 标准 rename）由 sink 自己探测并回报
+    let commit = match req.sink.safe_commit(&temp_path, &target).await {
         Ok(c) => c,
         Err(e) => {
             let cleanup = req.sink.try_remove(&temp_path).await;
@@ -271,14 +276,39 @@ pub async fn run_staged_download(mut req: DownloadRequest<'_>) -> StagedOutcome 
     };
 
     // 2) 字节拷贝
-    let copy_result = copy_bytes(
-        req.source.as_mut(),
-        sink.as_mut(),
-        req.source_total,
-        req.control,
-        req.progress,
-    )
-    .await;
+    //
+    // 有并发区间读取器且文件足够大 → 走并发路径（多个 READ 同时在途，
+    // 写入侧严格按 offset 升序，落盘内容与串行版本逐字节一致）。
+    // 否则退回单句柄串行读（小文件不值得多句柄的固定开销）。
+    let use_pipelined = req.range_fetcher.is_some()
+        && req.source_total >= rshell_protocol::ssh::sftp::DOWNLOAD_PIPELINE_MIN_BYTES;
+    let copy_result = if use_pipelined {
+        let fetcher = req
+            .range_fetcher
+            .clone()
+            .expect("range_fetcher checked above");
+        let mut writer = sink;
+        rshell_protocol::ssh::sftp::copy_pipelined(
+            req.source_total,
+            move |offset, len| {
+                let fetcher = fetcher.clone();
+                async move { fetcher.fetch(offset, len).await }
+            },
+            &mut writer,
+            req.control,
+            req.progress,
+        )
+        .await
+    } else {
+        copy_bytes(
+            req.source.as_mut(),
+            sink.as_mut(),
+            req.source_total,
+            req.control,
+            req.progress,
+        )
+        .await
+    };
 
     let bytes = match copy_result {
         Ok(bytes) => bytes,
@@ -333,11 +363,10 @@ pub async fn run_staged_download(mut req: DownloadRequest<'_>) -> StagedOutcome 
         };
     }
 
-    // 5) 提交
-    let caps = rshell_protocol::ssh::sftp::SftpCapabilities::default();
+    // 5) 提交 —— 提交语义（原子替换 / 标准 rename）由 sink 自己探测并回报
     let commit = match req
         .sink
-        .safe_commit(&temp_str, &target.to_string_lossy(), caps)
+        .safe_commit(&temp_str, &target.to_string_lossy())
         .await
     {
         Ok(c) => c,
@@ -848,6 +877,8 @@ mod tests {
         let outcome = run_staged_download(DownloadRequest {
             source: source_reader,
             source_total: payload.len() as u64,
+            // 测试用串行路径：并发区间读由生产侧的 SFTP 会话提供。
+            range_fetcher: None,
             target: target.clone(),
             temp_path: temp.clone(),
             conflict: ConflictPolicy::Fail,
@@ -892,6 +923,8 @@ mod tests {
         let outcome = run_staged_download(DownloadRequest {
             source: source_reader,
             source_total: payload.len() as u64,
+            // 测试用串行路径：并发区间读由生产侧的 SFTP 会话提供。
+            range_fetcher: None,
             target: target.clone(),
             temp_path: temp.clone(),
             conflict: ConflictPolicy::Overwrite,
@@ -940,6 +973,8 @@ mod tests {
         let outcome = run_staged_download(DownloadRequest {
             source: source_reader,
             source_total: payload.len() as u64,
+            // 测试用串行路径：并发区间读由生产侧的 SFTP 会话提供。
+            range_fetcher: None,
             target: target.clone(),
             temp_path: temp.clone(),
             conflict: ConflictPolicy::Overwrite,

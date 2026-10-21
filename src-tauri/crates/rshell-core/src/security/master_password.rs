@@ -26,7 +26,30 @@ use crate::event_bus::EventBus;
 /// 持久化文件格式版本
 const PERSIST_VERSION: u32 = 1;
 /// PBKDF2 迭代次数
-const DEFAULT_ITERATIONS: u32 = 100_000;
+///
+/// OWASP（Password Storage Cheat Sheet）对 PBKDF2-HMAC-SHA256 的当前建议是
+/// **600,000** 次。原先的 100,000 明显偏低：拿到 `master_password.json`
+/// 的攻击者可以离线爆破，GPU/多线程下成本被显著压低。
+///
+/// 迭代数写进持久化文件，将来提高时旧文件仍按旧值验证（不会让用户被锁在
+/// 门外），新设置则用新值。
+const DEFAULT_ITERATIONS: u32 = 600_000;
+/// 迭代数允许的下界：低于此值视作文件被篡改/损坏，不予采用。
+const MIN_ITERATIONS: u32 = 100_000;
+/// 迭代数允许的上界：文件里的值是攻击者可控的输入，没有上限就能把
+/// `iterations` 设成 40 亿 —— 每次解锁都在 Tokio worker 上同步烧数小时 CPU
+/// （KDF 是同步阻塞调用），把运行时打满。
+const MAX_ITERATIONS: u32 = 5_000_000;
+
+/// 连续验证失败达到该次数后进入退避。
+///
+/// 主密码的验证入口是注册在 handler 列表里的常规 Tauri 命令，WebView 内
+/// 任何时候都可无限次调用；失败时既没有计数也没有退避，等于给了无限次
+/// 在线穷举的机会。
+const MAX_FAILED_ATTEMPTS: u32 = 5;
+/// 进入退避后的锁定时长。
+const LOCKOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 验证令牌明文（加密后落盘，用于校验密码正确性）
 const VERIFICATION_TOKEN: &[u8] = b"RShell_MasterPassword_Verification_Token";
 
@@ -63,6 +86,21 @@ struct PersistedMasterPassword {
     token: String,
 }
 
+/// 派生出密钥（放到阻塞线程池执行）。
+///
+/// PBKDF2 是**同步 CPU 密集**计算：600,000 次迭代在现代 CPU 上是数百毫秒量级。
+/// 直接在 async fn 里调用会占住 Tokio worker 线程 —— 一次解锁就把一个 worker
+/// 卡住，别的会话命令跟着排队。放到 `spawn_blocking` 里，让它去阻塞线程池。
+async fn derive_key_offloaded(
+    password: String,
+    salt: [u8; 16],
+    iterations: u32,
+) -> Result<[u8; 32], CoreError> {
+    tokio::task::spawn_blocking(move || hash::derive_key(&password, &salt, iterations))
+        .await
+        .map_err(|e| CoreError::Internal(format!("Key derivation task failed: {e}")))
+}
+
 /// 主密码管理器
 pub struct MasterPassword {
     state: Arc<RwLock<MasterPasswordState>>,
@@ -74,6 +112,10 @@ pub struct MasterPassword {
     encrypted_token: Arc<RwLock<Option<Vec<u8>>>>,
     /// PBKDF2 迭代次数
     iterations: u32,
+    /// 连续验证失败次数（成功即清零）
+    failed_attempts: Arc<RwLock<u32>>,
+    /// 退避截止时刻：在此之前拒绝一切验证尝试
+    locked_until: Arc<RwLock<Option<std::time::Instant>>>,
     /// 持久化文件路径；None 表示不落盘（仅内存，供测试使用）
     persist_path: Option<PathBuf>,
     event_bus: Arc<EventBus>,
@@ -88,6 +130,8 @@ impl MasterPassword {
             salt: Arc::new(RwLock::new(None)),
             encrypted_token: Arc::new(RwLock::new(None)),
             iterations: DEFAULT_ITERATIONS,
+            failed_attempts: Arc::new(RwLock::new(0)),
+            locked_until: Arc::new(RwLock::new(None)),
             persist_path: None,
             event_bus,
         }
@@ -119,7 +163,19 @@ impl MasterPassword {
                             (Ok(salt_bytes), Ok(token_bytes)) if salt_bytes.len() == 16 => {
                                 let mut salt_array = [0u8; 16];
                                 salt_array.copy_from_slice(&salt_bytes);
-                                iterations = persisted.iterations.max(1);
+                                // 迭代数是**文件里的值**，攻击者可写：过低的值等于
+                                // 把 KDF 降级成一次哈希，过高的值会把每次解锁变成
+                                // 数小时的 CPU 燃烧（KDF 是同步阻塞调用，跑在
+                                // Tokio worker 上）。夹到允许区间内。
+                                iterations =
+                                    persisted.iterations.clamp(MIN_ITERATIONS, MAX_ITERATIONS);
+                                if iterations != persisted.iterations {
+                                    warn!(
+                                        stored = persisted.iterations,
+                                        applied = iterations,
+                                        "Master password iteration count out of range; clamped"
+                                    );
+                                }
                                 salt = Some(salt_array);
                                 token = Some(token_bytes);
                             }
@@ -163,6 +219,8 @@ impl MasterPassword {
             salt: Arc::new(RwLock::new(salt)),
             encrypted_token: Arc::new(RwLock::new(token)),
             iterations,
+            failed_attempts: Arc::new(RwLock::new(0)),
+            locked_until: Arc::new(RwLock::new(None)),
             persist_path: Some(path),
             event_bus,
         }
@@ -182,8 +240,8 @@ impl MasterPassword {
         // 生成随机盐
         let salt = hash::generate_salt();
 
-        // 派生密钥
-        let derived = hash::derive_key(password, &salt, self.iterations);
+        // 派生密钥（放到阻塞线程池：600k 次迭代不能占住 Tokio worker）
+        let derived = derive_key_offloaded(password.to_string(), salt, self.iterations).await?;
 
         // 创建验证令牌（一个已知的明文）
         let encrypted_token = aes::encrypt(&derived, VERIFICATION_TOKEN)
@@ -207,10 +265,32 @@ impl MasterPassword {
     }
 
     /// 验证主密码
+    ///
+    /// 连续失败达到 `MAX_FAILED_ATTEMPTS` 次后进入 `LOCKOUT_DURATION` 的退避：
+    /// 退避期内**直接拒绝**（不做 KDF 派生），把在线穷举的速率压到
+    /// 「每 30 秒 5 次」量级。
+    ///
+    /// 退避是**内存态**的：重启应用即清零。这是刻意的 —— 它防的是「WebView
+    /// 内的脚本无限次调用命令」这一在线穷举，不承担离线爆破的防护（离线爆破
+    /// 由 PBKDF2 迭代数负责）。
     pub async fn verify(&self, password: &str) -> Result<bool, CoreError> {
         let state = self.state.read().await.clone();
         if state == MasterPasswordState::NotSet {
             return Err(CoreError::InvalidState("Master password not set".into()));
+        }
+
+        // 退避期内直接拒绝：不派生密钥（KDF 本身就是成本），
+        // 也不给「还能再试一次」的暗示。
+        {
+            let locked_until = self.locked_until.read().await;
+            if let Some(until) = *locked_until {
+                if let Some(remaining) = until.checked_duration_since(std::time::Instant::now()) {
+                    return Err(CoreError::AuthenticationFailed(format!(
+                        "Too many failed attempts; retry in {} seconds",
+                        remaining.as_secs().saturating_add(1)
+                    )));
+                }
+            }
         }
 
         let salt = self.salt.read().await;
@@ -222,8 +302,8 @@ impl MasterPassword {
             ));
         };
 
-        // 派生密钥
-        let derived = hash::derive_key(password, salt, self.iterations);
+        // 派生密钥（放到阻塞线程池：600k 次迭代不能占住 Tokio worker）
+        let derived = derive_key_offloaded(password.to_string(), *salt, self.iterations).await?;
 
         // 尝试解密验证令牌
         match aes::decrypt(&derived, encrypted_token) {
@@ -231,11 +311,15 @@ impl MasterPassword {
                 if decrypted == VERIFICATION_TOKEN {
                     *self.derived_key.write().await = Some(derived);
                     *self.state.write().await = MasterPasswordState::Unlocked;
+                    // 成功即清零失败计数与退避
+                    *self.failed_attempts.write().await = 0;
+                    *self.locked_until.write().await = None;
                     info!("Master password verified successfully");
                     self.event_bus
                         .publish(AppEvent::MasterPasswordVerified { success: true });
                     Ok(true)
                 } else {
+                    self.record_failed_attempt().await;
                     warn!("Master password verification failed: wrong token");
                     self.event_bus
                         .publish(AppEvent::MasterPasswordVerified { success: false });
@@ -243,11 +327,30 @@ impl MasterPassword {
                 }
             }
             Err(_) => {
+                self.record_failed_attempt().await;
                 warn!("Master password verification failed: decryption error");
                 self.event_bus
                     .publish(AppEvent::MasterPasswordVerified { success: false });
                 Ok(false)
             }
+        }
+    }
+
+    /// 记一次失败；达到阈值就进入退避。
+    async fn record_failed_attempt(&self) {
+        let attempts = {
+            let mut counter = self.failed_attempts.write().await;
+            *counter = counter.saturating_add(1);
+            *counter
+        };
+        if attempts >= MAX_FAILED_ATTEMPTS {
+            let until = std::time::Instant::now() + LOCKOUT_DURATION;
+            *self.locked_until.write().await = Some(until);
+            warn!(
+                attempts,
+                lockout_secs = LOCKOUT_DURATION.as_secs(),
+                "Master password verification locked out after repeated failures"
+            );
         }
     }
 
@@ -269,8 +372,9 @@ impl MasterPassword {
         // 生成新盐
         let new_salt = hash::generate_salt();
 
-        // 派生新密钥
-        let new_derived = hash::derive_key(new_password, &new_salt, self.iterations);
+        // 派生新密钥（放到阻塞线程池）
+        let new_derived =
+            derive_key_offloaded(new_password.to_string(), new_salt, self.iterations).await?;
 
         // 重新加密验证令牌
         let new_encrypted_token = aes::encrypt(&new_derived, VERIFICATION_TOKEN)

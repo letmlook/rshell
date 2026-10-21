@@ -371,6 +371,10 @@ impl HostKeyManager {
         key_type: &str,
         key_blob: &str,
     ) -> Result<(), CoreError> {
+        // 写入前逐字段校验：known_hosts 是按行解析的，字段里带换行就能往信任库
+        // 里注入一条攻击者自己写的条目。
+        validate_host_pattern(host)?;
+        validate_key_fields(key_type, key_blob)?;
         let key = format!("{}:{}", host, port);
         let now = Utc::now().to_rfc3339();
 
@@ -400,7 +404,15 @@ impl HostKeyManager {
         )?;
         entries.insert(key.clone(), entry.clone());
 
-        // 时间戳写进 sidecar（known_hosts 本体保持 OpenSSH 标准格式）
+        // 时间戳写 sidecar（known_hosts 本体保持 OpenSSH 标准格式）
+        //
+        // sidecar 写失败**不算信任失败**：信任本身已经落进 known_hosts 并
+        // 生效了。此前这里把 sidecar 的错误往上抛 —— 调用方据此判定「信任失败」
+        // 并拒绝唤醒握手，但 known_hosts 里已经有这条记录，下次连接该主机不再
+        // 弹确认框。用户的心理模型（以为没信任）与真实状态（已信任）相反。
+        //
+        // 丢的只是首次/上次连接时间戳（下次更新时补上），比「信任状态分叉」
+        // 好得多。真正的信任失败（known_hosts 写不进去）仍然照实报错。
         let mut meta = self.load_meta();
         meta.insert(
             key.clone(),
@@ -409,7 +421,14 @@ impl HostKeyManager {
                 last_seen: entry.last_seen.clone(),
             },
         );
-        self.save_meta(&meta)?;
+        if let Err(error) = self.save_meta(&meta) {
+            warn!(
+                host = %host,
+                port,
+                error = %error,
+                "Host key trusted, but its timestamp sidecar could not be written"
+            );
+        }
 
         info!("Host key trusted: {}:{}", host, port);
         Ok(())
@@ -424,10 +443,19 @@ impl HostKeyManager {
         self.persist_known_hosts(&entries, &[Overlay::Remove { map_key: &key }])?;
         entries.remove(&key);
 
-        // sidecar 里同步删掉，别留下指向已删条目的时间戳
+        // sidecar 里同步删掉，别留下指向已删条目的时间戳。
+        // 同样只记 warn：删除已经生效（known_hosts 里没有了），残留一条孤立
+        // 时间戳不会让主机重新被信任。
         let mut meta = self.load_meta();
         if meta.remove(&key).is_some() {
-            self.save_meta(&meta)?;
+            if let Err(error) = self.save_meta(&meta) {
+                warn!(
+                    host = %host,
+                    port,
+                    error = %error,
+                    "Host key deleted, but its timestamp sidecar could not be updated"
+                );
+            }
         }
 
         info!("Host key deleted: {}:{}", host, port);
@@ -493,6 +521,45 @@ fn sidecar_path(known_hosts_path: &std::path::Path) -> PathBuf {
 fn map_key_of(pattern: &str) -> String {
     let (host, port) = parse_host_port(pattern, 22);
     format!("{}:{}", host, port)
+}
+
+/// 校验 host 模式字段不含空白/换行。
+///
+/// known_hosts 是**按行**解析的：host 字段里带换行就能把一行内容拆成两行，
+/// 从而在信任库里插入一条攻击者自己写的条目（下次连接那台主机免确认直连）。
+/// 离线信任命令（`TrustHostKey`）的 host / key_type / blob 都由前端 IPC 提供，
+/// 属于不可信输入。
+fn validate_host_pattern(host: &str) -> Result<(), CoreError> {
+    if host.is_empty() {
+        return Err(CoreError::InvalidState(
+            "Host key host pattern must not be empty".into(),
+        ));
+    }
+    if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(CoreError::InvalidState(format!(
+            "Host key host pattern must not contain whitespace or control characters: {host:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// 校验算法名与 base64 公钥是**单个** token（不含空白/换行）。
+///
+/// 与 host 同理：这两个字段直接写进 known_hosts 的一行，带换行就能注入行。
+fn validate_key_fields(key_type: &str, key_blob: &str) -> Result<(), CoreError> {
+    for (name, value) in [("key type", key_type), ("key blob", key_blob)] {
+        if value.is_empty() {
+            return Err(CoreError::InvalidState(format!(
+                "Host key {name} must not be empty"
+            )));
+        }
+        if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(CoreError::InvalidState(format!(
+                "Host key {name} must not contain whitespace or control characters: {value:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 条目 → 本应用拥有的一行（OpenSSH 标准格式：端口 22 写裸 host，其余 `[host]:port`）

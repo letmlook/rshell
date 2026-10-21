@@ -1,6 +1,6 @@
 # macOS 验证记录
 
-本记录按轮次分节记日期（最新一轮：2026-10-03）。分支：`codex/release-hardening`（凭据加固与发布就绪合并入 main）。此记录区分代码检查、自动测试、原生进程启动和真实交互，不将未执行项记为通过。
+本记录按轮次分节记日期（最新一轮：2026-10-21）。分支：`main`。此记录区分代码检查、自动测试、原生进程启动和真实交互，不将未执行项记为通过。
 
 ## 2026-09-27：凭据加固与发布就绪轮
 
@@ -375,7 +375,7 @@ Task 1 之前的 baseline commit 为 `86c6ac0`；本轮最终 HEAD 为 `a50245e`
 - **store 对异常 IPC 响应的健壮性**：会话与分组 store 直接把 IPC 返回值赋给 `items`，后端异常返回（非数组）会让它变成不可迭代，界面整块崩掉。现两处都做数组校验。
 - **串口设备枚举**：`SerialConnection::list_ports()` 一直存在于协议层却从未经 IPC 暴露，界面让用户手打 `/dev/cu.usbserial-XXXX`——插拔一次名字就变。现补 `ListSerialPorts` 命令与下拉选择（可手工输入兜底，枚举失败时说明原因）。
 - **Telnet 终端类型子协商**：客户端对 `DO TERMINAL-TYPE` 回 `WILL TERMINAL-TYPE`，服务器随后发 `SB TERMINAL-TYPE SEND` 时必须回 `SB TERMINAL-TYPE IS <类型>`（RFC 1091）。此前子协商内容被整段丢弃——客户端答应了却从不真发，服务器可能一直等或按错误类型渲染。现实现应答并补 3 项单测（含自定义类型如实发出、其它子协商不误判）。
-- **插件扫描的静默拒绝**：清单解析失败、或目录名与清单 `name` 不一致的插件目录，扫描时只记一条 warn 日志就跳过——用户扫描插件只看到「没有插件」，不知道自己��目录被拒了。现以 `state = Error` 的条目出现在列表里，`PluginInfo` 新增 `error` 字段承载原因（Rust + TS 两侧同步）。
+- **插件扫描的静默拒绝**：清单解析失败、或目录名与清单 `name` 不一致的插件目录，扫描时只记一条 warn 日志就跳过——用户扫描插件只看到「没有插件」，不知道自己的目录被拒了。现以 `state = Error` 的条目出现在列表里，`PluginInfo` 新增 `error` 字段承载原因（Rust + TS 两侧同步）。
 - **插件面板的能力可见性**：`PluginInfo.permissions` / `extensions` 一直经 IPC 传到前端却从不展示，用户加载一个声明了网络访问的插件只看得到「已加载」。现展示清单声明的权限（翻成中文说法）与扩展点，并明确说明「已加载」只表示模块编译并登记成功——宿主不向 WASM guest 提供任何宿主能力，声明的权限不会生效。这与沙箱「allow_network 尚未实现，必须报错而不是被忽略」的立场一致。
 - **应用级快捷键**：工具栏的 title 写着「新建连接 (Ctrl+N)」，但全局处理器里根本没有这个快捷键——按了没反应，是虚假提示。同时应用接管的键会**漏给远端 shell**（xterm 在目标阶段先处理，窗口处理器的 `preventDefault` 太晚，Ctrl+F 照样送出 0x06）。现抽出 `utils/shortcuts.ts` 作唯一定义处：窗口处理器据此决定做什么，终端据此决定吞不吞该键。Escape 仍照常送远端。
 - **文件面板的权限提示**：capability 早已改为全局读写（`fs:read-all` + `**`），但界面仍按旧的「逐目录授权」模型给出「该目录尚未授权，请重新选择」的建议——scope 根本不是失败原因，真正的拒绝来自操作系统。新文案说明真实原因并指向「更换本地目录」；越界提示也从「超出已授权的根目录」改成「超出当前本地目录」（那是用户选定的传输目录，不是权限根）。
@@ -400,6 +400,106 @@ Task 1 之前的 baseline commit 为 `86c6ac0`；本轮最终 HEAD 为 `a50245e`
 #### 仍待真实环境验收
 
 编辑连接后能否正常连接、保留的凭据是否仍可用、「记录到文件」触发器是否真的落盘（绝对路径、只追加不覆盖）、四种触发器动作在真实远端输出下的触发时机、键盘交互认证在真实服务器上的应答流程、分组的增删改与连接归组在真实界面上的表现、快速命令热键在真实窗口里的捕获与冲突表现、终端外观改动在真实 WebView 中的即时生效、主机密钥「上次连接时间」在真实连接后是否正确刷新，均需真机确认。
+
+### 2026-10-21：深度 code review 修复轮（3 high / 8 medium / 10 low 全量修复）
+
+针对全仓库深度审查（会话与协议层、传输链路、前端 IPC 与事件契约、安全模块）报出的
+3 个 high、8 个 medium、10 个 low，本轮全部修复。改动只落在工作区，未提交。
+
+#### high
+
+- **主密码与私钥口令明文进 tracing span**：`AppCommand` 的 6 个含密变体（4 个主密码 + 2 个密钥口令）
+  此前以 `#[instrument(fields(command = ?command))]` 记录整个命令体，明文口令会进日志。
+  改为 `rshell-api` 新增 `Secret` 类型（`Debug` 恒为 `<redacted>`），
+  并让 span 只记录 `AppCommand::variant_name()`——新增命令变体时穷尽 match 会在编译期强制补齐。
+  实测：用同一 `#[instrument]` 形状在独立工程复刻，修复前输出含 `password: "SUPERSECRET-MASTER-PW"`，
+  修复后仅 `command="SetupMasterPassword"`，无明文。
+- **Telnet NAWS 协商方向反了**：客户端此前发 `IAC DO NAWS`（要求服务端发窗口尺寸），
+  与 RFC 1073 §2/§6 规定的方向相反，真实服务端不会把尺寸推回来。
+  改为发 `IAC WILL NAWS`、对 `IAC DO NAWS` 回 `IAC WILL NAWS`；协商完成前 resize
+  只记住尺寸、协商成功后补发。协议层 telnet 用例 21 项全绿。
+  独立复审后又补了两处：收到 `DONT NAWS` / `WONT NAWS` 时按 RFC 854 回负确认
+  （`WONT` / `DONT`），否则对端协商状态停在半开；收到对端 `WILL NAWS`（对端想给
+  我们发它的尺寸）时回 `DONT NAWS` **拒绝**——我们不消费对端尺寸，回 `DO` 之后
+  再丢弃 `SB NAWS` 就是「只答应不兑现」。
+- **TerminalPane 重复 attach**：每次 attach 都会让 Tauri 反序列化一个新的 Channel，
+  其 index 计数器从 0 重启，与 JS 侧递增的期望值整体错位，`_pendingMessages` 无限增长。
+  前端按 `${sessionId}:${terminalId}` 幂等（失败不记 key，保证「重试附加」真重发）；
+  后端 `TermSink` 按 `channel.id()` 去重，重复句柄移入 `retired` 随 sink 释放——
+  不能直接 drop（drop 会触发 `on_drop` 发 `end`，把仍在用的共享回调注销掉）。
+
+#### medium
+
+Telnet/Serial 请求-应答补超时；SFTP 通道开启与版本握手补超时并缩短锁持有；
+应用锁态禁止全局快捷键 / 终端输入 / 复制 / 粘贴；上传恢复前做远端存在性探测（入队即报 `target_exists`）；
+staged 失败路径按 `LateConflict` 发布 `TransferConflict`；主密码 PBKDF2 迭代数 100k→600k（OWASP 建议值，
+读取时夹取到 [100k, 5M]）、连续失败退避（5 次失败锁 30s）、KDF 派生移出 Tokio worker；
+生产下载接回并发区间读（`RangeFetcher` 注入 staged 生命周期，保留 temp→commit→cleanup 语义）；
+托管密钥下拉每次打开重拉（此前是一次性快照，删掉的密钥仍能被选中）。
+
+#### low
+
+组件卸载闩锁（KeyManagerPanel）；主机密钥字段校验（防 known_hosts 行注入）；
+sidecar 写失败降级为 warn（信任状态已落盘，不该报「信任失败」）；
+`TransferTaskInfo` 三个恒空字段改为可选；`listKeys` 返回类型改为 `SshKeyInfo[]`；
+12 个会话作用域命令的 `IpcError.session_id` 不再恒为 null；
+孤儿 `.partial-<uuid>` 临时文件回收扫描（本地 + 远端目录，限定「本次目标名 + 普通文件 + 超龄 + 非在途」四个条件；阈值本地 1 小时、远端 24 小时——远端 mtime 来自服务器时钟，阈值短了会误删别的实例刚写的同名临时文件）；
+提交通道改惰性开启（每任务 2 条 SSH 通道 → 1 条）+ 每会话并发传输闸门（上限 3，超出排队而非失败）；
+前端接通 `SessionUpdated` 事件（此前后端更新会话只发它、前端只监听 `SessionListChanged`，
+白名单里那条「已由全量刷新覆盖」的理由并不成立），白名单条目已删。
+
+顺带移除 `SftpCapabilities` 这个恒为空的能力参数：提交语义改由提交路径自己探测并经
+`CommitOutcome` 如实回报。
+
+#### 独立复审后补修
+
+改动完成后另起一轮独立复审（只读、不改文件），报出 3 条中危 + 6 条低危，已全部修掉：
+
+- **上传前存在性探测的锁范围**：探测原先在 `SshClient` 读锁内做远端 stat——tokio
+  RwLock 写优先，一个不回应 STAT 的远端会把同会话的断开/开标签全部堵住。改为
+  只有「取缓存会话」在锁内，stat 在锁外并另加 10s 超时（探测只是优化，超时按
+  「探测失败」处理，不阻断入队）。
+- **`with_sftp` 的注释与实现不符**：新写的注释声称「版本握手在锁外」，实际握手在
+  `sftp_session()` 里、仍在锁内。注释改为如实描述：锁的持有被开通道（15s）与版本
+  握手（15s）两个上限约束，不会无限期占着读锁。
+- **孤儿回收的注释与实现不符**：回收已收窄到「仅本次目标文件名」，注释却仍宣称
+  回收整个目录的崩溃残留。注释改为如实描述，并写明代价（上次崩溃留下的
+  `b.txt.partial-<uuid>` 要等下次传 `b.txt` 才被清掉——这正是最常见的重传场景）。
+- **远端时钟偏差**：远端 mtime 来自服务器时钟，与本地慢超过阈值时会把对方**刚写**
+  的同名临时文件判成「超龄」。远端阈值改为 24 小时，本地仍是 1 小时。
+- **冲突路径提取**：晚冲突的消息用 `rsplit_once(": ")` 取路径，目标路径本身含
+  `": "` 时会取错（前缀里没有 `": "`，用第一个分隔符才对）。
+- **传输闸门条目不回收**：会话下再无任务时回收该会话的闸门条目（判定用任务表，
+  排队中的任务也在表里，所以不会出现上限被绕过）。
+- **NAWS 只答应不兑现 / 缺负确认**：见上。
+- **`retired` 通道句柄无上界**：同一 channel id 不重复入 `retired`，使其以上界为
+  channel id 数而非 attach 次数。
+
+#### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0，无告警 |
+| `cargo test --workspace` | exit 0，累计 **414** 用例通过、**0** 失败 |
+| `npm run typecheck` | exit 0（`vue-tsc --noEmit`） |
+| `npm test` | Test Files **49 passed (49)**、Tests **441 passed (441)** |
+| `npm run build` | exit 0，最大 chunk 403 KiB（vendor-xterm） |
+| `npm run check:docs` | 通过（14 份现行文档） |
+| `npm run check:bundle` | 通过（10 个 JS chunk，均 ≤ 500 KiB） |
+| `npm run check:release` | 通过（版本 0.1.0） |
+| `npm run test:scripts` | **48** 项通过、0 失败 |
+
+新增用例：Rust 侧 18 项（孤儿临时文件回收 10 项、传输闸门 2 项、posix-rename 扩展探测 1 项、
+NAWS 协商 7 项（含重写的既有 resize 用例与新增的负确认用例）、主密码脱敏 2 项、终端通道去重 1 项等）；
+前端新增会话事件用例，IPC 契约测试 21 项全绿。
+
+#### 仍待真实环境验收
+
+本轮**没有**任何一项改动在真实 SSH 服务器 / 物理串口 / 打包签名与公证上验证过，
+下列行为必须真机确认：NAWS 协商后的真实服务端窗口尺寸上报；惰性提交通道在真实
+OpenSSH 上的 `posix-rename` 原子替换；并发传输闸门在真实并发下的排队表现；
+孤儿临时文件回收在真实远端目录上的实际删除范围；主密码 600k 迭代下的解锁耗时与退避表现。
 
 ### 2026-10-21：原生应用启动（首次真机运行证据）
 

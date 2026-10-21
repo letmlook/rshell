@@ -32,6 +32,13 @@ const BUFFER_CAP_BYTES: usize = 256 * 1024;
 struct TermSink {
     /// 已 attach 的前端通道（同一 pty 被 HMR 重挂时可能有多个）
     channels: Vec<Channel<Vec<u8>>>,
+    /// 被判定为「同一个 JS Channel 重复 attach」而退居的句柄。
+    ///
+    /// 它们**不参与扇出**，但也不能立刻 drop：`Channel` 的 `on_drop` 会向共享的
+    /// JS 回调发 `{end:true,index:N}`，而 JS 侧在 `index` 恰好等于当前期望值时
+    /// 会 `unregisterCallback` 掉整个回调 —— 连先注册的那个也会一起失聪。
+    /// 留到 sink 销毁时一起释放，那时前端本来也在拆这个通道。
+    retired: Vec<Channel<Vec<u8>>>,
     /// 滚动历史：attach 时补发给新通道
     backlog: VecDeque<u8>,
 }
@@ -40,6 +47,7 @@ impl TermSink {
     fn new() -> Self {
         Self {
             channels: Vec::new(),
+            retired: Vec::new(),
             backlog: VecDeque::with_capacity(BUFFER_CAP_BYTES),
         }
     }
@@ -108,11 +116,38 @@ impl TerminalChannels {
 
     /// 前端 mount xterm 后调用 —— 补发滚动历史后登记通道。
     /// 之后每次 push 都扇出到这个通道。**不会断开 SSH**。
+    ///
+    /// 同一个 JS Channel 对象被 attach 两次时按「重复」处理（见 `retired` 字段）：
+    /// Tauri 每次反序列化 Channel 都会新建一个 Rust 侧句柄、且**各自从 0 开始的
+    /// index 计数器**（tauri 的 `channel_on`）。两个句柄共用同一个 JS 回调 id，
+    /// 它们的 index 序列互相交错（0,0,1,1,…），而 JS 侧只有一个顺序守卫 ——
+    /// 后到的那些永远排不上队，全部堆进 `_pendingMessages` 且永不排空。
+    /// 屏幕看着正常（多出来的那份被吞掉），但会话产生过的**每一字节输出都被
+    /// 无限期留在 WebView 内存里**。
     pub async fn attach(&self, session_id: Uuid, terminal_id: Uuid, channel: Channel<Vec<u8>>) {
         let mut inner = self.inner.write().await;
         let sink = inner
             .entry((session_id, terminal_id))
             .or_insert_with(TermSink::new);
+
+        // 重复 attach（同一个 JS Channel 对象）：保留先注册的那个继续服务。
+        //
+        // 注意这里**不能**用新句柄替换旧的：Tauri 的 `Channel` 句柄自带
+        // index 计数器，新句柄从 0 重新计数，而 JS 侧期望的是继续递增的序号
+        // —— 换过去等于把「交错」变成「整体错位」，问题更糟。
+        if sink.channels.iter().any(|c| c.id() == channel.id()) {
+            // 也不能直接 drop：drop 会触发 on_drop 向共享的 JS 回调发 end 消息，
+            // JS 侧在 index 恰好等于期望值时会注销整个回调，把先注册的那个也带走。
+            // 退居到 retired，等 sink 销毁时一起释放。
+            //
+            // 同一个 channel id 不重复入 retired：重复 attach 的永远是同一个
+            // id，再存一份只是白白占着句柄 —— `retired` 因此以 channel id
+            // 数为上界，而不是以 attach 次数为上界。
+            if !sink.retired.iter().any(|c| c.id() == channel.id()) {
+                sink.retired.push(channel);
+            }
+            return;
+        }
 
         // 先补发历史：新标签挂上就能看到此前的输出（含 shell 提示符），
         // 而不是一片空白、非得敲一次回车才有内容。
@@ -302,6 +337,38 @@ mod tests {
         assert_eq!(
             tc.debug_summary().await,
             vec![((sid, tid), "attached\u{d7}2".to_string())]
+        );
+    }
+
+    /// 回归：同一个 JS Channel 对象被 attach 两次时，后端必须只保留一个句柄。
+    ///
+    /// 此前每次 attach 都 `channels.push`，于是同一个 JS 回调 id 上挂着两个 Rust
+    /// 句柄 —— Tauri 给每个句柄独立计数（各自从 0 开始），两者的 index 序列
+    /// 互相交错，JS 侧的顺序守卫把后到的那份永久堆进 `_pendingMessages`。
+    /// 屏幕看着正常，但会话的每一字节输出都被无限期留在 WebView 内存里。
+    #[tokio::test]
+    async fn duplicate_attach_of_same_channel_id_keeps_one_handle() {
+        let tc = TerminalChannels::new();
+        let (sid, tid) = (Uuid::new_v4(), Uuid::new_v4());
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let channel = recording_channel(seen.clone(), false);
+
+        tc.attach(sid, tid, channel.clone()).await;
+        tc.attach(sid, tid, channel.clone()).await;
+
+        assert_eq!(
+            tc.debug_summary().await,
+            vec![((sid, tid), "attached\u{d7}1".to_string())],
+            "同一 channel id 重复 attach 不得留下第二个句柄"
+        );
+
+        // 且只有一个句柄参与扇出：输出不会重复投递
+        tc.push(sid, tid, b"once").await;
+        assert_eq!(
+            seen.lock().expect("sink poisoned").as_slice(),
+            &[b"once".to_vec()],
+            "重复 attach 的通道不得收到两份输出"
         );
     }
 

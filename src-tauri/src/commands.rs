@@ -19,8 +19,8 @@
 
 use rshell_api::types::{
     ComposeTarget, ConflictPolicy, CredentialUpdate, Folder, HostKeyEntry, PluginInfo,
-    RemoteFileEntry, SessionConfig, SessionCredential, SessionLoadIssue, TerminalColorScheme,
-    TransferTaskInfo,
+    RemoteFileEntry, Secret, SessionConfig, SessionCredential, SessionLoadIssue,
+    TerminalColorScheme, TransferTaskInfo,
 };
 use rshell_api::{AppCommand, CommandOutcome};
 use tauri::ipc::Channel;
@@ -91,7 +91,7 @@ pub async fn connect_session(session_id: Uuid, state: State<'_, AppState>) -> Re
         .dispatcher
         .dispatch(AppCommand::ConnectSession { session_id })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     Ok(())
 }
 
@@ -104,7 +104,7 @@ pub async fn disconnect_session(
         .dispatcher
         .dispatch(AppCommand::DisconnectSession { session_id })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     Ok(())
 }
 
@@ -152,7 +152,7 @@ pub async fn send_input(
             data,
         })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     Ok(())
 }
 
@@ -177,7 +177,7 @@ pub async fn open_terminal(
             rows,
         })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     Ok(())
 }
 
@@ -196,7 +196,7 @@ pub async fn close_terminal(
             terminal_id,
         })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     // R3-11：命令成功后摘掉该 (session, terminal) 的 sink 条目。
     // 此前只有会话删除回调会清理（见 lib.rs 的 set_on_session_deleted），
     // 于是每关一个标签就残留最多 256 KiB 积压，直到整个会话被删除。
@@ -226,7 +226,7 @@ pub async fn resize_terminal(
             rows,
         })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     Ok(())
 }
 
@@ -319,7 +319,7 @@ pub async fn enqueue_upload(
             conflict: conflict.unwrap_or_default(),
         })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     Ok(())
 }
 
@@ -340,7 +340,7 @@ pub async fn enqueue_download(
             conflict: conflict.unwrap_or_default(),
         })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     Ok(())
 }
 
@@ -412,7 +412,7 @@ pub async fn browse_remote_dir(
         .dispatcher
         .dispatch(AppCommand::BrowseRemoteDir { session_id, path })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     match outcome {
         CommandOutcome::RemoteDir { path, entries } => Ok(RemoteDirectoryResult { path, entries }),
         other => Err(IpcError::outcome_mismatch("remote_dir", other.kind())),
@@ -434,7 +434,7 @@ pub async fn get_remote_home_dir(
         .dispatcher
         .dispatch(AppCommand::GetRemoteHomeDir { session_id })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     match outcome {
         CommandOutcome::RemoteHomeDir(path) => Ok(path),
         other => Err(IpcError::outcome_mismatch("remote_home_dir", other.kind())),
@@ -451,7 +451,7 @@ pub async fn create_remote_directory(
         .dispatcher
         .dispatch(AppCommand::CreateRemoteDirectory { session_id, path })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     Ok(())
 }
 
@@ -465,7 +465,7 @@ pub async fn delete_remote_entry(
         .dispatcher
         .dispatch(AppCommand::DeleteRemoteEntry { session_id, path })
         .await
-        .map_err(IpcError::from)?;
+        .map_err(|e| IpcError::from(e).with_session(session_id))?;
     Ok(())
 }
 
@@ -487,7 +487,7 @@ pub async fn generate_ssh_key(
         .dispatch(AppCommand::GenerateSshKey {
             name,
             key_type,
-            passphrase,
+            passphrase: passphrase.map(Secret::new),
         })
         .await
         .map_err(IpcError::from)?;
@@ -505,7 +505,7 @@ pub async fn import_private_key(
         .dispatcher
         .dispatch(AppCommand::ImportPrivateKey {
             path: std::path::PathBuf::from(path),
-            passphrase,
+            passphrase: passphrase.map(Secret::new),
         })
         .await
         .map_err(IpcError::from)?;
@@ -529,7 +529,9 @@ pub async fn setup_master_password(
 ) -> Result<(), IpcError> {
     state
         .dispatcher
-        .dispatch(AppCommand::SetupMasterPassword { password })
+        .dispatch(AppCommand::SetupMasterPassword {
+            password: Secret::new(password),
+        })
         .await
         .map_err(IpcError::from)?;
     Ok(())
@@ -544,8 +546,8 @@ pub async fn change_master_password(
     state
         .dispatcher
         .dispatch(AppCommand::ChangeMasterPassword {
-            old_password,
-            new_password,
+            old_password: Secret::new(old_password),
+            new_password: Secret::new(new_password),
         })
         .await
         .map_err(IpcError::from)?;
@@ -560,7 +562,9 @@ pub async fn disable_master_password(
 ) -> Result<(), IpcError> {
     state
         .dispatcher
-        .dispatch(AppCommand::DisableMasterPassword { password })
+        .dispatch(AppCommand::DisableMasterPassword {
+            password: Secret::new(password),
+        })
         .await
         .map_err(IpcError::from)?;
     Ok(())
@@ -970,7 +974,9 @@ pub async fn verify_master_password(
 ) -> Result<bool, IpcError> {
     let outcome = state
         .dispatcher
-        .dispatch(AppCommand::VerifyMasterPassword { password })
+        .dispatch(AppCommand::VerifyMasterPassword {
+            password: Secret::new(password),
+        })
         .await
         .map_err(IpcError::from)?;
     match outcome {

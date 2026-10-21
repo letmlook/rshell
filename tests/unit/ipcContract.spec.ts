@@ -405,7 +405,6 @@ const listenerFileCounts = new Map<string, number>(
  * 给事件接线后必须从此处移除；新增 0 监听事件必须登记并说明理由。
  */
 const EVENT_LISTENER_WHITELIST = new Set([
-  "SessionUpdated", // 单会话元数据更新提示，前端经 SessionListChanged 全量刷新已覆盖
   "SshKeyListChanged", // 密钥面板刷新由自身操作触发，无跨面板消费需求
   "SshKeyGenerated", // 同上
   "PluginListUpdated", // 插件面板刷新由自身操作触发
@@ -420,7 +419,7 @@ const OUTCOME_RETURN_MAP: Record<string, { helper: string; typeText: string }> =
   SessionId: { helper: "createSession", typeText: "Uuid" },
   Triggers: { helper: "listTriggers", typeText: "Trigger[]" },
   QuickCommands: { helper: "listQuickCommands", typeText: "QuickCommand[]" },
-  Keys: { helper: "listKeys", typeText: "unknown[]" },
+  Keys: { helper: "listKeys", typeText: "SshKeyInfo[]" },
   Tunnels: { helper: "listTunnels", typeText: "ActiveTunnelInfo[]" },
   Plugins: { helper: "listPlugins", typeText: "PluginInfo[]" },
   Themes: { helper: "listThemes", typeText: "ThemeInfo" },

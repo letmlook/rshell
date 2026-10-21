@@ -191,7 +191,12 @@ impl CommandDispatcher {
     /// 写命令返回 `Ok(CommandOutcome::None)`；读命令返回数据变体。
     /// 切片 1 仅迁移首批 7 个命令的分支；其余分支保持返回 `None`,
     /// 在切片 3+ 按功能域逐项完成 CommandOutcome 全貌（设计 §3.2 完整 13 变体）。
-    #[instrument(skip(self, command), fields(command = ?command))]
+    ///
+    /// span 只记**变体名**（`command = "SetupMasterPassword"`），不记整条命令：
+    /// 旧写法 `fields(command = ?command)` 用 `Debug` 把负载写进 span，而负载里
+    /// 有主密码、私钥口令、终端输入、脚本源码、撰写文本——都可能含凭据
+    /// （AGENTS.md：不要记录私钥、密码或脚本中可能含有的凭据）。
+    #[instrument(skip(self, command), fields(command = command.variant_name()))]
     pub async fn dispatch(&self, command: AppCommand) -> Result<CommandOutcome, CoreError> {
         debug!("Dispatching command");
 
@@ -995,19 +1000,23 @@ mod tests {
 
         dispatcher
             .dispatch(AppCommand::SetupMasterPassword {
-                password: correct.clone(),
+                password: rshell_api::types::Secret::new(correct.clone()),
             })
             .await
             .unwrap();
 
         let ok = dispatcher
-            .dispatch(AppCommand::VerifyMasterPassword { password: correct })
+            .dispatch(AppCommand::VerifyMasterPassword {
+                password: rshell_api::types::Secret::new(correct),
+            })
             .await
             .unwrap();
         assert!(matches!(ok, CommandOutcome::Verified(true)));
 
         let mismatch = dispatcher
-            .dispatch(AppCommand::VerifyMasterPassword { password: wrong })
+            .dispatch(AppCommand::VerifyMasterPassword {
+                password: rshell_api::types::Secret::new(wrong),
+            })
             .await
             .unwrap();
         assert!(matches!(mismatch, CommandOutcome::Verified(false)));

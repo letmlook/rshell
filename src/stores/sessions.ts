@@ -238,6 +238,31 @@ export const useSessionsStore = defineStore("sessions", () => {
     await refresh();
   }
 
+  /**
+   * 单个会话的元数据被后端更新（`SessionUpdated`）。
+   *
+   * 后端只在「更新会话」这条路径上发这个精确事件（新建 / 删除走
+   * `SessionListChanged`），所以这里只重取那一条并就地替换——不做全量
+   * `refresh()`，免得后台事件把列表的 loading 状态点亮。
+   *
+   * 列表里没有这条会话时不擅自增删：条目增删由 `SessionListChanged` 负责。
+   */
+  async function refreshSession(id: Uuid) {
+    try {
+      const sessions = await listSessions();
+      if (!Array.isArray(sessions)) return;
+      const index = items.value.findIndex((s) => s.id === id);
+      if (index < 0) return;
+      const updated = sessions.find((s) => s.id === id);
+      if (!updated) return;
+      const next = items.value.slice();
+      next[index] = updated;
+      items.value = next;
+    } catch (e) {
+      error.value = String(e);
+    }
+  }
+
   /** 订阅后端事件总线,实时更新 connectionState(设计 §4.3 流程 A)。*/
   async function subscribeEvents() {
     if (unlisten) return;
@@ -248,6 +273,8 @@ export const useSessionsStore = defineStore("sessions", () => {
         const normalized = payload.state.toLowerCase() as ConnectionStateValue;
         connectionState.value.set(payload.session_id, normalized);
         connectionState.value = new Map(connectionState.value);
+      } else if (typeof event !== "string" && "SessionUpdated" in event) {
+        void refreshSession(event.SessionUpdated.session_id);
       } else if (event === "SessionListChanged") {
         void refresh();
       }
@@ -276,6 +303,7 @@ export const useSessionsStore = defineStore("sessions", () => {
     update,
     duplicate,
     refresh,
+    refreshSession,
     create,
     connect,
     isConnecting,

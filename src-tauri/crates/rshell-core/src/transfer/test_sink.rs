@@ -174,12 +174,7 @@ impl TransferSink for FakeSink {
         }
     }
 
-    async fn safe_commit(
-        &self,
-        from: &str,
-        to: &str,
-        _caps: rshell_protocol::ssh::sftp::SftpCapabilities,
-    ) -> Result<CommitOutcome, ProtocolError> {
+    async fn safe_commit(&self, from: &str, to: &str) -> Result<CommitOutcome, ProtocolError> {
         self.commit_calls.fetch_add(1, AtomicOrdering::SeqCst);
         // 在 commit 真正生效之前，触发测试回调 —— 让测试在 commit 期间
         // 设置 cancel_decision 标志，模拟「commit 期间取消到达」。

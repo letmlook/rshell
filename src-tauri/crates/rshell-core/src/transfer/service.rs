@@ -7,26 +7,33 @@ use crate::error::CoreError;
 use crate::event_bus::EventBus;
 use crate::session::service::validate_remote_mutation_path;
 use crate::session::service::SshClientHandle;
+use crate::transfer::partial::{
+    file_stem, is_reclaimable_partial, join_remote, parent_dir, reclaim_local_partials,
+    PARTIAL_RECLAIM_MIN_AGE, PARTIAL_RECLAIM_MIN_AGE_REMOTE,
+};
 use crate::transfer::staged::{
     run_staged_download, run_staged_upload, staging_local_temp_path, staging_temp_path_str,
     DownloadRequest, FailedStage, StagedOutcome, UploadRequest, DECISION_CANCELLED,
     DECISION_PENDING,
 };
 use rshell_api::types::{
-    ConflictPolicy, TransferDirection as ApiTransferDirection, TransferTaskInfo,
+    ConflictPolicy, FileType, TransferDirection as ApiTransferDirection, TransferTaskInfo,
     TransferTaskState as ApiTransferTaskState,
 };
 use rshell_api::AppEvent;
-use rshell_protocol::ssh::sftp::{CommitStrategy, SftpClient, TransferControl, TransferSink};
+use rshell_protocol::ssh::sftp::{
+    CommitStrategy, SftpChannelOpener, SftpClient, TransferControl, TransferSink,
+};
 use rshell_protocol::transfer::LocalSink;
 use rshell_protocol::ProtocolError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
-use tokio::sync::{watch, RwLock};
+use std::time::SystemTime;
+use tokio::sync::{watch, RwLock, Semaphore};
 use tracing::{info, warn};
 
 /// SSH 客户端解析回调（外部注入，避免 TransferService 反向依赖 SessionService）
@@ -335,9 +342,36 @@ impl Drop for TransferCleanupGuard {
     }
 }
 
+/// 上传前远端存在性探测（stat）的挂钟上限。
+///
+/// 探测只是「早失败、少传一次」的优化：它不该让整个入队流程挂在一个不回应
+/// STAT 的远端上。超时按「探测失败」处理 —— 不阻断入队，真正的闸门在提交前
+/// 的复查（staged lifecycle 第 4 步）。
+const REMOTE_EXISTS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 同一会话上并发传输任务的上限。
+///
+/// SSH 的通道额度（服务端 `MaxSessions`，OpenSSH 默认 10）是**按连接**计的，
+/// 同一会话的终端标签页、目录浏览也都在抢这个额度。传输任务每个至少要占
+/// 1 条 SFTP 数据通道（提交时再短暂占 1 条提交通道），并发一多，服务端会
+/// 直接拒绝 channel-open，任务随即失败——用户看到的是「传输莫名失败」。
+///
+/// 这里给传输任务设一个闸门：超出的任务在**不占用任何通道**的前提下排队，
+/// 等前面的任务结束后再开通道。用「排队」替代「失败」。
+pub const MAX_CONCURRENT_TRANSFERS_PER_SESSION: usize = 3;
+
 /// 冲突标记前缀：写入 `error_message`，前端据此在队列行上提供「覆盖/重命名」。
 /// 固定字符串而非整句文案解析——文案会随语言/版本变化。
 pub const TRANSFER_CONFLICT_PREFIX: &str = "target_exists: ";
+
+/// 把远端目录项的 `modified`（秒级 Unix 时间戳字符串）解析成 `SystemTime`。
+///
+/// 服务器给不出可解析的值时返回 `None` —— 调用方据此**跳过**该条目，
+/// 宁可不回收也不凭猜测删除远端文件。
+fn parse_unix_seconds(raw: &str) -> Option<SystemTime> {
+    let secs: u64 = raw.trim().parse().ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs))
+}
 
 /// 传输错误里若含冲突标记则取出目标路径
 fn conflict_target(error: &str) -> Option<String> {
@@ -451,6 +485,20 @@ pub fn resolve_local_target(
     }
 }
 
+/// `run_staged_transfer` 的入参打包。
+///
+/// 参数个数触到 clippy 的上限时，把它们收进一个结构体比放宽 lint 好。
+struct StagedTransferArgs<'a> {
+    task: &'a TransferTask,
+    task_id: Uuid,
+    ssh_client: &'a SshClientHandle,
+    tasks: &'a Arc<RwLock<HashMap<Uuid, TransferTask>>>,
+    gates: &'a Arc<RwLock<HashMap<Uuid, Arc<Semaphore>>>>,
+    control_rx: &'a mut watch::Receiver<TransferControl>,
+    progress: &'a mut (dyn FnMut(u64, u64) + Send),
+    cancel_decision: Arc<AtomicU8>,
+}
+
 /// 文件传输服务
 pub struct TransferService {
     /// 传输任务队列
@@ -466,6 +514,14 @@ pub struct TransferService {
     event_bus: Arc<EventBus>,
     /// 获取 SSH 客户端的函数（由外部注入）
     ssh_client_provider: Arc<std::sync::RwLock<Option<SshClientProvider>>>,
+    /// 每个会话一条的传输闸门（信号量）——见 [`MAX_CONCURRENT_TRANSFERS_PER_SESSION`]。
+    ///
+    /// 按 session_id 索引：SSH 的通道额度是**按连接**计的，不同会话互不影响。
+    ///
+    /// 条目数上限是「曾经跑过传输的会话数」，每条几十字节。会话被删除后条目
+    /// 仍留着——**不影响正确性**：闸门只是限流，同一 session_id 再次用到时
+    /// 拿到的还是同一条信号量（map 里已有），删掉的会话也不会再有任务。
+    transfer_gates: Arc<RwLock<HashMap<Uuid, Arc<Semaphore>>>>,
 }
 
 impl TransferService {
@@ -477,6 +533,7 @@ impl TransferService {
             cancel_decisions: Arc::new(RwLock::new(HashMap::new())),
             event_bus,
             ssh_client_provider: Arc::new(std::sync::RwLock::new(None)),
+            transfer_gates: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -489,11 +546,11 @@ impl TransferService {
         *p = Some(provider);
     }
 
-    /// 上传目标解析：只做纯路径计算，**不做存在性探测**。
+    /// 上传目标解析：**纯路径计算**（远端存在性探测在别处做）。
     ///
-    /// 探测需要开 SFTP 通道，会消耗 SSH provider 并打乱「provider 被调用时任务
-    /// 已在表内且可控」这一已被 R2-01/R2-02 测试锁定的时序。改为由前端用已加载的
-    /// 目录列表检测（体验即时），后端在 SFTP `create` 时强制（防 TOCTOU 竞态）。
+    /// 存在性探测需要一条 SFTP 通道，而通道要在 provider 之后才拿得到 ——
+    /// 探测放在 `execute_transfer` 里（任务已在表内、provider 已调用），这样
+    /// R2-01/R2-02 锁定的时序不变。
     fn resolve_upload_target(remote: &str, conflict: &ConflictPolicy) -> Result<String, CoreError> {
         match conflict {
             ConflictPolicy::Overwrite => Ok(remote.to_string()),
@@ -502,6 +559,54 @@ impl TransferService {
                 let renamed = sibling_path(remote, name)?;
                 validate_remote_mutation_path(&renamed)?;
                 Ok(renamed)
+            }
+        }
+    }
+
+    /// 远端目标是否已存在（用于上传前的覆盖冲突判定）。
+    ///
+    /// 复用**浏览用的缓存 SFTP 会话**（`sftp_session`）——用户刚浏览过远端目录，
+    /// 那条通道通常已经开着，这里几乎零成本；没开时才会新开一条（受
+    /// `SFTP_CHANNEL_OPEN_TIMEOUT` 约束）。
+    ///
+    /// **锁范围**：只有「取缓存会话」在 `SshClient` 的读锁内（开通道 + 版本
+    /// 握手，两者都有上限）；真正的远端 I/O（stat）在**锁外**。否则一个不回应
+    /// STAT 的远端会把整条会话的写锁（断开、开/关标签）一起堵住——tokio
+    /// RwLock 写优先，一旦有写者在等，后续读者也一起堵。
+    ///
+    /// stat 本身也套了超时：探测只是「早失败、少传一次」的优化，不值得让
+    /// 整个入队流程挂在一个不响应的远端上。
+    ///
+    /// 探测失败（通道开不起来 / 超时）时返回 `false`：**不阻断**入队。真正的
+    /// 保护在 staged lifecycle 的提交前复查（`run_staged_upload` 第 4 步）——
+    /// 那里是 TOCTOU 窗口后的最终闸门。
+    async fn remote_target_exists(ssh_client: &SshClientHandle, remote: &str) -> bool {
+        let sftp = {
+            let ssh = ssh_client.read().await;
+            ssh.sftp_session().await
+        };
+        let sftp = match sftp {
+            Ok(sftp) => sftp,
+            Err(error) => {
+                warn!(
+                    remote = %remote,
+                    error = %error,
+                    "Upload pre-check could not open an SFTP session; \
+                     relying on the commit-time conflict check"
+                );
+                return false;
+            }
+        };
+        match tokio::time::timeout(REMOTE_EXISTS_TIMEOUT, sftp.exists(remote)).await {
+            Ok(exists) => exists,
+            Err(_) => {
+                warn!(
+                    remote = %remote,
+                    timeout_secs = REMOTE_EXISTS_TIMEOUT.as_secs(),
+                    "Upload pre-check did not get an answer from the remote; \
+                     relying on the commit-time conflict check"
+                );
+                false
             }
         }
     }
@@ -677,6 +782,30 @@ impl TransferService {
             }
         };
 
+        // 上传前的远端存在性探测。
+        //
+        // 契约（`rshell-api/src/types.rs` 的 `ConflictPolicy` 文档）：`Fail` 是
+        // 安全默认，**入队即返回** `CoreError::TargetExists`，前端据此弹
+        // 「覆盖 / 重命名 / 取消」并用用户选定的策略重试一次。
+        //
+        // 此前上传路径完全不做存在性探测（只有下载走 `resolve_local_target`
+        // 有真实检查，两侧不对称）：远端已有同名文件时任务被正常接受，整个
+        // 文件传完才在提交前被判 `late_conflict` 失败 —— 前端的
+        // `target_exists` 分支对上传永远不触发，用户白等一次完整传输。
+        //
+        // 探测放在这里（provider 之后、拷贝之前）：既满足「入队即报错」的
+        // 契约，又不打乱 R2-01/R2-02 锁定的「provider 被调用时任务已在表内
+        // 且可控」的时序。真正的 TOCTOU 闸门仍在 staged lifecycle 的提交前
+        // 复查（`run_staged_upload` 第 4 步）。
+        if task.direction == TransferDirection::Upload
+            && !matches!(task.conflict, ConflictPolicy::Overwrite)
+            && Self::remote_target_exists(&ssh_client, &task.remote_path).await
+        {
+            let err = format!("Remote target already exists: {}", task.remote_path);
+            self.mark_failed(task_id, err.clone()).await?;
+            return Err(CoreError::TargetExists(err));
+        }
+
         // 建立 pause/resume/cancel 共用的控制通道 + 取消决策 atomic。
         //
         // 通道注册必须与启动决策在同一把 tasks 写锁临界区内完成：
@@ -732,6 +861,7 @@ impl TransferService {
         let tasks = self.tasks.clone();
         let control_channels = self.control_channels.clone();
         let cancel_decisions = self.cancel_decisions.clone();
+        let gates = self.transfer_gates.clone();
         let event_bus = self.event_bus.clone();
         tokio::spawn(async move {
             // R2-17：兜底守卫覆盖整个任务体——正常路径末尾 disarm；
@@ -770,14 +900,16 @@ impl TransferService {
                 }
             };
 
-            let outcome = Self::run_staged_transfer(
-                &task,
+            let outcome = Self::run_staged_transfer(StagedTransferArgs {
+                task: &task,
                 task_id,
-                &ssh_client,
-                &mut control_rx,
-                &mut progress,
+                ssh_client: &ssh_client,
+                tasks: &tasks,
+                gates: &gates,
+                control_rx: &mut control_rx,
+                progress: &mut progress,
                 cancel_decision,
-            )
+            })
             .await;
 
             // 关闭发送端 → forwarder 排空最后一批进度后自行退出
@@ -799,6 +931,23 @@ impl TransferService {
             // Cancelled，并附上 commit 策略与 cleanup residue。
             Self::finalize_staged(&tasks, &event_bus, task_id, outcome).await;
 
+            // 该会话下再无任务 → 回收闸门条目。
+            //
+            // 闸门只是限流用的；会话没任务了就没必要留着。判定用的是**任务表**
+            // （排队中的任务也在表里），所以不会出现「删掉闸门后并发上限被
+            // 绕过」——新任务会拿到一条新的信号量，而此时该会话确实没有在途
+            // 任务。
+            {
+                let session_id = task.session_id;
+                let has_tasks = {
+                    let tasks_guard = tasks.read().await;
+                    tasks_guard.values().any(|t| t.session_id == session_id)
+                };
+                if !has_tasks {
+                    gates.write().await.remove(&session_id);
+                }
+            }
+
             // 正常清理已全部完成：解除守卫，Drop 不再兜底
             cleanup_guard.disarm();
         });
@@ -809,14 +958,17 @@ impl TransferService {
     /// R2-T2：跑一次 staged transfer —— 包住「打开 SFTP / 选 sink / 跑
     /// upload 或 download staged 循环」。被 [`execute_transfer`] 的
     /// 异步任务体调用。
-    async fn run_staged_transfer(
-        task: &TransferTask,
-        task_id: Uuid,
-        ssh_client: &SshClientHandle,
-        control_rx: &mut watch::Receiver<TransferControl>,
-        progress: &mut (dyn FnMut(u64, u64) + Send),
-        cancel_decision: Arc<AtomicU8>,
-    ) -> StagedOutcome {
+    async fn run_staged_transfer(args: StagedTransferArgs<'_>) -> StagedOutcome {
+        let StagedTransferArgs {
+            task,
+            task_id,
+            ssh_client,
+            tasks,
+            gates,
+            control_rx,
+            progress,
+            cancel_decision,
+        } = args;
         // 启动窗口内到达的暂停/取消在此收口：循环尚未触碰远端，暂停挂起
         // 在打开 SFTP 通道之前，取消立即中止。
         if let Err(msg) = wait_for_run_before_start(control_rx).await {
@@ -827,27 +979,84 @@ impl TransferService {
             };
         }
 
-        // 只在打开 SFTP 子通道时持有客户端读锁；SFTP 流独立于发送客户端，
-        // 拷贝循环（含暂停挂起期间）不得阻塞会话断开等需要写锁的操作。
-        // 第二条通道专用于提交（posix-rename 扩展）：打不开只降级为
-        // 标准 rename，不让传输任务失败。
-        let sftp_result = {
-            let ssh = ssh_client.read().await;
-            async {
-                let channel = ssh.open_sftp_channel().await.map_err(|e| {
-                    ProtocolError::ProtocolError(format!("Failed to open SFTP channel: {e}"))
-                })?;
-                let commit_channel = match ssh.open_sftp_channel().await {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        warn!(error = %e, "commit channel unavailable; falling back to standard rename");
-                        None
-                    }
+        // 每会话的传输闸门 —— 超额的任务在这里排队，**不占用任何 SSH 通道**。
+        //
+        // 排队期间任务已是 `Transferring`（R2-01 锁定的时序：provider 被调用时
+        // 任务已置 Transferring），这里不改动状态语义，只是把「开通道」这一步
+        // 往后推。拿到额度后再复查一次取消状态——排队期间被取消的任务不该
+        // 白占一条通道。
+        let gate = Self::session_gate(gates, task.session_id).await;
+        let permit = match gate.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                // 信号量被关闭（服务已停）——直接收场
+                return StagedOutcome::Failed {
+                    stage: FailedStage::Copy,
+                    message: "transfer service is shutting down".into(),
+                    residue_path: None,
                 };
-                SftpClient::new_with_commit_channel(channel, commit_channel).await
             }
-            .await
         };
+        {
+            let tasks = tasks.read().await;
+            let cancelled = tasks
+                .get(&task_id)
+                .is_some_and(|t| t.state == TransferTaskState::Cancelled);
+            if cancelled {
+                info!(
+                    task_id = %task_id,
+                    "Transfer cancelled while waiting for a transfer slot; not starting"
+                );
+                drop(permit);
+                return StagedOutcome::Cancelled {
+                    residue_path: None,
+                    cleanup_failure: None,
+                };
+            }
+        }
+
+        // 打开 SFTP 子通道。**每次开通道都单独取放读锁**，不在一把锁里连开两条：
+        // 锁的持有时间越短，会话断开 / 开标签这些需要写锁的操作就越不容易被堵。
+        //
+        // 提交通道是**惰性**的：这里只开数据通道一条；提交那一刻才由
+        // `commit_opener` 临时开一条短命通道，握手、探测 posix-rename、发一次
+        // rename，随即释放。传输期间（往往是几十分钟）每个任务只占 1 条通道，
+        // 不再像原先那样独占 2 条 —— 后者很容易撞上服务端的 MaxSessions
+        // （OpenSSH 默认 10，按连接计，终端标签页也在抢同一个额度）。
+        let sftp_result = {
+            let channel = {
+                let ssh = ssh_client.read().await;
+                ssh.open_sftp_channel().await
+            }
+            .map_err(|e| ProtocolError::ProtocolError(format!("Failed to open SFTP channel: {e}")));
+            let channel = match channel {
+                Ok(c) => c,
+                Err(e) => {
+                    drop(permit);
+                    return StagedOutcome::Failed {
+                        stage: FailedStage::ExclusiveOpen,
+                        message: format!("{e}"),
+                        residue_path: None,
+                    };
+                }
+            };
+            let opener: SftpChannelOpener = {
+                let handle = ssh_client.clone();
+                Arc::new(move || {
+                    let handle = handle.clone();
+                    Box::pin(async move {
+                        let ssh = handle.read().await;
+                        ssh.open_sftp_channel().await
+                    })
+                })
+            };
+            // 版本握手只消费已开好的通道，不再需要 SshClient —— 放在锁外做。
+            SftpClient::new(channel)
+                .await
+                .map(|client| client.with_commit_opener(opener))
+        };
+        // 额度在整个传输期间持有：闸门限制的是**同时占用通道**的任务数。
+        let _permit = permit;
         let sftp = match sftp_result {
             Ok(c) => c,
             Err(e) => {
@@ -892,7 +1101,7 @@ impl TransferService {
                         };
                     }
                 };
-                run_staged_upload(UploadRequest {
+                let outcome = run_staged_upload(UploadRequest {
                     source: Box::new(source),
                     source_total,
                     target: task.remote_path.clone(),
@@ -903,7 +1112,12 @@ impl TransferService {
                     progress,
                     cancel_decision,
                 })
-                .await
+                .await;
+                // 上传的 staging temp 在**远端**目标目录里 —— 传完顺手回收
+                // 那里**本次目标**的超龄孤儿临时文件（上次进程崩溃留下的同名
+                // 孤儿，会在下次传同一个目标时被清掉）。
+                Self::reclaim_remote_orphans(&sftp, task, tasks, task_id).await;
+                outcome
             }
             TransferDirection::Download => {
                 let source_total = match sftp.metadata(&task.remote_path).await {
@@ -937,9 +1151,30 @@ impl TransferService {
                     }
                 };
                 let local_sink: Arc<dyn TransferSink> = Arc::new(LocalSink::new());
-                run_staged_download(DownloadRequest {
+                // 并发区间读取器：大文件用多个 READ 同时在途（串行读的吞吐上限
+                // 是 CHUNK_SIZE / RTT）。句柄池固定数量，整个传输只开几次。
+                // 建不起来不影响任务 —— 退回单句柄串行读。
+                let range_fetcher = match sftp
+                    .range_fetcher(
+                        &task.remote_path,
+                        rshell_protocol::ssh::sftp::DOWNLOAD_CONCURRENCY,
+                    )
+                    .await
+                {
+                    Ok(fetcher) => Some(fetcher),
+                    Err(error) => {
+                        warn!(
+                            remote = %task.remote_path,
+                            error = %error,
+                            "Could not open a ranged reader; falling back to serial download"
+                        );
+                        None
+                    }
+                };
+                let outcome = run_staged_download(DownloadRequest {
                     source,
                     source_total,
+                    range_fetcher,
                     target: task.local_path.clone(),
                     temp_path: std::path::PathBuf::from(&temp_path),
                     conflict: task.conflict.clone(),
@@ -948,8 +1183,136 @@ impl TransferService {
                     progress,
                     cancel_decision,
                 })
-                .await
+                .await;
+                // 下载的 staging temp 在**本地**目标目录里 —— 传完顺手回收
+                // 那里**本次目标**的超龄孤儿临时文件（上次进程崩溃留下的同名
+                // 孤儿，会在下次传同一个目标时被清掉）。
+                Self::reclaim_local_orphans(task, tasks, task_id).await;
+                outcome
             }
+        }
+    }
+
+    /// 取（必要时创建）某会话的传输闸门。
+    async fn session_gate(
+        gates: &Arc<RwLock<HashMap<Uuid, Arc<Semaphore>>>>,
+        session_id: Uuid,
+    ) -> Arc<Semaphore> {
+        let mut gates = gates.write().await;
+        gates
+            .entry(session_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS_PER_SESSION)))
+            .clone()
+    }
+
+    /// 收集「在途」传输任务的 id —— 回收孤儿临时文件时用来保护它们。
+    ///
+    /// 只保护**非终态**的任务（Pending / Transferring / Paused）。已经失败
+    /// 的任务如果留下了 residue，它的临时文件在超过最小存留时长后可以被回收
+    /// —— 用户当时已经收到过 residue 路径的提示。
+    async fn live_transfer_ids(tasks: &Arc<RwLock<HashMap<Uuid, TransferTask>>>) -> HashSet<Uuid> {
+        let tasks = tasks.read().await;
+        tasks
+            .values()
+            .filter(|t| !t.state.is_terminal())
+            .map(|t| t.id)
+            .collect()
+    }
+
+    /// 回收**远端**目标目录里超龄的孤儿 staging 临时文件。
+    ///
+    /// 只回收「本次目标」的临时文件（`<目标名>.partial-<uuid>`）——同目录里
+    /// 其它目标的孤儿不在范围内，避免误删用户自己造出来的同名文件。代价是：
+    /// 上次崩溃留下的 `b.txt.partial-<uuid>` 只有在之后又传 `b.txt` 时才会被
+    /// 清掉——这正是「重传同一个目标」这个最常见的场景。
+    ///
+    /// 远端的 mtime 来自**服务器时钟**，可能与本地差很多（容器宿主、未同步
+    /// NTP）。本地时钟落后超过阈值时，对方**刚写**的同名临时文件会被判成
+    /// 「超龄」而误删——所以远端用更长的阈值（见
+    /// [`PARTIAL_RECLAIM_MIN_AGE_REMOTE`]），留出时钟偏差的余量。
+    ///
+    /// 远端没有本地文件系统那样的 mtime 精度保证（`RemoteFileEntry.modified`
+    /// 是秒级字符串，解析不出来就跳过），删除前逐条核对：
+    /// - 名字匹配 `<目标名>.partial-<合法 uuid>`；
+    /// - 类型是**普通文件**（目录与符号链接不碰）；
+    /// - 其 task id 不在在途任务集合里；
+    /// - mtime 早于最小存留时长。
+    ///
+    /// 任何一步失败都只记日志 —— 回收是尽力而为，不能让传输任务失败。
+    async fn reclaim_remote_orphans(
+        sftp: &SftpClient,
+        task: &TransferTask,
+        tasks: &Arc<RwLock<HashMap<Uuid, TransferTask>>>,
+        task_id: Uuid,
+    ) {
+        let (Some(dir), Some(stem)) = (parent_dir(&task.remote_path), file_stem(&task.remote_path))
+        else {
+            return;
+        };
+        let entries = match sftp.list_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    dir = %dir,
+                    error = %error,
+                    "Could not list the remote directory for orphan cleanup; skipping"
+                );
+                return;
+            }
+        };
+        let mut live = Self::live_transfer_ids(tasks).await;
+        // 当前任务此刻仍是「在途」——它的 residue 不该被自己回收掉。
+        live.insert(task_id);
+        let now = SystemTime::now();
+        for entry in entries {
+            if entry.file_type != FileType::File {
+                continue;
+            }
+            let Some(modified) = parse_unix_seconds(&entry.modified) else {
+                continue;
+            };
+            if !is_reclaimable_partial(
+                &entry.name,
+                stem,
+                &live,
+                modified,
+                now,
+                PARTIAL_RECLAIM_MIN_AGE_REMOTE,
+            ) {
+                continue;
+            }
+            let path = join_remote(&dir, &entry.name);
+            match sftp.remove_file(&path).await {
+                Ok(()) => info!(path = %path, "Removed an orphaned staging temp file"),
+                Err(error) => {
+                    warn!(path = %path, error = %error, "Could not remove an orphaned staging temp file")
+                }
+            }
+        }
+    }
+
+    /// 回收**本地**目标目录里超龄的孤儿 staging 临时文件。
+    async fn reclaim_local_orphans(
+        task: &TransferTask,
+        tasks: &Arc<RwLock<HashMap<Uuid, TransferTask>>>,
+        task_id: Uuid,
+    ) {
+        let Some(dir) = task.local_path.parent() else {
+            return;
+        };
+        let Some(stem) = task.local_path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let mut live = Self::live_transfer_ids(tasks).await;
+        live.insert(task_id);
+        let removed =
+            reclaim_local_partials(dir, stem, &live, PARTIAL_RECLAIM_MIN_AGE, SystemTime::now())
+                .await;
+        for path in removed {
+            info!(
+                path = %path.display(),
+                "Removed an orphaned staging temp file"
+            );
         }
     }
 
@@ -1050,8 +1413,32 @@ impl TransferService {
                             },
                             None => CleanupStatus::Cleaned,
                         });
-                        // 冲突用固定前缀标记，前端据此提供「覆盖/重命名」入口
-                        if let Some(path) = conflict_target(t.error_message.as_ref().unwrap()) {
+                        // 冲突用固定前缀标记，前端据此提供「覆盖/重命名」入口。
+                        //
+                        // 晚冲突（提交前才发现同名文件）的 message 是
+                        // 「target appeared before commit: <path>」——它**不**带
+                        // `target_exists: ` 前缀，所以下面的 `conflict_target`
+                        // 恒为 None，`TransferConflict` 事件在生产路径上从不
+                        // 发布（前端那条「目标已存在」日志因此永不出现）。
+                        // 这里按 stage 判定：晚冲突就是冲突，把路径按统一前缀
+                        // 补齐，事件与错误串对齐。
+                        let conflict_path = match stage {
+                            FailedStage::LateConflict => Some(
+                                // 用**第一个** ": " 切分：前缀「target appeared before
+                                // commit」里没有 ": "，而目标路径本身可能含 ": "
+                                // （如 `/home/u/a: b.txt`）——用 rsplit 会把路径
+                                // 截错，前端拿到的就是一个不存在的路径。
+                                message
+                                    .split_once(": ")
+                                    .map(|(_, path)| path.to_string())
+                                    .unwrap_or_else(|| message.clone()),
+                            ),
+                            _ => None,
+                        };
+                        let conflict_path = conflict_path
+                            .or_else(|| conflict_target(t.error_message.as_ref().unwrap()));
+                        if let Some(path) = conflict_path {
+                            t.error_message = Some(format!("{TRANSFER_CONFLICT_PREFIX}{path}"));
                             event_bus.publish(AppEvent::TransferConflict {
                                 task_id,
                                 path: path.clone(),
@@ -1422,6 +1809,76 @@ mod tests {
 
     fn make_service() -> TransferService {
         TransferService::new(Arc::new(crate::event_bus::EventBus::new()))
+    }
+
+    // ── 每会话传输闸门 ──
+
+    /// 同一会话的并发传输必须共用一条闸门，不同会话的闸门必须彼此独立。
+    ///
+    /// SSH 的通道额度是按连接计的：闸门按 session_id 分组，超额的任务排队
+    /// 而不是被服务端拒绝 channel-open。
+    #[tokio::test]
+    async fn session_gate_is_shared_per_session_and_independent_across_sessions() {
+        let gates: Arc<RwLock<HashMap<Uuid, Arc<Semaphore>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+
+        let gate_a = TransferService::session_gate(&gates, session_a).await;
+        let gate_a_again = TransferService::session_gate(&gates, session_a).await;
+        let gate_b = TransferService::session_gate(&gates, session_b).await;
+
+        assert!(
+            Arc::ptr_eq(&gate_a, &gate_a_again),
+            "同一会话必须共用同一条闸门，否则并发上限会失效"
+        );
+        assert!(
+            !Arc::ptr_eq(&gate_a, &gate_b),
+            "不同会话的通道额度互不相干，闸门不得共用"
+        );
+        assert_eq!(
+            gate_a.available_permits(),
+            MAX_CONCURRENT_TRANSFERS_PER_SESSION
+        );
+    }
+
+    /// 闸门把并发传输限制在额度内：拿满额度后新的请求必须排队等待。
+    #[tokio::test]
+    async fn session_gate_limits_the_number_of_concurrent_transfers() {
+        let gates: Arc<RwLock<HashMap<Uuid, Arc<Semaphore>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let session = Uuid::new_v4();
+        let gate = TransferService::session_gate(&gates, session).await;
+
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_TRANSFERS_PER_SESSION {
+            permits.push(
+                gate.clone()
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore is open"),
+            );
+        }
+        assert_eq!(gate.available_permits(), 0);
+
+        // 额度用尽后再取必须排队 —— 用超时证明它确实在等，而不是立刻拿到
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            gate.clone().acquire_owned(),
+        )
+        .await;
+        assert!(
+            waiting.is_err(),
+            "额度用尽后必须排队等待，而不是再放行一个并发传输"
+        );
+
+        // 归还一个额度 → 排队者被唤醒
+        drop(permits.pop());
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(1), gate.acquire_owned())
+            .await
+            .expect("waiting task must be woken up")
+            .expect("semaphore is open");
+        drop(permit);
     }
 
     // ── R2-T2：retry 入口回归 ──

@@ -8,7 +8,9 @@
 use crate::ProtocolError;
 use rshell_api::types::{FilePermissions, FileType, RemoteFileEntry};
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
@@ -21,6 +23,22 @@ const POSIX_RENAME_EXTENSION: &str = "posix-rename@openssh.com";
 /// 单次读写分块大小（64 KiB）
 const CHUNK_SIZE: usize = 64 * 1024;
 
+/// SFTP 版本握手（`SSH_FXP_VERSION` 往返）的等待上限。
+///
+/// russh-sftp 的 `SftpSession::new` / `RawSftpSession::init` 都是
+/// 「发版本包 → 等对端回版本包」的请求/响应，**自身没有超时**。对端接受
+/// TCP 但不回版本包时，这里会永久挂住；而调用方在这期间持有 `SshClient`
+/// 读锁 —— tokio RwLock 写优先会让后续的写者（开/关标签、断开）全部排队，
+/// 一旦有写者在等，后续读者也一起堵，整条会话的输入都失去响应。
+const SFTP_VERSION_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 提交通道版本握手的上限。
+///
+/// 提交通道只决定提交时能不能用原子替换（`posix-rename`），失败只降级为
+/// 标准 rename —— 它是**可选优化**，不该占用与数据通道同等的预算。因此给
+/// 它一个更短的上限：黑洞对端最多多占几秒，不会让整个传输任务卡住。
+const SFTP_COMMIT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 下载方向的在途 READ 并发度。
 ///
 /// SFTP 的 READ 是请求/响应协议：russh-sftp 的 `File::poll_read` 只有一个
@@ -30,10 +48,10 @@ const CHUNK_SIZE: usize = 64 * 1024;
 /// 路并发，所以上传明显快于下载。
 ///
 /// 这里把下载改成多个在途 READ 并发，与上传的并发度对齐。
-const DOWNLOAD_CONCURRENCY: usize = 8;
+pub const DOWNLOAD_CONCURRENCY: usize = 8;
 
 /// 下载并发度低于该值时退回串行拷贝：省掉多句柄/多任务的固定开销。
-const DOWNLOAD_PIPELINE_MIN_BYTES: u64 = (CHUNK_SIZE * 2) as u64;
+pub const DOWNLOAD_PIPELINE_MIN_BYTES: u64 = (CHUNK_SIZE * 2) as u64;
 
 /// 通用句柄池：把「借出/归还」与具体 I/O 解耦，便于脱离 SFTP 服务器单测。
 ///
@@ -81,10 +99,30 @@ impl<T> HandlePool<T> {
 /// 池空时（并发数被调高，或某个任务被中止时连同句柄一起丢弃）退回现开一个，
 /// 保证读取不会因为句柄泄漏而永久阻塞。
 #[derive(Clone)]
-struct RemoteHandlePool {
+pub struct RemoteHandlePool {
     session: Arc<russh_sftp::client::SftpSession>,
     path: Arc<str>,
     handles: Arc<HandlePool<russh_sftp::client::fs::File>>,
+}
+
+/// 并发区间读取器：能**并发**读出远端文件的多个区间。
+///
+/// SFTP 的 READ 是请求/响应协议（单 `f_read` 槽），串行读的吞吐上限是
+/// `CHUNK_SIZE / RTT`；把区间拆开、多个 READ 同时在途才能提上去。
+///
+/// 实现方负责复用固定数量的远端句柄（见 [`RemoteHandlePool`]），避免把
+/// OPEN/CLOSE 放大到「每 64 KiB 一对」。
+#[async_trait::async_trait]
+pub trait RangeFetcher: Send + Sync {
+    /// 读出 `[offset, offset+len)` 的内容。
+    async fn fetch(&self, offset: u64, len: usize) -> Result<Vec<u8>, ProtocolError>;
+}
+
+#[async_trait::async_trait]
+impl RangeFetcher for RemoteHandlePool {
+    async fn fetch(&self, offset: u64, len: usize) -> Result<Vec<u8>, ProtocolError> {
+        self.read_range(offset, len).await
+    }
 }
 
 impl RemoteHandlePool {
@@ -152,18 +190,6 @@ pub enum TransferControl {
     Cancel,
 }
 
-/// R2-T2：服务器声明的 SFTP 扩展集合，用于决定安全提交策略。
-///
-/// 仅记录**本轮需要用到**的扩展——其它扩展（`statvfs`、`expand-path`、
-/// `hardlink`、`fsync`、`limits`）由 `russh-sftp` 高层 API 自行处理。
-/// 这里聚焦「提交语义」相关的两条：`posix-rename@openssh.com` 与
-/// `hardlink@openssh.com`（后者仅作探测参考，提交路径不会用）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SftpCapabilities {
-    /// `posix-rename@openssh.com`：远端接受 POSIX 语义的重命名（原子替换）。
-    pub posix_rename: bool,
-}
-
 /// R2-T2：传输状态机用的 sink 抽象 —— 把远端（`SftpClient`）和本地
 /// (`tokio::fs`) 统一成同一组操作：独占打开、stat、safe_commit、try_remove。
 ///
@@ -201,12 +227,10 @@ pub trait TransferSink: Send + Sync {
     ) -> Result<Box<dyn tokio::io::AsyncRead + Unpin + Send>, ProtocolError>;
 
     /// 安全提交（rename）；成功即目标被替换，失败保留旧目标。
-    async fn safe_commit(
-        &self,
-        from: &str,
-        to: &str,
-        caps: SftpCapabilities,
-    ) -> Result<CommitOutcome, ProtocolError>;
+    ///
+    /// 提交语义（原子替换 vs 标准 rename）由实现自己探测并通过
+    /// [`CommitOutcome`] 如实回报 —— 调用方不需要（也无法）预先知道。
+    async fn safe_commit(&self, from: &str, to: &str) -> Result<CommitOutcome, ProtocolError>;
 
     /// 尽力删除临时文件；「不存在」视为成功。
     async fn try_remove(&self, path: &str) -> Result<(), ProtocolError>;
@@ -215,7 +239,7 @@ pub trait TransferSink: Send + Sync {
     fn is_remote(&self) -> bool;
 }
 
-/// R2-T2：提交阶段使用的策略，由 `SftpCapabilities` 决定。
+/// R2-T2：提交阶段实际使用的策略，由提交路径自己探测后如实回报。
 ///
 /// 语义差别：
 /// - `PosixRename`：明确走 `posix-rename@openssh.com` 扩展，远端保证
@@ -282,6 +306,14 @@ enum PosixRenameReply {
 
 /// 规范应答是 `SSH_FXP_STATUS`（Ok / OpUnsupported / 其它错误码）；
 /// `SSH_FXP_EXTENDED_REPLY` 不在 OpenSSH 的应答集合里，视为成功兜底。
+/// 服务器的 SSH_FXP_VERSION 是否声明了 `posix-rename@openssh.com` 扩展。
+fn supports_posix_rename(version: &russh_sftp::protocol::Version) -> bool {
+    version
+        .extensions
+        .get(POSIX_RENAME_EXTENSION)
+        .is_some_and(|v| v == "1")
+}
+
 fn map_posix_rename_reply(packet: russh_sftp::protocol::Packet) -> PosixRenameReply {
     use russh_sftp::protocol::{Packet, StatusCode};
     match packet {
@@ -304,13 +336,33 @@ fn map_posix_rename_reply(packet: russh_sftp::protocol::Packet) -> PosixRenameRe
 /// （russh-sftp 按请求 id 多路复用，并发请求是协议层支持的）。
 pub struct SftpClient {
     session: Arc<russh_sftp::client::SftpSession>,
-    /// 独立的提交通道（`RawSftpSession`）：提交只发一次 rename 请求，
-    /// 不值得挤占数据通道；`None` 表示没有可用提交通道，`safe_commit`
-    /// 回退到数据通道上的标准 rename。
-    commit_session: Option<Arc<russh_sftp::client::RawSftpSession>>,
-    /// 版本握手中服务器声明了 `posix-rename@openssh.com`。
-    posix_rename: bool,
+    /// 惰性提交通道的开启回调（见 [`SftpChannelOpener`]）。
+    ///
+    /// 提交需要 `RawSftpSession` 才能发 `posix-rename@openssh.com` 的
+    /// EXTENDED 请求，而高层 `SftpSession` 不暴露内部 raw 句柄。早期实现
+    /// 因此**常驻**一条专用提交通道 —— 每个传输任务独占 2 条 SSH 通道，
+    /// 很容易撞上服务端 `MaxSessions`（OpenSSH 默认 10，按连接计，终端
+    /// 标签页也在抢同一个额度）。
+    ///
+    /// 现在改成**惰性**：提交那一刻才临时开一条短命通道，握手、探测扩展、
+    /// 发一次 rename，随即随 `RawSftpSession` 一起释放。传输期间（往往是
+    /// 几十分钟）每个任务只占数据通道 1 条。
+    commit_opener: Option<SftpChannelOpener>,
 }
+
+/// 开一条 SFTP 通道的回调。
+///
+/// 返回的 future 必须是 `Send`（会被放进 `tokio::spawn` 里的传输任务），
+/// 且**不能**在返回 future 之前持有任何会阻塞其它操作的锁。
+pub type SftpChannelOpener = Arc<
+    dyn Fn() -> Pin<
+            Box<
+                dyn Future<Output = Result<russh::Channel<russh::client::Msg>, ProtocolError>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
 
 impl SftpClient {
     /// 从 SSH 通道创建 SFTP 客户端
@@ -319,56 +371,92 @@ impl SftpClient {
     /// 调用 `channel.into_stream()` 将其转换为 AsyncRead + AsyncWrite 流。
     pub async fn new(channel: russh::Channel<russh::client::Msg>) -> Result<Self, ProtocolError> {
         let stream = channel.into_stream();
-        let session = russh_sftp::client::SftpSession::new(stream)
-            .await
-            .map_err(|e| ProtocolError::ProtocolError(format!("SFTP init failed: {}", e)))?;
+        // 版本握手必须有时限：对端不回 SSH_FXP_VERSION 时这里会永久挂住，
+        // 而调用方正持有 SshClient 读锁（见 SFTP_VERSION_HANDSHAKE_TIMEOUT）。
+        let session = tokio::time::timeout(
+            SFTP_VERSION_HANDSHAKE_TIMEOUT,
+            russh_sftp::client::SftpSession::new(stream),
+        )
+        .await
+        .map_err(|_| {
+            ProtocolError::ProtocolError(format!(
+                "SFTP version handshake timed out after {}s",
+                SFTP_VERSION_HANDSHAKE_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| ProtocolError::ProtocolError(format!("SFTP init failed: {}", e)))?;
 
         info!("SFTP session initialized");
         Ok(Self {
             session: Arc::new(session),
-            commit_session: None,
-            posix_rename: false,
+            commit_opener: None,
         })
     }
 
-    /// 带独立提交通道创建 SFTP 客户端。
+    /// 挂上**惰性**提交通道回调。
     ///
-    /// `commit_channel` 必须已请求 sftp 子系统。提交通道在版本握手时顺带
-    /// 探测 `posix-rename@openssh.com`（OpenSSH ≥4 在 SSH_FXP_VERSION 里
-    /// 声明该扩展）；握手失败或扩展缺失时静默降级为 `None`——提交路径
-    /// 随后走标准 rename，**不能**因为提交通道的问题让传输任务失败。
-    pub async fn new_with_commit_channel(
-        channel: russh::Channel<russh::client::Msg>,
-        commit_channel: Option<russh::Channel<russh::client::Msg>>,
-    ) -> Result<Self, ProtocolError> {
-        let mut client = Self::new(channel).await?;
-        match commit_channel {
-            Some(commit_channel) => {
-                let stream = commit_channel.into_stream();
-                let raw = russh_sftp::client::RawSftpSession::new_with_config(
-                    stream,
-                    russh_sftp::client::Config::default(),
-                );
-                match raw.init().await {
-                    Ok(version) => {
-                        client.posix_rename = version
-                            .extensions
-                            .get(POSIX_RENAME_EXTENSION)
-                            .is_some_and(|v| v == "1");
-                        client.commit_session = Some(Arc::new(raw));
-                        info!(
-                            posix_rename = client.posix_rename,
-                            "SFTP commit channel ready"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "SFTP commit channel init failed; commits fall back to standard rename");
-                    }
-                }
-            }
-            None => debug!("no dedicated SFTP commit channel; commits use standard rename"),
+    /// 提交通道只在提交那一刻才开，用完即弃 —— 见 [`SftpClient`] 上
+    /// `commit_opener` 字段的说明。
+    pub fn with_commit_opener(&self, opener: SftpChannelOpener) -> SftpClient {
+        SftpClient {
+            session: self.session.clone(),
+            commit_opener: Some(opener),
         }
-        Ok(client)
+    }
+
+    /// 打开一个**并发区间读取器**：固定数量的远端句柄池，按需借还。
+    ///
+    /// 供传输层把「下载」从单句柄串行读改成多区间并发读（SFTP 的 READ 是
+    /// 请求/响应协议，串行读的吞吐上限是 `CHUNK_SIZE / RTT`）。
+    ///
+    /// 句柄池在**整个传输**期间复用：逐区间 `open` 会把 OPEN/CLOSE 放大到
+    /// 「每 64 KiB 一对」（1 GiB 文件即 16384 次 OPEN + 16384 次 CLOSE）。
+    pub async fn range_fetcher(
+        &self,
+        path: &str,
+        capacity: usize,
+    ) -> Result<Arc<dyn RangeFetcher>, ProtocolError> {
+        let pool = RemoteHandlePool::open(self.session.clone(), path, capacity).await?;
+        Ok(Arc::new(pool))
+    }
+
+    /// 临时开一条提交通道，握手并探测 `posix-rename@openssh.com`。
+    ///
+    /// 返回值：
+    /// - `Ok(Some(session))`：服务器声明了该扩展，可以走原子替换；
+    /// - `Ok(None)`：通道正常但扩展不存在 —— 提交走标准 rename；
+    /// - `Err(..)`：通道开不起来或握手失败 —— 调用方降级为标准 rename。
+    ///
+    /// 提交通道的版本握手同样要有时限：它失败只应降级为标准 rename，
+    /// 不能让整个传输任务卡在这里。
+    async fn open_commit_session(
+        opener: &SftpChannelOpener,
+    ) -> Result<Option<Arc<russh_sftp::client::RawSftpSession>>, ProtocolError> {
+        let channel = opener().await?;
+        let stream = channel.into_stream();
+        let raw = russh_sftp::client::RawSftpSession::new_with_config(
+            stream,
+            russh_sftp::client::Config::default(),
+        );
+        let version = tokio::time::timeout(SFTP_COMMIT_HANDSHAKE_TIMEOUT, raw.init())
+            .await
+            .map_err(|_| {
+                ProtocolError::ProtocolError(format!(
+                    "SFTP commit channel handshake timed out after {}s",
+                    SFTP_COMMIT_HANDSHAKE_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                ProtocolError::ProtocolError(format!("SFTP commit channel init failed: {e}"))
+            })?;
+        if supports_posix_rename(&version) {
+            info!("SFTP commit channel ready; posix-rename is available");
+            Ok(Some(Arc::new(raw)))
+        } else {
+            debug!("server does not advertise posix-rename; commits use standard rename");
+            // 通道用不上 → 立刻释放，别占着服务端的 MaxSessions 额度
+            Ok(None)
+        }
     }
 
     /// 列出远程目录内容
@@ -636,17 +724,6 @@ impl SftpClient {
         self.session.metadata(path).await.is_ok()
     }
 
-    /// R2-T2：探测远端 SFTP 扩展，仅返回提交语义相关的能力。
-    ///
-    /// 探测来源是提交通道的 SSH_FXP_VERSION 扩展声明（见
-    /// [`Self::new_with_commit_channel`]）；没有提交通道时一切降级为
-    /// `false`，提交走标准 rename。
-    pub async fn probe_capabilities(&self) -> Result<SftpCapabilities, ProtocolError> {
-        Ok(SftpCapabilities {
-            posix_rename: self.posix_rename,
-        })
-    }
-
     /// R2-T2：以「独占」方式打开/创建临时文件用于 staging。
     ///
     /// `OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE` 等价于
@@ -684,8 +761,7 @@ impl SftpClient {
     fn clone_for_sink(&self) -> SftpClient {
         SftpClient {
             session: self.session.clone(),
-            commit_session: self.commit_session.clone(),
-            posix_rename: self.posix_rename,
+            commit_opener: self.commit_opener.clone(),
         }
     }
 
@@ -701,40 +777,50 @@ impl SftpClient {
     /// 的语义是「结果未知」，盲目录入标准 rename 可能撞上 temp 已被移走的
     /// 二次错误，掩盖真实原因。
     ///
+    /// 提交通道是**惰性**的：这一刻才临时开一条短命通道，握手、探测扩展、
+    /// 发一次 rename，随即释放 —— 传输期间不占额度。
+    ///
     /// 调用前**必须**再次检查目标是否存在——本客户端把策略决定提前到
     /// 此处之外的位置，避免「先删后改」的脏路径（ADR-0002 明令禁止）。
-    pub async fn safe_commit(
-        &self,
-        from: &str,
-        to: &str,
-        _capabilities: SftpCapabilities,
-    ) -> Result<CommitOutcome, ProtocolError> {
-        if self.posix_rename {
-            if let Some(commit) = &self.commit_session {
-                let data = encode_posix_rename_data(from, to);
-                let packet = commit
-                    .extended(POSIX_RENAME_EXTENSION, data)
-                    .await
-                    .map_err(|e| ProtocolError::TransferCommitFailed {
-                        path: to.to_string(),
-                        reason: format!("posix-rename failed: {e}"),
-                    })?;
-                match map_posix_rename_reply(packet) {
-                    PosixRenameReply::Applied => {
-                        return Ok(CommitOutcome {
-                            strategy: CommitStrategy::PosixRename,
-                        });
-                    }
-                    // 探测说支持、实际拒绝：按不支持处理，走标准 rename
-                    PosixRenameReply::Unsupported => {
-                        debug!("server rejected posix-rename; falling back to standard rename");
-                    }
-                    PosixRenameReply::Failed(reason) => {
-                        return Err(ProtocolError::TransferCommitFailed {
+    pub async fn safe_commit(&self, from: &str, to: &str) -> Result<CommitOutcome, ProtocolError> {
+        if let Some(opener) = &self.commit_opener {
+            match Self::open_commit_session(opener).await {
+                Ok(Some(commit)) => {
+                    let data = encode_posix_rename_data(from, to);
+                    let packet = commit
+                        .extended(POSIX_RENAME_EXTENSION, data)
+                        .await
+                        .map_err(|e| ProtocolError::TransferCommitFailed {
                             path: to.to_string(),
-                            reason,
-                        });
+                            reason: format!("posix-rename failed: {e}"),
+                        })?;
+                    match map_posix_rename_reply(packet) {
+                        PosixRenameReply::Applied => {
+                            return Ok(CommitOutcome {
+                                strategy: CommitStrategy::PosixRename,
+                            });
+                        }
+                        // 探测说支持、实际拒绝：按不支持处理，走标准 rename
+                        PosixRenameReply::Unsupported => {
+                            debug!("server rejected posix-rename; falling back to standard rename");
+                        }
+                        PosixRenameReply::Failed(reason) => {
+                            return Err(ProtocolError::TransferCommitFailed {
+                                path: to.to_string(),
+                                reason,
+                            });
+                        }
                     }
+                }
+                Ok(None) => {
+                    debug!("server does not advertise posix-rename; using standard rename");
+                }
+                Err(error) => {
+                    // 提交通道开不起来只降级为标准 rename —— 不能让传输任务失败
+                    warn!(
+                        error = %error,
+                        "Could not open the SFTP commit channel; falling back to standard rename"
+                    );
                 }
             }
         }
@@ -850,13 +936,8 @@ impl TransferSink for RemoteSink {
         Ok(Box::new(file))
     }
 
-    async fn safe_commit(
-        &self,
-        from: &str,
-        to: &str,
-        caps: SftpCapabilities,
-    ) -> Result<CommitOutcome, ProtocolError> {
-        self.client.safe_commit(from, to, caps).await
+    async fn safe_commit(&self, from: &str, to: &str) -> Result<CommitOutcome, ProtocolError> {
+        self.client.safe_commit(from, to).await
     }
 
     async fn try_remove(&self, path: &str) -> Result<(), ProtocolError> {
@@ -925,7 +1006,7 @@ where
 ///
 /// 纯函数：分块正确性直接决定落盘内容是否损坏，必须独立可测。
 /// `total == 0` 返回空区间；`chunk == 0` 视为 1，避免死循环。
-fn plan_ranges(total: u64, chunk: usize) -> Vec<(u64, usize)> {
+pub fn plan_ranges(total: u64, chunk: usize) -> Vec<(u64, usize)> {
     let step = chunk.max(1) as u64;
     let mut ranges = Vec::with_capacity(total.div_ceil(step) as usize);
     let mut offset = 0u64;
@@ -997,7 +1078,10 @@ impl<T> Drop for AbortOnDrop<T> {
 /// - `done` 单调递增，进度回调语义与串行版本一致。
 ///
 /// 暂停/取消在派发新区间前和每次写入前各检查一次，与串行版本同款语义。
-async fn copy_pipelined<F, Fut, W, P>(
+///
+/// `W` / `P` 允许是 `dyn`（`?Sized`）：调用方（core 的 staged 下载）手里
+/// 拿到的正是 `Box<dyn AsyncWrite>` 与 `&mut (dyn FnMut(u64,u64) + Send)`。
+pub async fn copy_pipelined<F, Fut, W, P>(
     total: u64,
     fetch: F,
     writer: &mut W,
@@ -1007,8 +1091,8 @@ async fn copy_pipelined<F, Fut, W, P>(
 where
     F: Fn(u64, usize) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>, ProtocolError>> + Send + 'static,
-    W: tokio::io::AsyncWrite + Unpin,
-    P: FnMut(u64, u64),
+    W: tokio::io::AsyncWrite + Unpin + ?Sized,
+    P: FnMut(u64, u64) + ?Sized,
 {
     let ranges = plan_ranges(total, CHUNK_SIZE);
     progress(0, total);
@@ -1877,6 +1961,26 @@ mod tests {
     // 提交语义的线格式与应答映射必须锁死：posix-rename@openssh.com 的请求体
     // 是「oldpath + newpath 两个连续 SSH string」，应答只有 STATUS（Ok /
     // OpUnsupported / 其它错误码）。这里不依赖真实服务器。
+
+    #[test]
+    fn posix_rename_is_detected_from_the_version_extensions() {
+        let mut version = russh_sftp::protocol::Version::new();
+        assert!(
+            !supports_posix_rename(&version),
+            "未声明扩展时不得走 posix-rename"
+        );
+
+        version
+            .extensions
+            .insert(POSIX_RENAME_EXTENSION.to_string(), "1".to_string());
+        assert!(supports_posix_rename(&version));
+
+        // 版本号对不上也不算支持 —— 扩展语义由值本身决定
+        version
+            .extensions
+            .insert(POSIX_RENAME_EXTENSION.to_string(), "2".to_string());
+        assert!(!supports_posix_rename(&version));
+    }
 
     #[test]
     fn posix_rename_wire_format_matches_openssh_extension() {

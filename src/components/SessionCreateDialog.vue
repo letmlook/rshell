@@ -4,7 +4,14 @@ import { useSessionsStore } from "../stores/sessions";
 import { listKeys, listSerialPorts } from "../ipc/client";
 import { useFoldersStore } from "../stores/folders";
 import { pickLocalPath } from "../utils/pathPicker";
-import type { Protocol, SerialFlowControl, SerialParity, SessionConfig, Uuid } from "../ipc/types";
+import type {
+  Protocol,
+  SerialFlowControl,
+  SerialParity,
+  SessionConfig,
+  SshKeyInfo,
+  Uuid,
+} from "../ipc/types";
 
 const props = defineProps<{ visible: boolean; editId?: Uuid | null }>();
 const emit = defineEmits<{
@@ -20,14 +27,8 @@ const folders = useFoldersStore();
 // 交互式认证流程），此前界面没有这个选项，等于该能力无法使用。
 type AuthMode = "password" | "managed-key" | "external-key" | "keyboard-interactive";
 
-interface KeyRow {
-  id: Uuid;
-  name: string;
-  key_type: string;
-  fingerprint: string;
-  has_passphrase: boolean;
-}
-
+// 密钥行直接用 IPC 契约里的 `SshKeyInfo`（后端 `ListKeys` 返回的就是它），
+// 不再本地声明一份靠 `as unknown as` 强转的副本。
 const form = ref({
   name: "",
   protocol: "SSH" as Protocol,
@@ -54,17 +55,32 @@ const serialPorts = ref<string[]>([]);
 /** 串口设备的手工输入（列表里没有的设备路径） */
 const serialPortsError = ref<string | null>(null);
 
-/** 托管密钥列表：对话框打开（SSH 协议）时拉取一次 */
-const managedKeys = ref<KeyRow[]>([]);
-const managedKeysLoaded = ref(false);
+/** 托管密钥列表：对话框打开（SSH 协议）时拉取 */
+const managedKeys = ref<SshKeyInfo[]>([]);
 const submitting = ref(false);
 const error = ref<string | null>(null);
 
+/**
+ * 拉取托管密钥列表。
+ *
+ * **每次打开对话框都重拉**（不再用「已加载过就跳过」的标志）：密钥面板是
+ * 另一个视图，用户完全可能在密钥管理里生成/删除密钥后再回到这里。一次性
+ * 快照会导致两种错误：
+ * ① 新生成的密钥在下拉里看不到 —— 用户必须重启应用才能用上它；
+ * ② 已删除的密钥仍留在下拉里、且 `managedKeyId` 仍指向它 —— 建出来的连接
+ *    必然认证失败。
+ */
 async function loadManagedKeys() {
-  if (managedKeysLoaded.value) return;
   try {
-    managedKeys.value = (await listKeys()) as unknown as KeyRow[];
-    managedKeysLoaded.value = true;
+    const keys = await listKeys();
+    managedKeys.value = Array.isArray(keys) ? keys : [];
+    // 选中的密钥若已被删除，清空选择（而不是留一个指向死对象的 id）。
+    if (
+      form.value.managedKeyId &&
+      !managedKeys.value.some((k) => k.id === form.value.managedKeyId)
+    ) {
+      form.value.managedKeyId = "";
+    }
     if (managedKeys.value.length > 0 && !form.value.managedKeyId) {
       form.value.managedKeyId = managedKeys.value[0].id;
     }
