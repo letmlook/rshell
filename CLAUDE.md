@@ -61,6 +61,17 @@ cargo test --workspace
 
 本机 stable 自动更新冲突时，为命令设置 `RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1`，不要把工具链故障误报为项目编译失败。
 
+真机用例（不进 CI，需要真实的 multipass Linux 实例）：
+```bash
+cd src-tauri
+RSHELL_REAL_HOST=<ip> RSHELL_REAL_USER=<user> RSHELL_REAL_PASS=<pass> \
+RSHELL_REAL_KEY=~/.ssh/id_ed25519 RSHELL_REAL_TELNET_PORT=2323 \
+cargo test -p rshell-core --test real_machine -- --ignored --test-threads=1
+```
+这批用例直接驱动 `CommandDispatcher::dispatch(AppCommand)`——界面上每个可见操作
+最终都落到这个入口，前端与后端之间没有第二条路径。改命令契约或服务装配后，
+它能替代（不能替代界面呈现的）手动点击验收。
+
 ## 验收
 
 可见按钮必须调用真实操作或明确禁用，不能静默成功、使用假数据回退或发布并未发生的 Connected/Active 状态。文件删除必须确认并限定目标；SFTP 写操作只接受绝对、非根、无歧义路径。
