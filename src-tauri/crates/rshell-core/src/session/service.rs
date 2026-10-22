@@ -1321,6 +1321,8 @@ impl SessionService {
         if self.sessions.read().await.contains_key(&id) {
             return Err(CoreError::InvalidState("Session already exists".into()));
         }
+        // 同一分组内名称不允许重复（不同分组允许同名 —— 分组本身就是区分维度）。
+        self.ensure_unique_name_in_folder(&config, None).await?;
         set_presence(
             &mut config,
             credential.as_ref().is_some_and(|c| !c.secret.is_empty()),
@@ -1356,6 +1358,39 @@ impl SessionService {
         Ok(id)
     }
 
+    /// 同一分组内的会话名必须唯一。
+    ///
+    /// 左侧列表按分组组织：同一分组里出现两个同名条目，用户没法分辨点开的是
+    /// 哪一个（连接信息可能完全一样）。**不同分组之间允许同名** —— 分组本身
+    /// 就是区分维度，这也是「同信息可以建多条、只要不在同一目录」的语义。
+    ///
+    /// 比较大小写不敏感，与分组名的判定（`folder_service`）保持一致。
+    /// `exclude` 是改名时要排除的会话自身。
+    async fn ensure_unique_name_in_folder(
+        &self,
+        config: &SessionConfig,
+        exclude: Option<Uuid>,
+    ) -> Result<(), CoreError> {
+        let name = config.name.trim();
+        if name.is_empty() {
+            // 空名由前端补成 `user@host`（见 SessionCreateDialog），后端不判重。
+            return Ok(());
+        }
+        let sessions = self.sessions.read().await;
+        let clash = sessions.values().any(|state| {
+            Some(state.config.id) != exclude
+                && state.config.folder_id == config.folder_id
+                && state.config.name.trim().eq_ignore_ascii_case(name)
+        });
+        drop(sessions);
+        if clash {
+            return Err(CoreError::InvalidState(
+                "A session with the same name already exists in this folder".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// 更新会话
     #[instrument(skip(self, config))]
     pub async fn update_session(&self, id: Uuid, config: SessionConfig) -> Result<(), CoreError> {
@@ -1377,6 +1412,11 @@ impl SessionService {
                 "Session ID cannot be changed".into(),
             ));
         }
+        // 改名也要过同名闸门（排除自己）。
+        //
+        // 必须在拿到 `sessions` **写锁之前**检查：这个检查自己也要读同一张表，
+        // tokio 的 RwLock 不可重入 —— 持着写锁再读就是死锁。
+        self.ensure_unique_name_in_folder(&config, Some(id)).await?;
         let _lifecycle = self.lifecycle.lock().await;
         let mut sessions = self.sessions.write().await;
         let state = sessions
@@ -1659,6 +1699,85 @@ mod tests {
             },
             serial_config: None,
         }
+    }
+
+    // ===== 同一分组内的会话名唯一（不同分组允许同名） =====
+
+    /// 同一分组里再建同名会话 → 拒绝。
+    #[tokio::test]
+    async fn create_session_rejects_duplicate_name_in_the_same_folder() {
+        let svc = make_service();
+        svc.create_session(make_config("multipass-linux", "host1"))
+            .await
+            .unwrap();
+
+        let err = svc
+            .create_session(make_config("multipass-linux", "host2"))
+            .await
+            .expect_err("同一分组内的同名会话必须被拒绝");
+        assert!(
+            matches!(err, CoreError::InvalidState(ref m) if m.contains("same name")),
+            "错误信息应说明是同名冲突，实际: {err:?}"
+        );
+    }
+
+    /// 不同分组里可以建同名会话（分组本身就是区分维度）。
+    #[tokio::test]
+    async fn create_session_allows_duplicate_name_across_folders() {
+        let svc = make_service();
+        let folder_a = Uuid::new_v4();
+        let folder_b = Uuid::new_v4();
+
+        let mut first = make_config("multipass-linux", "host1");
+        first.folder_id = Some(folder_a);
+        svc.create_session(first).await.unwrap();
+
+        let mut second = make_config("multipass-linux", "host2");
+        second.folder_id = Some(folder_b);
+        svc.create_session(second)
+            .await
+            .expect("不同分组之间允许同名会话");
+    }
+
+    /// 大小写不同视为同名。
+    #[tokio::test]
+    async fn duplicate_name_check_is_case_insensitive() {
+        let svc = make_service();
+        svc.create_session(make_config("multipass-linux", "host1"))
+            .await
+            .unwrap();
+        let err = svc
+            .create_session(make_config("Multipass-Linux", "host2"))
+            .await
+            .expect_err("大小写不同也算同名");
+        assert!(matches!(err, CoreError::InvalidState(_)));
+    }
+
+    /// 改名成同组里已存在的名字 → 拒绝；改成不存在的名字 → 允许。
+    #[tokio::test]
+    async fn update_session_rejects_duplicate_name_but_allows_own_name() {
+        let svc = make_service();
+        let first = svc
+            .create_session(make_config("alpha", "host1"))
+            .await
+            .unwrap();
+        svc.create_session(make_config("beta", "host2"))
+            .await
+            .unwrap();
+
+        // 改成自己的名字（其它字段有改动）应当放行
+        let mut own = make_config("alpha", "host1");
+        own.id = first;
+        svc.update_session(first, own.clone()).await.unwrap();
+
+        // 改成别人的名字应当被拒
+        let mut clash = make_config("beta", "host1");
+        clash.id = first;
+        let err = svc
+            .update_session(first, clash)
+            .await
+            .expect_err("改名撞上同组已有名字必须被拒绝");
+        assert!(matches!(err, CoreError::InvalidState(_)));
     }
 
     #[test]
@@ -2582,14 +2701,21 @@ mod tests {
         *credentials.fail.lock().unwrap() = true;
         let repo = Arc::new(SessionRepository::new(tmp.path().into(), credentials));
         let svc = make_service_with_repo(repo);
-        for protocol in [Protocol::Telnet, Protocol::Serial, Protocol::SSH] {
-            for credential in [
+        for (index, protocol) in [Protocol::Telnet, Protocol::Serial, Protocol::SSH]
+            .into_iter()
+            .enumerate()
+        {
+            for (n, credential) in [
                 None,
                 Some(SessionCredential {
                     secret: String::new(),
                 }),
-            ] {
-                let mut cfg = make_config("no secret", "localhost");
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // 名称必须互不相同：同一分组内的会话名不允许重复。
+                let mut cfg = make_config(&format!("no secret {index}-{n}"), "localhost");
                 cfg.protocol = protocol;
                 if protocol == Protocol::Serial {
                     cfg.serial_config = Some(rshell_api::types::SerialConfig {

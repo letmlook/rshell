@@ -23,6 +23,7 @@ import ElForm, { ElFormItem } from "element-plus/es/components/form/index.mjs";
 import ElInput from "element-plus/es/components/input/index.mjs";
 import ElInputNumber from "element-plus/es/components/input-number/index.mjs";
 import ElLoading from "element-plus/es/components/loading/index.mjs";
+import ElRadio from "element-plus/es/components/radio/index.mjs";
 import ElSelect, { ElOption } from "element-plus/es/components/select/index.mjs";
 import ElSwitch from "element-plus/es/components/switch/index.mjs";
 import ElTable, { ElTableColumn } from "element-plus/es/components/table/index.mjs";
@@ -44,6 +45,7 @@ const componentPlugins: Plugin[] = [
   ElInputNumber,
   ElLoading,
   ElOption,
+  ElRadio,
   ElSelect,
   ElSwitch,
   ElTable,

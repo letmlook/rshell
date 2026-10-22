@@ -3,6 +3,15 @@
  * never reach the bundle. The build-output contract enforces a 500 KiB cap
  * on every emitted JS chunk, so adding a component here usually requires
  * also importing it in src/element-plus.ts. */
+/* Element Plus 的 CSS 变量总表（--el-*）。必须先于各组件样式引入：
+ * 组件样式里大量引用 var(--el-xxx)，变量缺失时该声明在「计算值阶段」失效，
+ * 属性会退回继承值/初始值——例如 --el-font-size-base 缺失会让
+ * .el-radio-button__inner 的 font-size 继承到 .el-radio-group 的 0px，
+ * 单选按钮的文字被压成零宽、整组按钮看不见也点不着。
+ *
+ * 变量总表在前，src/styles/tokens.css 在后（main.ts 的导入顺序），
+ * 应用自己的配色仍覆盖 Element Plus 默认值。 */
+@import "element-plus/theme-chalk/base.css";
 @import "element-plus/theme-chalk/el-button.css";
 @import "element-plus/theme-chalk/el-button-group.css";
 @import "element-plus/theme-chalk/el-checkbox.css";
@@ -17,6 +26,9 @@
 @import "element-plus/theme-chalk/el-input-number.css";
 @import "element-plus/theme-chalk/el-loading.css";
 @import "element-plus/theme-chalk/el-option.css";
+@import "element-plus/theme-chalk/el-radio.css";
+@import "element-plus/theme-chalk/el-radio-button.css";
+@import "element-plus/theme-chalk/el-radio-group.css";
 @import "element-plus/theme-chalk/el-select.css";
 @import "element-plus/theme-chalk/el-switch.css";
 @import "element-plus/theme-chalk/el-table.css";
