@@ -19,6 +19,7 @@ import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue
 import { readDir } from "@tauri-apps/plugin-fs";
 import { browseRemoteDir } from "../../ipc/client";
 import { isWithinRoot } from "../../utils/rootBoundary";
+import { entryIsDirectory } from "../../utils/localFs";
 import type { Uuid } from "../../ipc/types";
 
 const props = defineProps<{
@@ -140,8 +141,18 @@ async function loadSubDirs(dir: string): Promise<DirNode[]> {
       .map((entry) => makeNode(entry.name, joinPath(dir, entry.name), 1));
   }
   const items = await readDir(dir);
-  return items
-    .filter((item) => item.isDirectory)
+  // readDir 不跟随符号链接：指向目录的符号链接（macOS 的 /tmp、/var…）会被
+  // 报成文件，目录树里就少了这一支。用 stat 补一次真实类型。
+  const dirs = await Promise.all(
+    items.map(async (item) => {
+      if (item.isDirectory) return item;
+      if (!item.isSymlink) return null;
+      const isDir = await entryIsDirectory(joinPath(dir, item.name), false);
+      return isDir ? item : null;
+    }),
+  );
+  return dirs
+    .filter((item): item is NonNullable<typeof item> => item !== null)
     .map((item) => makeNode(item.name, joinPath(dir, item.name), 1));
 }
 

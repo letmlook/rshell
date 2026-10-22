@@ -124,7 +124,10 @@ async function load(path: string) {
           const info = await stat(full);
           return {
             name: item.name,
-            isDirectory: item.isDirectory,
+            // stat 跟随符号链接：macOS 的 /tmp、/var、/etc 都是指向 /private/* 的
+            // 符号链接，只看 readDir 的 isDirectory 会把它们当文件，目录模式下
+            // 直接被过滤掉、用户根本选不到。详见 utils/localFs.ts。
+            isDirectory: info.isDirectory,
             size: info.size ?? 0,
             modified: info.mtime ? new Date(info.mtime).toISOString() : "",
           };

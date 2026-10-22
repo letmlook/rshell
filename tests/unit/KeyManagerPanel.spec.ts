@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { flushPromises, mount } from "@vue/test-utils";
+import { DOMWrapper, flushPromises, mount } from "@vue/test-utils";
 import ElementPlus from "element-plus";
 import KeyManagerPanel from "../../src/components/KeyManagerPanel.vue";
 import { deleteSshKey, exportPublicKey, importPrivateKey } from "../../src/ipc/client";
@@ -53,6 +53,26 @@ const mountPanel = () =>
 const importButton = (wrapper: Wrapper) =>
   wrapper.findAll("button").find(button => button.text() === "导入");
 
+/**
+ * 对话框开了 `append-to-body`：内容被 teleport 到 <body>，
+ * `wrapper.find(".el-dialog …")` 找不到它，必须从 document.body 里取。
+ *
+ * 为什么必须 teleport：密钥面板挂在侧栏里，而侧栏是 `overflow: hidden`
+ * （SidePanel.vue 的 `.side-panel`）——不 teleport 的 el-dialog 会被裁掉，
+ * 真机实测点「导出公钥」后对话框完全不可见（DOM 里有、屏幕上没有）。
+ */
+function dialogInBody(selector: string): DOMWrapper<Element> | undefined {
+  const el = document.body.querySelector(selector);
+  return el ? new DOMWrapper(el) : undefined;
+}
+
+/** 对话框底部按钮（取消 / 确认） */
+function dialogFooterButton(label: string): DOMWrapper<Element> | undefined {
+  const buttons = [...document.body.querySelectorAll(".el-dialog__footer button")];
+  const target = buttons.find((button) => button.textContent?.trim() === label);
+  return target ? new DOMWrapper(target) : undefined;
+}
+
 async function openImportDialog(wrapper: Wrapper) {
   pickLocalPath.mockResolvedValue("/tmp/id_ed25519");
   await importButton(wrapper)!.trigger("click");
@@ -66,10 +86,10 @@ describe("embedded key manager", () => {
     const button = importButton(wrapper);
     expect(button, "import must remain reachable inside the side panel").toBeDefined();
     await openImportDialog(wrapper);
-    const input = wrapper.find('.el-dialog input[type="password"]');
-    expect(input.exists(), "passphrase dialog must appear after picking a file").toBe(true);
-    await input.setValue("test-passphrase");
-    await wrapper.find(".el-dialog__footer button.el-button--primary").trigger("click");
+    const input = dialogInBody('.el-dialog input[type="password"]');
+    expect(input, "passphrase dialog must appear after picking a file").toBeDefined();
+    await input!.setValue("test-passphrase");
+    await dialogFooterButton("导入")!.trigger("click");
     await flushPromises();
     expect(importPrivateKey).toHaveBeenCalledWith("/tmp/id_ed25519", "test-passphrase");
     wrapper.unmount();
@@ -99,7 +119,7 @@ describe("embedded key manager", () => {
     });
     await flushPromises();
 
-    expect(wrapper.find(".export-body").text()).toContain("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5");
+    expect(dialogInBody(".export-body")!.text()).toContain("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5");
     wrapper.unmount();
   });
 
@@ -107,11 +127,11 @@ describe("embedded key manager", () => {
     const wrapper = mountPanel();
     await flushPromises();
     await openImportDialog(wrapper);
-    await wrapper.findAll(".el-dialog__footer button").find(button => button.text() === "取消")!.trigger("click");
+    await dialogFooterButton("取消")!.trigger("click");
     await flushPromises();
     expect(importPrivateKey).not.toHaveBeenCalled();
     await openImportDialog(wrapper);
-    await wrapper.find(".el-dialog__footer button.el-button--primary").trigger("click");
+    await dialogFooterButton("导入")!.trigger("click");
     await flushPromises();
     expect(importPrivateKey).toHaveBeenCalledWith("/tmp/id_ed25519", null);
     wrapper.unmount();

@@ -292,6 +292,7 @@ onBeforeUnmount(() => {
       :model-value="exported !== null"
       title="导出公钥"
       width="560px"
+      append-to-body
       @close="exported = null"
     >
       <p class="export-name">{{ exported?.name }}</p>
@@ -306,6 +307,7 @@ onBeforeUnmount(() => {
       :model-value="importState !== null"
       title="导入私钥"
       width="440px"
+      append-to-body
       @close="cancelImport"
     >
       <p class="import-path">{{ importState?.path }}</p>

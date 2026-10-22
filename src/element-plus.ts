@@ -60,6 +60,8 @@ export function registerElementPlus(app: App) {
   }
 }
 
+// 以 API 形式调用的两个组件：它们没有 <el-xxx> 模板标签，样式表必须单独引入
+// （见 src/styles/element-plus.css）。ElMessageBox 已由应用内自绘窗体
+// utils/dialog.ts 取代，没有任何调用方，因此不再导出。
 export { ElMessage } from "element-plus/es/components/message/index.mjs";
-export { ElMessageBox } from "element-plus/es/components/message-box/index.mjs";
 export { ElNotification } from "element-plus/es/components/notification/index.mjs";

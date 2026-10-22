@@ -118,6 +118,36 @@ const TAG_TO_STYLE: Record<string, string> = {
   "el-tooltip": "",
 };
 
+/**
+ * 以 **API 形式**调用（而不是写 `<el-xxx>` 标签）的 Element Plus 组件。
+ *
+ * 这类组件没有模板标签，上面的「标签 → 样式」对账完全看不到它们，
+ * 于是漏掉样式表时不会报错、只会**静默不可见**：
+ *   - 缺 `el-notification.css` → ElNotification 退化成追加到 <body> 末尾的
+ *     普通块级元素（position 不再是 fixed），落到视口之外；
+ *   - 缺 `el-message.css` → ElMessage 同样没有定位与配色。
+ * 真实事故：触发器「显示通知」动作触发成功（后端日志有 Trigger matched），
+ * 但界面上什么也没出现 —— 通知被渲染到了看不见的地方。
+ */
+const API_COMPONENTS: Record<string, string> = {
+  ElMessage: "el-message.css",
+  ElNotification: "el-notification.css",
+  ElMessageBox: "el-message-box.css",
+};
+
+/** src/ 里真正调用了哪些 API 形式组件（`ElMessage.info(...)` 这类） */
+function usedApiComponents(): Set<string> {
+  const used = new Set<string>();
+  for (const file of walkSources("src")) {
+    const body = readFileSync(file, "utf8");
+    for (const name of Object.keys(API_COMPONENTS)) {
+      // 只认「调用点」：`ElXxx.` 开头；导出/导入语句不算调用
+      if (new RegExp(`\\b${name}\\s*\\.`).test(body)) used.add(name);
+    }
+  }
+  return used;
+}
+
 describe("Element Plus 接入契约", () => {
   const registrationSource = readFileSync("src/element-plus.ts", "utf8");
   const styleSource = readFileSync("src/styles/element-plus.css", "utf8");
@@ -181,6 +211,35 @@ describe("Element Plus 接入契约", () => {
     // 变量总表缺失 → 组件样式里的 var(--el-xxx) 在计算值阶段失效，
     // 文字/尺寸会退回继承值（例如单选按钮文字继承到 font-size:0 而消失）。
     expect(styleSource).toContain("theme-chalk/base.css");
+  });
+
+  it("以 API 形式调用的每个 Element Plus 组件都有对应的样式导入", () => {
+    // 这类组件没有 <el-xxx> 标签，漏掉样式表时提示会静默不可见。
+    const missing: string[] = [];
+    for (const name of usedApiComponents()) {
+      const file = API_COMPONENTS[name];
+      if (!file) {
+        missing.push(`${name}: 未知组件 —— 需要在 API_COMPONENTS 里登记`);
+        continue;
+      }
+      if (!styleSource.includes(`theme-chalk/${file}`)) {
+        missing.push(`${name}: 缺少 theme-chalk/${file} 的样式导入`);
+      }
+    }
+    expect(missing).toEqual([]);
+  });
+
+  it("没有零引用的 Element Plus API 导出（避免用起来才发现没样式）", () => {
+    // 导出了却没有任何调用方 —— 与「两侧零引用的类型」同理：它在声明
+    // 一个不存在的能力，而且一旦有人用它，样式表还得现补。
+    const exported = new Set(
+      [...registrationSource.matchAll(
+        /export\s*\{([^}]+)\}\s*from\s*["']element-plus[^"']*["']/g,
+      )].flatMap((m) => m[1].split(",").map((s) => s.trim()).filter(Boolean)),
+    );
+    const used = usedApiComponents();
+    const unused = [...exported].filter((name) => !used.has(name));
+    expect(unused).toEqual([]);
   });
 
   it("样式导入清单与注册清单没有互相遗漏的孤儿条目", () => {

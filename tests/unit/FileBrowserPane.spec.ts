@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import FileBrowserPane from "../../src/components/transfer/FileBrowserPane.vue";
 import { browseRemoteDir } from "../../src/ipc/client";
-import { readDir } from "@tauri-apps/plugin-fs";
+import { readDir, stat } from "@tauri-apps/plugin-fs";
 
 vi.mock("../../src/ipc/client", () => ({ browseRemoteDir: vi.fn() }));
 vi.mock("@tauri-apps/plugin-fs", () => ({ readDir: vi.fn(), stat: vi.fn() }));
@@ -54,6 +54,28 @@ describe("FileBrowserPane", () => {
     await flushPromises();
     expect(readDir).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain("0 项");
+  });
+
+  // readDir 不跟随符号链接：macOS 的 /tmp、/var、/etc 会被报成「文件」，
+  // 图标与双击进入都会失准。面板必须以 stat（跟随符号链接）的类型为准。
+  it("本地列表按 stat 的类型把符号链接目录当作文件夹", async () => {
+    vi.mocked(readDir).mockResolvedValue([
+      { name: "tmp", isDirectory: false, isFile: false, isSymlink: true },
+    ] as never);
+    vi.mocked(stat).mockResolvedValue({
+      isDirectory: true,
+      isFile: false,
+      isSymlink: true,
+      size: 0,
+      mtime: null,
+    } as never);
+    const wrapper = mount(FileBrowserPane, {
+      props: { mode: "local", path: "/", rootPath: "/" },
+      global: { stubs },
+    });
+    await flushPromises();
+
+    expect(wrapper.find("[data-testid='rows']").text()).toContain('"is_dir":true');
   });
 });
 

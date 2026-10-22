@@ -193,7 +193,9 @@ async function load(path: string, pushHistory = true) {
           return {
             name: item.name,
             size: details.size,
-            is_dir: item.isDirectory,
+            // stat 跟随符号链接：readDir 的 isDirectory 把 macOS 的 /tmp、/var
+            // 这类符号链接目录报成文件，图标与双击进入都会失准。详见 utils/localFs.ts。
+            is_dir: details.isDirectory,
             modified: details.mtime?.toISOString() ?? "",
           };
         } catch (e) {

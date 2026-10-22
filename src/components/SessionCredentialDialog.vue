@@ -36,7 +36,7 @@ async function save() {
 </script>
 
 <template>
-  <el-dialog :model-value="true" title="更新凭据" width="440px" @close="close">
+  <el-dialog :model-value="true" title="更新凭据" width="440px" append-to-body @close="close">
     <p>{{ session.name }} · {{ session.host }}</p>
     <p>重新输入凭据并保存到系统钥匙串，然后重新连接。</p>
     <el-form label-width="100px" @submit.prevent="save">

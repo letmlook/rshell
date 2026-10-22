@@ -580,6 +580,18 @@ impl SessionService {
     }
 
     /// 连接到会话
+    ///
+    /// **对已连接的会话是幂等的**：直接返回成功，并把真实的连接状态推给前端。
+    ///
+    /// 为什么要这样：前端的连接状态是由 `ConnectionStateChanged` 事件驱动的，
+    /// 而事件是**一次性**的。页面重载（HMR、窗口重建）之后前端会丢掉已经
+    /// 收到的状态，于是又发一次 `connect` —— 这时后端连接其实还活着。
+    /// 旧实现在这里抛 `Invalid state: ... is already connecting or connected`，
+    /// 前端把它当成连接失败：界面把一条**活着的连接**显示成「网络连接失败」，
+    /// 并把会话标成 failed，进而按「锁态禁止输入」把终端输入也一起禁掉。
+    ///
+    /// 真正并发连接（状态是 `Connecting`）仍然报错：那时确实有一次连接正在
+    /// 进行中，调用方应当等待而不是假装已经连上。
     #[instrument(skip(self))]
     pub async fn connect(&self, session_id: Uuid) -> Result<(), CoreError> {
         info!(session_id = %session_id, "Connecting session");
@@ -594,6 +606,19 @@ impl SessionService {
         }
         let attempt = Uuid::new_v4();
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        // 已经连着：幂等返回，并把真实状态推给前端（前端可能刚丢了状态）。
+        if let Some((state, info)) = self.current_connection(session_id).await {
+            if matches!(state, ConnectionState::Connected) {
+                info!(session_id = %session_id, "Session already connected; connect is a no-op");
+                self.event_bus
+                    .publish(rshell_api::AppEvent::ConnectionStateChanged {
+                        session_id,
+                        state,
+                        info,
+                    });
+                return Ok(());
+            }
+        }
         let config = self
             .claim_connection(session_id, attempt, cancel_tx)
             .await?;
@@ -621,6 +646,20 @@ impl SessionService {
             }
         }
         result
+    }
+
+    /// 读当前连接状态与连接信息（会话不存在时返回 None）。
+    ///
+    /// 只读快照，不参与 `lifecycle` 互斥：这里回答的是「现在是什么状态」，
+    /// 而不是「我要开始一次连接」，不需要排他。
+    async fn current_connection(
+        &self,
+        session_id: Uuid,
+    ) -> Option<(ConnectionState, Option<ConnectionInfo>)> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(&session_id)
+            .map(|s| (s.connection_state, s.connection_info.clone()))
     }
 
     /// Claim and snapshot before network I/O; lifecycle mutations coordinate here.
@@ -3231,6 +3270,54 @@ mod tests {
         let states = svc.sessions.read().await;
         assert!(states[&id].attempt.is_none());
         assert_eq!(states[&id].connection_state, ConnectionState::Disconnected);
+    }
+
+    // ── 幂等 connect ──
+    // 前端的连接状态由 `ConnectionStateChanged` 事件驱动，而事件只发一次。
+    // 页面重载后前端丢了状态，会再发一次 connect —— 那时后端连接还活着。
+    // 旧实现在这里报 "already connecting or connected"，前端把一条活着的连接
+    // 显示成「网络连接失败」并把终端输入一起锁掉。
+    #[tokio::test]
+    async fn connect_on_connected_session_is_idempotent_and_republishes_state() {
+        let svc = make_service();
+        let cfg = make_config("already-up", "127.0.0.1");
+        let id = cfg.id;
+        svc.sessions.write().await.insert(
+            id,
+            SessionState {
+                config: cfg,
+                connection_state: ConnectionState::Connected,
+                connection_info: None,
+                attempt: None,
+                cancel_connect: None,
+            },
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        svc.event_bus.subscribe(move |event| {
+            let _ = tx.send(event.clone());
+        });
+
+        // 幂等：已连接时 connect 必须成功，而不是报错
+        svc.connect(id)
+            .await
+            .expect("connect on a connected session must succeed");
+
+        // 并且把真实状态再推一次，前端据此把会话标记为 connected
+        let mut republished = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ConnectionStateChanged {
+                session_id, state, ..
+            } = event
+            {
+                if session_id == id && state == ConnectionState::Connected {
+                    republished = true;
+                }
+            }
+        }
+        assert!(
+            republished,
+            "已连接会话的 connect 必须重发 ConnectionStateChanged"
+        );
     }
 
     // ── 托管密钥会话（managed_key_id）──

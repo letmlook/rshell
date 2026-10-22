@@ -591,3 +591,121 @@ RUST_BACKTRACE=1 RUST_LOG=info ./src-tauri/target/debug/rshell
 这一条覆盖的是**启动路径**：本轮新增的 `MasterPassword::with_path` / `FolderService::with_path` / `ThemeManager::with_persistence` 都跑在启动装配里，它们在真实进程里读文件、持锁、初始化，没有出现单元测试覆盖不到的崩溃。
 
 **边界（必须说清）**：本次只证明了「应用能启动、事件循环稳定、启动装配不崩」。**界面渲染、交互、真实 SSH/SFTP 连接仍未经真机验证**——截图受系统录屏权限限制无法取得，窗口内的一切仍只有单元测试与构建检查覆盖。外部 SSH 服务、物理串口、签名与公证同样未验证。
+
+### 2026-10-22：界面手动点击验收（macOS 原生应用 + multipass Linux 真机）
+
+上一节把**后端协议行为**放到了真实 Linux 服务端上验证。这一轮补的是**界面这一侧**：
+把 macOS 原生应用跑起来，逐个面板、逐个按钮手动点一遍，对着真实服务器确认
+「点了真的有反应」——并顺带挖出 5 个此前只靠单元测试看不出来的缺陷。
+
+#### 环境
+
+| 项 | 值 |
+|---|---|
+| 客户端 | macOS 上 `npm run tauri:dev` 起的 Tauri 2 原生应用（`target/debug/rshell`） |
+| 服务端 | multipass Ubuntu 24.04（`rshell-test`，`192.168.252.2`），OpenSSH 9.6p1 |
+| 认证 | 密码认证 + **外部私钥**（`~/.ssh/id_ed25519`）两条路径都走通 |
+| 被测连接 | `Key-auth-test`（外部私钥）、`multipass-linux`（默认组）、`multipass-linux`（GROUP2 组） |
+| 远端 / 本地测试目录 | `/home/ubuntu/rshell-e2e` / `/tmp/rshell-e2e` |
+
+#### 手动点击验收矩阵
+
+| 面板 / 功能 | 实际操作 | 观察到的结果 | 结论 |
+|---|---|---|---|
+| 新建连接 · 认证方式 | 依次点「密码 / 托管密钥 / 外部私钥 / 键盘交互」 | 四种都可选中（修复前整个 radio 组是惰性纯文本，只有密码可达） | 通过 |
+| 新建连接 · 外部私钥 | 路径选择器里双击 `~/.ssh` → 选中 `id_ed25519` → 打开 | 字段填入 `/Users/letmlook/.ssh/id_ed25519`；创建后后端 `SSH authentication successful`，终端出现真实登录横幅与 `ubuntu@rshell-test:~$` | 通过 |
+| 会话多开 | 「新开标签」 | 第二个标签 `multipass-linux #2` 是**独立 pty**（各有横幅与提示符），共享同一条 SSH 连接；左侧列表仍只有一条连接信息 | 通过 |
+| 名称唯一性 | 同组同名 / 跨组同名各建一条 | 同组同名被拒（`A session with the same name already exists in this folder`）；跨组同名通过并各自连上 | 通过 |
+| 传输 · 上传 | 选本地 `/tmp/rshell-e2e/local-src.txt` → 点 ↑ | 远端出现 34 B 的同名文件；后端 `Transfer completed strategy=PosixRename` | 通过 |
+| 传输 · 下载 | 选远端 `remote-src.txt` → 点 ↓ | 本地落地 13 B，内容 `remote-ready`；后端 `strategy=StandardRename` | 通过 |
+| 传输 · 队列 | 看「传输 (2)」标签 | 两条都「完成 100%」，并如实标出提交方式（原子 / 非原子） | 通过 |
+| 密钥 · 生成 | 名称 `e2e-ed25519` → 生成 | 私钥落盘（399 B，权限 600），列表显示指纹 `SHA256:h4bAW+zWP…` | 通过 |
+| 密钥 · 导出公钥 | 点「导出公钥」→ 复制 | 对话框可见并显示完整公钥；点「复制」后系统剪贴板里正是那 92 字节公钥 | 通过（修复后） |
+| 密钥 · 删除 | 点「删除」→ 确认 | 确认窗显示密钥名与「此操作无法撤销」；确认后私钥文件从磁盘移除 | 通过 |
+| 工具 · 快速命令 | 新建 `e2e-cmd`（作用域选「所有已连接会话」） | 三种作用域（当前会话 / 所有已连接会话 / 选定会话）都能选；列表出现该条 | 通过 |
+| 工具 · 触发器 | 新建触发器（匹配=正则，动作=显示通知） | 两种匹配 + 四种动作都可选；内容留空时点「添加」被明确拒绝（提示「动作内容不能为空」），填上后创建成功 | 通过 |
+| 工具 · 触发器（真实触发） | 终端里输出匹配文本 | 后端 `Trigger matched`；界面右上角弹出「触发器通知 / RSHELL_TRIGGER_FIRED」 | 通过（修复后） |
+| 工具 · 隧道 | 建 Local 隧道 `127.0.0.1:18080 → localhost:22` | 端口真的在监听（`lsof` 看到 `rshell … 127.0.0.1:18080 LISTEN`）；经该端口读到远端 `SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20` | 通过 |
+| 工具 · 撰写窗格 | 发送 `RSHELL_COMPOSE_OK` | 文本真的出现在远端终端；面板显示「已发送」 | 通过 |
+| 工具 · 脚本 | 运行默认 Rhai 脚本 | 后端 `Script executed successfully`，日志打出「会话数: 3」与 3 个会话 id；界面显示「执行完成」 | 通过 |
+| 工具 · 同步输入 | 打开面板 | 三个会话各自显示 connected / disconnected，开启 / 关闭按钮可用 | 通过 |
+| 设置 · 主题 | 切 Light 再切回 Dark | 整个界面配色实时跟随切换 | 通过 |
+| 设置 · 终端 | 逐项查看 | 配色方案、字号、光标形状、字体、回滚行数、光标闪烁、选中即复制、鼠标行为都在 | 通过 |
+| 设置 · 插件 / 安全 | 逐项查看 | 插件空状态渲染正常；主密码设置表单与主机密钥列表都在 | 通过 |
+
+#### 手动点击挖出的 5 个缺陷（单元测试发现不了）
+
+1. **本地路径选择器读不了任何含点目录的路径**（已单独提交 `ac4e800`）。
+   `tauri-plugin-fs` 在 Unix 上 `requireLiteralLeadingDot` 默认为 `true`，`allow:["**"]`
+   不匹配任何含点开头路径分量的路径：`readDir(主目录)` 成功，但逐条 `stat` 到 `~/.ssh`
+   被 scope 拒绝，异常上抛把**整个目录**报成「无权读取 /Users/letmlook」。
+   改为 `plugins.fs.requireLiteralLeadingDot=false`（`fs:deny-webview-data-*` 仍优先）。
+
+2. **`readDir` 不跟随符号链接 → `/tmp`、`/var`、`/etc`、`/home` 在目录模式下彻底消失**。
+   `read_dir` 用 `DirEntry::file_type()`（不跟随），`stat` 用 `fs::metadata()`（跟随）。
+   macOS 上 `/tmp` 是指向 `/private/tmp` 的符号链接，被报成「文件」，目录模式按
+   `isDirectory` 过滤后**用户在列表里根本选不到它**（真机实测：`/` 下只列出
+   `Applications/bin/cores/…`，唯独没有 `tmp`）。改为以 `stat` 的类型为准
+   （`src/utils/localFs.ts` 统一处理选择器、文件面板、目录树三处）。
+
+3. **侧栏里的 `el-dialog` 完全没有显示**。Element Plus 2.14 的 `el-dialog` 默认
+   `appendToBody=false`，对话框就地渲染在 `.side-panel-body`（`overflow:auto`）里，
+   而 `.side-panel` 是 `overflow:hidden`——对话框被裁掉。症状是：点「导出公钥」
+   **界面毫无反应**，但 DOM 里其实已经有公钥（AX 树能读到内容、截图里却什么都没有）。
+   改为给侧栏内的三个对话框（导出公钥 / 导入私钥 / 更新凭据）加 `append-to-body`。
+
+4. **所有 `ElMessage` / `ElNotification` 提示都落在视口之外**。
+   逐组件引入时只引了 `<el-xxx>` 标签对应的样式表，而以 **API 形式**调用的
+   `el-message.css` / `el-notification.css` 根本没被导入：没有 `position:fixed`，
+   提示变成追加到 `<body>` 末尾的普通块级元素，落到视口之外——「传输失败」
+   「同步输入失败」「触发器通知」这类**全局提示用户一条都看不到**。
+   补上两个样式表，并把「程序化 API 的样式表」纳入 `tests/unit/elementPlusContract.spec.ts`
+   的对账范围（此前只对账模板里的标签，看不见 API 形式调用）。
+
+5. **对已连接的会话再点一次「连接」，活连接被显示成「网络连接失败」并锁死终端输入**。
+   前端的连接状态由 `ConnectionStateChanged` **事件**驱动，而事件只发一次；
+   页面重载后前端丢了状态，会再发一次 `connect`——那时后端连接其实还活着。
+   旧实现在这里抛 `Invalid state: … is already connecting or connected`，前端把它
+   当成连接失败：界面挂出「网络连接失败」卡片、把会话标成 failed，
+   再按「锁态禁止输入」把**正在工作的终端输入**一起禁掉。
+   改为 `connect` 对已连接会话**幂等**：直接返回成功，并把真实状态重推一次给前端。
+
+#### 新增回归用例
+
+| 文件 | 用例 | 守住的是 |
+|---|---|---|
+| `tests/unit/LocalPathPicker.spec.ts` | 指向目录的符号链接在目录模式下照常列出 | 缺陷 2 |
+| `tests/unit/FileBrowserPane.spec.ts` | 本地列表按 `stat` 的类型把符号链接目录当作文件夹 | 缺陷 2 |
+| `tests/unit/PathBar.spec.ts` | 本地目录树把指向目录的符号链接也列进来 | 缺陷 2 |
+| `tests/unit/elementPlusContract.spec.ts` | 以 API 形式调用的每个 Element Plus 组件都有样式导入；没有零引用的 API 导出 | 缺陷 4 |
+| `tests/unit/KeyManagerPanel.spec.ts` | 对话框必须能在 `document.body` 里找到（teleport 后 `wrapper.find` 找不到） | 缺陷 3 |
+| `rshell-core/src/session/service.rs` | `connect_on_connected_session_is_idempotent_and_republishes_state` | 缺陷 5 |
+
+前四条都做了**反证**（把修复撤掉，用例必须失败）：
+撤掉 `stat` 类型判定 → 符号链接目录从列表消失；撤掉 `el-notification.css` 导入 →
+契约用例报「缺少 theme-chalk/el-notification.css 的样式导入」；撤掉后端幂等分支 →
+`connect on a connected session must succeed: InvalidState("Session … is already
+connecting or connected")`。
+
+#### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0，无告警 |
+| `cargo test --workspace` | exit 0，累计 **419** 用例通过、**0** 失败、9 忽略（真机用例） |
+| `npm run typecheck` | exit 0（`vue-tsc --noEmit`） |
+| `npm test` | Test Files **50 passed (50)**、Tests **450 passed (450)** |
+| `npm run build` | exit 0，最大 chunk 403 407 B（vendor-xterm） |
+| `npm run check:docs` | 通过（14 份现行文档） |
+| `npm run check:bundle` | 通过（10 个 JS chunk，均 ≤ 500 000 B） |
+| `npm run check:release` | 通过（版本 0.1.0） |
+| `npm run test:scripts` | **48** 项通过、0 失败 |
+
+#### 仍未验证
+
+- **客户端仍未在 Linux 上原生编译运行**：跑的是 macOS 编译出的二进制，服务端是 Linux。
+  协议层行为已由真实 Linux 服务端验证，但「代码在 Linux 上编译并运行」本身没有验证。
+- **物理串口**、**签名与公证**、**Windows** 仍未验证。
+- **Telnet 协议**：本轮没有再点一遍 telnet 连接（协议层行为已由上一节的真机用例覆盖，
+  但**界面上的 telnet 连接入口**没在真机上点过）。

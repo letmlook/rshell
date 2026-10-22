@@ -11,9 +11,32 @@ vi.mock("../../src/components/transfer/PathBar.vue", () => ({
   default: { name: "PathBar", props: ["mode", "path"], template: '<div class="path-bar-stub" />' },
 }));
 
+/**
+ * 条目名 → 是否目录。
+ *
+ * stat 与 readDir 的类型判定语义**不同**，桩必须还原这个差别，否则用例会把
+ * 两种语义混成一种：
+ *   - readDir 用 DirEntry::file_type()，**不跟随符号链接**（macOS 的 /tmp、
+ *     /var、/etc 都被报成文件）；
+ *   - stat 用 std::fs::metadata()，**跟随符号链接**（拿到真实类型）。
+ * 选择器现在以 stat 的结果为准，所以这里按条目名分别给出两种判定。
+ */
+const entryKinds = new Map<string, boolean>();
+
 /** 各返回一个元素的数组，便于 `[...dirEntry("a"), ...fileEntry("b")]` 拼列表 */
-const dirEntry = (name: string) => [{ name, isDirectory: true }] as never;
-const fileEntry = (name: string) => [{ name, isDirectory: false }] as never;
+const dirEntry = (name: string) => {
+  entryKinds.set(name, true);
+  return [{ name, isDirectory: true, isFile: false, isSymlink: false }] as never;
+};
+const fileEntry = (name: string) => {
+  entryKinds.set(name, false);
+  return [{ name, isDirectory: false, isFile: true, isSymlink: false }] as never;
+};
+/** 指向目录的符号链接：readDir 报「文件」，stat 报「目录」 */
+const symlinkToDirEntry = (name: string) => {
+  entryKinds.set(name, true);
+  return [{ name, isDirectory: false, isFile: false, isSymlink: true }] as never;
+};
 
 function info(over: Record<string, unknown> = {}) {
   return { size: 10, mtime: new Date(2026, 0, 2), ...over } as never;
@@ -36,7 +59,13 @@ describe("LocalPathPicker", () => {
     // resetAllMocks：连同上一次残留的 mockResolvedValueOnce 队列一起清掉，
     // 否则前一个用例没消费完的返回值会漏进下一个用例（表现为"行渲染不出来"）
     vi.resetAllMocks();
-    vi.mocked(stat).mockResolvedValue(info());
+    entryKinds.clear();
+    // stat 跟随符号链接：按条目名给出真实类型
+    vi.mocked(stat).mockImplementation((async (path: string) => {
+      const name = String(path).split(/[\\/]/).pop() ?? "";
+      const isDirectory = entryKinds.get(name) ?? false;
+      return info({ isDirectory, isFile: !isDirectory, isSymlink: false });
+    }) as never);
     vi.mocked(readDir).mockResolvedValue([] as never);
   });
 
@@ -110,6 +139,18 @@ describe("LocalPathPicker", () => {
 
     await wrapper.get('input[type="checkbox"]').setValue(true);
     expect(wrapper.text()).toContain(".git");
+  });
+
+  // 真机实测（macOS）：`/` 下只列出 Applications/bin/cores/…，唯独没有 `tmp`。
+  // 根因是 readDir 不跟随符号链接，/tmp→/private/tmp 被报成「文件」，
+  // 目录模式按 isDirectory 过滤 → 用户根本选不到 /tmp。
+  it("指向目录的符号链接在目录模式下照常列出（以 stat 的类型为准）", async () => {
+    vi.mocked(readDir).mockResolvedValue([...symlinkToDirEntry("tmp"), ...fileEntry("a.txt")] as never);
+    const wrapper = mountPicker();
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("tmp");
+    expect(wrapper.text()).not.toContain("a.txt");
   });
 });
 

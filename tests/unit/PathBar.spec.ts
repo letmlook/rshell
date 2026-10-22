@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import PathBar from "../../src/components/transfer/PathBar.vue";
 import { browseRemoteDir } from "../../src/ipc/client";
+import { readDir, stat } from "@tauri-apps/plugin-fs";
 
 vi.mock("../../src/ipc/client", () => ({ browseRemoteDir: vi.fn() }));
 // 本地模式的树用 readDir 列子目录；这里替身齐全以防组件走到本地分支
@@ -202,5 +203,29 @@ describe("PathBar 目录树下拉", () => {
     await flushPromises();
 
     expect(wrapper.get('[data-test="fs-path-tree"]').text()).toContain("SFTP unavailable");
+  });
+
+  // readDir 不跟随符号链接：macOS 的 /tmp、/var、/etc 会被报成「文件」，
+  // 目录树按 isDirectory 过滤 → 树里少了这一支，用户点不到。
+  it("本地目录树把指向目录的符号链接也列进来", async () => {
+    vi.mocked(readDir).mockResolvedValue([
+      { name: "tmp", isDirectory: false, isFile: false, isSymlink: true },
+    ] as never);
+    vi.mocked(stat).mockResolvedValue({
+      isDirectory: true,
+      isFile: false,
+      isSymlink: true,
+      size: 0,
+      mtime: null,
+    } as never);
+    const wrapper = mount(PathBar, {
+      props: { mode: "local", path: "/" },
+      global: { stubs },
+    });
+
+    await wrapper.get('[data-test="fs-path-tree-toggle"]').trigger("click");
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="fs-path-tree"]').text()).toContain("tmp");
   });
 });
