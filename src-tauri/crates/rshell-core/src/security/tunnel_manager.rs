@@ -436,20 +436,25 @@ impl TunnelManager {
 
         // 在 write guard 内做变更 + 取消 listener,之后立即释放 guard
         // (save_to_disk 内部会再 .read().await 拿 read guard)
-        let removed = {
+        let (removed, handle) = {
             let mut tunnels = self.tunnels.write().await;
             if let Some(mut tunnel) = tunnels.remove(&tunnel_id) {
-                if let Some(handle) = tunnel.listener_handle.take() {
-                    handle.abort();
-                }
                 // R3-02：广播取消，断掉已建立连接的中继。少了这一步，
                 // 「关闭隧道」只停 accept 循环，已连上的客户端仍继续访问。
                 let _ = tunnel.cancel.send(true);
-                true
+                (true, tunnel.listener_handle.take())
             } else {
-                false
+                (false, None)
             }
         };
+
+        // 等监听任务真正结束（socket 随之关闭）。同 suspend：abort 只是请求，
+        // 不等的话「关掉再在同一端口重建」会撞「Address already in use」。
+        // 锁外等待，避免与 accept 循环里的写锁互锁。
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         if removed {
             self.event_bus.publish(AppEvent::TunnelStateChanged {
@@ -486,7 +491,7 @@ impl TunnelManager {
     /// 仅对 Active 状态的隧道生效：Error（会话已断开）不可挂起，
     /// 重复挂起也返回错误，避免静默假成功。
     pub async fn suspend_tunnel(&self, tunnel_id: Uuid) -> Result<(), CoreError> {
-        {
+        let handle = {
             let mut tunnels = self.tunnels.write().await;
             let tunnel = tunnels
                 .get_mut(&tunnel_id)
@@ -497,14 +502,23 @@ impl TunnelManager {
                     tunnel_id, tunnel.state
                 )));
             }
-            // abort 监听任务即 drop 监听 socket：新连接从此被拒绝。
-            if let Some(handle) = tunnel.listener_handle.take() {
-                handle.abort();
-            }
             // R3-02：挂起同样必须断掉已建立连接的中继，否则挂起只是不再接受
             // 新连接，旧连接仍畅通——与 close 的语义要求一致。
             let _ = tunnel.cancel.send(true);
             tunnel.state = TunnelState::Suspended;
+            tunnel.listener_handle.take()
+        };
+
+        // abort 只是「**请求**取消」：监听任务要到下一次被 poll 才会真正结束，
+        // 而监听 socket 是**在那个任务里**持有的。不等它结束就返回的话，
+        // 紧接着的 `resume_tunnel` 重新 bind 同一端口会撞上
+        // 「Address already in use」——用户看到的就是「暂停后立刻恢复失败」。
+        //
+        // 必须在锁外等：accept 循环内部会取 `tunnels` 写锁更新连接计数，
+        // 持着写锁等它结束就是死锁。
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
         }
 
         self.event_bus.publish(AppEvent::TunnelStateChanged {
@@ -749,6 +763,7 @@ async fn deactivate_session_tunnels(
     deactivated_at: Instant,
 ) {
     let mut deactivated = Vec::new();
+    let mut handles = Vec::new();
     {
         let mut map = tunnels.write().await;
         for (tunnel_id, tunnel) in map.iter_mut() {
@@ -759,7 +774,7 @@ async fn deactivate_session_tunnels(
                 continue;
             }
             if let Some(handle) = tunnel.listener_handle.take() {
-                handle.abort();
+                handles.push(handle);
             }
             // R3-02：会话断开后同样要断掉已建立连接的中继。SSH 连接已死，
             // 留着这些连接只是让它们逐条报错，不该继续算作可用转发。
@@ -767,6 +782,12 @@ async fn deactivate_session_tunnels(
             tunnel.state = TunnelState::Error(SESSION_DISCONNECTED_REASON.into());
             deactivated.push(*tunnel_id);
         }
+    }
+    // 等监听任务真正结束（socket 随之关闭），见 suspend_tunnel 的同款说明。
+    // 锁外等待：accept 循环会取同一张表的写锁。
+    for handle in handles {
+        handle.abort();
+        let _ = handle.await;
     }
     if deactivated.is_empty() {
         return;

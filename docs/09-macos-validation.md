@@ -709,3 +709,129 @@ connecting or connected")`。
 - **物理串口**、**签名与公证**、**Windows** 仍未验证。
 - **Telnet 协议**：本轮没有再点一遍 telnet 连接（协议层行为已由上一节的真机用例覆盖，
   但**界面上的 telnet 连接入口**没在真机上点过）。
+
+### 2026-10-22：CommandDispatcher 级真机端到端验收（macOS 客户端 + multipass Linux 真机）
+
+#### 为什么从「手动点击」换成「命令级」验收
+
+macOS 处于锁屏状态时，AX 层对**所有**应用都不可用，不只是 RShell：
+
+- `computer_desktop_state` 只有壁纸，**无 Dock、无菜单栏**；
+- `computer_app_state` 对 RShell 的窗口和新启动的 TextEdit 一律返回
+  `ax_window_unresolved`（elements=0）；
+- `computer_window_set_frame` 报「window_id … belongs to pid … in WindowServer but
+  has no matching AXWindow」；
+- 应用本身是健康的：后端持续收到 `ListSessions` / `ListFolders` 派发。
+
+也就是说，**手动点击这条路在解锁前走不通**（解锁需要用户的 Touch ID / 密码，
+不得猜测凭据）。于是改走另一条等价的路：界面上的每个可见操作最终都落到
+`CommandDispatcher::dispatch(AppCommand)`，前端与后端之间**没有第二条路径**；
+直接驱动同一个入口，在**真实 multipass 实例**上验证界面对应的后端行为 ——
+等价性由「同一个入口」保证，真实性由「真的 sshd / telnetd / OpenSSH 端口转发」保证。
+
+用例落在 `src-tauri/crates/rshell-core/tests/real_machine.rs`（集成测试，只用公开 API），
+全部 `#[ignore]` + `RSHELL_REAL_*` 环境变量门控，与 `crates/rshell-protocol/tests/sftp_bench.rs`
+同一范式，不进 CI。
+
+#### 测试台怎么保证「与界面同构」
+
+| 装配项 | 做法 |
+|---|---|
+| 服务装配 | 按 `src-tauri/src/lib.rs` 的 `setup` 顺序逐个构造 `Services`（12 个服务） |
+| 数据目录 | 把 `$HOME` 指向临时目录 → `dirs::data_local_dir()/rshell` 落在隔离区，**不污染**用户真实数据目录（正在跑的 dev app 也在用那个目录） |
+| known_hosts | 用应用自己的 `data_local_dir()/rshell/known_hosts`——**必须**与 `rshell-protocol` 的 `build_known_hosts_paths` 读的是同一个文件，否则「永久信任」写进去客户端根本看不到 |
+| 凭据存储 | 测试内实现 `CredentialStore`（内存版），不碰系统钥匙串 |
+| 主机密钥 | 默认挂一个自动应答任务（等价于用户在弹窗点「始终信任」），主机密钥用例单独关掉它、自己走完决策链 |
+| 并发 | 同一进程内用 `tokio::sync::Mutex` 串行化（共享 known_hosts，并行会互相干扰） |
+
+#### 10 条用例（全部在真实 multipass 实例上通过）
+
+| 用例 | 验的是 | 关键断言 |
+|---|---|---|
+| `real_ssh_session_runs_commands_and_browses_remote` | SSH 连接 / 命令往返 / 远端目录 | `echo` 真的回显；`BrowseRemoteDir` 条目非空；`GetRemoteHomeDir` 是绝对路径；对已连接会话再 `connect` 幂等成功 |
+| `real_telnet_session_logs_in_and_runs_commands` | Telnet 完整登录 | 等到 `login:` → 发用户名 → 等到 `assword:` → 发口令 → 等到 shell 提示符 → 命令真的回显 |
+| `real_unknown_host_key_requires_decision_and_permanent_trust_persists` | 未知主机决策链 | 拒绝 → 连接失败且 known_hosts **无**条目；永久信任 → 连接成功且**落盘**；第三次连接**不再**要求决策；`ListHostKeys` 看得见、`DeleteHostKey` 删得掉 |
+| `real_trigger_executes_all_four_action_kinds` | 触发器四种动作 | 发送文本真的到远端；通知摘要为 `notify: …`；写文件真的落盘；断开后会话变 `Disconnected`；`ToggleTrigger` / `DeleteTrigger` 生效 |
+| `real_local_and_dynamic_tunnels_forward_real_traffic` | 隧道 Local + Dynamic | Local 端口真的转到 sshd（读到 `SSH-2.0-OpenSSH…`）；Dynamic 的 SOCKS5 握手 + CONNECT 真的转到 sshd；暂停/恢复/关闭的状态流转 |
+| `real_quick_command_script_and_key_lifecycle` | 快速命令 / Rhai 脚本 / 密钥 | 快速命令文本真的到远端；脚本 `rshell_list_sessions()` 回传「会话数: N」；密钥生成→列表→导出公钥→删除 |
+| `real_multi_tab_ptys_are_independent_and_names_unique_per_folder` | 会话多开 + 名称规则 | 两个标签的输出**互不串台**；关掉一个另一个照常工作；同组同名被拒、跨组同名放行 |
+| `real_master_password_setup_lock_unlock_and_rotate` | 主密码全流程 | `NotSet → Unlocked → Locked`；错口令不解锁；对口令解锁；改密后新口令可用、旧口令失效；停用后回到 `NotSet` |
+| `real_transfer_uploads_downloads_and_reports_conflict` | 上传 / 下载 / 冲突策略 | 上传完成且远端有文件；同名 `Fail` 策略**被拒**且**远端内容没被改**；`Overwrite` 覆盖成功；`Rename` 另存新文件且原文件保留；下载内容一致 |
+| `real_folders_sync_input_compose_and_themes` | 分组 / 同步输入 / 撰写窗格 / 主题 | 删分组后组内连接回到默认组（连接不丢）；同步输入把字节送到了另一个会话；撰写窗格文本到达会话；导入的配色方案**落盘** |
+
+#### 本轮挖出并修掉的产品缺陷：隧道「暂停 → 恢复」必失败
+
+真机用例第一次跑就撞上：
+
+```
+恢复隧道失败: Internal("Failed to bind 127.0.0.1:61061: Address already in use (os error 48)")
+```
+
+**根因**：`suspend_tunnel` 只调用了 `JoinHandle::abort()`。`abort()` 是「**请求**取消」——
+监听任务要到下一次被 poll 才会真正结束，而**监听 socket 是在那个任务里持有的**。
+`suspend_tunnel` 立刻返回、`resume_tunnel` 紧接着重新 bind 同一端口，socket 还没被
+释放 → 必然 `Address already in use`。用户点「暂停」再点「恢复」就会看到这条错误。
+
+**修法**（`rshell-core/src/security/tunnel_manager.rs`）：`abort()` 之后**等一次
+`JoinHandle`**，保证监听任务真的结束、socket 真的关闭，再返回。
+
+等句柄这一步必须在**锁外**做：accept 循环内部会取 `tunnels` 写锁更新连接计数，
+持着写锁等它结束就是死锁。因此 `suspend_tunnel` / `close_tunnel` /
+`deactivate_session_tunnels` 三处都改成「锁内取出句柄 → 锁外 abort + await」。
+
+**反证**：把 `suspend_tunnel` 的 `let _ = handle.await;` 撤掉后重跑隧道用例，
+用例以**同样的错误**失败（`Failed to bind 127.0.0.1:61061: Address already in use`）；
+恢复修复后 10 条用例全绿。
+
+#### 过程中被用例纠正的三个「我自己写错了」的地方
+
+| 我一开始写的 | 实际契约 | 依据 |
+|---|---|---|
+| `ToggleSyncInput` 再传一次同一组会话来关闭 | 该命令实为「**设置**同步组」，关闭要传**空数组** | `src/ipc/client.ts` 与 `SyncInputPanel.vue` 的 `disable()` 都是传 `[]` |
+| 脚本里用 `sessions` 变量 | 脚本 API 是函数 `rshell_list_sessions()` | `rshell-core/src/script/engine.rs` 注册的函数表 |
+| SOCKS5 只读十字节应答 | 还要先读**两字节**方法选择应答 | `rshell-core/src/security/tunnel_manager.rs::socks5_handshake` |
+
+另外发现一条**刻意限制**：应用侧的 `DeleteRemoteEntry` 只允许删远端**普通文件**，
+删目录会被拒（`Only regular remote files can be deleted`）——这是防误删整棵树的
+安全设计，不是缺陷。测试目录的清理由用例用 `ssh` 收尾（与仓库既有真机用例同款）。
+
+#### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0，无告警 |
+| `cargo test --workspace` | exit 0，累计 **419** 通过、**0** 失败、**19** 忽略（其中 **10** 条是本轮新增的真机用例） |
+| 真机用例（本轮新增，`--ignored --test-threads=1`） | **10 passed / 0 failed**，3.6 s |
+| `npm run typecheck` | exit 0（`vue-tsc --noEmit`） |
+| `npm test` | Test Files **50 passed (50)**、Tests **450 passed (450)** |
+| `npm run build` | exit 0，最大 chunk 403 407 B（vendor-xterm） |
+| `npm run check:docs` | 通过（14 份现行文档） |
+| `npm run check:bundle` | 通过（10 个 JS chunk，均 ≤ 500 000 B） |
+| `npm run check:release` | 通过（版本 0.1.0） |
+| `npm run test:scripts` | **48** 项通过、0 失败 |
+
+真机用例的运行方式：
+
+```bash
+cd src-tauri
+RSHELL_REAL_HOST=192.168.252.2 \
+RSHELL_REAL_SSH_PORT=22 \
+RSHELL_REAL_TELNET_PORT=2323 \
+RSHELL_REAL_USER=ubuntu \
+RSHELL_REAL_PASS=… \
+RSHELL_REAL_KEY=~/.ssh/id_ed25519 \
+RSHELL_REAL_PATH=/home/ubuntu \
+cargo test -p rshell-core --test real_machine -- --ignored --test-threads=1
+```
+
+#### 仍未验证
+
+- **界面上的手动点击仍未补齐**：锁屏解除前，Telnet 连接入口、主机密钥未知主机的
+  弹窗操作、会话列表右键菜单、应用菜单栏、终端查找/清屏、传输右键菜单与拖拽、
+  触发器通知的**界面呈现**、快速命令热键、同步输入面板的**界面交互**、
+  主密码设置→锁定→解锁的**界面流程**、隧道 Dynamic 的**界面配置**、
+  配色导入导出、编辑已有连接等入口没在真机界面上点过。
+  本轮验证的是它们**背后的后端行为**（同一个命令入口），不等于界面呈现已验收。
+- **客户端仍未在 Linux 上原生编译运行**：跑的是 macOS 编译出的二进制，服务端是 Linux。
+- **物理串口**、**签名与公证**、**Windows** 仍未验证。
