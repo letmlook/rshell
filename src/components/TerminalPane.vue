@@ -23,12 +23,13 @@
  * onContextLoss:WebGL addon 在某些环境下会触发 context loss,自动 fallback 到 canvas
  * (设计 §9 #3 + 切片 1.3 完成判据)。
  */
-import { computed, onMounted, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from "vue";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { SearchAddon } from "@xterm/addon-search";
+import type { ISearchDecorationOptions } from "@xterm/addon-search";
 import { Channel } from "@tauri-apps/api/core";
 import { invoke } from "@tauri-apps/api/core";
 import { ElMessage } from "element-plus/es/components/message/index.mjs";
@@ -64,6 +65,13 @@ const props = withDefaults(
 const containerRef = ref<HTMLDivElement | null>(null);
 const searchBarVisible = ref(false);
 const searchTerm = ref("");
+/**
+ * 查找输入框。
+ *
+ * 打开查找栏时**必须**把焦点挪到这个输入框：否则焦点还留在终端里，
+ * 用户接着打的字会**被送进远端 shell**（能执行远端命令），搜索框却是空的。
+ */
+const searchInputRef = ref<{ focus?: () => void } | null>(null);
 /** 匹配计数：当前第几个 / 共几个（-1 = 超过阈值无法定位） */
 const searchIndex = ref(-1);
 const searchCount = ref(0);
@@ -145,7 +153,7 @@ const isDropped = computed(() => everConnected.value && props.connectionState !=
 
 /** 断线提示条用；连接状态的常驻展示在窗口底部 StatusBar，这里不重复占位 */
 const droppedLabel = computed(() =>
-  props.connectionState === "connecting" ? "重新连接中" : "已断开",
+  props.connectionState === "connecting" ? "正在重新连接" : "已断开",
 );
 
 /** 真实重连:走 sessions store 的 connect（后端握手 + 事件广播），失败如实提示 */
@@ -327,23 +335,94 @@ function onTerminalTheme(event: Event) {
   if (term) term.options.theme = (event as CustomEvent<ITheme>).detail;
 }
 
+/**
+ * 查找高亮配色。
+ *
+ * **必须**把它作为 `decorations` 传给 SearchAddon：xterm 的
+ * `onDidChangeResults` **只在传了 decorations 时才触发**（addon 的
+ * `_fireResults` 第一行就是 `if (options?.decorations)`）。
+ * 不传的话 `searchCount` 永远是 0，查找栏会一直显示「无匹配」——
+ * 哪怕目标文本就在眼前、也确实被选中并跳转了（用户看着像"能找到"，
+ * 计数却在说没有）。顺带也拿不到「全部匹配高亮」。
+ *
+ * 深色终端用暗金高亮，浅色终端用亮金，否则文字会糊在背景里。
+ */
+function searchDecorations(): ISearchDecorationOptions {
+  const background = term?.options.theme?.background ?? "#1e1e2e";
+  const r = parseInt(background.slice(1, 3), 16) || 0;
+  const g = parseInt(background.slice(3, 5), 16) || 0;
+  const b = parseInt(background.slice(5, 7), 16) || 0;
+  const light = (r * 299 + g * 587 + b * 114) / 1000 > 128;
+  return light
+    ? {
+        matchBackground: "#ffe28a",
+        matchBorder: "#d9a800",
+        matchOverviewRuler: "#d9a800",
+        activeMatchBackground: "#ffb300",
+        activeMatchBorder: "#a87900",
+        activeMatchColorOverviewRuler: "#a87900",
+      }
+    : {
+        matchBackground: "#5c4b00",
+        matchBorder: "#8a6d00",
+        matchOverviewRuler: "#8a6d00",
+        activeMatchBackground: "#b58900",
+        activeMatchBorder: "#ffb300",
+        activeMatchColorOverviewRuler: "#ffb300",
+      };
+}
+
 function findNext() {
   if (search && searchTerm.value) {
-    search.findNext(searchTerm.value, { caseSensitive: searchCaseSensitive.value });
+    search.findNext(searchTerm.value, {
+      caseSensitive: searchCaseSensitive.value,
+      decorations: searchDecorations(),
+    });
   }
 }
 
 function findPrev() {
   if (search && searchTerm.value) {
-    search.findPrevious(searchTerm.value, { caseSensitive: searchCaseSensitive.value });
+    search.findPrevious(searchTerm.value, {
+      caseSensitive: searchCaseSensitive.value,
+      decorations: searchDecorations(),
+    });
   }
 }
+
+// 输入即搜：否则用户打完字看到的还是「—」，必须按回车才知道有没有命中。
+watch(searchTerm, (value) => {
+  if (!value) {
+    search?.clearDecorations();
+    searchIndex.value = -1;
+    searchCount.value = 0;
+    return;
+  }
+  findNext();
+});
+
+// 切换「区分大小写」后要重新搜一遍，否则计数与命中停留在旧规则上。
+watch(searchCaseSensitive, () => {
+  if (searchTerm.value) findNext();
+});
 
 function closeSearch() {
   searchBarVisible.value = false;
   if (search) search.clearDecorations();
   searchIndex.value = -1;
   searchCount.value = 0;
+}
+
+/**
+ * 打开查找栏并把焦点交给输入框。
+ *
+ * 焦点必须跟着走：查找栏是覆盖在终端上的，焦点若留在终端，用户接着打的
+ * 字符会被送进**远端 shell**（等于盲敲远端命令），搜索框却一个字都没有。
+ */
+async function openSearchBar() {
+  searchBarVisible.value = true;
+  await nextTick();
+  searchInputRef.value?.focus?.();
 }
 
 /**
@@ -388,7 +467,7 @@ function onTerminalAction(event: Event) {
   // R2-13：window 级快捷键（Ctrl+F/Escape）由 App.vue 统一拦截后经本事件
   // 路由到当前激活终端；这里按 sessionId 过滤，非激活面板不响应。
   if (detail.sessionId !== props.sessionId) return;
-  if (detail.action === "find") searchBarVisible.value = true;
+  if (detail.action === "find") void openSearchBar();
   if (detail.action === "clear") term?.clear();
   if (detail.action === "closeFind") closeSearch();
   if (detail.action === "copy") void copySelection();
@@ -552,6 +631,10 @@ onMounted(async () => {
     cursorBlink: appearance.cursorBlink,
     scrollback: appearance.scrollback,
     theme: themeStore.terminalTheme ?? readXtermThemeFromCssVars(),
+    // 查找高亮要用 SearchAddon 的 `decorations` 选项，而它属于 xterm 的
+    // **proposed API**：不开这个开关，带 decorations 的 findNext 会直接抛
+    // 「You must set the allowProposedApi option to true」——查找整个报错。
+    allowProposedApi: true,
   });
   // 未连接时先禁输入，等真实 connected 事件再放开
   term.options.disableStdin = !isConnected.value;
@@ -749,7 +832,7 @@ onBeforeUnmount(() => {
     <!-- 断开/连接中的状态条：状态取自后端 ConnectionStateChanged，不是本地猜测 -->
     <div v-else-if="isDropped" class="terminal-dropped-bar" role="status" data-test="term-dropped">
       <span class="rs-status-dot rs-status-dot--failed" aria-hidden="true" />
-      <span class="dropped-text">会话已{{ droppedLabel }}，输入已暂停。重新连接后可继续键入。</span>
+      <span class="dropped-text">会话{{ droppedLabel }}，输入已暂停。重新连接后可继续键入。</span>
       <el-button
         size="small"
         type="primary"
@@ -775,6 +858,7 @@ onBeforeUnmount(() => {
     <!-- 切片 2.4 搜索栏（默认隐藏） -->
     <div v-if="searchBarVisible" class="search-bar" :class="{ 'is-offset': isDropped || connectionState === 'connecting' }">
       <el-input
+        ref="searchInputRef"
         v-model="searchTerm"
         size="small"
         placeholder="搜索终端内容"

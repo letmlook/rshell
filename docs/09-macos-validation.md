@@ -835,3 +835,91 @@ cargo test -p rshell-core --test real_machine -- --ignored --test-threads=1
   本轮验证的是它们**背后的后端行为**（同一个命令入口），不等于界面呈现已验收。
 - **客户端仍未在 Linux 上原生编译运行**：跑的是 macOS 编译出的二进制，服务端是 Linux。
 - **物理串口**、**签名与公证**、**Windows** 仍未验证。
+
+### 2026-10-23：解锁后继续的界面手动点击验收（macOS 原生应用 + multipass Linux 真机）
+
+上一节结束时 macOS 处于锁屏，AX 层对所有应用都不可用；解锁后继续逐项点击。
+
+#### 本轮在界面上跑通的功能
+
+| 功能 | 验证结果 |
+|---|---|
+| **Telnet 连接入口** | 新建连接 → 协议选 `Telnet` → 主机 `192.168.252.2` / 端口 `2323` → 连接：**真实 telnetd** 的登录横幅（`Linux 6.8.0-147-generic (rshell-test) (pts/0)` + `rshell-test login:`）→ 用户名 → `Password:` → 登录成功拿到 `ubuntu@rshell-test:~$` → `echo RSHELL_GUI_TELNET_OK_42` **真的回显** |
+| **四种认证方式** | 新建连接弹窗里 密码 / 托管密钥 / 外部私钥 / 键盘交互 四个单选项都可选中、都会切换对应表单（选 Telnet 协议时用户名与认证整块隐藏——登录是带内交互） |
+| **查找栏** | 工具栏「查找」打开搜索栏（搜索框 + 上/下 + 匹配计数 + 区分大小写 + 关闭），搜 `RSHELL` → 计数显示 **`1/4`**，4 处匹配**全部高亮**，当前匹配橙色描边 |
+| **会话列表右键菜单** | 右键连接行弹出应用自己的菜单（**9 项**：连接 / 断开 / 更新凭据 / 打开 SFTP / 打开标签 / 新开标签 / 编辑连接 / 复制连接信息 / 删除连接）。不是浏览器的默认菜单 |
+| **删除连接的确认** | 点「删除连接」→ 弹窗「确定删除连接「ubuntu@localhost」吗？此操作不可撤销。」并**限定了目标**（`localhost:22`），确认后才真删 |
+| **断线后的界面表现** | telnetd 登录超时断开后：终端上方出现状态条 + 「重新连接」按钮，状态栏回到「未连接」，输入被禁用（符合「不得静默成功」） |
+
+#### 本轮在界面上挖出并修掉的 4 个缺陷
+
+1. **查找栏的匹配计数恒为「无匹配」**——目标文本就在眼前、也确实被选中并跳转了，
+   计数却在说没有。
+   **根因**：`@xterm/addon-search` 的 `onDidChangeResults` **只在传了 `decorations`
+   选项时才会触发**（addon 内部 `_fireResults` 的第一行就是 `if (options?.decorations)`）。
+   应用此前调用 `search.findNext(term, { caseSensitive })` 没传 `decorations`，
+   计数事件永不触发 → `searchCount` 恒为 0 → 界面永远显示「无匹配」。
+   **修法**：查找时传 `decorations`（配色按终端背景亮度选深色/浅色两套，避免文字糊在背景里）。
+
+2. **`decorations` 是 xterm 的 proposed API，不开开关会让查找整个报错**。
+   终端此前用 `new Terminal({...})` 构造、没开 `allowProposedApi`，带 `decorations`
+   的 `findNext` 会直接抛
+   `You must set the allowProposedApi option to true to use proposed API`。
+   **修法**：构造 Terminal 时加 `allowProposedApi: true`。
+   （这是第 1 条修复的必要配套：只传 `decorations` 而不开开关，查找会从「计数不对」变成「直接报错」。）
+
+3. **查找栏打开后输入框没有焦点**——焦点还留在终端里，用户接着打的字会被
+   **送进远端 shell**（等于盲敲远端命令），搜索框却一个字都没有。
+   **修法**：打开查找栏后 `nextTick` + `searchInputRef.focus()`。
+
+4. **断线提示条文案叠字**：`会话已{{ droppedLabel }}` 而 `droppedLabel` 本身就是
+   「已断开」→ 界面显示「**会话已已断开**，输入已暂停」。
+   **修法**：`droppedLabel` 改为「已断开 / 正在重新连接」，模板去掉多余的「已」。
+
+#### 新增回归用例
+
+| 文件 | 用例 | 守住的是 |
+|---|---|---|
+| `tests/unit/xtermSearchAddon.spec.ts` | 用**真实的 xterm + 真实 addon**（不是 mock）断言：不传 `decorations` 不触发计数事件；传了则 `resultCount` 为真实命中数（2）；终端没开 `allowProposedApi` 时带 `decorations` 的查找会抛异常 | 缺陷 1、2 |
+| `tests/unit/TerminalSearch.spec.ts` | 查找必须传 `decorations`（替身照抄真实语义：只在有 decorations 时才触发计数事件）；「上」按钮同样传；清空关键词后计数归零；构造 Terminal 必须带 `allowProposedApi`；打开查找栏必须把焦点交给输入框；断线提示不得出现「已已」 | 缺陷 1、2、3、4 |
+
+**全部做了反证**：撤掉 `decorations` → 3 条计数用例失败（计数停在「无匹配」）；
+撤掉 `focus()` → 焦点用例失败；撤掉 `allowProposedApi` → 真实依赖用例报
+「必须设置 allowProposedApi」。
+
+#### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `npx vitest run tests/unit/TerminalSearch.spec.ts tests/unit/xtermSearchAddon.spec.ts` | 2 文件 / **9** 用例通过 |
+| `npm test` | Test Files **51 passed (51)**、Tests **455 passed (455)** |
+| `npm run typecheck` | exit 0（`vue-tsc --noEmit`） |
+
+#### 仍未验证
+
+- **主机密钥「未知主机」确认弹窗（界面层）**：要让一台主机变成"未知"，需要一个
+  不在任何 known_hosts 里的 `host:port`。本机 22 端口需要 root 才能做端口转发，
+  改用 `127.0.0.1:2222` 转发就得改端口字段，而 `el-input-number` 的端口框在自动化
+  下难以可靠改值（本轮实测：CGEvent 退格与粘贴都不触发 Vue 的 v-model 同步）。
+  **后端决策链已由真机用例覆盖**（拒绝→连接失败且不落盘 / 永久信任→落盘 /
+  已信任→不再询问 / 列表 / 删除），未覆盖的只是这个弹窗的**界面交互**。
+- 隧道 Dynamic 的**界面配置**、传输面板右键菜单与拖拽、同步输入面板的界面交互、
+  主密码的界面流程、配色导入导出、应用菜单栏（连接/视图/工具）——本轮未点。
+- **客户端仍未在 Linux 上原生编译运行**；物理串口、签名与公证、Windows 未验证。
+
+#### 本轮摸清的 macOS 自动化配方（省下大量试错）
+
+- **往 xterm 送键的可靠入口是 AX 树里的 `Terminal input` textarea**
+  （xterm 的 helper textarea）：对它用 `computer_type` 能稳定触发
+  `SendInput`；直接用 CGEvent 往终端画布打字则常常丢失。
+- **Element Plus 的 `el-input` 用 CGEvent 打字常常不触发 `input` 事件**
+  （DOM 值变了、Vue 的 v-model 没变）；**原生「编辑→粘贴」菜单路径**
+  （`computer_secondary_action(["Edit","Paste"]`）更可靠，但粘贴会**追加**而不是替换，
+  替换要先选中。
+- **端口输入框（`el-input-number`）要先 `cmd+a` 再按退格**才能清空重打；
+  单纯 `cmd+a` + 直接打字会变成「22」+「2323」= `222323`。
+- **右键菜单要用前台像素右键**（`delivery_mode: "foreground"` + `button: "right"`）；
+  背景像素点击被 0.22.1 策略拒绝。
+- **telnetd 的登录窗口只有 60 秒**：自动化每次工具往返约 20 秒，
+  用户名和口令要**一次调用**发出去才赶得上（应用侧行为正确：日志显示断开点
+  正好是连接后 60.0 秒，是服务端超时，不是应用自己断的）。
