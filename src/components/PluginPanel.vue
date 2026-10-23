@@ -92,7 +92,7 @@ onMounted(scan);
     </p>
     <p v-if="error" class="error">{{ error }}</p>
 
-    <el-empty v-if="items.length === 0" description="暂未发现插件" />
+    <el-empty v-if="items.length === 0" description="暂未发现插件" :image-size="60" />
     <el-table v-else :data="items" stripe size="small">
       <el-table-column prop="id" label="Plugin ID" />
       <el-table-column prop="name" label="名称" />

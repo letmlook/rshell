@@ -205,7 +205,7 @@ onBeforeUnmount(() => { active = false; unlisten?.(); unlisten = null; });
       />
       <el-button type="primary" @click="create">添加</el-button>
     </div>
-    <el-empty v-if="items.length === 0" description="暂无快速命令" />
+    <el-empty v-if="items.length === 0" description="暂无快速命令" :image-size="60" />
     <div v-else class="groups" data-test="quick-command-groups">
       <section v-for="group in groups" :key="group.label" class="group">
         <h4 v-if="group.label !== '未分组'">{{ group.label }}</h4>

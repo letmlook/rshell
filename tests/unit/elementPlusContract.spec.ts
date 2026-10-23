@@ -148,6 +148,23 @@ function usedApiComponents(): Set<string> {
   return used;
 }
 
+/**
+ * 模板里每个 `<el-empty ...>` 标签的原文。
+ *
+ * 逐个标签而不是逐个文件：`el-empty` 的 `image-size` 是**每个标签自己**的属性，
+ * 同一文件里可能有多处用法。
+ */
+function emptyTags(): { file: string; tag: string }[] {
+  const out: { file: string; tag: string }[] = [];
+  for (const file of walkSources("src")) {
+    const body = readFileSync(file, "utf8");
+    for (const m of body.matchAll(/<el-empty\b[\s\S]*?>/g)) {
+      out.push({ file, tag: m[0] });
+    }
+  }
+  return out;
+}
+
 describe("Element Plus 接入契约", () => {
   const registrationSource = readFileSync("src/element-plus.ts", "utf8");
   const styleSource = readFileSync("src/styles/element-plus.css", "utf8");
@@ -257,5 +274,14 @@ describe("Element Plus 接入契约", () => {
     const withoutStyle = registered.filter((n) => !styleFor(n));
     // 例外：样式表是空文件、仓库明确不引入的组件
     expect(withoutStyle.filter((n) => STYLE_EXEMPT[kebab(n)] === undefined)).toEqual([]);
+  });
+  // el-empty 的默认插图是**硬编码的浅色**（#f5f7fa 等），本应用界面恒为深色
+  // （设置里的主题切换只作用于终端配色），默认尺寸下每个空状态都是一大块
+  // 刺眼的白。必须显式缩小；全局样式里另有 .el-empty__image 的压暗规则。
+  it("每个 el-empty 都显式指定 image-size（默认插图在深色界面里是一大块白）", () => {
+    const missing = emptyTags()
+      .filter(({ tag }) => !/image-size\s*=/.test(tag))
+      .map(({ file, tag }) => `${file}: ${tag.replace(/\s+/g, " ")}`);
+    expect(missing).toEqual([]);
   });
 });

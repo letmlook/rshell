@@ -1068,3 +1068,35 @@ Key-auth-test   ID 884af187-8258-43b7-8ee…
 **反证**：把两处修复都撤掉后，`TunnelPanel.spec.ts` + `FileBrowserPane.spec.ts`
 共 **8 条**用例失败（列表化那条、中文文案两条，以及依赖旧表格结构的旧断言）；
 恢复修复后 28 条全绿。
+
+### 2026-10-23：再修一个视觉缺陷（空状态插图是一大块白）
+
+点开菜单时看到工具面板的空状态里是一大块**刺眼的白图**（Element Plus `el-empty`
+的默认插图）。
+
+**根因**：`el-empty` 的默认插图是**硬编码的浅色**（`#f5f7fa` / `#c0c4cc`），
+而本应用的界面**恒为深色** —— 设置里的「主题 Light/Dark」只切换**终端配色**
+（`--rs-*` token 由终端调色板驱动），不改界面底色。于是每个空状态都是一块大白图
+（工具面板「暂无隧道」最明显）。
+
+**修法**（两处）：
+1. `src/styles/global.css` 加一条全局规则 `.el-empty__image { opacity: 0.22; }`
+   —— 插图退回背景、只留下文案，**一处覆盖所有 el-empty**（包括以后新增的）。
+2. 给 `TunnelPanel` / `QuickCommandPanel` / `PluginPanel` 三处补 `:image-size="60"`
+   —— `HostKeyPanel` / `SyncInputPanel` 早就是 60，这三处漏了。
+
+**回归用例**：`tests/unit/elementPlusContract.spec.ts` 新增
+「每个 el-empty 都显式指定 image-size（默认插图在深色界面里是一大块白）」
+—— 逐个 `<el-empty ...>` 标签扫描 `src/`，缺 `image-size` 就报错，防止以后再漏。
+
+**真机复验**：隧道面板空状态现在是 60px、22% 不透明度的淡灰小图。
+
+**反证**：去掉 `PluginPanel` 的 `:image-size="60"` → 契约用例失败；恢复后全绿。
+
+#### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `npx vitest run` | Test Files **52 passed (52)**、Tests **463 passed (463)** |
+| `npm run typecheck` / `npm run build` / `npm run check:docs` / `npm run check:bundle` / `npm run check:release` | 均通过 |
+| `npm run test:scripts` | **48** 项通过、0 失败 |

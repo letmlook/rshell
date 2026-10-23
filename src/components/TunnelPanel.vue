@@ -361,7 +361,7 @@ onBeforeUnmount(() => {
       </ul>
     </section>
 
-    <el-empty v-if="items.length === 0" description="暂无隧道" />
+    <el-empty v-if="items.length === 0" description="暂无隧道" :image-size="60" />
     <!--
       隧道列表用卡片而不是表格。
 
