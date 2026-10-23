@@ -999,3 +999,72 @@ cargo test -p rshell-core --test real_machine -- --ignored --test-threads=1
    监听地址就是靠它改对的），或**原生「编辑→粘贴」菜单路径**。
 2. **AX 的元素索引会漂移**：同一轮里 `监听` 字段的 token 有时写到 `目标` 字段去。
    规律是「**写完立刻核对，必要时重写**」，不能一次写两个字段就假定都对了。
+
+### 2026-10-23：修掉两个界面缺陷（隧道操作列被裁 / 目录错误只有英文）
+
+上一节验收时撞到两个**真实界面缺陷**，本轮修掉并都做了反证。
+
+#### 缺陷 1：隧道「挂起 / 恢复 / 关闭」按钮在默认侧栏宽度下点不到
+
+**现象**：隧道列表用 `el-table` 渲染，三列固定宽度合计
+`Tunnel ID 120 + 状态 min-width 120 + 操作 190 = 430px`，而**默认侧栏只有 280px**
+（`DEFAULT_SIDEBAR_WIDTH`，最大 360px）。「操作」列被裁在视口外，用户必须先发现
+表格底部的横向滚动条才点得到操作按钮——真机验收时就是这样才用
+`computer_scroll(direction="right")` 横向滚动表格才点到的。
+
+**修法**：把隧道列表从表格改成**卡片列表**（`ul/li`），每条隧道一张卡：
+状态 + 规则（`Local 127.0.0.1:18081 → localhost:22`，比原来的 Tunnel ID 对用户有用）
++ 三个操作按钮 + 会话名/ID。卡片不依赖列宽，窄侧栏下三个按钮仍然一行可见。
+Tunnel ID 退到卡片底部的次要信息（带 `title` 便于复制排查）。
+
+**回归用例**：`tests/unit/TunnelPanel.spec.ts`
+「隧道列表用卡片渲染：三个操作按钮与状态同处一个条目，不依赖表格列宽」
+——断言列表存在、**不再渲染 `table`**、状态/规则/三个按钮都在同一个条目里。
+顺带把一条旧断言从「行 JSON 里含 `Active`/`Error`」改成断言**用户真正看到的文案**
+（「运行中」/「错误：…」）——旧断言落在 el-table 桩打印的行 JSON 上，是桩的副产品。
+
+**真机复验**：恢复隧道后侧栏里直接看到
+
+```
+运行中  Local 127.0.0.1:18081 → l…
+[挂起] [恢复] [关闭]
+Key-auth-test   ID 884af187-8258-43b7-8ee…
+```
+
+三个按钮**不再需要横向滚动**。
+
+#### 缺陷 2：目录读不到时只甩一句英文原始错误
+
+**现象**：传输面板的本地目录指向一个已被删除的目录时，界面只显示
+`failed to read directory at path: /tmp/rshell-e2e with error: No such file or directory (os error 2)`
+——中文界面里一段英文系统错误，用户既不知道是「目录没了」还是「没权限」，
+也不知道下一步该做什么。
+
+**修法**（`src/components/transfer/FileBrowserPane.vue` 的 `describeLoadError`）：
+补两条**已知**错误的中文说明，仍然把目录路径与下一步写清楚：
+- 目录不存在 / 已被移除（ENOENT、No such file、os error 2）→「目录 X 不存在或已被移除。可点上方「更换本地目录」另选一个目录。」
+- 没有读权限（Permission denied、EACCES、os error 13）→「无权读取 X：当前账户没有该目录的读权限。可点上方「更换本地目录」另选一个目录。」
+
+其余错误**原样透出**：不猜、不吞掉真实原因（原有的 scope 拒绝分支保持不变）。
+
+**回归用例**：`tests/unit/FileBrowserPane.spec.ts` 两条
+（目录不存在 / 没有权限），断言文案含中文原因、含具体路径、含「更换本地目录」，
+且**不再只剩英文原始错误**。
+
+**真机复验**：本地面板现在显示
+「目录 /tmp/rshell-e2e 不存在或已被移除。可点上方「更换本地目录」另选一个目录。」
+
+#### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `npx vitest run` | Test Files **52 passed (52)**、Tests **462 passed (462)** |
+| `npm run typecheck` | exit 0 |
+| `npm run build` | exit 0 |
+| `npm run check:docs` | 通过（14 份现行文档） |
+| `cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` | 均 exit 0 |
+| `cargo test --workspace` | **419** 通过、**0** 失败、**19** 忽略 |
+
+**反证**：把两处修复都撤掉后，`TunnelPanel.spec.ts` + `FileBrowserPane.spec.ts`
+共 **8 条**用例失败（列表化那条、中文文案两条，以及依赖旧表格结构的旧断言）；
+恢复修复后 28 条全绿。

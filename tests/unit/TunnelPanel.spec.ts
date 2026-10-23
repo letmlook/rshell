@@ -1,6 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
-import { computed, defineComponent, h, inject, provide, ref, type Ref } from "vue";
 import TunnelPanel from "../../src/components/TunnelPanel.vue";
 import {
   listTunnels,
@@ -89,27 +88,6 @@ describe("TunnelPanel", () => {
     "el-form": shell,
     "el-input": { template: "<input />" },
     "el-empty": { template: "<div />" },
-    // 行内的操作按钮必须真的渲染出来，否则「挂起/恢复」这类入口无法测试。
-    // el-table 把行数据 provide 给列桩，列桩按行渲染 #default({ row })。
-    "el-table-column": defineComponent({
-      name: "el-table-column",
-      setup(_props, { slots }) {
-        const rows = inject<Ref<unknown[]>>("rs-rows", ref([]));
-        return () => h("div", rows.value.map((row) => slots.default?.({ row })));
-      },
-    }),
-    "el-table": defineComponent({
-      name: "el-table",
-      props: ["data"],
-      setup(props, { slots }) {
-        provide("rs-rows", computed(() => (props.data ?? []) as unknown[]));
-        return () =>
-          h("div", { "data-testid": "rows" }, [
-            h("pre", JSON.stringify(props.data)),
-            slots.default?.(),
-          ]);
-      },
-    }),
   };
 
   beforeEach(() => {
@@ -159,7 +137,10 @@ describe("TunnelPanel", () => {
     vi.mocked(listTunnels).mockResolvedValueOnce([activeTunnel]);
     const wrapper = mount(TunnelPanel, { global: { stubs } });
     await flushPromises();
-    expect(wrapper.text()).toContain("Active");
+    // 断言用户真正看到的文案（此前这条断言落在 el-table 桩打印的行 JSON 上，
+    // 是桩的副产品而不是界面行为）
+    expect(wrapper.text()).toContain("运行中");
+    expect(wrapper.text()).not.toContain("错误");
     expect(vi.mocked(listTunnels).mock.calls.length).toBe(1);
 
     // 模拟后端断开会话：列表状态已变 Error，并广播 ActiveTunnelsChanged
@@ -170,8 +151,9 @@ describe("TunnelPanel", () => {
     await flushPromises();
 
     expect(vi.mocked(listTunnels).mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(wrapper.text()).toContain("Error");
-    expect(wrapper.text()).not.toContain("Active");
+    expect(wrapper.text()).toContain("错误");
+    expect(wrapper.text()).toContain("session disconnected");
+    expect(wrapper.text()).not.toContain("运行中");
     wrapper.unmount();
     expect(eventHandlers.length).toBe(0);
   });
@@ -209,6 +191,28 @@ describe("TunnelPanel", () => {
     await flushPromises();
 
     expect(resumeTunnel).toHaveBeenCalledWith("tunnel-1");
+    wrapper.unmount();
+  });
+
+  it("隧道列表用卡片渲染：三个操作按钮与状态同处一个条目，不依赖表格列宽", async () => {
+    // 表格三列合计 430px 放不进默认侧栏（280px），「挂起/恢复/关闭」会被裁在
+    // 视口外——用户必须先发现横向滚动条才点得到操作。列表化后不再有列宽约束。
+    vi.mocked(listTunnels).mockResolvedValue([activeTunnel]);
+    const wrapper = mount(TunnelPanel, { global: { stubs } });
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="tunnel-list"]').exists()).toBe(true);
+    expect(wrapper.find("table").exists(), "隧道列表不得再渲染成表格").toBe(false);
+
+    const item = wrapper.findAll('[data-test="tunnel-list"] > li');
+    expect(item).toHaveLength(1);
+    const entry = item[0];
+    // 状态、规则、三个操作按钮都在同一条目里
+    expect(entry.text()).toContain("运行中");
+    expect(entry.text()).toContain("127.0.0.1:8080");
+    expect(entry.find('[data-test="tunnel-suspend"]').exists()).toBe(true);
+    expect(entry.find('[data-test="tunnel-resume"]').exists()).toBe(true);
+    expect(entry.find('[data-test="tunnel-close"]').exists()).toBe(true);
     wrapper.unmount();
   });
 

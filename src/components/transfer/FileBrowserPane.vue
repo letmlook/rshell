@@ -149,10 +149,10 @@ function isEntryGone(e: unknown): boolean {
 }
 
 /**
- * Tauri 的 fs scope 拒绝时，后端原文会指向 capability 文件（"maybe it is not
- * allowed on the scope for `allow-read-dir` permission in your capability file"），
- * 这在「目录是用户自己选的」场景下是误导——真实原因是进程重启后运行时 scope
- * 为空。改写成用户可行动的说法，但不吞掉失败：仍然展示是哪个目录出的问题。
+ * 把后端 / 系统的原始错误翻译成用户看得懂的中文说明。
+ *
+ * 只做**已知**错误的翻译（目录没了 / 没权限 / scope 拒绝）；其余错误原样透出，
+ * 不猜、不吞掉真实原因。原始错误仍作为细节附在后面，便于排查。
  */
 function describeLoadError(e: unknown, path: string): string {
   const raw = String(e);
@@ -161,6 +161,12 @@ function describeLoadError(e: unknown, path: string): string {
     // 真正的拒绝来自操作系统（权限不足 / 路径不存在 / 挂载点不可用）。
     // 旧的「尚未授权，请重新选择」建议会把人引向错误的操作。
     return `无权读取 ${path}：系统拒绝了该目录的访问（路径可能已失效，或当前账户没有读权限）。可点上方「更换本地目录」另选一个目录。`;
+  }
+  if (isEntryGone(e)) {
+    return `目录 ${path} 不存在或已被移除。可点上方「更换本地目录」另选一个目录。`;
+  }
+  if (/permission denied|eacces|os error 13/i.test(raw)) {
+    return `无权读取 ${path}：当前账户没有该目录的读权限。可点上方「更换本地目录」另选一个目录。`;
   }
   return raw;
 }

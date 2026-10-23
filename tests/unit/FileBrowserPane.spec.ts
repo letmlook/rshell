@@ -49,6 +49,38 @@ describe("FileBrowserPane", () => {
     expect(wrapper.find("[data-testid='rows']").text()).toContain("[]");
   });
 
+  // 目录读不到时，界面不得只甩一句英文原始错误：用户要知道是「目录没了」
+  // 还是「没权限」，以及下一步做什么。
+  it("本地目录读不到时给出中文原因与下一步，而不是只显示原始英文错误", async () => {
+    vi.mocked(readDir).mockRejectedValue(
+      new Error("failed to read directory at path: /tmp/gone with error: No such file or directory (os error 2)"),
+    );
+    const wrapper = mount(FileBrowserPane, {
+      props: { mode: "local", path: "/tmp/gone", rootPath: "/tmp" },
+      global: { stubs },
+    });
+    await flushPromises();
+    const text = wrapper.text();
+    expect(text).toContain("不存在");
+    expect(text).toContain("/tmp/gone");
+    expect(text).toContain("更换本地目录");
+    expect(text, "不得只剩英文原始错误").not.toContain("failed to read directory at path");
+  });
+
+  it("本地目录没权限时给出中文原因", async () => {
+    vi.mocked(readDir).mockRejectedValue(
+      new Error("failed to read directory at path: /root with error: Permission denied (os error 13)"),
+    );
+    const wrapper = mount(FileBrowserPane, {
+      props: { mode: "local", path: "/root", rootPath: "/" },
+      global: { stubs },
+    });
+    await flushPromises();
+    const text = wrapper.text();
+    expect(text).toContain("无权读取");
+    expect(text).toContain("/root");
+  });
+
   it("does not read an arbitrary local directory before one is chosen", async () => {
     const wrapper = mount(FileBrowserPane, { props: { mode: "local", path: "" }, global: { stubs } });
     await flushPromises();

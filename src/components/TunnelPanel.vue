@@ -259,6 +259,11 @@ function canSuspend(state: TunnelState): boolean {
   return state === "Active";
 }
 
+/** 错误态（会话断开等）单独标红，和「运行中/已挂起」区分开 */
+function isErrorState(state: TunnelState): boolean {
+  return typeof state === "object" && state !== null && "Error" in state;
+}
+
 // R2-04：后端在会话断开时会把该会话隧道置 Error 并逐条发布
 // TunnelStateChanged + ActiveTunnelsChanged（tunnel_manager deactivate_session_tunnels）。
 // 面板打开期间不订阅这两个事件，状态列会一直停留旧的 Active 文案，直到手点刷新。
@@ -357,15 +362,25 @@ onBeforeUnmount(() => {
     </section>
 
     <el-empty v-if="items.length === 0" description="暂无隧道" />
-    <el-table v-else :data="items" stripe size="small">
-      <el-table-column prop="id" label="Tunnel ID" width="120" />
-      <el-table-column label="状态" min-width="120">
-        <template #default="{ row }">
-          {{ stateLabel(row.state) }}
-        </template>
-      </el-table-column>
-      <el-table-column label="操作" width="190">
-        <template #default="{ row }">
+    <!--
+      隧道列表用卡片而不是表格。
+
+      表格三列（Tunnel ID 120 + 状态 120 + 操作 190 = 430px）**放不进默认侧栏
+      （280px，最大 360px）**：「挂起 / 恢复 / 关闭」三个按钮会被裁在视口外，
+      用户必须先发现横向滚动条才点得到操作。卡片布局不依赖列宽，窄侧栏下
+      三个按钮仍然一行可见。
+    -->
+    <ul v-else class="tunnel-list" data-test="tunnel-list">
+      <li v-for="row in items" :key="row.id" class="tunnel-item">
+        <div class="tunnel-item-head">
+          <span class="tunnel-item-state" :class="{ 'is-error': isErrorState(row.state) }">
+            {{ stateLabel(row.state) }}
+          </span>
+          <span class="tunnel-item-rule" :title="ruleLabel(row.rule)">
+            {{ ruleLabel(row.rule) }}
+          </span>
+        </div>
+        <div class="tunnel-item-actions">
           <el-button
             size="small"
             :disabled="!canSuspend(row.state) || pendingIds.has(row.id)"
@@ -383,9 +398,13 @@ onBeforeUnmount(() => {
             恢复
           </el-button>
           <el-button size="small" type="danger" data-test="tunnel-close" @click="remove(row.id)">关闭</el-button>
-        </template>
-      </el-table-column>
-    </el-table>
+        </div>
+        <div class="tunnel-item-meta">
+          <span class="tunnel-item-session">{{ sessionName(row.session_id) }}</span>
+          <span class="tunnel-item-id" :title="row.id">ID {{ row.id }}</span>
+        </div>
+      </li>
+    </ul>
   </section>
 </template>
 
@@ -458,5 +477,68 @@ h3 {
 .pending-session {
   color: var(--rs-fg-muted);
   font-size: 11px;
+}
+/* 隧道卡片：按钮行不依赖表格列宽，窄侧栏（默认 280px）下也一行可见 */
+.tunnel-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tunnel-item {
+  border: 1px solid var(--rs-border);
+  border-radius: 6px;
+  background: var(--rs-bg-surface);
+  padding: 8px 10px;
+}
+.tunnel-item-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+.tunnel-item-state {
+  flex: 0 0 auto;
+  color: var(--rs-fg-muted);
+}
+.tunnel-item-state.is-error {
+  color: var(--el-color-danger);
+}
+.tunnel-item-rule {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--rs-font-mono, monospace);
+}
+.tunnel-item-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.tunnel-item-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--rs-fg-muted);
+}
+.tunnel-item-session {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tunnel-item-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--rs-font-mono, monospace);
 }
 </style>
