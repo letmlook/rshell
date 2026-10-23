@@ -1100,3 +1100,71 @@ Key-auth-test   ID 884af187-8258-43b7-8ee…
 | `npx vitest run` | Test Files **52 passed (52)**、Tests **463 passed (463)** |
 | `npm run typecheck` / `npm run build` / `npm run check:docs` / `npm run check:bundle` / `npm run check:release` | 均通过 |
 | `npm run test:scripts` | **48** 项通过、0 失败 |
+
+### 2026-10-23：隧道 Dynamic(SOCKS5) + 主密码全流程 + 快速命令热键（并修掉热键的两个缺陷）
+
+本轮继续在界面上验收，补完三项、挖出两个真缺陷。
+
+#### 通过的界面验收
+
+| 功能 | 结果 |
+|---|---|
+| **隧道 Dynamic(SOCKS5) 的界面配置** | 「工具 → 隧道」里类型选 `Dynamic` → **「目标」字段自动隐藏**（SOCKS5 不需要目标）→ 监听 `127.0.0.1:8080` → 新建 → **真实 SOCKS5 握手**：方法选择应答 `0500`（无认证）、`CONNECT 192.168.252.2:22` 应答 `0500`（成功）→ 读到远端 `SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20` |
+| **主密码全流程** | 设置 → 界面变「**已设置 · 当前已解锁**」，`master_password.json` 落盘（0600），后端 `Master password set successfully` → 「立即锁定应用」→ **全屏遮罩「RShell 已锁定」** → **输错密码 → 「主密码不正确」**（后端 `verification failed: decryption error`，负路径正确）→ 输对密码 → `Master password verified successfully`，遮罩消失 → **重启应用后仍是锁定态**（主密码文件被读回），解锁后正常使用 |
+| **快速命令热键（配置侧）** | 工具面板里名称/命令/目标/发送回车/热键/分组/说明都能填，「添加」后命令与热键一起落盘（`quick-commands.json`） |
+
+#### 挖出并修掉的两个缺陷：快速命令热键在终端里按不动
+
+**现象**：在终端里按 `Ctrl+Shift+H`（或任何带修饰键的热键）——快速命令**不执行**，
+而且**按键还会漏进远端 shell**（终端里多出 `hhh`）。
+
+**根因（两处，同一条链上）**：
+
+1. **触发侧判据用错**：App.vue 的 `triggerHotkeyCommand` 用裸 `isTextInputTarget` 拦截，
+   而 xterm 的 **helper textarea 本身就是 `<textarea>`** → 在终端里按热键永远被跳过
+   —— 而那恰恰是热键唯一该生效的地方。应用快捷键那条路（`utils/shortcuts.ts` 的
+   `isTypingInTextField`）**本来就排除了 helper**，两条路径判据不一致。
+   （`utils/shortcuts.ts` 里早就写着「按普通输入框处理的话，终端里就一个快捷键都触发不了」，
+   只是用户热键这条路径没照做。）
+2. **终端侧不吞键**：xterm 的按键处理在**目标阶段**先跑（早于冒泡到 window），
+   窗口处理器再 `preventDefault()` 已经太晚 → 按一次热键，远端会收到一串垃圾字符。
+   `TerminalPane` 的按键处理此前只吞**应用**快捷键，不吞**用户热键**。
+
+**修法**：把热键表提到共享模块 `src/utils/quickCommandHotkeys.ts`，
+**触发侧与终端侧读同一份**：
+- `utils/hotkey.ts` 新增 `isTerminalHelperTextarea` 与 `hotkeyBlockedByTarget`
+  （= `isTextInputTarget` 且**不是**终端 helper textarea）；
+  `utils/shortcuts.ts` 的 `isTypingInTextField` 改为复用它（单一判据）。
+- `App.vue` 的 `triggerHotkeyCommand` 改用 `hotkeyBlockedByTarget`。
+- `TerminalPane` 的按键处理加一条 `if (matchesUserHotkey(event)) return false;` ——
+  命中的键不送进远端 shell。
+
+**回归用例**：
+- `tests/unit/hotkey.spec.ts`：`hotkeyBlockedByTarget` 的语义（终端 helper 放行 /
+  普通输入框挡住 / 普通元素不挡）+ **App.vue 调用点的源码契约**（必须用
+  `hotkeyBlockedByTarget`、不得用裸 `isTextInputTarget`）。
+- `tests/unit/quickCommandHotkeys.spec.ts`（新）：共享热键表的收录与命中判断 +
+  **TerminalPane 必须吞掉用户热键**的源码契约。
+
+**反证**：把 App.vue 改回 `isTextInputTarget` → 契约用例失败；去掉 TerminalPane 的
+`matchesUserHotkey` → 契约用例失败；恢复后全绿。
+
+#### 界面端到端的验证限制（不是应用缺陷）
+
+带修饰键的组合键**无法在 macOS 上用这套自动化验证**：驱动送进 WebView 的按键
+**不带修饰键**——终端里收到的是纯 `h` / 纯 `f`。判据是**应用自带的 `Cmd+F` 同样
+不生效**（查找栏没打开，终端里只多了个 `f`）：连应用自己的快捷键都不通，说明是
+驱动/环境把修饰键吞了，与本次改动无关。因此热键的**界面端到端**部分只能由
+单元测试与源码契约守住；真机行为请在正常桌面会话里用真实键盘确认。
+
+#### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `npx vitest run` | Test Files **53 passed (53)**、Tests **473 passed (473)** |
+| `npm run typecheck` / `npm run build` / `npm run check:docs` / `npm run check:bundle` | 均通过 |
+| `npm run test:scripts` | **48** 项通过、0 失败 |
+| `cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` | 均 exit 0 |
+| `cargo test --workspace` | **419** 通过、**0** 失败、**19** 忽略 |
+
+测试数据已清理：快速命令、触发器、隧道、主密码全部复位（保留 4 条连接与 GROUP2 分组）。

@@ -15,7 +15,7 @@
  * 应用接管的键一律不进远端 shell——否则「按 Ctrl+F 打开查找」的同时还会往
  * shell 里塞一个 0x06。
  */
-import { isTextInputTarget } from "./hotkey";
+import { hotkeyBlockedByTarget } from "./hotkey";
 
 /** 应用接管的快捷键 */
 export type AppShortcut = "new-session" | "find" | "copy" | "paste";
@@ -25,12 +25,11 @@ export type AppShortcut = "new-session" | "find" | "copy" | "paste";
  *
  * 它是 `<textarea>`，按普通输入框处理的话，终端里就一个快捷键都触发不了；
  * 但它确实是「用户正在终端里打字」的地方，所以要区别对待。
+ *
+ * 判据统一放在 `utils/hotkey.ts` 的 `hotkeyBlockedByTarget`：
+ * 应用快捷键与**用户绑定的快速命令热键**必须用同一套，否则两者的行为不一致
+ * （真实事故：应用快捷键在终端里有效，用户热键在终端里永远不触发）。
  */
-function isTerminalHelper(target: EventTarget | null): boolean {
-  return (
-    target instanceof HTMLElement && target.classList.contains("xterm-helper-textarea")
-  );
-}
 
 /**
  * 事件是否落在普通文本输入里（对话框的输入框、搜索框等）。
@@ -39,7 +38,7 @@ function isTerminalHelper(target: EventTarget | null): boolean {
  * 终端自身的 helper textarea 是例外——那里快捷键就该生效。
  */
 export function isTypingInTextField(target: EventTarget | null): boolean {
-  return isTextInputTarget(target) && !isTerminalHelper(target);
+  return hotkeyBlockedByTarget(target);
 }
 
 /**

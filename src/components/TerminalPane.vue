@@ -40,6 +40,7 @@ import { useSessionsStore } from "../stores/sessions";
 import { useMasterPasswordStore } from "../stores/masterPassword";
 import { copyOnSelect, terminalAppearance } from "../utils/terminalPrefs";
 import { matchAppShortcut } from "../utils/shortcuts";
+import { matchesUserHotkey } from "../utils/quickCommandHotkeys";
 
 const themeStore = useThemeStore();
 const sessionsStore = useSessionsStore();
@@ -649,6 +650,10 @@ onMounted(async () => {
     // 还会往 shell 里塞一个 0x06（readline 的 forward-char）。
     // 事件仍会冒泡到 window，App.vue 那边照常处理。
     if (matchAppShortcut(event)) return false;
+    // **用户绑定的快速命令热键**同样不能漏进远端 shell：xterm 的按键处理
+    // 在目标阶段先跑（早于冒泡到 window），窗口处理器再 preventDefault()
+    // 已经太晚 —— 按一次热键远端会收到一串垃圾字符（实测 "hhh"）。
+    if (matchesUserHotkey(event)) return false;
     if (event.key !== "Backspace" || event.ctrlKey || event.metaKey || event.altKey) {
       return true;
     }

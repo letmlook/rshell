@@ -55,36 +55,25 @@ import { useHostKeyStore } from "./stores/hostKey";
 import { useThemeStore } from "./stores/theme";
 import { useMasterPasswordStore } from "./stores/masterPassword";
 import { useFoldersStore } from "./stores/folders";
-import { isTextInputTarget, matchesHotkey, parseHotkey, type Hotkey } from "./utils/hotkey";
+import { hotkeyBlockedByTarget, matchesHotkey } from "./utils/hotkey";
+import { quickCommandHotkeys, setQuickCommands } from "./utils/quickCommandHotkeys";
 import { matchAppShortcut } from "./utils/shortcuts";
 import { resolveQuickCommandTargets } from "./utils/quickCommand";
 import { executeQuickCommand, listQuickCommands } from "./ipc/client";
-import type { QuickCommand, Uuid, SessionConfig } from "./ipc/types";
+import type { Uuid, SessionConfig } from "./ipc/types";
 
 const store = useSessionsStore();
 const hostKeyStore = useHostKeyStore();
 const themeStore = useThemeStore();
 const masterPasswordStore = useMasterPasswordStore();
 const foldersStore = useFoldersStore();
-/** 绑定了热键的快速命令：热键命中时从这里取 */
-const quickCommands = ref<QuickCommand[]>([]);
-
 /**
- * 预解析好的热键表。
+ * 快速命令热键表住在 `utils/quickCommandHotkeys`（共享模块）。
  *
- * 终端里每按一次键都会走到热键匹配：若每次都重新 `parseHotkey` 拆分字符串，
- * 就是「每个按键 × 每条命令」次字符串解析。这条路径在输入热路径上，
- * 因此热键在命令列表变化时解析一次即可。
+ * 终端侧也要用同一份：终端得知道「这个键是不是用户热键」，才能把它从
+ * 远端 shell 那里吞掉。放在 App.vue 里就只有触发侧看得见，
+ * 按一次热键远端还会收到一串垃圾字符。
  */
-const parsedHotkeys = computed(() => {
-  const table: Array<{ command: QuickCommand; hotkey: Hotkey }> = [];
-  for (const command of quickCommands.value) {
-    if (!command.hotkey) continue;
-    const hotkey = parseHotkey(command.hotkey);
-    if (hotkey) table.push({ command, hotkey });
-  }
-  return table;
-});
 const dialogVisible = ref(false);
 /** 打开「新建连接」时为 null；打开「编辑连接」时为被编辑的连接 id */
 const editSessionId = ref<Uuid | null>(null);
@@ -674,8 +663,11 @@ function onGlobalKeydown(e: KeyboardEvent) {
 async function triggerHotkeyCommand(event: KeyboardEvent) {
   // 锁定态：热键不得向远端会话发命令（与 onGlobalKeydown 的锁定拦截同理）。
   if (masterPasswordStore.isLocked) return;
-  if (isTextInputTarget(event.target)) return;
-  const table = parsedHotkeys.value;
+  // 普通输入框里打字不算触发；但**终端的 helper textarea 必须放行** ——
+  // 那正是热键该生效的地方（用裸 isTextInputTarget 会把终端也一起挡掉，
+  // 热键就成了永远按不响的摆设）。
+  if (hotkeyBlockedByTarget(event.target)) return;
+  const table = quickCommandHotkeys.value;
   if (table.length === 0) return;
 
   const entry = table.find((item) => matchesHotkey(event, item.hotkey));
@@ -736,7 +728,7 @@ onMounted(async () => {
   await foldersStore.subscribeEvents();
   if (!mounted) return;
   try {
-    quickCommands.value = await listQuickCommands();
+    setQuickCommands(await listQuickCommands());
   } catch (error) {
     console.warn("[App] 快速命令列表拉取失败，热键暂不可用", error);
   }
@@ -775,7 +767,7 @@ onMounted(async () => {
         // 热键绑定可能变了：重新拉一次列表
         void listQuickCommands()
           .then((items) => {
-            quickCommands.value = items;
+            setQuickCommands(items);
           })
           .catch(() => undefined);
       }

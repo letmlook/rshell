@@ -121,3 +121,31 @@ export function isTextInputTarget(target: EventTarget | null): boolean {
   const tag = target.tagName.toLowerCase();
   return tag === "input" || tag === "textarea" || tag === "select";
 }
+
+/**
+ * 终端的隐藏输入框（xterm 的 helper textarea）。
+ *
+ * 它是 `<textarea>`，按普通输入框处理的话，**终端里就一个快捷键都触发不了**；
+ * 但它确实是「用户正在终端里打字」的地方，所以要区别对待。
+ */
+export function isTerminalHelperTextarea(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement && target.classList.contains("xterm-helper-textarea")
+  );
+}
+
+/**
+ * 这次按键是否该被「文本输入」挡住（即不该触发用户绑定的热键）。
+ *
+ * 普通输入框（对话框、搜索框）里敲 Ctrl+Shift+1 只是文本 → 挡住。
+ * **终端的 helper textarea 要放行** —— 那恰恰是热键该生效的地方。
+ *
+ * 真实事故：应用快捷键（Ctrl+F / Ctrl+Shift+C）用的是排除 helper 的判据
+ * （`utils/shortcuts.ts` 的 `isTypingInTextField`），而用户绑定的快速命令热键
+ * 用的是裸 `isTextInputTarget` —— 于是**终端里按热键永远不触发**
+ * （helper textarea 本身就是 textarea），而热键唯一的用途就是在终端里发命令。
+ * 两条路径必须用同一套判据。
+ */
+export function hotkeyBlockedByTarget(target: EventTarget | null): boolean {
+  return isTextInputTarget(target) && !isTerminalHelperTextarea(target);
+}

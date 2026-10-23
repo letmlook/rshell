@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   formatHotkey,
+  hotkeyBlockedByTarget,
   isTextInputTarget,
+  isTerminalHelperTextarea,
   matchesHotkey,
   parseHotkey,
 } from "../../src/utils/hotkey";
@@ -97,5 +99,69 @@ describe("isTextInputTarget", () => {
     expect(isTextInputTarget(editable)).toBe(true);
     expect(isTextInputTarget(div)).toBe(false);
     expect(isTextInputTarget(null)).toBe(false);
+  });
+});
+
+describe("hotkeyBlockedByTarget（热键该不该被文本输入挡住）", () => {
+  // 真实事故：用户绑定的快速命令热键用裸 isTextInputTarget 判据，而 xterm 的
+  // helper textarea 本身就是 <textarea> → 终端里按热键永远不触发，
+  // 而热键唯一的用途就是在终端里发命令。应用快捷键那条路用的是排除 helper
+  // 的判据，两条路径不一致。这里把「终端放行、普通输入框挡住」钉死。
+  it("终端的 helper textarea 不挡热键（那里正是热键该生效的地方）", () => {
+    const helper = document.createElement("textarea");
+    helper.classList.add("xterm-helper-textarea");
+    expect(isTextInputTarget(helper)).toBe(true);
+    expect(isTerminalHelperTextarea(helper)).toBe(true);
+    expect(hotkeyBlockedByTarget(helper)).toBe(false);
+  });
+
+  it("普通输入框挡热键（里面敲 Ctrl+Shift+1 只是文本）", () => {
+    const input = document.createElement("input");
+    const textarea = document.createElement("textarea");
+    const editable = document.createElement("div");
+    editable.setAttribute("contenteditable", "true");
+    expect(hotkeyBlockedByTarget(input)).toBe(true);
+    expect(hotkeyBlockedByTarget(textarea)).toBe(true);
+    expect(hotkeyBlockedByTarget(editable)).toBe(true);
+  });
+
+  it("终端之外的普通元素不挡热键", () => {
+    expect(hotkeyBlockedByTarget(document.createElement("div"))).toBe(false);
+    expect(hotkeyBlockedByTarget(null)).toBe(false);
+  });
+});
+
+// 与 ipcContract.spec.ts / elementPlusContract.spec.ts 同一写法：用
+// vi.importActual 拿 node 模块（不引入 @types/node）。
+const { readFileSync } = await vi.importActual<{
+  readFileSync(path: string, encoding: "utf8"): string;
+}>("node:fs");
+
+describe("App.vue 的热键路径判据（源码契约）", () => {
+  // 单元测试只测得出 util 的语义，测不出「App.vue 调的是哪个函数」——
+  // 而真实事故正是在调用点：用户热键用了裸 isTextInputTarget（把终端的
+  // helper textarea 也挡住了），应用快捷键用的是排除 helper 的判据。
+  // 这里把调用点钉死：两条路径必须用同一套判据。
+  const appSource = readFileSync("src/App.vue", "utf8");
+
+  it("用户绑定的快速命令热键用 hotkeyBlockedByTarget（终端里放行）", () => {
+    const body = appSource.slice(
+      appSource.indexOf("async function triggerHotkeyCommand"),
+      appSource.indexOf("async function triggerHotkeyCommand") + 900,
+    );
+    expect(body, "triggerHotkeyCommand 必须用 hotkeyBlockedByTarget").toContain(
+      "hotkeyBlockedByTarget(event.target)",
+    );
+    expect(body, "不得再用会连终端一起挡掉的裸 isTextInputTarget").not.toContain(
+      "isTextInputTarget(event.target)",
+    );
+  });
+
+  it("应用快捷键与用户热键共用同一套判据", () => {
+    expect(appSource).toContain('from "./utils/shortcuts"');
+    // matchAppShortcut 内部用的 isTypingInTextField 与 hotkeyBlockedByTarget 同源
+    expect(readFileSync("src/utils/shortcuts.ts", "utf8")).toContain(
+      "hotkeyBlockedByTarget(target)",
+    );
   });
 });
