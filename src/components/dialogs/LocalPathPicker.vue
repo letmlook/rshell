@@ -16,7 +16,7 @@
  *   directory —— 选当前所在目录（「选择此文件夹」），只列目录
  *   file      —— 选具体文件（「打开」按钮，仅选中文件时可用）
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch, type ComponentPublicInstance } from "vue";
 import { readDir, stat } from "@tauri-apps/plugin-fs";
 import { homeDir } from "@tauri-apps/api/path";
 import PathBar from "../transfer/PathBar.vue";
@@ -52,6 +52,15 @@ const entries = ref<PickerEntry[]>([]);
 const loading = ref(false);
 const errorText = ref<string | null>(null);
 const selectedFile = ref<string | null>(null);
+/** 各行的 DOM 引用：方向键导航要按索引取到下一个行元素 */
+const rowRefs = ref<HTMLElement[]>([]);
+/**
+ * 键盘焦点所在的行（roving tabindex）。
+ *
+ * 每行都 tabindex="0" 的话，N 行 = N 个 Tab 停靠点，键盘用户要按很多次
+ * Tab 才能到列表。惯例是列表只占**一个** Tab 停靠点，组内用方向键移动。
+ */
+const focusedIndex = ref(0);
 const showHidden = ref(false);
 const newFolderVisible = ref(false);
 const newFolderName = ref("");
@@ -163,6 +172,16 @@ function goUp() {
   if (parent && canGoUp.value) void load(parent);
 }
 
+/** 收集每行的 DOM 引用（列表会随目录变化重建） */
+function setRowRef(el: Element | ComponentPublicInstance | null, index: number) {
+  if (el instanceof HTMLElement) rowRefs.value[index] = el;
+}
+
+/** 列表内容变化（换目录 / 搜索）后把焦点行收敛回合法范围 */
+watch(visibleEntries, (list) => {
+  if (focusedIndex.value > list.length - 1) focusedIndex.value = Math.max(0, list.length - 1);
+});
+
 function onRowClick(entry: PickerEntry) {
   if (entry.isDirectory) {
     selectedFile.value = null;
@@ -173,6 +192,40 @@ function onRowClick(entry: PickerEntry) {
 
 function onRowDblClick(entry: PickerEntry) {
   if (entry.isDirectory) void load(joinPath(currentPath.value, entry.name));
+}
+
+/**
+ * 键盘激活一行：目录 = 进入，文件 = 选中。
+ *
+ * 此前 Enter/空格都映射到 onRowClick（对目录只是清掉选中），于是键盘用户
+ * 能把焦点移到目录上却**进不去** —— 子目录里的文件仍然只能用鼠标选。
+ * 目录的「进入」语义与双击一致，这里补上。
+ */
+function onRowActivate(entry: PickerEntry) {
+  if (entry.isDirectory) {
+    void load(joinPath(currentPath.value, entry.name));
+    return;
+  }
+  onRowClick(entry);
+}
+
+/**
+ * 列表键盘导航：上下键移动焦点，Enter/空格选中。
+ *
+ * 文件名是纯文本节点，鼠标之外的可达性此前只有「点」这一条路 ——
+ * 键盘用户（或自动化）无法只靠键盘选文件。这里给每行加 tabindex 与
+ * 方向键处理，Enter/空格等价于单击。
+ *
+ * 焦点移动按**当前行在列表中的位置**算：从事件目标所在行往上/往下找
+ * 兄弟行，不查全局 document（列表被 Teleport 到 body，从组件里查不到）。
+ */
+function onRowKeydown(_entry: PickerEntry, index: number, event: KeyboardEvent) {
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  event.preventDefault();
+  const next = event.key === "ArrowDown" ? index + 1 : index - 1;
+  if (next < 0 || next >= visibleEntries.value.length) return;
+  focusedIndex.value = next;
+  rowRefs.value[next]?.focus();
 }
 
 function submit() {
@@ -271,15 +324,22 @@ onMounted(async () => {
           <p v-else-if="visibleEntries.length === 0" class="picker-hint" data-test="picker-empty">
             {{ mode === "directory" ? "此目录没有子目录" : "此目录没有可选文件" }}
           </p>
-          <ul v-else class="picker-rows">
+          <ul v-else class="picker-rows" role="listbox" aria-label="目录内容">
             <li
-              v-for="entry in visibleEntries"
+              v-for="(entry, index) in visibleEntries"
               :key="entry.name"
               class="picker-row"
               :class="{ 'is-selected': mode === 'file' && selectedFile === joinPath(currentPath, entry.name) }"
               :data-test="`picker-row-${entry.name}`"
+              :ref="(el) => setRowRef(el, index)"
+              :tabindex="focusedIndex === index ? 0 : -1"
+              role="option"
+              :aria-selected="mode === 'file' && selectedFile === joinPath(currentPath, entry.name)"
               @click="onRowClick(entry)"
               @dblclick="onRowDblClick(entry)"
+              @keydown.enter.prevent="onRowActivate(entry)"
+              @keydown.space.prevent="onRowActivate(entry)"
+              @keydown="onRowKeydown(entry, index, $event)"
             >
               <span class="p-icon" :class="entry.isDirectory ? 'is-dir' : 'is-file'" aria-hidden="true">
                 <svg v-if="entry.isDirectory" width="14" height="14" viewBox="0 0 16 16">

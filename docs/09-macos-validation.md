@@ -1168,3 +1168,211 @@ Key-auth-test   ID 884af187-8258-43b7-8ee…
 | `cargo test --workspace` | **419** 通过、**0** 失败、**19** 忽略 |
 
 测试数据已清理：快速命令、触发器、隧道、主密码全部复位（保留 4 条连接与 GROUP2 分组）。
+
+### 2026-10-23：传输面板（右键 / 多选 / 批量删除 / 拖拽）+ 配色导入 + 三个应用菜单
+
+本轮把传输面板剩下的入口逐项点完，顺手挖出**三个真缺陷**并修掉：
+右键菜单与 WebView 原生菜单叠加、多选在界面上根本做不到、拖拽上传下载完全没实现。
+最后补上配色导入与「连接 / 视图 / 工具」三个应用菜单的界面验收。
+
+#### 通过的界面验收
+
+| 功能 | 结果 |
+|---|---|
+| **传输面板右键菜单** | 远端文件上右键 → 应用菜单 4 项（下载到本地 / 新建文件夹 / 删除 / 刷新）；菜单项上再右键**不再**冒出 WebKit 原生菜单（见下方缺陷一） |
+| **拖拽上传下载** | 远端 `.bashrc` 拖到本地面板 → 后端 `EnqueueDownload` 入队 → **本地落盘 `/tmp/rshell-e2e/.bashrc`（3771 B，与远端一致）**；本地 `drag-upload-test.txt` 拖到远端面板 → `EnqueueUpload` 入队 → **远端 `/home/ubuntu/drag-upload-test.txt`（24 B，内容一致）**。传输队列面板显示两条任务均为「完成 / 100%」 |
+| **配色方案导入** | 设置 → 终端 → 「导入…」→ 应用内路径选择器选中 JSON → **绿色提示「已导入配色方案「RShell 验收配色」」** → 后端 `ImportColorScheme` 成功 → **落盘 `color_schemes.json`** → 配色下拉框里**出现新方案** → 选中后后端 `SetTerminalColorScheme` 生效 |
+| **「连接」菜单** | 2 项：新建连接 / 刷新列表 |
+| **「视图」菜单** | 5 项：切换侧边栏 / 主题 / SSH 密钥 / 插件 / 传输队列（点「传输队列」真的切到传输工作区并展开队列面板） |
+| **「工具」菜单** | 3 项：快速命令 / 触发器 / 端口转发（点「触发器」真的打开触发器编辑器：名称 / 匹配 / 条件 / 动作 / 内容 + 添加 + 列表） |
+
+#### 缺陷一：右键应用自己的菜单时，WebKit 原生菜单叠在上面
+
+**现象**：在传输面板右键文件，应用自己的菜单（下载到本地 / 新建文件夹 / 删除 / 刷新）
+**同时**冒出 WebKit 原生菜单（`Reload` / `Inspect Element`），后者盖在应用菜单上。
+
+**根因**：应用自己的右键菜单是 **DOM 元素**（`ul.context-menu` / `.ctx-menu` /
+`.term-context-menu`）。它们的**触发**处（会话行、文件行、终端画布）都调了
+`event.preventDefault()`，所以原生菜单被压住了；但**菜单自身**没有拦 `contextmenu`
+—— 在菜单项上再右键时，事件落到菜单 DOM 上没人 `preventDefault()`，WebKit 的
+默认行为照做，原生菜单就弹了出来。
+
+**害处**：原生菜单里的 **Reload 会重载整个 WebView**，前端靠事件维持的状态
+（连接状态、传输队列、面板布局）全部丢失；而后端的连接还活着，界面与后端直接对不上。
+
+**修法**（两处，缺一不可）：
+- 三处应用菜单 DOM 自己吞掉默认行为：`TransferWorkspace` 的 `ul.context-menu`、
+  `SessionList` 的 `.ctx-menu`、`TerminalPane` 的 `.term-context-menu` 各加
+  `@contextmenu.prevent`（并在传输面板顺带关闭菜单 —— 与「点外部即关闭」同一语义）。
+- 新增 `src/utils/contextMenu.ts` 的**全局守卫** `installContextMenuGuard()`：
+  在 `window` 的 **capture 阶段**吞掉 `contextmenu` 默认行为，只给**可编辑文本区**
+  （`input` / `textarea` / `contenteditable`）留原生菜单 —— 主密码框、路径输入框
+  这类地方用户要靠右键粘贴。xterm 的 helper textarea 例外（终端自己管右键菜单）。
+  守卫装在 `App.vue` 的 `onMounted`，`onBeforeUnmount` 必须卸载（否则监听残留）。
+
+**回归用例**：`tests/unit/contextMenu.spec.ts`（新）—— 普通元素吞默认行为 /
+输入框与 textarea 放行 / 终端 helper textarea 不放行 / 卸载后不再拦 /
+capture 阶段拦截但事件仍传播给组件自己的处理器；
+`tests/unit/TransferDragDrop.spec.ts`（新）—— 传输面板菜单自身吞掉 `contextmenu`。
+
+**反证**：去掉全局守卫的 `preventDefault()` → 2 条用例失败；去掉传输面板菜单上的
+`@contextmenu.prevent` → 菜单用例失败；恢复后全绿。
+
+**真机复验**：右键远端文件 → 只有应用菜单；**在菜单项上再右键** → 仍然只有应用菜单
+（原生菜单不再叠加）。
+
+#### 缺陷二：传输面板的多选在界面上根本做不到
+
+**现象**：状态行有「已选 N 项」，后端 `enqueue_upload` / `enqueue_download` 都支持
+多文件，界面却**永远只能选中一个**。
+
+**根因**：`FileBrowserPane` 的 `toggleSelect(entry, ctrlKey, shiftKey)` 形参写了
+`ctrlKey` / `shiftKey` 两个修饰键，**但唯一的调用点** `onRowClick` 恒传
+`(false, false)` —— 两个形参是死参数。`el-table` 的 `row-click` 事件签名本就是
+`(row, column, event)`，事件里就有 `ctrlKey` / `metaKey` / `shiftKey`，只是没人接。
+
+**修法**：`onRowClick` 接收事件并把修饰键传下去；`toggleSelect` 按系统文件管理器的
+语义实现三种情况：
+- 无修饰键：单选（点唯一已选行则取消选择，原有行为不变）
+- **Ctrl/⌘**：在当前选中集上**增删**该行（多选）
+- **Shift**：从**锚点行**到该行做**区间**选择（锚点 = 最后一次非 Shift 点击的行）
+
+`row-click` 的第三个参数接到 `onRowClick`，并在导航时重置锚点。
+
+**连带修掉**：删除能力此前用 `validFile()`（要求**恰好**选中 1 个），多选时删除入口
+直接消失；`deleteSelected()` 也只删 `selectedRemote.value[0]`。后端
+`delete_remote_entry` 一次只接受**一个普通文件**（目录会被拒），所以前端改成
+**逐个调用**，确认框**逐条列出每一个待删目标**（不能只说「共 N 个」），单条失败
+不阻断其余。
+
+**回归用例**：`tests/unit/FileBrowserPane.spec.ts` 新增「FileBrowserPane 多选」组
+—— Ctrl 加选 / Ctrl 移出 / Shift 区间 / 无修饰键替换选中集 / 状态行反映真实选中数；
+`tests/unit/TransferWorkspace.spec.ts` 把「多选时隐藏删除」改写为「多选时**开放**
+删除、确认框逐条列出目标、逐个调用后端」，并新增「选中了目录时不给删」。
+
+**反证**：摘掉 `row-click` 的事件接线 → 4 条多选用例失败；把批量删除的确认文案退回
+「共 N 个」→ 1 条用例失败；恢复后全绿。
+
+> **界面端到端的验证限制（不是应用缺陷）**：多选依赖 **Ctrl/⌘ 与 Shift 修饰键**，
+> 而这套 macOS 自动化**送不进修饰键**（连应用自带的 `Cmd+F` 都不生效）。因此
+> 多选的界面端到端行为由单元测试与源码契约守住，真机行为请在正常桌面会话里用真实
+> 键盘确认。
+
+#### 缺陷三：拖拽上传下载完全没有实现（计划里的待办，界面也没有入口）
+
+**现象**：传输面板**没有任何拖拽入口**。`src/` 里除标题栏的 `data-tauri-drag-region`
+外没有 `draggable` / `@drop` / `dragstart`；`docs/superpowers/plans/task_plan.md`
+的切片 5 里「拖拽上传」仍是未勾选状态。
+
+**第一版实现（HTML5 drag & drop）为什么不行**：真机合成拖拽后，事件序列只有
+**`dragstart` → `dragend`**，**`drag` / `dragenter` / `dragover` / `drop` 一个都没有**
+—— WebKit 没建立拖拽会话，投放永远不会发生。
+
+**对照实验（决定性证据）**：同一套 CGEvent 合成拖拽在 **Chrome（Blink）** 里完整派发
+`dragstart → drag → dragover → drop`，在 **Tauri 的 WKWebView** 里只有
+`dragstart → dragend`。说明这是 **WebKit 的原生拖拽会话不被合成事件驱动**，
+不是页面代码的问题。（顺带排除了「用 `dataTransfer.types` 判断拖拽来源」这条路：
+WebKit 在 `dragover` 阶段未必暴露自定义 MIME 类型，判不到就不会 `preventDefault`，
+drop 根本不会被允许触发。）
+
+**最终实现（指针事件）**：改用 `pointerdown` / `pointermove` / `pointerup` ——
+在 WKWebView 里行为正常。关键点：
+- **监听挂在 `window` 上**，不是面板上：拖拽一开始指针就会离开源面板，
+  面板级监听收不到后续 `pointermove` / `pointerup`（拖到对面面板时必然发生），
+  投放就永远判不出来。
+- 位移**超过 5px** 才算拖拽，否则每次点行都会被当成拖拽。
+- 落下时用 `document.elementFromPoint` 找出指针下面的面板（面板根节点带
+  `data-pane="local|remote"`），投给谁由**来源面板**判定并把目标一起带上来
+  （`drop-entries` 带 `from` 与 `to`）—— 抬起发生在来源面板，上层据此决定上传还是下载。
+- 拖回本面板或拖到面板外不做任何事；目录不参与（后端一次只传一个普通文件，
+  目录递归不在当前契约内）。
+
+**三处容易踩的细节**（自查补上，均有回归用例守住）：
+- **拖过之后浏览器仍会派发 click**（指针起止在同一行时），不吞掉的话「拖一下」会
+  顺手改掉选中集 —— 与用户意图不符。在面板根元素的 **capture 阶段**吞掉那一次 click。
+- **`pointercancel` 不能当 `pointerup`**：手势被系统取消时没有可靠落点，拿它当抬起
+  会把文件投到用户根本没松开的位置。`pointercancel` 只清理，不投放。
+- **组件卸载时必须摘掉 window 上的指针监听**：组件在拖拽中途卸载时，监听残留会
+  一直跟着已销毁的组件跑。
+- **拖拽会拉出跨面板的文本选区**：WebKit 在 mousedown 的默认动作里就把选区锚点
+  定下来了，等 pointermove 发现是拖拽再改 `user-select` 已经太晚 —— 拖过去会拖出一条
+  跨面板的文本高亮。必须在 **capture 阶段**拦 mousedown、取消默认的文本选择
+  （只针对文件名单元格，那里的文本本来就不可选），并在越过阈值时清掉已有选区。
+
+**回归用例**：`tests/unit/TransferDragDrop.spec.ts`（新）—— 拖到另一面板 = 投放 /
+拖回本面板不投放 / 拖到面板外不投放 / 位移未过阈值不算拖拽 / 投放带目标面板 /
+共享状态拖完清干净 / 拖拽后 click 被吞 / pointercancel 只清理不投放 /
+卸载时摘掉监听；`TransferWorkspace` 层另有用例断言「远端→本地 = 下载入队」
+「本地→远程 = 上传入队」「同侧不传」「目录不入队」。
+
+**反证**：去掉阈值判断 → 「位移未过阈值不算拖拽」失败；去掉「同侧不投」判断 →
+「拖回本面板不投放」失败；摘掉 `drop-entries` 接线 → 两条方向用例失败；去掉 click
+拦截器 / 把 `pointercancel` 接成 `pointerup` / 卸载时不摘监听 → 各有一条用例失败；
+恢复后全绿。
+
+#### 独立复审发现的三处拖放缺陷（已修）
+
+独立复审（只读审查本轮改动）指出拖放路径上的三处实打实的缺陷，逐条修掉并补了反证：
+
+1. **未选本地目录时拖到本地面板 → 下载落点变成文件系统根 `/`**（安全问题）。
+   `localRoot` 是唯一的本地落点来源：没有它 `internalLocalPath` 是空串，
+   `joinPath("", name)` 会拼成 `"/name"`。工具栏与右键菜单都被 `capabilities` 的
+   `localRoot` 闸门挡住，**拖拽这条路绕过了闸门**。修法：`uploadEntries` /
+   `downloadEntries` 恢复 `!!localRoot.value` 检查，没有本地目录时给出可见提示
+   （`请先选择本地目录`）而不是静默入队。
+2. **投放目标高亮从不出现**（`.is-drop-target` 是死代码）。判定里混进了实例级的
+   `dragging` —— 它只有**来源面板**为 true，于是「恰恰该高亮的目标面板」永远不高亮，
+   来源面板也因 `dragState.from === props.mode` 不高亮。修法：判定只用**共享状态**
+   （`utils/transferDrag` 里的 `dragState` / `hoverPane`），并把「是否正在拖拽」
+   也放进共享状态。
+3. **跨面板拖拽之后，来源面板内的下一个点击被整个吞掉**。按 DOM 规范，跨面板拖拽的
+   click 派发到 pointerdown / pointerup 两者的**最近公共祖先**（在面板之外），面板级
+   拦截器看不到它 → 标志位残留 → 面板内随后的第一个点击被 `preventDefault()` +
+   `stopPropagation()` 吞掉（用户看到「点了没反应」，行不被选中）。修法：标志位改为
+   共享状态 `clickPending`，**抬起后一个 tick 就复位**，且拦截器只在事件**落在本面板内**
+   时才吞。
+
+另外修掉的：批量删除失败时仍清空整个选中集（改为只清删成功的，失败的保持选中以便
+重试）、搜索词变化不清选中（过滤后用户看不见的选中项会被误删）、`drag-entries`
+事件零消费者（删掉这条无用通道）、拖拽阈值用曼哈顿距离（手抖 3px+3px 就超阈值，
+改成欧氏距离 8px）、全局右键守卫让只读文本区（传输日志）失去右键复制（加了
+`data-allow-native-menu` 标记）、路径选择器键盘进不了子目录（Enter 在目录上改为进入）、
+列表每行一个 Tab 停靠点（改成 roving tabindex + `role="listbox"`）。
+
+**反证**：去掉 `localRoot` 闸门 → 2 条用例失败；把实例级 `dragging` 混回高亮判定 →
+1 条失败；去掉「下一 tick 复位」→ 1 条失败；去掉 capture 阶段的 mousedown 拦截 →
+1 条失败；恢复后全绿。
+
+#### 顺带补的可用性缺口：路径选择器只能靠鼠标选文件
+
+**现象**：「导入配色方案」等入口用的应用内路径选择器（`LocalPathPicker`），
+文件名是纯文本节点，**键盘选不了文件** —— 除了「点」没有第二条路。
+
+**修法**：每行加 `tabindex="0"` / `role="option"` / `aria-selected`，
+`Enter` / `空格` 等价于单击，上下方向键在行之间移动焦点（焦点行按索引定位，
+不查全局 `document` —— 列表被 Teleport 到 body，从组件里查不到）。
+
+**回归用例**：`tests/unit/LocalPathPicker.spec.ts` 新增「键盘可以选中文件：Enter
+等价于单击」（含 `tabindex` 断言）与「方向键在列表行之间移动焦点」。
+
+**反证**：去掉 `tabindex` 与两个 keydown 处理 → 2 条用例失败；恢复后全绿。
+
+#### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `npx vitest run` | Test Files **55 passed (55)**、Tests **510 passed (510)**（连跑三次稳定） |
+| `npm run typecheck` / `npm run build` / `npm run check:docs` / `npm run check:bundle` / `npm run check:release` | 均通过 |
+| `npm run test:scripts` | **48** 通过、0 失败 |
+| `cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` | 均 exit 0 |
+| `cargo test --workspace` | **419** 通过、**0** 失败、**19** 忽略 |
+
+**本轮的真机证据**（macOS 原生应用 + multipass Linux `192.168.252.2`）：
+- 拖拽下载：后端 `EnqueueDownload` 入队 → 本地 `/tmp/rshell-e2e/.bashrc`（3771 B）
+- 拖拽上传：后端 `EnqueueUpload` 入队 → 远端 `/home/ubuntu/drag-upload-test.txt`（24 B）
+- 传输队列面板：两条任务均「完成 / 100%」
+- 配色导入：后端 `ImportColorScheme` → 落盘 `color_schemes.json` → 出现在方案列表
+- 配色切换：后端 `SetTerminalColorScheme` → `Color scheme changed to: RShell 验收配色`
+
+测试数据已清理：导入的配色方案已从 `color_schemes.json` 移除、拖拽用的本地/远端
+文件已删除、`~/rshell-acceptance-scheme.json` 已删除（保留 4 条连接与 GROUP2 分组）。

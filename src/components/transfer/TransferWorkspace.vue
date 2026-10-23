@@ -68,9 +68,19 @@ watch(() => props.remotePath, (v) => {
   }
 });
 
-const validFile = (entries: FsEntry[]) => entries.length === 1 && !entries[0].is_dir && safeName(entries[0].name);
 /** 可传输文件集合：全部为普通文件且名称安全（支持多选批量传输） */
 const transferable = (entries: FsEntry[]) => entries.filter((e) => !e.is_dir && safeName(e.name));
+/**
+ * 可删除集合：全部为普通文件且名称安全。
+ *
+ * 后端 delete_remote_entry 只接受单个普通文件路径（目录会被拒），
+ * 所以批量删除由前端逐个调用后端。目录一律不进这个集合。
+ */
+const deletableEntries = (entries: FsEntry[]) =>
+  entries.filter((e) => !e.is_dir && safeName(e.name));
+/** 是否可删除：至少一个目标，且选中的全是普通文件（混入选了目录就不给删） */
+const deletable = (entries: FsEntry[]) =>
+  entries.length > 0 && deletableEntries(entries).length === entries.length;
 
 /**
  * 目标已存在时的处理选择。
@@ -157,7 +167,7 @@ const capabilities = computed(() => ({
   upload: !!props.sessionId && !!props.connected && !!localRoot.value && transferable(selectedLocal.value).length > 0,
   download: !!props.sessionId && !!props.connected && !!localRoot.value && transferable(selectedRemote.value).length > 0,
   createFolder: !!props.sessionId && !!props.connected && !!internalRemotePath.value,
-  delete: !!props.sessionId && !!props.connected && validFile(selectedRemote.value),
+  delete: !!props.sessionId && !!props.connected && deletable(selectedRemote.value),
   refresh: !!props.connected || !!localRoot.value,
   sync: !!props.connected && !!localRoot.value,
 }));
@@ -252,12 +262,28 @@ function onRemoteSyncRequest(path: string) {
 }
 
 async function upload() {
-  if (!capabilities.value.upload || !props.sessionId) return;
-  const files = transferable(selectedLocal.value);
+  return uploadEntries(selectedLocal.value);
+}
+
+/**
+ * 上传指定条目（右键菜单 / 拖拽 / 工具栏都走这里）。
+ *
+ * 批量：逐个入队。单条失败不阻断其余文件，失败条目在面板顶部汇总提示。
+ * 入队前先读一次远端目录：同名文件当场问覆盖/重命名/跳过，
+ * 而不是先让后端拒绝一次再问（少一次往返，也不会先失败再解释）。
+ */
+async function uploadEntries(source: FsEntry[]) {
+  if (!props.sessionId || !props.connected) return;
+  // 本地根是**唯一**的本地落点来源：没有它，internalLocalPath 是空串，
+  // joinPath("", name) 会拼成 "/name" —— 直接写到文件系统根目录。
+  // 工具栏与右键菜单都被 capabilities.download/upload 的 localRoot 闸门挡住，
+  // 拖拽这条路也必须守同一道闸门。
+  if (!localRoot.value) {
+    ElMessage.error("请先选择本地目录");
+    return;
+  }
+  const files = transferable(source);
   if (files.length === 0) return;
-  // 批量：逐个入队。单条失败不阻断其余文件，失败条目在面板顶部汇总提示。
-  // 入队前先读一次远端目录：同名文件当场问覆盖/重命名/跳过，
-  // 而不是先让后端拒绝一次再问（少一次往返，也不会先失败再解释）。
   const existing = await existingNames(internalRemotePath.value, true);
   const failures: string[] = [];
   let queued = 0;
@@ -292,8 +318,18 @@ async function upload() {
 }
 
 async function download() {
-  if (!capabilities.value.download || !props.sessionId) return;
-  const files = transferable(selectedRemote.value);
+  return downloadEntries(selectedRemote.value);
+}
+
+/** 下载指定条目（同上，多选 / 拖拽共用） */
+async function downloadEntries(source: FsEntry[]) {
+  if (!props.sessionId || !props.connected) return;
+  // 同上传：没有本地根就没有合法的本地落点（否则会写到 "/"）
+  if (!localRoot.value) {
+    ElMessage.error("请先选择本地目录");
+    return;
+  }
+  const files = transferable(source);
   if (files.length === 0) return;
   // 同上传：先读本地目标目录，同名文件当场问覆盖/重命名/跳过
   const existing = await existingNames(internalLocalPath.value, false);
@@ -329,6 +365,21 @@ async function download() {
   }
 }
 
+/**
+ * 面板间拖放：拖到远端面板 = 上传，拖到本地面板 = 下载。
+ *
+ * 拖放请求由**来源面板**发出（指针在来源面板按下、抬起也在那里），
+ * payload 里带着目标面板，据此决定方向。
+ * 目录不参与（后端一次只能传一个普通文件，目录递归不在当前契约内）。
+ */
+async function onDropEntries(payload: { from: "local" | "remote"; to: "local" | "remote"; entries: FsEntry[] }) {
+  // 拖回本面板（同侧）不做任何事
+  if (payload.from === payload.to) return;
+  if (payload.entries.length === 0) return;
+  if (payload.to === "remote") await uploadEntries(payload.entries);
+  else await downloadEntries(payload.entries);
+}
+
 async function createFolder() {
   if (!capabilities.value.createFolder || !props.sessionId) return;
   const value = await promptDialog({
@@ -350,26 +401,51 @@ async function createFolder() {
   }
 }
 
+/**
+ * 删除选中的远程文件（支持多选）。
+ *
+ * 确认框逐条列出待删目标 —— 批量删除必须让用户看清**每一个**目标，
+ * 不能只说「共 N 个」。后端一次只能删一个普通文件，所以逐个调用；
+ * 单条失败不阻断其余，失败项在面板顶部汇总提示。
+ */
 async function deleteSelected() {
   if (!capabilities.value.delete || !props.sessionId) return;
-  const file = selectedRemote.value[0];
-  const target = joinPath(internalRemotePath.value, file.name);
+  const files = deletableEntries(selectedRemote.value);
+  if (files.length === 0) return;
+  const targets = files.map((file) => ({
+    name: file.name,
+    path: joinPath(internalRemotePath.value, file.name),
+  }));
   const ok = await confirmDialog({
-    title: "删除远程文件",
-    message: `确定删除远程文件「${file.name}」吗？此操作不可撤销。`,
-    detail: target,
+    title: targets.length === 1 ? "删除远程文件" : `删除 ${targets.length} 个远程文件`,
+    message: targets.length === 1
+      ? `确定删除远程文件「${targets[0].name}」吗？此操作不可撤销。`
+      : `确定删除以下 ${targets.length} 个远程文件吗？此操作不可撤销：\n${targets.map((t) => `· ${t.name}`).join("\n")}`,
+    detail: targets.map((t) => t.path).join("\n"),
     confirmText: "删除",
     danger: true,
   });
   if (!ok) return;
-  try {
-    await deleteRemoteEntry(props.sessionId, target);
-    appendTransferLog("success", `已删除远程文件：${target}`);
-    selectedRemote.value = [];
-    await remotePane.value?.refresh();
-  } catch (error) {
-    appendTransferLog("error", `删除远程文件失败：${target}`, String(error));
-    ElMessage.error(`删除失败：${String(error)}`);
+  const failures: string[] = [];
+  const failedNames = new Set<string>();
+  let deleted = 0;
+  for (const target of targets) {
+    try {
+      await deleteRemoteEntry(props.sessionId, target.path);
+      deleted += 1;
+    } catch (error) {
+      failures.push(`${target.name}：${String(error)}`);
+      failedNames.add(target.name);
+      appendTransferLog("error", `删除远程文件失败：${target.path}`, String(error));
+    }
+  }
+  // 只清掉**删成功**的：失败的保持选中，用户可以直接重试，
+  // 不必重新勾一遍（勾选的是「要删的东西」，不是「已删的东西」）
+  selectedRemote.value = selectedRemote.value.filter((file) => failedNames.has(file.name));
+  await remotePane.value?.refresh();
+  if (deleted > 0) appendTransferLog("success", `已删除 ${deleted} 个远程文件`);
+  if (failures.length > 0) {
+    ElMessage.error(`删除失败 ${failures.length} 个：${failures.join("；")}`);
   }
 }
 
@@ -412,7 +488,7 @@ const contextActions = computed<ContextAction[]>(() => {
   const actions: ContextAction[] = [];
   if (capabilities.value.download) actions.push("download");
   if (capabilities.value.createFolder) actions.push("createFolder");
-  // 删除只对单个普通文件开放：批量删除需要逐条确认，语义与单条不同
+  // 删除对多选同样开放：确认框会逐条列出每一个待删目标
   if (capabilities.value.delete) actions.push("delete");
   actions.push("refresh");
   return actions;
@@ -475,6 +551,7 @@ const rightWidth = computed(() => `${100 - splitPct.value}%`);
         @request-sync="onLocalSyncRequest"
         @selection-change="(s) => selectedLocal = s"
         @row-context-menu="(p) => onRowContextMenu('local', p)"
+        @drop-entries="onDropEntries"
       />
     </div>
     <div
@@ -494,6 +571,7 @@ const rightWidth = computed(() => `${100 - splitPct.value}%`);
         @request-sync="onRemoteSyncRequest"
         @selection-change="(s) => selectedRemote = s"
         @row-context-menu="(p) => onRowContextMenu('remote', p)"
+        @drop-entries="onDropEntries"
       />
     </div>
 
@@ -505,12 +583,20 @@ const rightWidth = computed(() => `${100 - splitPct.value}%`);
       @click="closeContextMenu"
       @contextmenu.prevent="closeContextMenu"
     />
+    <!--
+      右键菜单自身也要吞掉 contextmenu 默认行为：
+      应用菜单是 DOM 元素，WebView 的原生菜单（Reload / Inspect Element）
+      会在右键命中菜单项时叠上来盖住它，且原生菜单的 Reload 会重载整个
+      WebView、丢掉前端状态。这里 preventDefault 掉默认行为，并按
+      「点击外部即关闭」的同一语义把菜单收掉。
+    -->
     <ul
       v-if="contextMenu"
       class="context-menu"
       data-test="context-menu"
       role="menu"
       :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }"
+      @contextmenu.prevent="closeContextMenu"
     >
       <li
         v-for="action in contextActions"

@@ -193,25 +193,57 @@ describe("TransferWorkspace 右键菜单", () => {
     expect(wrapper.find('[data-test="context-delete"]').exists()).toBe(true);
   });
 
-  // 批量删除的确认语义与单条不同，因此只对单个普通文件开放删除
-  it("hides delete for a multi-file remote selection", async () => {
+  // 批量删除：确认框必须逐条列出每一个待删目标，且逐个调用后端
+  // （后端 delete_remote_entry 一次只接受一个普通文件路径）。
+  it("offers delete for a multi-file remote selection and deletes each target after confirmation", async () => {
+    vi.mocked(confirmDialog).mockResolvedValue(true);
+    const wrapper = workspace();
+    const remote = wrapper.findAllComponents(FileBrowserPane)[1];
+    const entries = [
+      { name: "a.txt", is_dir: false, size: 1, modified: "" },
+      { name: "b.txt", is_dir: false, size: 1, modified: "" },
+    ];
+    remote.vm.$emit("selection-change", entries);
+    await flushPromises();
+    remote.vm.$emit("row-context-menu", { entries, x: 10, y: 20 });
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="context-download"]').exists()).toBe(true);
+    const deleteItem = wrapper.find('[data-test="context-delete"]');
+    expect(deleteItem.exists()).toBe(true);
+    await deleteItem.trigger("click");
+    await flushPromises();
+
+    // 确认框要把每一个目标都摆出来，不能只说「共 N 个」
+    const confirmArgs = vi.mocked(confirmDialog).mock.calls.at(-1)?.[0];
+    expect(String(confirmArgs?.message)).toContain("a.txt");
+    expect(String(confirmArgs?.message)).toContain("b.txt");
+    expect(String(confirmArgs?.detail)).toContain("/a.txt");
+    expect(String(confirmArgs?.detail)).toContain("/b.txt");
+
+    expect(deleteRemoteEntry).toHaveBeenCalledTimes(2);
+    expect(deleteRemoteEntry).toHaveBeenCalledWith("session-1", "/a.txt");
+    expect(deleteRemoteEntry).toHaveBeenCalledWith("session-1", "/b.txt");
+  });
+
+  // 选中了目录时不给删：后端只接受普通文件，目录删除会失败
+  it("hides delete when the selection contains a directory", async () => {
     const wrapper = workspace();
     const remote = wrapper.findAllComponents(FileBrowserPane)[1];
     remote.vm.$emit("selection-change", [
       { name: "a.txt", is_dir: false, size: 1, modified: "" },
-      { name: "b.txt", is_dir: false, size: 1, modified: "" },
+      { name: "folder", is_dir: true, size: 0, modified: "" },
     ]);
     await flushPromises();
     remote.vm.$emit("row-context-menu", {
       entries: [
         { name: "a.txt", is_dir: false, size: 1, modified: "" },
-        { name: "b.txt", is_dir: false, size: 1, modified: "" },
+        { name: "folder", is_dir: true, size: 0, modified: "" },
       ],
       x: 10,
       y: 20,
     });
     await flushPromises();
-    expect(wrapper.find('[data-test="context-download"]').exists()).toBe(true);
     expect(wrapper.find('[data-test="context-delete"]').exists()).toBe(false);
   });
 

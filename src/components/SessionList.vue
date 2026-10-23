@@ -360,12 +360,17 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- 右键菜单 -->
+    <!--
+      右键菜单自身要吞掉 contextmenu 默认行为：菜单是 DOM 元素，
+      WebView 原生菜单（Reload / Inspect Element）会在右键命中菜单项时
+      叠上来，且原生菜单的 Reload 会重载整个 WebView、丢掉前端状态。
+    -->
     <div
       v-if="contextMenu.visible"
       class="ctx-menu"
       :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }"
       @click.stop
+      @contextmenu.prevent="closeContextMenu"
     >
       <button class="ctx-item" @click="runMenuItem(ctxConnect)">连接</button>
       <button class="ctx-item" @click="runMenuItem(ctxDisconnect)">断开</button>

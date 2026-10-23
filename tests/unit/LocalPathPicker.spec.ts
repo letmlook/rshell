@@ -108,6 +108,74 @@ describe("LocalPathPicker", () => {
     expect(wrapper.text()).not.toContain("notes.txt");
   });
 
+  /**
+   * 键盘可达：文件名是纯文本节点，鼠标之外原先没有选文件的路径 ——
+   * 键盘用户（或自动化）只能靠点。行上要有 tabindex，Enter/空格等同单击。
+   */
+  it("键盘可以选中文件：Enter 等价于单击", async () => {
+    vi.mocked(readDir).mockResolvedValue([...fileEntry("id_ed25519")] as never);
+    const wrapper = mountPicker({ mode: "file" });
+    await flushPromises();
+
+    const row = wrapper.get('[data-test="picker-row-id_ed25519"]');
+    expect(row.attributes("tabindex")).toBe("0");
+    const submitDisabled = () =>
+      (wrapper.get('[data-test="picker-submit"]').element as HTMLButtonElement).disabled;
+    expect(submitDisabled()).toBe(true);
+
+    await row.trigger("keydown.enter");
+    await flushPromises();
+    expect(submitDisabled()).toBe(false);
+  });
+
+  it("方向键在列表行之间移动焦点", async () => {
+    vi.mocked(readDir).mockResolvedValue([...fileEntry("a.txt"), ...fileEntry("b.txt")] as never);
+    const wrapper = mountPicker({ mode: "file" });
+    await flushPromises();
+
+    // Teleport 到 body 后行不在 document 里，focus() 不改变 activeElement；
+    // 这里直接记录 focus 被调到了哪一行。
+    const focused: string[] = [];
+    const stubFocus = () => {
+      // roving tabindex 会触发重渲染，旧的行节点会被替换 —— 每次重新查询
+      for (const row of wrapper.findAll('[data-test^="picker-row-"]')) {
+        (row.element as HTMLElement).focus = () => {
+          focused.push(row.attributes("data-test") ?? "");
+        };
+      }
+    };
+    stubFocus();
+
+    await wrapper.find('[data-test="picker-row-a.txt"]').trigger("keydown", { key: "ArrowDown" });
+    expect(focused).toEqual(["picker-row-b.txt"]);
+    stubFocus();
+    await wrapper.find('[data-test="picker-row-b.txt"]').trigger("keydown", { key: "ArrowUp" });
+    expect(focused).toEqual(["picker-row-b.txt", "picker-row-a.txt"]);
+  });
+
+  // roving tabindex：列表只占一个 Tab 停靠点，组内用方向键移动
+  it("列表只占一个 Tab 停靠点（roving tabindex）", async () => {
+    vi.mocked(readDir).mockResolvedValue([...fileEntry("a.txt"), ...fileEntry("b.txt")] as never);
+    const wrapper = mountPicker({ mode: "file" });
+    await flushPromises();
+
+    const tabindexes = wrapper.findAll('[data-test^="picker-row-"]').map((r) => r.attributes("tabindex"));
+    expect(tabindexes.filter((t) => t === "0")).toHaveLength(1);
+  });
+
+  // 键盘必须能进入子目录：此前 Enter 只映射到「选中」，目录进不去
+  it("键盘 Enter 能进入目录", async () => {
+    vi.mocked(readDir)
+      .mockResolvedValueOnce(dirEntry("sub") as never)
+      .mockResolvedValueOnce(fileEntry("inner.txt") as never);
+    const wrapper = mountPicker();
+    await flushPromises();
+
+    await wrapper.get('[data-test="picker-row-sub"]').trigger("keydown.enter");
+    await flushPromises();
+    expect(readDir).toHaveBeenLastCalledWith("C:\\data\\sub");
+  });
+
   it("双击目录进入，取消不 emit 结果", async () => {
     vi.mocked(readDir)
       .mockResolvedValueOnce(dirEntry("sub") as never)

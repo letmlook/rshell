@@ -626,7 +626,12 @@ const columns = [
       <p v-if="logEntries.length === 0" class="log-empty" data-test="xfer-log-empty">
         暂无日志记录。传输入队、暂停/取消、目标冲突与失败都会记在这里。
       </p>
-      <ul v-else class="log-list" data-test="xfer-log-list">
+      <!--
+        纯文本只读区：保留 WebView 原生右键菜单（复制选中的日志文字）。
+        全局守卫默认吞掉右键菜单（避免 WebKit 的 Reload / Inspect Element），
+        但这类没有自有菜单的只读文本区需要原生菜单来复制。
+      -->
+      <ul v-else class="log-list" data-test="xfer-log-list" data-allow-native-menu>
         <li
           v-for="entry in logEntries"
           :key="entry.seq"

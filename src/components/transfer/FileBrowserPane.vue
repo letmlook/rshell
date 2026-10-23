@@ -14,6 +14,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { readDir, stat } from "@tauri-apps/plugin-fs";
 import { browseRemoteDir } from "../../ipc/client";
 import { isWithinRoot } from "../../utils/rootBoundary";
+import { DRAG_THRESHOLD, clickPending, dragState, hoverPane } from "../../utils/transferDrag";
 import PathBar from "./PathBar.vue";
 import type { Uuid, FilePermissions } from "../../ipc/types";
 
@@ -51,6 +52,13 @@ const emit = defineEmits<{
    * 点在未选行上时是那单独一行；点在列表空白处时为空数组（只给面板级操作）。
    */
   (e: "row-context-menu", payload: { entries: FsEntry[]; x: number; y: number }): void;
+  /**
+   * 拖放完成。`from` 是来源面板，`to` 是**目标**面板（投到了哪个面板上），
+   * `entries` 是被拖动的条目。
+   *
+   * 抬起发生在来源面板（指针在来源面板按下），所以由来源面板发出这条请求。
+   */
+  (e: "drop-entries", payload: { from: "local" | "remote"; to: "local" | "remote"; entries: FsEntry[] }): void;
 }>();
 
 const entries = ref<FsEntry[]>([]);
@@ -62,10 +70,26 @@ const history = ref<string[]>([]);
 const historyIndex = ref(-1);
 const search = ref("");
 const selected = ref<Set<string>>(new Set());
+/** Shift 区间选择的锚点行（最后一次非 Shift 点击的行） */
+const anchorName = ref<string | null>(null);
 
 const canBack = computed(() => historyIndex.value > 0);
 const canForward = computed(() => historyIndex.value < history.value.length - 1);
 const visibleEntries = computed(() => entries.value.filter((entry) => entry.name.toLowerCase().includes(search.value.toLowerCase())));
+
+/**
+ * 搜索词变化时清掉选中集。
+ *
+ * 多选可达之后这个问题才显出来：搜索过滤后，状态行仍显示「已选 N 项」，
+ * 但其中多数已**看不见** —— 上传/下载/删除会作用于用户已经看不到的文件。
+ * 看不见的选中项留着没意义，清掉最干净。
+ */
+watch(search, () => {
+  if (selected.value.size === 0 && anchorName.value === null) return;
+  selected.value = new Set();
+  anchorName.value = null;
+  emit("selection-change", []);
+});
 
 /**
  * 列表容器的实测高度，喂给 el-table 的 height。
@@ -91,6 +115,11 @@ function measureList() {
 
 onMounted(() => {
   measureList();
+  // 拖拽后的 click 拦截器挂在**组件根元素**的 capture 阶段：行点击由
+  // el-table 在目标阶段处理，冒泡阶段再拦就晚了；挂在根元素上既能覆盖
+  // 面板内的行点击，又不会误伤应用其它区域。
+  rootRef.value?.addEventListener("click", onWindowClickCapture, true);
+  rootRef.value?.addEventListener("mousedown", onRootMouseDownCapture, true);
   // ResizeObserver 在 jsdom 里不存在，缺省时保持自适应高度即可
   if (typeof ResizeObserver === "undefined" || !listWrapRef.value) return;
   listObserver = new ResizeObserver(() => measureList());
@@ -100,6 +129,15 @@ onMounted(() => {
 onBeforeUnmount(() => {
   listObserver?.disconnect();
   listObserver = null;
+  // window 上的监听必须摘干净：组件在拖拽中途卸载时，指针监听残留会一直
+  // 跟着已销毁的组件跑。
+  rootRef.value?.removeEventListener("click", onWindowClickCapture, true);
+  rootRef.value?.removeEventListener("mousedown", onRootMouseDownCapture, true);
+  detachPointerListeners();
+  dragPointer.value = null;
+  dragging.value = false;
+  dragState.value = null;
+  hoverPane.value = null;
 });
 
 /** 根目录是否已授权（本地模式）。未授权时路径栏显示「选择文件夹」入口 */
@@ -175,6 +213,7 @@ async function load(path: string, pushHistory = true) {
   loading.value = true;
   errorText.value = null;
   selected.value = new Set();
+  anchorName.value = null;
   emit("selection-change", []);
   try {
     if (props.mode === "remote" && props.sessionId) {
@@ -281,29 +320,60 @@ function onRowDblClick(entry: FsEntry) {
   }
 }
 
+/**
+ * 选中集更新。
+ *
+ * 修饰键决定语义（与系统文件管理器一致）：
+ *   - 无修饰键：单选；若点的是唯一已选行则取消选择
+ *   - Ctrl/⌘：在当前选中集上增删该行（多选）
+ *   - Shift：从「锚点行」到该行做区间选择（区间按列表顺序，不是按已选集合）
+ *
+ * 之前 ctrlKey/shiftKey 两个形参恒为 false —— 调用点永远传 (false, false)，
+ * 于是多选在界面上根本做不到，「批量上传/批量下载」这条路径不可达
+ * （后端 enqueue_upload 是支持多文件的，前端却只能选中一个）。
+ */
 function toggleSelect(entry: FsEntry, ctrlKey: boolean, shiftKey: boolean) {
+  if (shiftKey && anchorName.value !== null) {
+    const list = visibleEntries.value;
+    const from = list.findIndex((x) => x.name === anchorName.value);
+    const to = list.findIndex((x) => x.name === entry.name);
+    if (from >= 0 && to >= 0) {
+      const [lo, hi] = from <= to ? [from, to] : [to, from];
+      selected.value = new Set(list.slice(lo, hi + 1).map((x) => x.name));
+      emitSelection();
+      return;
+    }
+  }
   if (!ctrlKey && !shiftKey) {
     if (selected.value.size === 1 && selected.value.has(entry.name)) {
       selected.value = new Set();
     } else {
       selected.value = new Set([entry.name]);
     }
+    anchorName.value = entry.name;
   } else if (selected.value.has(entry.name)) {
     selected.value.delete(entry.name);
     selected.value = new Set(selected.value);
+    anchorName.value = entry.name;
   } else {
     selected.value.add(entry.name);
     selected.value = new Set(selected.value);
+    anchorName.value = entry.name;
   }
+  emitSelection();
+}
+
+/** 把当前选中集按可见顺序发给上层（上层据此决定上传/下载/删除的目标） */
+function emitSelection() {
   emit(
     "selection-change",
     entries.value.filter((x) => selected.value.has(x.name)),
   );
 }
 
-function onRowClick(entry: FsEntry) {
+function onRowClick(entry: FsEntry, event?: MouseEvent) {
   // 单击 = 选中(单击目录不会进入 —— 进入靠双击,避免误触)
-  toggleSelect(entry, false, false);
+  toggleSelect(entry, !!event?.ctrlKey || !!event?.metaKey, !!event?.shiftKey);
 }
 
 /**
@@ -317,6 +387,9 @@ function onRowContextMenu(entry: FsEntry, event: MouseEvent) {
     targets = entries.value.filter((x) => selected.value.has(x.name));
   } else {
     selected.value = new Set([entry.name]);
+    // 锚点跟着选中走：否则下一次 Shift 点击的区间起点可能是一个已经不在
+    // 选中集里的行，区间结果会出乎意料
+    anchorName.value = entry.name;
     targets = [entry];
     emit("selection-change", targets);
   }
@@ -329,6 +402,175 @@ function onPaneContextMenu(event: MouseEvent) {
   if ((event.target as HTMLElement).closest(".el-table__row")) return;
   event.preventDefault();
   emit("row-context-menu", { entries: [], x: event.clientX, y: event.clientY });
+}
+
+// ── 拖拽 ──
+// 本地 ⇄ 远程 面板之间互相拖：本地拖到远程 = 上传，远程拖到本地 = 下载。
+//
+// 用指针事件而不是 HTML5 drag & drop：macOS 的 WKWebView 里 HTML5 拖放
+// 只会派发 dragstart / dragend，dragover / drop 根本不触发（真机合成手势
+// 实测：事件序列只有 dragstart → dragend，缺 drag / dragover / drop），
+// 于是投放永远不发生。同一套合成手势在 Chrome（Blink）里能完整派发，
+// 说明是 WebKit 的原生拖拽会话不被合成事件驱动，不是页面代码的问题。
+// 指针事件在 WKWebView 里行为正常，且能被自动化验证。
+const dragPointer = ref<{ x: number; y: number; entries: FsEntry[] } | null>(null);
+/** 拖拽进行中（指针已越过阈值） */
+const dragging = ref(false);
+/** 面板根元素：click 拦截器挂在这里 */
+const rootRef = ref<HTMLElement | null>(null);
+/**
+ * 本面板是否正被当作拖拽目标高亮。
+ *
+ * 判定只用**共享状态**：拖拽是否在进行中、指针停在哪个面板、来源是哪个面板
+ * —— 这三样都在 `utils/transferDrag` 里（两个面板是兄弟组件，实例级的
+ * `dragging` 只有来源面板为 true，混进来会让目标面板永远不高亮）。
+ */
+const isDropTarget = computed(
+  () => dragState.value !== null && hoverPane.value === props.mode && dragState.value.from !== props.mode,
+);
+
+/**
+ * 按下：记住起点与要拖的条目（多选时带走整个选中集）。
+ *
+ * 监听挂在 window 上而不是面板上：拖拽一旦开始，指针会离开源面板，
+ * 面板级监听就收不到后续的 pointermove / pointerup 了（拖到对面面板时
+ * 必然发生），投放也就永远判不出来。
+ */
+/**
+ * 从文件名单元格起手时取消浏览器默认的文本选择。
+ *
+ * 必须在 **capture 阶段**拦 mousedown：WebKit 在 mousedown 的默认动作里就把
+ * 选区锚点定下来了，等到 pointermove 发现是拖拽再改 user-select 已经太晚 ——
+ * 拖过去会拖出一条跨面板的文本高亮。
+ *
+ * 只针对文件名单元格（.name-cell）：那里的文本本来也**不能**选（user-select:none），
+ * 取消默认动作不影响任何用户可见的选中行为。
+ */
+function onRootMouseDownCapture(event: MouseEvent) {
+  if (event.button !== 0) return;
+  const target = event.target as HTMLElement | null;
+  if (!target?.closest(".name-cell")) return;
+  event.preventDefault();
+}
+
+function onRowPointerDown(entry: FsEntry, event: PointerEvent) {
+  if (event.button !== 0) return;
+  // 拖拽期间禁掉本面板的文本选中：
+  // pointerdown 落在 .name-cell（user-select:none）上，但 WebKit 在 mousedown
+  // 时就把选区锚点定下来了，后续移动会把选区扩到面板的其它区域（表头、搜索框），
+  // 拖过去会拖出一条跨区域的高亮。
+  //
+  // 整块面板临时设为不可选：pointerdown 落在 .name-cell（user-select:none）上，
+  // 但 WebKit 在 mousedown 时就把选区锚点定下来了，后续移动会把选区扩到
+  // 面板的其它区域（表头、搜索框），拖过去会拖出一条跨区域的高亮。
+  // 这里不能 preventDefault —— 那会连带挡掉行点击（单击选中就失效了）。
+  rootRef.value?.classList.add("is-dragging-select");
+  const dragged = selected.value.has(entry.name)
+    ? entries.value.filter((x) => selected.value.has(x.name))
+    : [entry];
+  dragPointer.value = { x: event.clientX, y: event.clientY, entries: dragged };
+  window.addEventListener("pointermove", onPointerMove);
+  window.addEventListener("pointerup", onPointerUp);
+  window.addEventListener("pointercancel", onPointerCancel);
+}
+
+/** 移动：越过阈值才算拖拽，并记下指针停在哪个面板上 */
+function onPointerMove(event: PointerEvent) {
+  const start = dragPointer.value;
+  if (!start) return;
+  // 欧氏距离：曼哈顿距离下横向 3px + 纵向 3px 的正常手抖就会超阈值，
+  // 一次普通点击被误判成拖拽 → 点击被吞、行不被选中。
+  const moved = Math.hypot(event.clientX - start.x, event.clientY - start.y);
+  if (!dragging.value) {
+    if (moved < DRAG_THRESHOLD) return;
+    dragging.value = true;
+    // 越过阈值 = 确认是拖拽：清掉 mousedown 时可能已经建立的选区
+    window.getSelection?.()?.removeAllRanges();
+    dragState.value = { from: props.mode, names: start.entries.map((x) => x.name) };
+  }
+  hoverPane.value = paneUnderPointer(event.clientX, event.clientY);
+}
+
+/** 拆掉 window 上的拖拽监听（抬起 / 取消 / 卸载都要走这里） */
+function detachPointerListeners() {
+  window.removeEventListener("pointermove", onPointerMove);
+  window.removeEventListener("pointerup", onPointerUp);
+  window.removeEventListener("pointercancel", onPointerCancel);
+  rootRef.value?.classList.remove("is-dragging-select");
+}
+
+/**
+ * 指针抬起：落在另一个面板上就投放。
+ *
+ * 真的拖过之后，浏览器仍会在松手时派发 click —— 拖拽不该顺手改掉选中集，
+ * 所以这里记一笔，由 capture 阶段的 click 拦截器吞掉那一次 click。
+ */
+function onPointerUp(event: PointerEvent) {
+  const start = dragPointer.value;
+  const wasDragging = dragging.value;
+  dragPointer.value = null;
+  dragging.value = false;
+  detachPointerListeners();
+  dragState.value = null;
+  hoverPane.value = null;
+  if (!start || !wasDragging) return;
+  // 抬起后浏览器紧接着派发 click：这一次要吞掉（否则「拖一下」会顺手改掉选中集）。
+  // 标志位下一 tick 就复位 —— 跨面板拖拽时 click 派发到两者的公共祖先，
+  // 面板级拦截器看不到它，标志位若留着就会把面板内**下一个**点击也吞掉。
+  clickPending.value = true;
+  setTimeout(() => { clickPending.value = false; }, 0);
+  const target = paneUnderPointer(event.clientX, event.clientY);
+  // 拖回本面板（或拖到面板外）不做任何事
+  if (!target || target === props.mode) return;
+  // 抬起发生在**源面板**（指针在源面板按下），所以由源面板发出投放请求，
+  // 并带上目标面板：上层据此决定是上传还是下载。
+  emit("drop-entries", { from: props.mode, to: target, entries: start.entries });
+}
+
+/**
+ * 手势被系统取消（pointercancel）：只清理，**不投放**。
+ *
+ * pointercancel 之后没有可靠的落点，拿它当 pointerup 会把文件投到
+ * 一个用户根本没松开的位置。
+ */
+function onPointerCancel() {
+  dragPointer.value = null;
+  dragging.value = false;
+  detachPointerListeners();
+  dragState.value = null;
+  hoverPane.value = null;
+}
+
+/**
+ * 吞掉拖拽后紧随的那一次 click。
+ *
+ * 拖过之后松手，浏览器仍会派发 click（指针起止都在同一行时），不吞掉的话
+ * 「拖一下」会顺带改掉选中集 —— 与用户意图不符。
+ *
+ * 只在事件**落在本面板内**时才吞：跨面板拖拽时 click 按 DOM 规范派发到
+ * 两个面板的公共祖先（不在本面板内），那一次 click 本来就不该由本面板处理；
+ * 若标志位留着，还会把面板内**下一个**点击也吞掉（用户看到「点了没反应」）。
+ */
+function onWindowClickCapture(event: MouseEvent) {
+  if (!clickPending.value) return;
+  const target = event.target as Node | null;
+  if (!target || !rootRef.value?.contains(target)) return;
+  clickPending.value = false;
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+/**
+ * 指针坐标下是哪个面板。
+ *
+ * 面板根节点带 data-pane="local|remote"：用 elementFromPoint 找到指针
+ * 下面的元素，再向上找带该标记的祖先。
+ */
+function paneUnderPointer(x: number, y: number): "local" | "remote" | null {
+  const element = document.elementFromPoint(x, y);
+  const host = element?.closest("[data-pane]");
+  const mode = host?.getAttribute("data-pane");
+  return mode === "local" || mode === "remote" ? mode : null;
 }
 
 watch(
@@ -348,7 +590,7 @@ watch(
 </script>
 
 <template>
-  <div class="pane">
+  <div ref="rootRef" class="pane">
     <!-- 路径栏 -->
     <div class="path-bar">
       <button class="path-btn" :disabled="!canBack" title="后退" @click="goBack">
@@ -397,8 +639,15 @@ watch(
       />
     </div>
 
-    <!-- 列表 -->
-    <div ref="listWrapRef" class="list-wrap" @contextmenu="onPaneContextMenu">
+    <!-- 列表：也是另一面板的拖放目标（本地 ⇄ 远程 互拖） -->
+    <div
+      ref="listWrapRef"
+      class="list-wrap"
+      :class="{ 'is-drop-target': isDropTarget }"
+      data-test="fs-list"
+      :data-pane="mode"
+      @contextmenu="onPaneContextMenu"
+    >
       <p v-if="errorText" class="err">{{ errorText }}</p>
       <el-table
         :data="visibleEntries"
@@ -409,12 +658,16 @@ watch(
         :empty-text="mode === 'local' && !path ? '先选择本地文件夹' : '空目录'"
         class="fs-table"
         @row-dblclick="onRowDblClick"
-        @row-click="(row: FsEntry) => onRowClick(row)"
+        @row-click="(row: FsEntry, _column: unknown, event: MouseEvent) => onRowClick(row, event)"
         @row-contextmenu="(row: FsEntry, _column: unknown, event: MouseEvent) => onRowContextMenu(row, event)"
       >
         <el-table-column prop="name" label="名称" min-width="220">
           <template #default="{ row }">
-            <span class="name-cell">
+            <span
+              class="name-cell"
+              data-test="fs-row-name"
+              @pointerdown="onRowPointerDown(row, $event)"
+            >
               <span class="icon" :class="row.is_dir ? 'is-dir' : 'is-file'" aria-hidden="true">
                 <svg v-if="row.is_dir" width="14" height="14" viewBox="0 0 16 16"><path d="M2 4.5 V12.5 H14 V6 H8 L6.5 4.5 Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
                 <svg v-else width="14" height="14" viewBox="0 0 16 16"><path d="M3.5 2 H10 L12.5 4.5 V14 H3.5 Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /><path d="M10 2 V4.5 H12.5" fill="none" stroke="currentColor" stroke-width="1.2" /></svg>
@@ -535,10 +788,29 @@ watch(
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  /* 文件名单元格可拖：拖到对面面板 = 上传 / 下载 */
+  cursor: grab;
+  touch-action: none;
+  /* 拖拽时不要拉出文本选区（否则会跨面板拖出一条高亮） */
+  user-select: none;
 }
 .icon { color: var(--rs-icon-folder); display: inline-flex; }
 .icon.is-file { color: var(--rs-fg-muted); }
 .filename.selected { color: var(--rs-fg); }
+
+/* 拖拽进行中：禁掉本面板的文本选中 */
+.pane.is-dragging-select {
+  user-select: none;
+}
+.pane.is-dragging-select :deep(*) {
+  user-select: none;
+}
+
+/* 拖放悬停时的投放提示 */
+.list-wrap.is-drop-target {
+  outline: 2px dashed var(--rs-accent);
+  outline-offset: -2px;
+}
 
 .err {
   padding: var(--rs-s-2);

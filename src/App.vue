@@ -56,6 +56,7 @@ import { useThemeStore } from "./stores/theme";
 import { useMasterPasswordStore } from "./stores/masterPassword";
 import { useFoldersStore } from "./stores/folders";
 import { hotkeyBlockedByTarget, matchesHotkey } from "./utils/hotkey";
+import { installContextMenuGuard } from "./utils/contextMenu";
 import { quickCommandHotkeys, setQuickCommands } from "./utils/quickCommandHotkeys";
 import { matchAppShortcut } from "./utils/shortcuts";
 import { resolveQuickCommandTargets } from "./utils/quickCommand";
@@ -113,6 +114,8 @@ const transferPanelHeight = ref<number | undefined>(undefined);
 type TransferAction = "pause" | "resume" | "cancel" | "remove" | "retry";
 let unlistenTransfers: (() => void) | null = null;
 let mounted = false;
+/** 全局右键菜单守卫的卸载函数（onBeforeUnmount 必须调用，否则监听残留） */
+let removeContextMenuGuard: (() => void) | null = null;
 
 async function refreshTransfers() {
   try {
@@ -707,6 +710,9 @@ onMounted(async () => {
   mounted = true;
   window.addEventListener("resize", onViewportResize);
   window.addEventListener("keydown", onGlobalKeydown);
+  // 全局吞掉 WebView 原生右键菜单（Reload / Inspect Element）：
+  // 它会盖在应用自己的右键菜单上，且 Reload 会重载整个 WebView、丢掉前端状态。
+  removeContextMenuGuard = installContextMenuGuard();
   await store.refresh();
   if (!mounted) return;
   await store.subscribeEvents();
@@ -801,6 +807,8 @@ onBeforeUnmount(() => {
   mounted = false;
   window.removeEventListener("resize", onViewportResize);
   window.removeEventListener("keydown", onGlobalKeydown);
+  removeContextMenuGuard?.();
+  removeContextMenuGuard = null;
   dockviewApi = null;
   unlistenTransfers?.();
   store.disposeEvents();

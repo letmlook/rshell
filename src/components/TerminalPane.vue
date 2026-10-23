@@ -898,13 +898,18 @@ onBeforeUnmount(() => {
       @contextmenu="onContextMenu"
     />
 
-    <!-- 终端右键菜单 -->
+    <!--
+      终端右键菜单自身要吞掉 contextmenu 默认行为：菜单是 DOM 元素，
+      WebView 原生菜单（Reload / Inspect Element）会在右键命中菜单项时
+      叠上来盖住它，且原生菜单的 Reload 会重载整个 WebView、丢掉前端状态。
+    -->
     <ul
       v-if="contextMenu"
       class="term-context-menu"
       data-test="term-context-menu"
       role="menu"
       :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }"
+      @contextmenu.prevent="closeContextMenu"
     >
       <li role="none">
         <button

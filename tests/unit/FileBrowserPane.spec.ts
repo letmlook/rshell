@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { flushPromises, mount } from "@vue/test-utils";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import FileBrowserPane from "../../src/components/transfer/FileBrowserPane.vue";
 import { browseRemoteDir } from "../../src/ipc/client";
 import { readDir, stat } from "@tauri-apps/plugin-fs";
@@ -9,7 +9,11 @@ vi.mock("@tauri-apps/plugin-fs", () => ({ readDir: vi.fn(), stat: vi.fn() }));
 
 const stubs = {
   "el-input": { props: ["size"], template: "<input />" },
-  "el-table": { props: ["data"], template: "<div data-testid='rows'>{{ JSON.stringify(data) }}<slot /></div>" },
+  "el-table": {
+    name: "el-table",
+    props: ["data"],
+    template: "<div data-testid='rows'>{{ JSON.stringify(data) }}<slot /></div>",
+  },
   "el-table-column": { template: "<div />" },
 };
 
@@ -108,6 +112,89 @@ describe("FileBrowserPane", () => {
     await flushPromises();
 
     expect(wrapper.find("[data-testid='rows']").text()).toContain('"is_dir":true');
+  });
+});
+
+/**
+ * 多选。
+ *
+ * toggleSelect 的 ctrlKey/shiftKey 两个形参之前恒为 false —— 调用点永远传
+ * (false, false)，于是多选在界面上根本做不到，「批量上传/批量下载」这条
+ * 后端支持的路径不可达，状态行的「已选 N 项」也永远只有 1。
+ */
+describe("FileBrowserPane 多选", () => {
+  // 远端列表走 SFTP 协议字段（file_type），不是本地的 is_dir
+  const remoteFiles = [
+    { name: "a.txt", size: 1, file_type: "File", modified: "0", owner: "u", permissions: "rw-r--r--" },
+    { name: "b.txt", size: 1, file_type: "File", modified: "0", owner: "u", permissions: "rw-r--r--" },
+    { name: "c.txt", size: 1, file_type: "File", modified: "0", owner: "u", permissions: "rw-r--r--" },
+  ];
+
+  async function mountRemote() {
+    vi.mocked(browseRemoteDir).mockResolvedValue({ entries: remoteFiles } as never);
+    const wrapper = mount(FileBrowserPane, {
+      props: { mode: "remote", path: "/", sessionId: "s" },
+      global: { stubs },
+    });
+    await flushPromises();
+    return wrapper;
+  }
+
+  /** 触发 el-table 的 row-click（签名 row, column, event） */
+  async function clickRow(wrapper: VueWrapper, name: string, modifiers: { ctrlKey?: boolean; shiftKey?: boolean } = {}) {
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true, ...modifiers });
+    const table = wrapper.findComponent({ name: "el-table" });
+    const row = remoteFiles.find((f) => f.name === name)!;
+    table.vm.$emit("row-click", { name: row.name, size: row.size, is_dir: false, modified: "" }, null, event);
+    await flushPromises();
+  }
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it("Ctrl+点击把行加入选中集（多选可达）", async () => {
+    const wrapper = await mountRemote();
+    await clickRow(wrapper, "a.txt");
+    await clickRow(wrapper, "b.txt", { ctrlKey: true });
+
+    const selected = wrapper.emitted("selection-change")?.at(-1)?.[0] as { name: string }[];
+    expect(selected?.map((x) => x.name)).toEqual(["a.txt", "b.txt"]);
+  });
+
+  it("Ctrl+点击已选中的行会把它移出选中集", async () => {
+    const wrapper = await mountRemote();
+    await clickRow(wrapper, "a.txt");
+    await clickRow(wrapper, "b.txt", { ctrlKey: true });
+    await clickRow(wrapper, "a.txt", { ctrlKey: true });
+
+    const selected = wrapper.emitted("selection-change")?.at(-1)?.[0] as { name: string }[];
+    expect(selected?.map((x) => x.name)).toEqual(["b.txt"]);
+  });
+
+  it("Shift+点击从锚点行选到该行（区间选择）", async () => {
+    const wrapper = await mountRemote();
+    await clickRow(wrapper, "a.txt");
+    await clickRow(wrapper, "c.txt", { shiftKey: true });
+
+    const selected = wrapper.emitted("selection-change")?.at(-1)?.[0] as { name: string }[];
+    expect(selected?.map((x) => x.name)).toEqual(["a.txt", "b.txt", "c.txt"]);
+  });
+
+  it("无修饰键点击只选中该行（多选被替换）", async () => {
+    const wrapper = await mountRemote();
+    await clickRow(wrapper, "a.txt");
+    await clickRow(wrapper, "b.txt", { ctrlKey: true });
+    await clickRow(wrapper, "c.txt");
+
+    const selected = wrapper.emitted("selection-change")?.at(-1)?.[0] as { name: string }[];
+    expect(selected?.map((x) => x.name)).toEqual(["c.txt"]);
+  });
+
+  it("状态行的「已选 N 项」反映真实选中数", async () => {
+    const wrapper = await mountRemote();
+    await clickRow(wrapper, "a.txt");
+    await clickRow(wrapper, "b.txt", { ctrlKey: true });
+
+    expect(wrapper.text()).toContain("已选 2 项");
   });
 });
 
