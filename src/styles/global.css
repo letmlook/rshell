@@ -73,3 +73,104 @@ body {
   background-clip: content-box;
   border: 2px solid transparent;
 }
+
+/*
+ * 侧栏列表卡片 —— 侧栏只有 200~360px 宽（见 utils/workspaceLayout.ts），
+ * 放不下 el-table：表格按列宽排版，窄容器里要么把弹性列压成 0 宽
+ * （Element Plus 在溢出时把无 width/min-width 的列 realWidth 设成
+ * Number("") = 0，内容整列不可见），要么把操作按钮裁到视口之外。
+ * 卡片布局不依赖列宽，窄侧栏下标题、内容与按钮都完整可见。
+ */
+.rs-cards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rs-card {
+  border: 1px solid var(--rs-border);
+  border-radius: 6px;
+  background: var(--rs-bg-surface);
+  padding: 8px 10px;
+}
+.rs-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+.rs-card-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--rs-fg);
+  font-weight: 600;
+}
+.rs-card-tag {
+  flex: 0 0 auto;
+  color: var(--rs-fg-muted);
+}
+.rs-card-body {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--rs-fg-muted);
+}
+.rs-card-line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+.rs-card-label {
+  flex: 0 0 auto;
+  color: var(--rs-fg-disabled);
+}
+.rs-card-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--rs-font-mono, monospace);
+}
+/* 需要完整换行显示的长文本（命令、指纹、错误原因） */
+.rs-card-value-wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.rs-card-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.rs-card-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--rs-fg-muted);
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.rs-card-tags {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+/* 标签不参与换行（el-tag 是 nowrap），过长时截断，绝不撑破卡片 */
+.rs-card-tags .el-tag {
+  max-width: 100%;
+  overflow: hidden;
+}
+.rs-card-tags .el-tag__content {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

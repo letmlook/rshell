@@ -1149,13 +1149,17 @@ Key-auth-test   ID 884af187-8258-43b7-8ee…
 **反证**：把 App.vue 改回 `isTextInputTarget` → 契约用例失败；去掉 TerminalPane 的
 `matchesUserHotkey` → 契约用例失败；恢复后全绿。
 
-#### 界面端到端的验证限制（不是应用缺陷）
+#### 界面端到端的验证限制（**该结论已被证伪，见 2026-10-24 一节**）
 
-带修饰键的组合键**无法在 macOS 上用这套自动化验证**：驱动送进 WebView 的按键
-**不带修饰键**——终端里收到的是纯 `h` / 纯 `f`。判据是**应用自带的 `Cmd+F` 同样
-不生效**（查找栏没打开，终端里只多了个 `f`）：连应用自己的快捷键都不通，说明是
-驱动/环境把修饰键吞了，与本次改动无关。因此热键的**界面端到端**部分只能由
-单元测试与源码契约守住；真机行为请在正常桌面会话里用真实键盘确认。
+> ~~带修饰键的组合键**无法在 macOS 上用这套自动化验证**：驱动送进 WebView 的按键
+> **不带修饰键**——终端里收到的是纯 `h` / 纯 `f`。~~
+>
+> **更正（2026-10-24）**：这条结论**是错的**。修饰键**可以**送达 WKWebView：
+> 同期的 Chrome 对照实验里 `ctrl:true, shift:true` 完整送达；在 Tauri 的 WKWebView 里
+> `Ctrl+F` 能打开终端查找栏、`Ctrl+Shift+C` 能把终端选中文本复制到剪贴板，
+> `Ctrl+Shift+9` 能触发绑定了该热键的快速命令（真机实测）。
+> 上一轮之所以观察到「纯 `f`」，是**别的键位**（`Ctrl+F` 在那个上下文里不是应用快捷键）
+> 与取样方式造成的误判。热键的界面端到端部分现在**有真机证据**了。
 
 #### 验证
 
@@ -1253,10 +1257,15 @@ capture 阶段拦截但事件仍传播给组件自己的处理器；
 **反证**：摘掉 `row-click` 的事件接线 → 4 条多选用例失败；把批量删除的确认文案退回
 「共 N 个」→ 1 条用例失败；恢复后全绿。
 
-> **界面端到端的验证限制（不是应用缺陷）**：多选依赖 **Ctrl/⌘ 与 Shift 修饰键**，
-> 而这套 macOS 自动化**送不进修饰键**（连应用自带的 `Cmd+F` 都不生效）。因此
-> 多选的界面端到端行为由单元测试与源码契约守住，真机行为请在正常桌面会话里用真实
-> 键盘确认。
+> **界面端到端的验证限制（该结论已被证伪，见 2026-10-24 一节）**：~~多选依赖
+> **Ctrl/⌘ 与 Shift 修饰键**，而这套 macOS 自动化**送不进修饰键**（连应用自带的
+> `Cmd+F` 都不生效）。因此多选的界面端到端行为由单元测试与源码契约守住，真机行为
+> 请在正常桌面会话里用真实键盘确认。~~
+>
+> **更正（2026-10-24）**：修饰键**能**送达（`Ctrl+F` 真机打开查找栏）。但
+> `computer_click` **不支持带修饰键点击**，而「Ctrl/Shift + 点击」无法用别的工具
+> 表达，所以**多选仍没有真机证据**——这一条限制继续成立，只是理由从「送不进修饰键」
+> 换成「点击工具没有修饰键参数」。
 
 #### 缺陷三：拖拽上传下载完全没有实现（计划里的待办，界面也没有入口）
 
@@ -1376,3 +1385,244 @@ drop 根本不会被允许触发。）
 
 测试数据已清理：导入的配色方案已从 `color_schemes.json` 移除、拖拽用的本地/远端
 文件已删除、`~/rshell-acceptance-scheme.json` 已删除（保留 4 条连接与 GROUP2 分组）。
+
+### 2026-10-24：侧栏四个面板塌列 + 右键菜单「一点开就没」+「编辑连接」不可达 + 热键/触发器/同步输入三个后端缺陷
+
+本轮把上一轮没验收完的界面入口逐个点完（新建连接的四种认证方式、编辑已有连接、
+终端查找/清屏），并把四个侧栏面板、快速命令热键、触发器四种动作、同步输入、撰写
+窗格、脚本面板、插件面板、密钥管理面板重新过了一遍。过程中挖出**九个真缺陷**并修掉，
+其中三个是「点下去根本没有反应」级别的：
+
+- 四个侧栏面板用表格排版，在 200~360px 的侧栏里**整列塌成 0 宽**（名称看不见、
+  操作按钮在视口外点不到）；
+- 四个右键菜单在 macOS 上**一点开就没**（WKWebView 一次右键派发两次 `contextmenu`）；
+- 右键菜单里的「编辑连接」**事件没被侧栏转发**，编辑已有连接整个不可达。
+
+#### 通过的界面验收
+
+| 项 | 结果 |
+|---|---|
+| **新建连接 · 密码** | 口令框出现；认证方式四选一（密码 / 托管密钥 / 外部私钥 / 键盘交互） |
+| **新建连接 · 托管密钥** | 换成「密钥」下拉，并预选已生成的托管密钥（`layout-check (ED25519)`） |
+| **新建连接 · 外部私钥** | 换成「私钥文件」（只读路径 + 「选择…」）+「密钥口令」 |
+| **新建连接 · 键盘交互** | 换成口令框 + 提示「服务器以提示串询问密码时自动应答」 |
+| **编辑已有连接** | 右键 →「编辑连接」→ 既有值全部回填（协议 / 名称 / 分组 / 主机 / 端口 / 用户名 / 认证方式 / 私钥路径）→ 保存后**列表、标签标题、窗口标题、状态栏**同步更新 |
+| **外部私钥认证（端到端）** | `Key-auth-test`（`~/.ssh/id_ed25519`）真机连上 multipass Linux，终端出现 Ubuntu 24.04 横幅与提示符 |
+| **终端查找** | 工具栏「查找」打开查找栏；搜 `updates` → 计数 **1/3**、三处匹配**全部高亮**、当前项橙色高亮 |
+| **终端清屏** | 工具栏「清屏」清空终端，只剩提示符 |
+| **侧栏四面板（卡片布局）** | 密钥 / 快速命令 / 触发器 / 插件四个面板在 **280px 默认宽度**下标题、内容、按钮全部可见可点 |
+
+#### 缺陷一：四个侧栏面板的表格在窄侧栏里塌列
+
+**现象**：密钥面板的「名称」列**整列空白**（AX 树里能读到 `layout-check`，屏幕上没有），
+「指纹」被挤成一列换行八行，最右侧「操作」列的表头被裁掉一半；快速命令面板的「热键」
+被截成 `Ctrl+Shi`，「执行 / 删除」整列落在视口外；触发器面板的「启用」开关与「删除」
+按钮**完全看不到**；插件面板九列合计 1010px 固定宽，插件名不可见、「加载 / 卸载」不可达。
+
+**根因**（Element Plus 的表格布局算法，见
+`node_modules/element-plus/es/components/table/src/table-layout.mjs`）：
+
+```js
+} else {
+  this.scrollX.value = true;
+  flexColumns.forEach((column) => { column.realWidth = Number(column.minWidth); });
+}
+```
+
+表格放不下时（`bodyMinWidth > bodyWidth`），**没写 `width` / `min-width` 的列**会被
+设成 `Number(column.minWidth)`；而 `min-width` 的默认值是**空字符串** → `Number("")`
+= **0** → 该列宽度塌成 0，**内容整列不可见**。另一面，固定列宽合计超过侧栏宽度时表格
+横向溢出，而侧栏没有横向滚动条 → 操作按钮在视口外。
+
+侧栏宽度只有 **200~360px**（`src/utils/workspaceLayout.ts`），而隧道面板早先已经因为
+同一个原因改成过卡片列表（`TunnelPanel` 的 `.tunnel-list`）——本轮把同样的做法扩展到
+其余四个面板。
+
+**修法**：四个面板的表格全部改成**卡片列表**（共享样式类见 `src/styles/global.css` 的
+`.rs-cards` / `.rs-card` …），内容与按钮不再依赖列宽。
+
+**回归用例**：
+- `tests/unit/sidePanelListContract.spec.ts`（新）：**每个 `el-table-column` 都必须显式
+  声明 `width` 或 `min-width`**（否则窄容器里整列不可见）+ **四个侧栏面板不得再使用
+  `el-table`** + 共享卡片样式类必须存在。
+- `tests/unit/KeyManagerPanel.spec.ts` / `QuickCommandPanel.spec.ts` / `TriggerEditor.spec.ts` /
+  `PluginPanel.spec.ts`：各加一条「列表用卡片渲染，不渲染表格」，并断言**名称/指纹/热键/
+  动作在卡片里可见**、操作按钮在卡片里。
+
+**反证**：把四个面板改回 `el-table` → 契约用例失败；把某个 `el-table-column` 的
+`min-width` 去掉 → 契约用例失败。
+
+#### 缺陷二：el-tag 在文档不可见时永远停在 `enter-from`（整块不可见）
+
+**现象**：插件面板的「状态 / 权限 / 扩展点」三个标签**整块看不见**（AX 树里有
+`网络访问`，`getComputedStyle` 读到 `opacity: 0`、`width: 0`）。
+
+**根因**：`el-tag` 把内容包在 `<Transition appear>` 里，靠**双 `requestAnimationFrame`**
+收尾 `el-zoom-in-center-enter-from` 类；而文档不可见时（窗口不在当前 Space / 屏幕锁着 /
+macOS「显示桌面」态）**WebKit 会挂起 rAF**（实测 `document.visibilityState === "hidden"`，
+rAF 回调一次都不触发），那个类就永远留在元素上 → 标签停在 `opacity: 0` + `scaleX(0)`，
+**彻底不可见**。这是 Element Plus 里**唯一**默认用 `appear` 的组件。
+
+**修法**：插件面板的三个 `el-tag` 加 `disable-transitions`（状态标签本来也不需要缩放动画）。
+
+**回归用例**：`tests/unit/elementPlusContract.spec.ts` 新增「每个 `el-tag` 都关掉过渡
+（文档不可见时 rAF 挂起，标签会永远停在 enter-from）」——源码契约，逐个标签检查。
+
+**反证**：去掉任一 `el-tag` 的 `disable-transitions` → 契约用例失败。
+
+#### 缺陷三：插件扩展点把 Rust 的 Debug 串直接甩给用户
+
+**现象**：扩展点显示 `ToolPanel { id: "acceptance", title: "验收面板" }` —— 内部结构漏给
+用户，而且这串文本很长，把卡片撑破、让侧栏出现横向滚动条（权限名早已翻成中文，只有
+扩展点没翻）。
+
+**修法**：`PluginPanel.vue` 新增 `extensionLabel()`，把 Debug 串翻成「工具面板（验收面板）」
+这样的说法（按 `title` > `name` > `scheme` > `position` > `id` 的顺序取人看的字段）；
+卡片里的标签超长时截断（`.rs-card-tags .el-tag__content`）。
+
+**回归用例**：`tests/unit/PluginPanel.spec.ts` 新增「扩展点翻成可读说法，不显示 Rust 的
+Debug 串」。
+
+#### 缺陷四：四个右键菜单在 macOS 上「一点开就没」
+
+**现象**：会话列表右键 → 菜单**闪一下就没了**（`openContextMenu` 明明把 `visible` 置成了
+`true`，AX 树里却找不到菜单项）。
+
+**根因（真机实测，不是猜测）**：在 `window` 的 capture 阶段挂一个计数器，**一次右键
+派发了两个 `contextmenu` 事件**：
+
+```
+n=2  SPAN.leaf-name | DIV.ctx-menu
+```
+
+第一个落在被右击的会话行上 → 应用弹出菜单；菜单随即出现在光标下，**第二个落在菜单
+自己身上** → 菜单按「收到 `contextmenu` 就关自己 / 点别处就关菜单」的语义把自己关掉。
+会话列表、文件列表、传输面板、终端四个菜单都这么做，于是**全都一点开就没**。
+
+**修法**：`src/utils/contextMenu.ts` 的全局守卫记住上一次 `contextmenu` 的坐标与时刻，
+**同一次点击的第二个事件直接吞掉**（坐标相同 + 400ms 内），不让它冒泡到「点别处就关
+菜单」的 window 监听器，也不让它触发菜单自身的关闭逻辑。判据用「坐标相同」而不只是
+「时间接近」，用户真的右键两次（不同位置）不会被误吞。
+
+**回归用例**：`tests/unit/contextMenu.spec.ts` 新增两条——「同一次右键的第二个
+`contextmenu` 不再冒泡到子元素」与「不同位置的右键仍然照常传给子元素」。
+
+**反证**：把守卫里的重复判定改成恒 false → 第一条用例失败。
+
+**修好后的真机证据**：会话列表右键菜单**稳定停留**，九项全部可点：连接 / 断开 /
+更新凭据 / 打开 SFTP / 打开标签 / 新开标签 / 编辑连接 / 复制连接信息 / 删除连接。
+
+#### 缺陷五：「编辑连接」事件没被侧栏转发 —— 编辑已有连接完全不可达
+
+**现象**：右键菜单点「编辑连接」→ 菜单关掉，**什么也没发生**（编辑对话框不出现）。
+
+**根因**：`SessionList` 发出 `edit-session`，`App.vue` 监听的是 **`<SidePanel>`** 上的
+`@edit-session` —— 而 `SidePanel` **既没在 `defineEmits` 里声明这个事件，也没在模板上
+转发**。事件在侧栏这一层就断了，`App.vue` 的处理器永远不会被调用。
+
+**修法**：`SidePanel.vue` 补上 `(e: "edit-session", id: string): void` 声明与
+`@edit-session="(id) => emit('edit-session', id)"` 转发。
+
+**回归用例**：`tests/unit/SidePanel.spec.ts` 新增「把 SessionList 的编辑连接事件转发给
+上层」。
+
+#### 缺陷六：带 Shift 的数字/符号热键永远不触发
+
+**现象**：热键 `Ctrl+Shift+9` 绑了快速命令，按下去**没有任何反应**（字母类热键正常）。
+
+**根因**：`matchesHotkey` 用 `event.key` 比对主键，而**带 Shift 时 `event.key` 是符号**
+（US 布局 `Shift+9` 是 `(`、`Shift+1` 是 `!`），用户写的 `Ctrl+Shift+9` 永远匹配不上。
+
+**修法**：主键匹配改为**物理键位 `event.code` 优先**（`Digit9`→`9`、`KeyA`→`a`），并保留
+`event.key` 作为符号键写法（`Ctrl+Shift+(`）的第二个候选，两者任一命中即匹配。
+
+**回归用例**：`tests/unit/hotkey.spec.ts` 新增 5 条（数字热键命中 / 物理键位不同则不命中 /
+符号键按 key 命中 / 字母按 code 命中）。
+
+**反证**：退回只看 `event.key` → 1 条失败。
+
+**真机证据**：新建快速命令「热键验收」、热键 `Ctrl+Shift+9`、命令
+`echo RSHELL_HOTKEY_OK` → 终端真实执行并回显 `RSHELL_HOTKEY_OK`，且按键**没有**漏进
+远端 shell。
+
+#### 缺陷七：触发器自触发无限循环
+
+**现象**：创建「匹配 `RSHELL_TRIGGER_` → 发送 `echo RSHELL_TRIGGER_FIRED`」的触发器后，
+一条触发器**自触发 19081 次**把终端刷屏（后端日志里 `Trigger matched` 连续刷）。
+
+**根因**：动作写出的文本成为新输出 → 再次匹配 → 无限循环。
+
+**修法（两层）**：① `create_trigger` 静态校验 —— 动作文本自身匹配自身条件时直接拒绝
+（`"Trigger action text matches its own condition; it would fire forever"`）；② 运行时
+**自触发冷却** —— `TriggerEngine` 新增 `self_cooldown`（会话 → 已自触发的 SendText
+触发器），SendText 触发后进入冷却，`check_output` 跳过冷却中的触发器；
+`SessionService::send_data`（用户/快速命令/同步输入的写入路径，与触发器动作的
+`client.send_data` 不同）调用 `clear_cooldown(session_id)` 解除冷却。
+
+**回归用例**：Rust 6 条（自匹配创建被拒 / 精确匹配同样被拒 / 不自匹配照常创建 / 冷却中
+不再匹配 / 用户输入解除冷却 / 冷却按会话隔离）。**反证**：去掉创建时校验 + 冷却判断
+→ 5 条失败。
+
+#### 缺陷八：同步输入目标会话断开后，每个按键都失败一次且界面仍说「已开启」
+
+**现象**：同步组里有已断开的会话时，每次按键都产生一条
+`Failed to send to synced session … Not found`（实测累计 102+ 条 WARN），界面仍在侧栏显示
+「同步输入已开启，当前同步 2 个会话」，用户完全看不出同步已失效。
+
+**修法**：`send_to_synced_sessions` 收集发送失败的会话，错误为 `CoreError::NotFound`
+（连接确实不存在）时把该会话**移出同步组**并发布 `SyncInputSessionsChanged`；新增纯
+函数 `should_drop_from_sync(&CoreError) -> bool`（只有 NotFound 才移，其它错误不移，
+免得用户莫名丢配置）与 `remove_sessions(&[Uuid])`。
+
+**回归用例**：Rust 4 条（断开会话被移出 / 移除发布变更事件 / 移除不存在的会话不动组 /
+只有 NotFound 才移）。**反证**：判定恒 false → 1 条失败。
+
+**真机证据**：断开一个会话后按一次键 → 日志里 `Removed disconnected sessions from sync
+group dropped=[d316ce61-…] remaining=1`，界面状态行更新为「当前同步 1 个会话」，
+且**只失败一次**。
+
+#### 缺陷九：contenteditable 的子元素上右键粘贴被误吞
+
+**现象**：在 `contenteditable` 区域里右键粘贴没反应。
+
+**根因**：守卫用 `target.isContentEditable` 判断，而 `contenteditable` 的**子元素**上这个
+属性不生效（为 false）。
+
+**修法**：改用 `target.closest("[contenteditable]")` 向上找。
+
+**回归用例**：`tests/unit/contextMenu.spec.ts` 新增「contenteditable 区域（含其子元素）
+保留原生菜单」。
+
+#### 环境限制（不是应用缺陷，但会干扰验收）
+
+- **macOS「显示桌面」态会挂起 WebView 的渲染**：此时 `document.visibilityState ===
+  "hidden"`、`requestAnimationFrame` **一次都不触发**，WebView 不重绘（DOM 变了、AX 树
+  更新了，像素不动）。本轮一度把「el-tag 不可见」「终端右键菜单没画出来」误当成应用
+  缺陷 —— 用 `getComputedStyle` / `getBoundingClientRect` 量到「状态正确、样式可见、
+  有布局盒，但既没进 AX 树也没画出来」才定位到是渲染挂起。按 `Escape` 退出「显示桌面」
+  态即可恢复。
+- **多选仍无真机证据**：`computer_click` 不支持带修饰键的点击，「Ctrl/Shift + 点击」用
+  别的工具也表达不出来。多选（传输面板、文件列表）继续由单元测试与源码契约守住。
+- **物理串口、签名与公证、Windows、Linux 原生编译运行**未验证（无对应环境）。
+
+#### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `npm test` | Test Files **56 passed (56)**、Tests **526 passed (526)** |
+| `npm run typecheck` / `npm run build` / `npm run check:docs` / `npm run check:bundle` / `npm run check:release` | 均通过 |
+| `npm run test:scripts` | **48** 通过、0 失败 |
+| `cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` | 均 exit 0 |
+| `cargo test --workspace` | **429** 通过、**0** 失败、**19** 忽略 |
+
+**本轮的真机证据**（macOS 原生应用 + multipass Linux `192.168.252.2`）：
+- 快速命令热键 `Ctrl+Shift+9` → 远端执行 `echo RSHELL_HOTKEY_OK` 并回显
+- 触发器「发送文本 / 显示通知 / 断开连接 / 记录到文件」四种动作 → 远端执行 / 界面通知 /
+  会话断开 / 本机 `~/rshell-trigger-acceptance.log` 写入 20 B
+- 同步输入、撰写窗格、脚本面板、插件面板、密钥管理面板逐项点过（详见上一节）
+- 新建连接四种认证方式字段切换正确；编辑已有连接回填与保存回写正确
+- 外部私钥认证真机连通；终端查找计数 1/3 + 三处高亮；终端清屏
+- 四个侧栏面板在 280px 默认宽度下卡片布局完整
+
+测试数据已清理：触发器与快速命令复位为空数组、验收密钥与验收插件已删除、
+远端 `/tmp/rshell-e2e` 已删除、会话名改回 `Key-auth-test`（保留 4 条连接与 GROUP2 分组）。

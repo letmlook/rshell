@@ -39,6 +39,19 @@ const groups = computed<CommandGroup[]>(() => {
 });
 const loading = ref(false);
 const error = ref<string | null>(null);
+
+/**
+ * 热键回显。
+ *
+ * `parseHotkey` 解析不了时返回 null（后端存了「Ctrl+Ctrl」这种非法组合），
+ * 直接 `formatHotkey(parseHotkey(x)!)` 会在渲染期抛 TypeError，把整个面板
+ * 搞崩 —— 解析不了就原样显示，让用户自己看出热键写错了。
+ */
+function hotkeyLabel(hotkey: string | null): string {
+  if (!hotkey) return "—";
+  const parsed = parseHotkey(hotkey);
+  return parsed ? formatHotkey(parsed) : hotkey;
+}
 const sessions = useSessionsStore();
 const newName = ref("");
 const newCommand = ref("");
@@ -209,27 +222,42 @@ onBeforeUnmount(() => { active = false; unlisten?.(); unlisten = null; });
     <div v-else class="groups" data-test="quick-command-groups">
       <section v-for="group in groups" :key="group.label" class="group">
         <h4 v-if="group.label !== '未分组'">{{ group.label }}</h4>
-        <el-table :data="group.commands" stripe size="small">
-          <el-table-column prop="name" label="名称" />
-          <el-table-column prop="command" label="命令" />
-          <el-table-column label="说明" min-width="120">
-            <template #default="{ row }">
-              <span :title="row.description">{{ row.description || "—" }}</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="热键" width="130">
-            <template #default="{ row }">
-              <span v-if="row.hotkey">{{ formatHotkey(parseHotkey(row.hotkey)!) }}</span>
-              <span v-else>—</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="操作" width="140">
-            <template #default="{ row }">
+        <!--
+          快速命令列表用卡片而不是表格。
+
+          表格五列（说明 120 + 热键 130 + 操作 140 = 390px 固定列）**放不进
+          默认侧栏（280px，最大 360px）**：真机实测「热键」被截成 `Ctrl+Shi`，
+          最右侧的「执行 / 删除」按钮整列落在视口外，用户点不到。
+        -->
+        <ul class="rs-cards" :data-test="`quick-command-group-${group.label}`">
+          <li
+            v-for="row in group.commands"
+            :key="row.id"
+            class="rs-card"
+            :data-test="`quick-command-card-${row.id}`"
+          >
+            <div class="rs-card-head">
+              <span class="rs-card-title" :title="row.name">{{ row.name }}</span>
+              <span class="rs-card-tag">{{ hotkeyLabel(row.hotkey) }}</span>
+            </div>
+            <div class="rs-card-body">
+              <div class="rs-card-line">
+                <span class="rs-card-label">命令</span>
+                <span class="rs-card-value rs-card-value-wrap" :title="row.command">
+                  {{ row.command }}
+                </span>
+              </div>
+              <div v-if="row.description" class="rs-card-line">
+                <span class="rs-card-label">说明</span>
+                <span class="rs-card-value">{{ row.description }}</span>
+              </div>
+            </div>
+            <div class="rs-card-actions">
               <el-button size="small" type="primary" @click="execute(row)">执行</el-button>
               <el-button size="small" type="danger" text @click="remove(row)">删除</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
+            </div>
+          </li>
+        </ul>
       </section>
     </div>
   </section>

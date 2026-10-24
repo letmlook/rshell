@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mount } from "@vue/test-utils";
+import { defineComponent } from "vue";
 import SidePanel from "../../src/components/SidePanel.vue";
 
 const stubs = {
@@ -48,5 +49,26 @@ describe("SidePanel", () => {
     await wrapper.setProps({ activeSessionConnected: true });
     await button.trigger("click");
     expect(wrapper.emitted("open-sftp")).toEqual([["s"]]);
+  });
+
+  /**
+   * 侧栏是会话事件的**中转层**：SessionList 发出的事件必须一路转发到 App.vue。
+   *
+   * 「编辑已有连接」此前就漏在这里：App.vue 监听的是 `<SidePanel>` 上的
+   * `@edit-session`，而 SidePanel 既没声明也没转发这个事件 —— 右键菜单里的
+   * 「编辑连接」点了毫无反应，编辑已有连接整个不可达。
+   */
+  it("把 SessionList 的编辑连接事件转发给上层", async () => {
+    const sessionList = defineComponent({
+      name: "SessionList",
+      emits: ["edit-session"],
+      template: "<button data-testid='edit-session' @click=\"$emit('edit-session', 's-1')\">编辑</button>",
+    });
+    const wrapper = mount(SidePanel, {
+      props: { active: "sessions" },
+      global: { stubs: { ...stubs, SessionList: sessionList } },
+    });
+    await wrapper.get('[data-testid="edit-session"]').trigger("click");
+    expect(wrapper.emitted("edit-session")).toEqual([["s-1"]]);
   });
 });

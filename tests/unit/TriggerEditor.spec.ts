@@ -42,7 +42,7 @@ const trigger = {
 };
 
 function mountPanel() {
-  // 真实 ElementPlus 渲染表格行，测试直接点击行内「删除」按钮
+  // 真实 ElementPlus 渲染触发器卡片，测试直接点击卡片里的「删除」按钮
   return mount(TriggerEditor, { global: { plugins: [ElementPlus] } });
 }
 
@@ -51,7 +51,7 @@ async function clickDelete() {
   await flushPromises();
   const buttons = wrapper.findAll("button");
   const deleteButton = buttons.find((b) => b.text() === "删除");
-  expect(deleteButton, "表格行内应渲染「删除」按钮").toBeDefined();
+  expect(deleteButton, "触发器条目内应渲染「删除」按钮").toBeDefined();
   await deleteButton!.trigger("click");
   await flushPromises();
   return wrapper;
@@ -93,6 +93,30 @@ describe("TriggerEditor 删除确认（R2-14）", () => {
     expect(eventHandlers.length).toBe(1);
     wrapper.unmount();
     expect(eventHandlers.length).toBe(0);
+  });
+});
+
+// 侧栏只有 200~360px：表格会把「启用」开关与「删除」按钮整列推出视口
+//（真机实测）。触发器列表必须用卡片渲染，且名称/正则/动作都要看得见。
+describe("TriggerEditor 列表布局", () => {
+  beforeEach(() => {
+    vi.mocked(listTriggers).mockReset().mockResolvedValue([trigger]);
+    eventHandlers.length = 0;
+  });
+
+  it("触发器列表用卡片渲染，不渲染表格", async () => {
+    const wrapper = mountPanel();
+    await flushPromises();
+
+    expect(wrapper.find(".el-table").exists()).toBe(false);
+    const card = wrapper.get('[data-test="trigger-card-trigger-1"]');
+    expect(card.text()).toContain("prompt-regex");
+    expect(card.text()).toContain("^\\$");
+    expect(card.text()).toContain("发送文本");
+    // 启用开关与删除按钮必须在卡片里（表格版本里它们整列在视口外）
+    expect(card.find(".el-switch").exists()).toBe(true);
+    expect(card.findAll("button").map((b) => b.text())).toContain("删除");
+    wrapper.unmount();
   });
 });
 

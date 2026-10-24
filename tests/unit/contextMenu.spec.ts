@@ -108,4 +108,62 @@ describe("全局右键菜单守卫", () => {
 
     expect(componentHandler).toHaveBeenCalledOnce();
   });
+
+  /**
+   * WebKit（macOS 的 WKWebView）一次右键会派发**两次** contextmenu：
+   * mousedown 一次、mouseup 一次。第一次打开应用自己的菜单，菜单随即出现在
+   * 光标下，第二次落在菜单自己身上 —— 应用按「收到 contextmenu 就关菜单」
+   * 处理的话，菜单会**一点开就没**。
+   *
+   * 真机实测：会话列表、文件列表、传输面板、终端四个右键菜单全部如此。
+   * 守卫必须把同一次点击的第二个事件吞掉（不让它冒泡到子元素）。
+   */
+  it("同一次右键的第二个 contextmenu 不再冒泡到子元素", () => {
+    const target = host();
+    installContextMenuGuard(target);
+    const child = document.createElement("div");
+    target.appendChild(child);
+    const handler = vi.fn();
+    child.addEventListener("contextmenu", handler);
+
+    const fire = (x: number, y: number) => {
+      child.dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: x,
+          clientY: y,
+        }),
+      );
+    };
+    fire(100, 200);
+    fire(100, 200); // 同一次右键的第二次事件：坐标与上一次完全相同
+
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("不同位置的右键仍然照常传给子元素（不能把用户真的右键两次也吞掉）", () => {
+    const target = host();
+    installContextMenuGuard(target);
+    const child = document.createElement("div");
+    target.appendChild(child);
+    const handler = vi.fn();
+    child.addEventListener("contextmenu", handler);
+
+    const fire = (x: number, y: number) => {
+      child.dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: x,
+          clientY: y,
+        }),
+      );
+    };
+    fire(100, 200);
+    fire(100, 200);
+    fire(300, 400);
+
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
 });

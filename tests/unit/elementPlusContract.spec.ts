@@ -284,4 +284,29 @@ describe("Element Plus 接入契约", () => {
       .map(({ file, tag }) => `${file}: ${tag.replace(/\s+/g, " ")}`);
     expect(missing).toEqual([]);
   });
+
+  /**
+   * el-tag 必须关掉过渡。
+   *
+   * el-tag 把内容包在 `<Transition appear>` 里，靠「双 requestAnimationFrame」
+   * 收尾 `el-zoom-in-center-enter-from` 类。而文档不可见时（窗口不在当前
+   * Space / 屏幕锁着）WebKit 会**挂起 rAF**，那个类就永远留在元素上：
+   * 标签停在 `opacity: 0` + `scaleX(0)`，整块看不见。
+   *
+   * 真机实测（macOS，屏幕锁着时打开插件面板）：状态/权限/扩展点三个标签
+   * 全部不可见，AX 树里却有文字（`getComputedStyle` 读到 opacity=0、宽 0）。
+   * 状态标签本来也不需要缩放动画，直接关掉过渡。
+   */
+  it("每个 el-tag 都关掉过渡（文档不可见时 rAF 挂起，标签会永远停在 enter-from）", () => {
+    const offenders: string[] = [];
+    for (const file of walkSources("src")) {
+      const body = readFileSync(file, "utf8");
+      for (const m of body.matchAll(/<el-tag\b[\s\S]*?>/g)) {
+        if (!/disable-transitions/.test(m[0])) {
+          offenders.push(`${file}: ${m[0].replace(/\s+/g, " ")}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
 });

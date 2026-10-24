@@ -822,6 +822,13 @@ impl SessionService {
                                                     for m in matches {
                                                         let summary = trigger_action_summary(&m.action);
                                                         let result = execute_trigger_action(&m.action, text, session_id, Some(&client)).await;
+                                                        // 自触发冷却：SendText 写出去的文本会变成新的输出，
+                                                        // 若那段输出又匹配本触发器就会无限循环
+                                                        // （真机实测过自触发 19081 次把终端刷屏）。
+                                                        // 冷却到用户在该会话再次输入为止。
+                                                        if matches!(m.action, TriggerAction::SendText(_)) {
+                                                            trigger_engine.enter_cooldown(session_id, m.trigger_id);
+                                                        }
                                                         match result {
                                                             Ok(()) => trigger_engine.notify_fired(m.trigger_id, session_id, &summary),
                                                             Err(e) => {
@@ -1168,6 +1175,11 @@ impl SessionService {
         terminal_id: Option<Uuid>,
         data: &[u8],
     ) -> Result<(), CoreError> {
+        // 用户（或同步输入/快速命令）写进来的内容是「新一轮」的天然分界：
+        // 解除该会话的自触发冷却，之后的输出重新参与匹配。
+        // 触发器自己写出去的文本不走这里（那条路径是 client.send_data），
+        // 所以冷却只会被真实的外部输入解除。
+        self.trigger_engine.clear_cooldown(session_id);
         let sender = {
             self.protocol_connections
                 .read()

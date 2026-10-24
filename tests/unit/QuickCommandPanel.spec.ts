@@ -97,9 +97,6 @@ const stubs = {
   "el-checkbox": { template: "<span />" },
   "el-button": { template: "<button><slot /></button>" },
   "el-empty": { props: ["description"], template: '<div>{{ description }}</div>' },
-  // 表格桩把数据序列化进文本：命令名/分组名才能被断言到
-  "el-table": { props: ["data"], template: "<div>{{ JSON.stringify(data) }}</div>" },
-  "el-table-column": { template: "<div />" },
 };
 
 function mountPanel() {
@@ -338,6 +335,38 @@ describe("QuickCommandPanel 分组与说明", () => {
     expect(text).toContain("uptime");
     expect(text).toContain("df -h");
     expect(text).toContain("who");
+    wrapper.unmount();
+  });
+
+  // 侧栏只有 200~360px：表格会把「热键」截断、把「执行 / 删除」整列推出
+  // 视口（真机实测）。列表必须用卡片渲染，且命令名与命令本身都要看得见。
+  it("快速命令列表用卡片渲染，不渲染表格", async () => {
+    vi.mocked(listQuickCommands).mockResolvedValue([
+      {
+        id: "q1",
+        name: "uptime",
+        command: "uptime -p",
+        send_enter: true,
+        description: "看机器负载",
+        scope: "AllSessions",
+        hotkey: "Ctrl+Shift+9",
+        group: "运维",
+      },
+    ]);
+    const wrapper = mountPanel();
+    await flushPromises();
+
+    expect(wrapper.find(".el-table").exists()).toBe(false);
+    const card = wrapper.get('[data-test="quick-command-card-q1"]');
+    expect(card.text()).toContain("uptime");
+    expect(card.text()).toContain("uptime -p");
+    expect(card.text()).toContain("看机器负载");
+    // 热键按物理键位回显
+    expect(card.text()).toContain("Ctrl+Shift+9");
+    // 操作按钮必须在卡片里（表格版本里它们整列在视口外）
+    const actions = card.findAll("button").map((button) => button.text());
+    expect(actions).toContain("执行");
+    expect(actions).toContain("删除");
     wrapper.unmount();
   });
 });

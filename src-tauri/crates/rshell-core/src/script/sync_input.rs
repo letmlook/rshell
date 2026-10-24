@@ -70,6 +70,11 @@ impl SyncInputService {
     ///
     /// 单个目标发送失败不阻断其余目标，但会为每个失败会话发布
     /// `SyncInputSendFailed` 事件——静默丢弃会让用户以为同步成功。
+    ///
+    /// 目标会话**已经断开**（连接不存在）时，把它从同步组里移除：留着只会
+    /// 让之后每一次按键都失败一次（真机上实测一个断开的会话让日志刷出上百条
+    /// 失败），而界面上仍然显示「同步输入已开启」——用户完全看不出同步其实
+    /// 已经失效。移除后界面会收到 `SyncInputSessionsChanged` 而更新。
     pub async fn send_to_synced_sessions(
         &self,
         source_session_id: Uuid,
@@ -84,6 +89,7 @@ impl SyncInputService {
             sync.clone()
         };
 
+        let mut dropped: Vec<Uuid> = Vec::new();
         for session_id in sync_targets(source_session_id, &sessions) {
             if let Err(e) = session_service.send_data(session_id, None, data).await {
                 warn!(session_id = %session_id, error = %e, "Failed to send to synced session");
@@ -91,11 +97,45 @@ impl SyncInputService {
                     session_id,
                     error: e.to_string(),
                 });
+                if should_drop_from_sync(&e) {
+                    dropped.push(session_id);
+                }
             }
+        }
+
+        if !dropped.is_empty() {
+            self.remove_sessions(&dropped);
         }
 
         Ok(())
     }
+
+    /// 把给定会话移出同步组，并发布变更事件（界面据此更新「当前同步 N 个会话」）
+    fn remove_sessions(&self, sessions: &[Uuid]) {
+        let remaining = match self.sync_sessions.write() {
+            Ok(mut sync) => {
+                sync.retain(|id| !sessions.contains(id));
+                sync.clone()
+            }
+            Err(_) => return,
+        };
+        info!(
+            dropped = ?sessions,
+            remaining = remaining.len(),
+            "Removed disconnected sessions from sync group"
+        );
+        self.event_bus.publish(AppEvent::SyncInputSessionsChanged {
+            session_ids: remaining,
+        });
+    }
+}
+
+/// 这类失败意味着会话**已经断开**（连接不存在）—— 应当把它移出同步组。
+///
+/// 其它失败（超时、权限、临时 IO 错误）不代表会话没了，移出同步组会让用户
+/// 莫名其妙地丢掉配置，因此只在连接确实不存在时才移。
+fn should_drop_from_sync(error: &CoreError) -> bool {
+    matches!(error, CoreError::NotFound(_))
 }
 
 /// 同步目标集合：排除源会话
@@ -182,5 +222,74 @@ mod tests {
     #[test]
     fn sync_targets_of_empty_group_is_empty() {
         assert!(sync_targets(Uuid::new_v4(), &[]).is_empty());
+    }
+
+    /// 断开的会话必须被移出同步组。
+    ///
+    /// 留着的话，之后每一次按键都会失败一次（真机上实测一个断开的会话让日志
+    /// 刷出上百条失败），而界面仍显示「同步输入已开启」——用户看不出同步
+    /// 其实已经失效。
+    #[test]
+    fn disconnected_sessions_are_removed_from_sync_group() {
+        let svc = make_svc();
+        let alive = Uuid::new_v4();
+        let dead = Uuid::new_v4();
+        svc.toggle_sync_input(vec![alive, dead]).unwrap();
+
+        svc.remove_sessions(&[dead]);
+
+        assert_eq!(
+            svc.get_sync_sessions().unwrap(),
+            vec![alive],
+            "断开的会话必须被移出同步组"
+        );
+    }
+
+    /// 移除后要发布变更事件，界面的「当前同步 N 个会话」才会跟着更新
+    #[test]
+    fn removing_sessions_publishes_change_event() {
+        let bus = Arc::new(EventBus::new());
+        let svc = SyncInputService::new(bus.clone());
+        let alive = Uuid::new_v4();
+        let dead = Uuid::new_v4();
+        svc.toggle_sync_input(vec![alive, dead]).unwrap();
+
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let g = got.clone();
+        bus.subscribe(move |event| {
+            if let AppEvent::SyncInputSessionsChanged { session_ids } = event {
+                *g.lock().unwrap() = session_ids.to_vec();
+            }
+        });
+
+        svc.remove_sessions(&[dead]);
+        assert_eq!(*got.lock().unwrap(), vec![alive]);
+    }
+
+    /// 只有「连接不存在」才把会话移出同步组
+    ///
+    /// 其它错误（超时、权限等）不代表会话没了 —— 移出同步组会让用户莫名其妙
+    /// 丢掉配置。
+    #[test]
+    fn only_missing_connection_is_dropped_from_sync_group() {
+        assert!(should_drop_from_sync(&CoreError::NotFound(
+            "Connection x not found".into()
+        )));
+        assert!(!should_drop_from_sync(&CoreError::ConnectionError(
+            "timeout".into()
+        )));
+        assert!(!should_drop_from_sync(&CoreError::Internal("boom".into())));
+    }
+
+    /// 移除不存在的会话不改变组，也不报错
+    #[test]
+    fn removing_unknown_session_keeps_group_intact() {
+        let svc = make_svc();
+        let alive = Uuid::new_v4();
+        svc.toggle_sync_input(vec![alive]).unwrap();
+
+        svc.remove_sessions(&[Uuid::new_v4()]);
+
+        assert_eq!(svc.get_sync_sessions().unwrap(), vec![alive]);
     }
 }

@@ -151,4 +151,22 @@ describe("embedded key manager", () => {
     expect(deleteSshKey).toHaveBeenCalledWith("key-1");
     wrapper.unmount();
   });
+
+  // 侧栏只有 200~360px：表格把没写宽度的「名称」「指纹」两列宽度设成 0
+  //（Element Plus 在溢出时的行为），真机上名称整列看不见、指纹换行八行，
+  // 最右侧的「导出公钥 / 删除」还被裁掉。密钥列表必须用卡片渲染。
+  it("密钥列表用卡片渲染，名称与指纹都要看得见", async () => {
+    const wrapper = mountPanel();
+    await flushPromises();
+
+    expect(wrapper.find(".el-table").exists()).toBe(false);
+    const card = wrapper.get('[data-test="key-card-key-1"]');
+    expect(card.text()).toContain("work");
+    expect(card.text()).toContain("SHA256:test");
+    expect(card.text()).toContain("ED25519");
+    const actions = card.findAll("button").map((button) => button.text());
+    expect(actions).toContain("导出公钥");
+    expect(actions).toContain("删除");
+    wrapper.unmount();
+  });
 });

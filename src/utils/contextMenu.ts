@@ -46,13 +46,51 @@ function allowsNativeMenu(target: EventTarget | null): boolean {
 }
 
 /**
+ * 同一次右键的两次 contextmenu 事件之间的判定窗口（毫秒）。
+ *
+ * 两次事件相隔只有几毫秒（一次 mousedown、一次 mouseup），400ms 足够宽松，
+ * 又不至于把用户「紧接着右键别处」也当成同一次点击。
+ */
+const REPEAT_CONTEXT_MENU_WINDOW_MS = 400;
+
+/**
  * 安装守卫。返回卸载函数（调用方必须在卸载时调用，否则监听会残留）。
  */
 export function installContextMenuGuard(target: EventTarget = window): () => void {
+  /**
+   * 上一次 contextmenu 事件的位置与时刻。
+   *
+   * WebKit（macOS 的 WKWebView）一次右键会派发**两次** contextmenu：
+   * mousedown 一次、mouseup 一次。第一次落在被右击的元素上 → 应用弹出自己的
+   * 菜单；菜单随即出现在光标下，第二次就落在**菜单自己**（或菜单的遮罩）身上。
+   *
+   * 应用自己的菜单普遍按「收到 contextmenu 就关自己 / 点别处就关菜单」的语义
+   * 处理，于是第二次事件把刚弹出的菜单**立刻关掉** —— 真机实测（macOS）：
+   * 会话列表、文件列表、传输面板、终端四个右键菜单全部「一点开就没」。
+   *
+   * 判据用「坐标相同 + 时间接近」：同一次右键的两个事件坐标完全一致、
+   * 间隔只有几毫秒；用户真的右键两次（不同位置）不会命中这个判据。
+   */
+  let last: { x: number; y: number; at: number } | null = null;
+
   const onContextMenu = (event: Event) => {
+    const mouse = event as MouseEvent;
+    const now = Date.now();
+    const isRepeat =
+      last !== null &&
+      now - last.at < REPEAT_CONTEXT_MENU_WINDOW_MS &&
+      Math.abs(mouse.clientX - last.x) <= 2 &&
+      Math.abs(mouse.clientY - last.y) <= 2;
+    last = { x: mouse.clientX, y: mouse.clientY, at: now };
+
     if (isEditableTextTarget(event.target)) return;
     if (allowsNativeMenu(event.target)) return;
     event.preventDefault();
+    if (isRepeat) {
+      // 同一次右键的第二个 contextmenu：吞掉，不让它冒泡到
+      // 「点别处就关菜单」的 window 监听器，也不让它触发菜单自身的关闭逻辑。
+      event.stopPropagation();
+    }
   };
   target.addEventListener("contextmenu", onContextMenu, true);
   return () => target.removeEventListener("contextmenu", onContextMenu, true);

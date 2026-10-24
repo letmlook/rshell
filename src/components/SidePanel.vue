@@ -60,6 +60,14 @@ const emit = defineEmits<{
   (e: "open-terminal", id: string, path: string): void;
   (e: "open-terminal-window", id: string): void;
   (e: "duplicate-session", id: string): void;
+  /**
+   * 编辑已有连接。
+   *
+   * 这一条曾经**漏掉**：App.vue 监听的是 `<SidePanel>` 上的 `@edit-session`，
+   * 而 SessionList 发出的 `edit-session` 没人接 —— 事件在侧栏这一层就断了，
+   * 右键菜单里的「编辑连接」点了毫无反应，编辑已有连接整个不可达。
+   */
+  (e: "edit-session", id: string): void;
   (e: "new-session"): void;
 }>();
 
@@ -150,6 +158,7 @@ function resetWidth() {
         @open-terminal="(id, p) => emit('open-terminal', id, p)"
         @open-terminal-window="(id) => emit('open-terminal-window', id)"
         @duplicate-session="(id) => emit('duplicate-session', id)"
+        @edit-session="(id) => emit('edit-session', id)"
       />
       <div v-else-if="active === 'files'" class="placeholder">
         <p>文件浏览位于传输工作区</p>

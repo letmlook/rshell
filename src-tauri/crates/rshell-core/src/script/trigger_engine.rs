@@ -8,7 +8,7 @@ use crate::event_bus::EventBus;
 use regex::Regex;
 use rshell_api::types::{Trigger, TriggerAction, TriggerCondition};
 use rshell_api::AppEvent;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
@@ -25,6 +25,21 @@ pub struct TriggerEngine {
     event_bus: Arc<EventBus>,
     path: Option<PathBuf>,
     read_only: bool,
+    /// 自触发冷却：会话 → 已被自己触发过的 SendText 触发器
+    ///
+    /// 真实事故：触发器「匹配到 X 就发送文本 Y」，而 Y 本身也含 X ——
+    /// 发送出去的 Y 会成为新的输出，再次匹配 X，再次发送 Y …
+    /// 真机上实测一条这样的触发器自触发 19081 次把终端刷屏。
+    ///
+    /// 只有 **SendText** 会造成这种循环（其它动作不写回会话输出），
+    /// 所以只有它们进冷却表。SendText 触发器触发后进入冷却，
+    /// 直到**用户在该会话里再次输入**才重新武装 ——
+    /// 用户的输入是「新一轮」的天然分界。
+    ///
+    /// 静态层面已经在 `create_trigger` 拒绝「动作文本匹配自身条件」的配置，
+    /// 但远端**对动作的回应**也可能再次匹配条件（例如远端回显同样的文本），
+    /// 那种情况静态检查看不出来，只能靠这里的运行时冷却兜住。
+    self_cooldown: Arc<RwLock<HashMap<Uuid, HashSet<Uuid>>>>,
 }
 
 /// 触发器匹配结果
@@ -42,6 +57,7 @@ impl TriggerEngine {
             event_bus,
             path: None,
             read_only: false,
+            self_cooldown: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -87,6 +103,7 @@ impl TriggerEngine {
             event_bus,
             path: Some(path),
             read_only: !writable,
+            self_cooldown: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -141,6 +158,23 @@ impl TriggerEngine {
                 ));
             }
             _ => {}
+        }
+        // 自触发防护（创建时）：动作要发送的文本本身若就匹配自己的条件，
+        // 这条触发器**必然**无限循环 —— 发出去的文本会变成新的输出，
+        // 再次匹配、再次发送。真机上实测过一条这样的触发器自触发 19081 次。
+        // 与其让它在运行期疯狂刷屏，不如在这里明确拒绝并说明原因。
+        if let TriggerAction::SendText(text) = &trigger.action {
+            let self_matching = match &trigger.condition {
+                TriggerCondition::RegexAppear(pattern) => Regex::new(pattern)
+                    .map(|re| re.is_match(text))
+                    .unwrap_or(false),
+                TriggerCondition::ExactMatch(needle) => text.contains(needle.as_str()),
+            };
+            if self_matching {
+                return Err(CoreError::InvalidState(
+                    "Trigger action text matches its own condition; it would fire forever".into(),
+                ));
+            }
         }
         let id = trigger.id;
         info!(trigger_id = %id, name = %trigger.name, "Creating trigger");
@@ -236,10 +270,14 @@ impl TriggerEngine {
     /// R2-18：正则使用创建/加载时预编译的缓存（热路径只做 is_match，
     /// 不再每条输出块重新编译）；缓存缺失（文件加载时的非法正则）视为
     /// 不匹配并告警。
+    ///
+    /// **自触发冷却**：处于冷却中的触发器本轮不参与匹配 ——
+    /// 它刚刚自己写出去过文本，那段文本会变成新的输出再次匹配它，
+    /// 不挡住就是无限循环（真机实测曾自触发 19081 次把终端刷屏）。
     pub fn check_output(
         &self,
         output: &str,
-        _session_id: Uuid,
+        session_id: Uuid,
     ) -> Result<Vec<TriggerMatch>, CoreError> {
         let triggers = self
             .triggers
@@ -253,6 +291,11 @@ impl TriggerEngine {
 
         for trigger in triggers.values() {
             if !trigger.enabled {
+                continue;
+            }
+            // 自触发冷却中：它刚刚自己写出去过文本，那段输出会再次匹配它
+            if self.is_cooling_down(session_id, trigger.id) {
+                debug!(trigger_id = %trigger.id, session_id = %session_id, "Trigger in self-trigger cooldown");
                 continue;
             }
 
@@ -286,6 +329,35 @@ impl TriggerEngine {
             session_id,
             action_summary: action_summary.to_string(),
         });
+    }
+
+    // ===== 自触发冷却 =====
+
+    /// 该触发器当前是否处于自触发冷却（本次不再匹配）
+    pub fn is_cooling_down(&self, session_id: Uuid, trigger_id: Uuid) -> bool {
+        self.self_cooldown
+            .read()
+            .map(|map| {
+                map.get(&session_id)
+                    .is_some_and(|set| set.contains(&trigger_id))
+            })
+            .unwrap_or(false)
+    }
+
+    /// 触发器触发后进入自触发冷却
+    pub fn enter_cooldown(&self, session_id: Uuid, trigger_id: Uuid) {
+        if let Ok(mut map) = self.self_cooldown.write() {
+            map.entry(session_id).or_default().insert(trigger_id);
+        }
+    }
+
+    /// 用户在该会话输入了新内容：解除该会话所有触发器的冷却
+    ///
+    /// 用户的输入是「新一轮」的天然分界 —— 之后的输出应当重新参与匹配。
+    pub fn clear_cooldown(&self, session_id: Uuid) {
+        if let Ok(mut map) = self.self_cooldown.write() {
+            map.remove(&session_id);
+        }
     }
 }
 
@@ -438,6 +510,121 @@ mod tests {
         eng.create_trigger(t).unwrap();
         let matches = eng.check_output("xxx", Uuid::new_v4()).unwrap();
         assert!(matches.is_empty());
+    }
+
+    // ===== 自触发防护 =====
+
+    /// 自匹配配置必须在创建时被拒绝：
+    /// 「匹配到 X 就发送 Y」而 Y 本身含 X —— 发出去的 Y 会变成新的输出，
+    /// 再次匹配 X，再次发送 Y …（真机实测自触发 19081 次把终端刷屏）
+    #[test]
+    fn send_text_trigger_matching_its_own_condition_is_rejected() {
+        let eng = make_engine();
+        let err = eng
+            .create_trigger(make_trigger(
+                "loop",
+                TriggerCondition::RegexAppear("RSHELL_TRIGGER_".to_string()),
+                TriggerAction::SendText("echo RSHELL_TRIGGER_FIRED".to_string()),
+            ))
+            .expect_err("self-matching trigger must be rejected");
+        assert!(
+            format!("{err}").contains("matches its own condition"),
+            "错误信息要说明原因: {err}"
+        );
+    }
+
+    /// 精确匹配条件下同样要拒绝
+    #[test]
+    fn send_text_trigger_matching_own_exact_condition_is_rejected() {
+        let eng = make_engine();
+        let err = eng
+            .create_trigger(make_trigger(
+                "loop",
+                TriggerCondition::ExactMatch("LOOP".to_string()),
+                TriggerAction::SendText("echo LOOP".to_string()),
+            ))
+            .expect_err("self-matching trigger must be rejected");
+        assert!(format!("{err}").contains("matches its own condition"));
+    }
+
+    /// 不自匹配的 SendText 触发器照常创建
+    #[test]
+    fn send_text_trigger_not_matching_its_own_condition_is_accepted() {
+        let eng = make_engine();
+        eng.create_trigger(make_trigger(
+            "ok",
+            TriggerCondition::ExactMatch("prompt>".to_string()),
+            TriggerAction::SendText("yes".to_string()),
+        ))
+        .expect("non-self-matching trigger must be accepted");
+    }
+
+    /// 冷却中的触发器不再匹配（挡住自触发循环）
+    #[test]
+    fn cooled_down_trigger_does_not_match_again() {
+        let eng = make_engine();
+        let t = make_trigger(
+            "loop",
+            TriggerCondition::ExactMatch("X".to_string()),
+            TriggerAction::SendText("Y".to_string()),
+        );
+        let id = eng.create_trigger(t.clone()).unwrap();
+        let sid = Uuid::new_v4();
+
+        // 第一次匹配
+        assert_eq!(eng.check_output("X", sid).unwrap().len(), 1);
+
+        // 触发后进入冷却：动作写出去的文本再次匹配时不再触发
+        eng.enter_cooldown(sid, id);
+        assert!(
+            eng.check_output("X", sid).unwrap().is_empty(),
+            "冷却中的触发器不得再次匹配（否则就是无限循环）"
+        );
+    }
+
+    /// 用户再次输入后解除冷却，触发器重新武装
+    #[test]
+    fn user_input_clears_the_cooldown() {
+        let eng = make_engine();
+        let t = make_trigger(
+            "loop",
+            TriggerCondition::ExactMatch("X".to_string()),
+            TriggerAction::SendText("Y".to_string()),
+        );
+        let id = eng.create_trigger(t.clone()).unwrap();
+        let sid = Uuid::new_v4();
+
+        eng.enter_cooldown(sid, id);
+        assert!(eng.check_output("X", sid).unwrap().is_empty());
+
+        eng.clear_cooldown(sid);
+        assert_eq!(
+            eng.check_output("X", sid).unwrap().len(),
+            1,
+            "用户输入后触发器应重新武装"
+        );
+    }
+
+    /// 冷却只作用于该会话：另一个会话的同名触发器不受影响
+    #[test]
+    fn cooldown_is_scoped_to_one_session() {
+        let eng = make_engine();
+        let t = make_trigger(
+            "loop",
+            TriggerCondition::ExactMatch("X".to_string()),
+            TriggerAction::SendText("Y".to_string()),
+        );
+        let id = eng.create_trigger(t.clone()).unwrap();
+        let hot = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        eng.enter_cooldown(hot, id);
+        assert!(eng.check_output("X", hot).unwrap().is_empty());
+        assert_eq!(
+            eng.check_output("X", other).unwrap().len(),
+            1,
+            "冷却不得影响其它会话"
+        );
     }
 
     #[test]

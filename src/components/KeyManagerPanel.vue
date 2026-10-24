@@ -263,28 +263,45 @@ onBeforeUnmount(() => {
       </el-form-item>
     </el-form>
 
-    <el-table :data="keys" stripe size="small" empty-text="暂无密钥">
-      <el-table-column prop="name" label="名称" />
-      <el-table-column prop="key_type" label="类型" width="90" />
-      <el-table-column prop="fingerprint" label="指纹" />
-      <el-table-column label="口令" width="60">
-        <template #default="{ row }">
-          {{ row.has_passphrase ? "✓" : "—" }}
-        </template>
-      </el-table-column>
-      <el-table-column label="操作" width="140">
-        <template #default="{ row }">
+    <el-empty v-if="keys.length === 0" description="暂无密钥" :image-size="60" />
+    <!--
+      密钥列表用卡片而不是表格。
+
+      表格五列（类型 90 + 口令 60 + 操作 140 = 290px 固定列）**放不进默认侧栏
+      （280px，最大 360px）**：Element Plus 在表格放不下时把没写 width 的
+      「名称」「指纹」两列宽度设成 0，于是名称整列看不见（真机实测：名称有值
+      却渲染成空白），指纹被挤成一列换行八行，最右侧「操作」列还被裁掉。
+    -->
+    <ul v-else class="rs-cards" data-test="key-list">
+      <li v-for="key in keys" :key="key.id" class="rs-card" :data-test="`key-card-${key.id}`">
+        <div class="rs-card-head">
+          <span class="rs-card-title" :title="key.name">{{ key.name }}</span>
+          <span class="rs-card-tag">{{ key.key_type }}</span>
+        </div>
+        <div class="rs-card-body">
+          <div class="rs-card-line">
+            <span class="rs-card-label">指纹</span>
+            <span class="rs-card-value rs-card-value-wrap" :title="key.fingerprint">
+              {{ key.fingerprint }}
+            </span>
+          </div>
+          <div class="rs-card-line">
+            <span class="rs-card-label">口令</span>
+            <span class="rs-card-value">{{ key.has_passphrase ? "已设置" : "无" }}</span>
+          </div>
+        </div>
+        <div class="rs-card-actions">
           <el-button
             size="small"
-            :data-test="`key-export-${row.id}`"
-            @click="exportKey(row.id)"
+            :data-test="`key-export-${key.id}`"
+            @click="exportKey(key.id)"
           >
             导出公钥
           </el-button>
-          <el-button size="small" type="danger" @click="remove(row.id)">删除</el-button>
-        </template>
-      </el-table-column>
-    </el-table>
+          <el-button size="small" type="danger" @click="remove(key.id)">删除</el-button>
+        </div>
+      </li>
+    </ul>
 
     <p v-if="exportError" class="error" data-test="key-export-error">{{ exportError }}</p>
 

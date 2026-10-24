@@ -14,6 +14,7 @@ function keyEvent(init: Partial<KeyboardEvent> & { key: string }): KeyboardEvent
     altKey: false,
     shiftKey: false,
     metaKey: false,
+    code: "",
     ...init,
   } as KeyboardEvent;
 }
@@ -77,6 +78,57 @@ describe("matchesHotkey", () => {
   it("主键大小写不敏感", () => {
     const letter = parseHotkey("Ctrl+Shift+K")!;
     expect(matchesHotkey(keyEvent({ key: "k", ctrlKey: true, shiftKey: true }), letter)).toBe(true);
+  });
+
+  /**
+   * 带 Shift 的数字/符号热键必须真的能触发。
+   *
+   * 真实事故：带 Shift 时 `event.key` 是**符号**（US 布局下 Shift+9 是 `(`、
+   * Shift+1 是 `!`），而热键表里存的是用户写的 `9` —— 只看 `event.key`
+   * 永远匹配不上，「绑了 Ctrl+Shift+9 却按不动」。`event.code`（`Digit9`）
+   * 是物理键位，不受 Shift 影响，才是热键该用的字段。
+   */
+  it("带 Shift 的数字热键按物理键位命中（event.key 是符号时也能匹配）", () => {
+    const hotkey9 = parseHotkey("Ctrl+Shift+9")!;
+    // Shift+9 在 US 布局下 event.key 是 "("，code 是 "Digit9"
+    expect(
+      matchesHotkey(
+        keyEvent({ key: "(", code: "Digit9", ctrlKey: true, shiftKey: true }),
+        hotkey9,
+      ),
+    ).toBe(true);
+  });
+
+  it("带 Shift 的数字热键：物理键位不同时不命中（Shift+8 ≠ Shift+9）", () => {
+    const hotkey9 = parseHotkey("Ctrl+Shift+9")!;
+    expect(
+      matchesHotkey(
+        keyEvent({ key: "*", code: "Digit8", ctrlKey: true, shiftKey: true }),
+        hotkey9,
+      ),
+    ).toBe(false);
+  });
+
+  // 用户也可以直接绑符号键（Ctrl+Shift+( ）—— 按 event.key 语义匹配
+  it("符号键热键按 event.key 命中", () => {
+    const symbol = parseHotkey("Ctrl+Shift+(")!;
+    expect(
+      matchesHotkey(
+        keyEvent({ key: "(", code: "Digit9", ctrlKey: true, shiftKey: true }),
+        symbol,
+      ),
+    ).toBe(true);
+  });
+
+  // 字母键的 code 是 KeyA，与用户写的 a 对应
+  it("字母热键按物理键位命中", () => {
+    const letter = parseHotkey("Ctrl+Shift+K")!;
+    expect(
+      matchesHotkey(
+        keyEvent({ key: "K", code: "KeyK", ctrlKey: true, shiftKey: true }),
+        letter,
+      ),
+    ).toBe(true);
   });
 });
 

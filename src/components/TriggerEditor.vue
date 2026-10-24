@@ -246,21 +246,47 @@ onBeforeUnmount(() => {
         <el-button type="primary" native-type="submit" data-test="trigger-add">添加</el-button>
       </el-form-item>
     </el-form>
-    <el-table :data="items" stripe size="small" empty-text="暂无触发器">
-      <el-table-column prop="name" label="名称" width="140" />
-      <el-table-column :formatter="triggerPattern" label="正则" width="140" />
-      <el-table-column :formatter="actionLabel" label="动作" />
-      <el-table-column label="启用" width="80">
-        <template #default="{ row }">
-          <el-switch :model-value="row.enabled" @change="toggle(row)" />
-        </template>
-      </el-table-column>
-      <el-table-column label="操作" width="80">
-        <template #default="{ row }">
+    <el-empty v-if="items.length === 0" description="暂无触发器" :image-size="60" />
+    <!--
+      触发器列表用卡片而不是表格。
+
+      表格五列（名称 140 + 正则 140 + 启用 80 + 操作 80 = 440px 固定列）
+      **放不进默认侧栏（280px，最大 360px）**：真机实测「启用」开关与
+      「删除」按钮整列落在视口外 —— 用户既看不到触发器是否启用，也删不掉它。
+    -->
+    <ul v-else class="rs-cards" data-test="trigger-list">
+      <li
+        v-for="row in items"
+        :key="row.id"
+        class="rs-card"
+        :data-test="`trigger-card-${row.id}`"
+      >
+        <div class="rs-card-head">
+          <span class="rs-card-title" :title="row.name">{{ row.name }}</span>
+          <el-switch
+            :model-value="row.enabled"
+            size="small"
+            :aria-label="`启用触发器 ${row.name}`"
+            @change="toggle(row)"
+          />
+        </div>
+        <div class="rs-card-body">
+          <div class="rs-card-line">
+            <span class="rs-card-label">正则</span>
+            <span class="rs-card-value rs-card-value-wrap" :title="triggerPattern(row)">
+              {{ triggerPattern(row) }}
+            </span>
+          </div>
+          <div class="rs-card-line">
+            <span class="rs-card-label">动作</span>
+            <span class="rs-card-value rs-card-value-wrap">{{ actionLabel(row) }}</span>
+          </div>
+        </div>
+        <div class="rs-card-actions">
           <el-button size="small" type="danger" @click="remove(row)">删除</el-button>
-        </template>
-      </el-table-column>
-    </el-table>
+        </div>
+      </li>
+    </ul>
   </section>
 </template>
 

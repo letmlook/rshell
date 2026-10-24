@@ -6,6 +6,12 @@
  *
  * 匹配要求修饰键**完全一致**：按 `Ctrl+1` 注册的快捷键不会被 `Ctrl+Shift+1`
  * 触发，也不会被光秃秃的 `1` 触发——否则一个随手敲的字符就可能执行命令。
+ *
+ * **主键按物理键位（`event.code`）匹配，而不是 `event.key`**：
+ * 带 Shift 时 `event.key` 会变成**符号**（US 布局下 Shift+9 是 `(`、Shift+1 是 `!`），
+ * 于是「绑定了带 Shift 的数字/符号热键」永远匹配不上 —— 用户在面板里写
+ * `Ctrl+Shift+9`，按下去毫无反应。`event.code` 是布局无关的物理键位
+ * （`Digit9`），不受 Shift 影响，是热键该用的字段。
  */
 export interface Hotkey {
   ctrl: boolean;
@@ -66,8 +72,22 @@ export function parseHotkey(text: string | null | undefined): Hotkey | null {
   return { ctrl, alt, shift, meta, key };
 }
 
-/** 事件里的键名 → 与热键主键同一套写法 */
-function eventKey(event: KeyboardEvent): string {
+/**
+ * 物理键位（`event.code`）→ 与热键主键同一套写法。
+ *
+ * 数字/符号键的 code 是 `Digit1` / `Minus` 这类物理位置名，**不受 Shift 影响** ——
+ * 这正是热键匹配需要的语义。字母键的 code 是 `KeyA`，与用户写的 `a` 对应。
+ */
+function codeKey(code: string): string | null {
+  if (!code) return null;
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^Numpad[0-9]$/.test(code)) return code.slice(6);
+  return null;
+}
+
+/** 事件里的键名 → 与热键主键同一套写法（`event.key` 语义） */
+function keyKey(event: KeyboardEvent): string {
   const key = event.key.toLowerCase();
   if (key === " ") return "space";
   if (key === "escape") return "escape";
@@ -76,6 +96,24 @@ function eventKey(event: KeyboardEvent): string {
   if (key === "arrowleft") return "left";
   if (key === "arrowright") return "right";
   return key;
+}
+
+/**
+ * 事件里的主键候选 → 与热键主键同一套写法。
+ *
+ * 返回**两个**候选：物理键位（`event.code` → `Digit9` → `9`）与符号键
+ * （`event.key` → `(`）。两者任一命中即算匹配：
+ *
+ * - 用户写 `Ctrl+Shift+9`（物理键 9）→ 靠 code 命中。带 Shift 时 `event.key`
+ *   是 `(`，只看 key 永远匹配不上 —— 这正是原来的缺陷。
+ * - 用户写 `Ctrl+Shift+(`（符号键）→ 靠 key 命中。
+ */
+function eventKeys(event: KeyboardEvent): string[] {
+  const fromCode = codeKey(event.code);
+  const fromKey = keyKey(event);
+  if (!fromCode) return [fromKey];
+  if (fromCode === fromKey) return [fromCode];
+  return [fromCode, fromKey];
 }
 
 /** 按下事件是否命中该热键 */
@@ -87,7 +125,7 @@ export function matchesHotkey(event: KeyboardEvent, hotkey: Hotkey): boolean {
   if (hotkey.meta !== meta) return false;
   if (hotkey.alt !== event.altKey) return false;
   if (hotkey.shift !== event.shiftKey) return false;
-  return eventKey(event) === hotkey.key;
+  return eventKeys(event).includes(hotkey.key);
 }
 
 /** 热键的可读形式（用于界面回显） */
