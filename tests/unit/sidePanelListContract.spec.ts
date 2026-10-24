@@ -57,12 +57,22 @@ function tableColumnTags(): { file: string; tag: string }[] {
  * 这些组件由 SidePanel.vue 渲染在 200~360px 的侧栏里（默认 280px），
  * 表格在这里必然溢出。
  */
-const SIDE_PANEL_COMPONENTS = [
-  "src/components/KeyManagerPanel.vue",
-  "src/components/QuickCommandPanel.vue",
-  "src/components/TriggerEditor.vue",
-  "src/components/PluginPanel.vue",
-];
+
+/**
+ * 侧栏面板清单 —— **从 SidePanel.vue 的 import 里解析**，不写死。
+ *
+ * 写死一份清单的话，以后往侧栏里加新面板、又用回表格，这条契约就发现不了。
+ * SidePanel.vue 里 import 的每个面板组件都渲染在 200~360px 的侧栏里，
+ * 所以「SidePanel 导入的组件一律不许用 el-table」就是这条契约的准确表述。
+ */
+function sidePanelComponents(): string[] {
+  const sidePanel = readFileSync("src/components/SidePanel.vue", "utf8");
+  const files: string[] = [];
+  for (const m of sidePanel.matchAll(/import\s+\w+\s+from\s+"\.\/([^"]+\.vue)"/g)) {
+    files.push(`src/components/${m[1]}`);
+  }
+  return files;
+}
 
 /** 侧栏卡片布局用到的共享样式类（定义在 src/styles/global.css） */
 const CARD_STYLE_CLASSES = [
@@ -85,8 +95,11 @@ describe("侧栏列表布局契约", () => {
   });
 
   it("侧栏面板不使用 el-table（表格在 200~360px 的侧栏里必然溢出）", () => {
+    const files = sidePanelComponents();
+    // 解析不出面板清单说明契约本身失效了 —— 宁可报错也不要静默放过
+    expect(files.length).toBeGreaterThan(0);
     const offenders: string[] = [];
-    for (const file of SIDE_PANEL_COMPONENTS) {
+    for (const file of files) {
       const body = readFileSync(file, "utf8");
       if (/<el-table\b/.test(body)) offenders.push(file);
     }
@@ -95,7 +108,11 @@ describe("侧栏列表布局契约", () => {
 
   it("共享的侧栏卡片样式存在（否则卡片会退化成没有样式的裸文本）", () => {
     const globalCss = readFileSync("src/styles/global.css", "utf8");
-    const missing = CARD_STYLE_CLASSES.filter(cls => !globalCss.includes(cls));
+    // 必须按**选择器边界**匹配：`.rs-cards` 里含有 `.rs-card` 这个子串，
+    // 子串匹配会让「把 .rs-card 整块删掉」也照样通过。
+    const missing = CARD_STYLE_CLASSES.filter(
+      cls => !new RegExp(`(?:^|[\\s,}])${cls.replace(".", "\\.")}\\s*[{,]`).test(globalCss),
+    );
     expect(missing).toEqual([]);
   });
 });

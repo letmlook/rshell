@@ -822,13 +822,6 @@ impl SessionService {
                                                     for m in matches {
                                                         let summary = trigger_action_summary(&m.action);
                                                         let result = execute_trigger_action(&m.action, text, session_id, Some(&client)).await;
-                                                        // 自触发冷却：SendText 写出去的文本会变成新的输出，
-                                                        // 若那段输出又匹配本触发器就会无限循环
-                                                        // （真机实测过自触发 19081 次把终端刷屏）。
-                                                        // 冷却到用户在该会话再次输入为止。
-                                                        if matches!(m.action, TriggerAction::SendText(_)) {
-                                                            trigger_engine.enter_cooldown(session_id, m.trigger_id);
-                                                        }
                                                         match result {
                                                             Ok(()) => trigger_engine.notify_fired(m.trigger_id, session_id, &summary),
                                                             Err(e) => {

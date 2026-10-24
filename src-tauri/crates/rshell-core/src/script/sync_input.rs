@@ -6,6 +6,7 @@
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
 use crate::session::service::SessionService;
+use rshell_api::types::ConnectionState;
 use rshell_api::AppEvent;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
@@ -32,13 +33,16 @@ impl SyncInputService {
     ///
     /// 设置需要同步输入的会话列表。空列表表示关闭同步输入。
     pub fn toggle_sync_input(&self, session_ids: Vec<Uuid>) -> Result<(), CoreError> {
-        let mut sync = self
-            .sync_sessions
-            .write()
-            .map_err(|e| CoreError::Internal(e.to_string()))?;
-        *sync = session_ids.clone();
+        {
+            let mut sync = self
+                .sync_sessions
+                .write()
+                .map_err(|e| CoreError::Internal(e.to_string()))?;
+            *sync = session_ids.clone();
+        }
 
         info!(count = session_ids.len(), "Sync input sessions updated");
+        // 发布在锁外：事件回调是同步模型，锁内发布会挡住订阅者回读状态
         self.event_bus
             .publish(AppEvent::SyncInputSessionsChanged { session_ids });
         Ok(())
@@ -97,7 +101,12 @@ impl SyncInputService {
                     session_id,
                     error: e.to_string(),
                 });
-                if should_drop_from_sync(&e) {
+                // 判定「这个会话是不是已经不可能再收到数据了」：
+                // 光看错误类型不够 —— 远端掉线时 `send_data` 返回的可能是
+                // `ConnectionError`（传输已死、连接条目还没来得及清理），
+                // 不一定是 `NotFound`。所以**再查一次会话状态**：
+                // 会话已不存在或已断开 → 移出同步组；仍在连接中 → 保留。
+                if should_drop_from_sync(&e) || session_is_gone(session_service, session_id).await {
                     dropped.push(session_id);
                 }
             }
@@ -124,6 +133,7 @@ impl SyncInputService {
             remaining = remaining.len(),
             "Removed disconnected sessions from sync group"
         );
+        // 发布在锁外（事件回调是同步模型，锁内发布会挡住订阅者回读状态）
         self.event_bus.publish(AppEvent::SyncInputSessionsChanged {
             session_ids: remaining,
         });
@@ -136,6 +146,19 @@ impl SyncInputService {
 /// 莫名其妙地丢掉配置，因此只在连接确实不存在时才移。
 fn should_drop_from_sync(error: &CoreError) -> bool {
     matches!(error, CoreError::NotFound(_))
+}
+
+/// 会话是否已经**不可能再收到数据**（不存在，或已断开）。
+///
+/// 仍在连接中（Connecting / Authenticating）不算断 —— 那种情况下发送失败
+/// 只是「还没连上」，把它移出同步组会让用户刚开同步就丢会话。
+async fn session_is_gone(session_service: &SessionService, session_id: Uuid) -> bool {
+    match session_service.get_state(session_id).await {
+        Ok(ConnectionState::Disconnected) => true,
+        Ok(_) => false,
+        // 会话不存在
+        Err(_) => true,
+    }
 }
 
 /// 同步目标集合：排除源会话
@@ -153,6 +176,7 @@ fn sync_targets(source_session_id: Uuid, sessions: &[Uuid]) -> Vec<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rshell_api::types::{AuthMethod, Protocol, SessionConfig};
     use std::sync::Arc;
 
     fn make_svc() -> SyncInputService {
@@ -291,5 +315,68 @@ mod tests {
         svc.remove_sessions(&[Uuid::new_v4()]);
 
         assert_eq!(svc.get_sync_sessions().unwrap(), vec![alive]);
+    }
+
+    /// **生产路径**：真正发一次，失败的会话被移出同步组
+    ///
+    /// 此前只有私有辅助函数与纯函数的单测，生产入口
+    /// `send_to_synced_sessions` 零覆盖 —— 「判定只看错误类型」这类问题
+    /// 就藏在那里（远端掉线时 `send_data` 返回的可能是 `ConnectionError`，
+    /// 未必是 `NotFound`）。
+    #[tokio::test]
+    async fn disconnected_target_is_removed_through_the_production_path() {
+        let bus = Arc::new(EventBus::new());
+        let svc = SyncInputService::new(bus.clone());
+        let sessions = SessionService::new(
+            bus.clone(),
+            Arc::new(crate::terminal::service::TerminalService::new(bus.clone())),
+            Arc::new(crate::script::trigger_engine::TriggerEngine::new(
+                bus.clone(),
+            )),
+            Arc::new(crate::security::host_key_decision::HostKeyDecisionRegistry::new(bus.clone())),
+        );
+
+        // 一个从未连接过的会话：状态 Disconnected，发送必然失败
+        let target = Uuid::new_v4();
+        sessions
+            .create_session(SessionConfig {
+                id: target,
+                name: "target".to_string(),
+                folder_id: None,
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                protocol: Protocol::SSH,
+                auth_method: AuthMethod::Password {
+                    username: "user".to_string(),
+                    has_password: true,
+                },
+                serial_config: None,
+            })
+            .await
+            .unwrap();
+        let source = Uuid::new_v4();
+
+        let changed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let c = changed.clone();
+        bus.subscribe(move |event| {
+            if let AppEvent::SyncInputSessionsChanged { session_ids } = event {
+                *c.lock().unwrap() = session_ids.to_vec();
+            }
+        });
+
+        svc.toggle_sync_input(vec![source, target]).unwrap();
+        svc.send_to_synced_sessions(source, b"ls\r", &sessions)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            svc.get_sync_sessions().unwrap(),
+            vec![source],
+            "发不出去的会话必须被移出同步组（否则之后每次按键都失败一次）"
+        );
+        assert!(
+            !changed.lock().unwrap().contains(&target),
+            "界面必须收到新的同步组列表"
+        );
     }
 }

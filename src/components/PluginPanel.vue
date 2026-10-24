@@ -54,7 +54,7 @@ const EXTENSION_LABELS: Record<string, string> = {
  * 把扩展点的 Debug 串翻成一句话。
  *
  * 取值优先级按「哪个字段是给人看的」排：title > name > scheme > position > id；
- * 都取不到就把所有字符串值拼起来。
+ * 都取不到就把串里所有引号内容拼起来（例如 `QuickCommand { commands: ["a","b"] }`）。
  */
 function extensionLabel(raw: string): string {
   const variant = /^([A-Za-z]+)/.exec(raw)?.[1] ?? "";
@@ -62,8 +62,14 @@ function extensionLabel(raw: string): string {
   if (!variant) return raw;
   const fields: Record<string, string> = {};
   for (const m of raw.matchAll(/(\w+):\s*"([^"]*)"/g)) fields[m[1]] = m[2];
+  const quoted = [...raw.matchAll(/"([^"]*)"/g)].map((m) => m[1]);
   const detail =
-    fields.title ?? fields.name ?? fields.scheme ?? fields.position ?? fields.id ?? Object.values(fields).join(" / ");
+    fields.title ??
+    fields.name ??
+    fields.scheme ??
+    fields.position ??
+    fields.id ??
+    (quoted.length > 0 ? quoted.join(" / ") : "");
   return detail ? `${base}（${detail}）` : base;
 }
 
@@ -168,7 +174,9 @@ onMounted(scan);
           </div>
           <div v-if="row.description || row.author" class="rs-card-line">
             <span class="rs-card-label">说明</span>
-            <span class="rs-card-value">{{ row.description || row.author }}</span>
+            <span class="rs-card-value" :title="row.description || row.author">
+              {{ row.description || row.author }}
+            </span>
           </div>
           <div v-if="row.permissions && row.permissions.length" class="rs-card-line">
             <span class="rs-card-label">权限</span>
@@ -179,7 +187,6 @@ onMounted(scan);
                 size="small"
                 disable-transitions
                 type="warning"
-                class="perm-tag"
               >
                 {{ permissionLabel(perm) }}
               </el-tag>
@@ -193,7 +200,6 @@ onMounted(scan);
                 :key="ext"
                 size="small"
                 disable-transitions
-                class="perm-tag"
                 :title="ext"
               >
                 {{ extensionLabel(ext) }}
@@ -250,5 +256,9 @@ h3 {
 .error {
   color: var(--el-color-danger);
   font-size: 12px;
+}
+/* 插件加载失败的原因：此前是普通灰，看起来像普通说明文字 */
+.plugin-error {
+  color: var(--el-color-danger);
 }
 </style>

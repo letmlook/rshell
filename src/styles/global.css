@@ -168,8 +168,9 @@ body {
   max-width: 100%;
   overflow: hidden;
 }
+/* el-tag__content 是 .el-tag（inline-flex）的 flex item：min-width 自动为 0，
+   所以 overflow:hidden + ellipsis 能生效，不需要额外的 display 设置 */
 .rs-card-tags .el-tag__content {
-  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

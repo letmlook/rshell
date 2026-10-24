@@ -120,8 +120,8 @@ describe("matchesHotkey", () => {
     ).toBe(true);
   });
 
-  // 字母键的 code 是 KeyA，与用户写的 a 对应
-  it("字母热键按物理键位命中", () => {
+  // 字母键按**打出来的字符**匹配（US 布局下它与物理键位一致）
+  it("字母热键命中（US 布局下字符与物理键位一致）", () => {
     const letter = parseHotkey("Ctrl+Shift+K")!;
     expect(
       matchesHotkey(
@@ -129,6 +129,22 @@ describe("matchesHotkey", () => {
         letter,
       ),
     ).toBe(true);
+  });
+
+  /**
+   * 字母键**只**按 `event.key` 匹配（打出来的字符），不收物理键位候选。
+   *
+   * 非 US 布局上两者会不同：QWERTZ 的物理 `KeyY` 那一格打出来是 `z`、Dvorak 的
+   * `KeyK` 那一格打出来是 `t`。如果字母也收物理键位候选，一次按键会**同时命中
+   * `y` 与 `z` 两条热键** —— 用户只想触发一条。
+   */
+  it("字母热键只按打出来的字符命中（QWERTZ 上不同时命中两条热键）", () => {
+    const hotkeyZ = parseHotkey("Ctrl+Shift+Z")!;
+    const hotkeyY = parseHotkey("Ctrl+Shift+Y")!;
+    // QWERTZ：物理 KeyY 那一格打出 "z"
+    const event = keyEvent({ key: "z", code: "KeyY", ctrlKey: true, shiftKey: true });
+    expect(matchesHotkey(event, hotkeyZ)).toBe(true);
+    expect(matchesHotkey(event, hotkeyY)).toBe(false);
   });
 });
 

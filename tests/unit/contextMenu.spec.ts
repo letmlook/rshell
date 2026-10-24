@@ -126,23 +126,15 @@ describe("全局右键菜单守卫", () => {
     const handler = vi.fn();
     child.addEventListener("contextmenu", handler);
 
-    const fire = (x: number, y: number) => {
-      child.dispatchEvent(
-        new MouseEvent("contextmenu", {
-          bubbles: true,
-          cancelable: true,
-          clientX: x,
-          clientY: y,
-        }),
-      );
-    };
-    fire(100, 200);
-    fire(100, 200); // 同一次右键的第二次事件：坐标与上一次完全相同
+    // 一次右键的真实事件序列：mousedown → contextmenu →（mouseup 时的）contextmenu
+    target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 2 }));
+    child.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    child.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
 
     expect(handler).toHaveBeenCalledOnce();
   });
 
-  it("不同位置的右键仍然照常传给子元素（不能把用户真的右键两次也吞掉）", () => {
+  it("用户真的右键两次时两次都能到达子元素（不能把第二次点击也吞掉）", () => {
     const target = host();
     installContextMenuGuard(target);
     const child = document.createElement("div");
@@ -150,20 +142,36 @@ describe("全局右键菜单守卫", () => {
     const handler = vi.fn();
     child.addEventListener("contextmenu", handler);
 
-    const fire = (x: number, y: number) => {
-      child.dispatchEvent(
-        new MouseEvent("contextmenu", {
-          bubbles: true,
-          cancelable: true,
-          clientX: x,
-          clientY: y,
-        }),
-      );
-    };
-    fire(100, 200);
-    fire(100, 200);
-    fire(300, 400);
+    // 第一次右键
+    target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 2 }));
+    child.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    child.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    // 第二次右键（新的按下 → 计数归零）
+    target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 2 }));
+    child.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    child.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
 
     expect(handler).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * 两次 contextmenu 的间隔 = **用户按住右键的时长**（可以超过一秒）。
+   * 所以判据不能是固定的时间窗口 —— 必须是「同一次按下里的第几次」。
+   */
+  it("两次事件相隔很久（用户按住右键）也仍然判为同一次点击", () => {
+    const target = host();
+    installContextMenuGuard(target);
+    const child = document.createElement("div");
+    target.appendChild(child);
+    const handler = vi.fn();
+    child.addEventListener("contextmenu", handler);
+
+    target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 2 }));
+    child.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    // 第二次事件「迟到」：模拟用户按住右键很久才松开
+    const late = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    child.dispatchEvent(late);
+
+    expect(handler).toHaveBeenCalledOnce();
   });
 });

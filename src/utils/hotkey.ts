@@ -101,18 +101,23 @@ function keyKey(event: KeyboardEvent): string {
 /**
  * 事件里的主键候选 → 与热键主键同一套写法。
  *
- * 返回**两个**候选：物理键位（`event.code` → `Digit9` → `9`）与符号键
- * （`event.key` → `(`）。两者任一命中即算匹配：
+ * **数字键**给两个候选：物理键位（`event.code` → `Digit9` → `9`）与实际打出来的
+ * 字符（`event.key` → `(`）。两者任一命中即算匹配：
  *
- * - 用户写 `Ctrl+Shift+9`（物理键 9）→ 靠 code 命中。带 Shift 时 `event.key`
+ * - 用户写 `Ctrl+Shift+9`（键帽上的 9）→ 靠 code 命中。带 Shift 时 `event.key`
  *   是 `(`，只看 key 永远匹配不上 —— 这正是原来的缺陷。
  * - 用户写 `Ctrl+Shift+(`（符号键）→ 靠 key 命中。
+ *
+ * **字母键只认 `event.key`**（与改动前的行为完全一致）：`event.key` 是**实际打出来
+ * 的字符**，在 QWERTZ / Dvorak 布局上它与物理键位不同（物理 `KeyY` 那一格打出来
+ * 是 `z`）。若字母也收物理键位候选，一次按键会**同时命中 `y` 与 `z` 两条热键**。
  */
 function eventKeys(event: KeyboardEvent): string[] {
   const fromCode = codeKey(event.code);
   const fromKey = keyKey(event);
-  if (!fromCode) return [fromKey];
-  if (fromCode === fromKey) return [fromCode];
+  if (!fromCode || fromCode === fromKey) return [fromKey];
+  // 物理键位候选只用于数字键（见上面的理由）
+  if (!/^[0-9]$/.test(fromCode)) return [fromKey];
   return [fromCode, fromKey];
 }
 
