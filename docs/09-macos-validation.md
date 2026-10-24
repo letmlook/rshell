@@ -1703,6 +1703,13 @@ group dropped=[d316ce61-…] remaining=1`，界面状态行更新为「当前同
 - 冷却表读锁在热路径上逐触发器取 → 改为进循环前取一次。
 - `toggle_sync_input` 原来**持写锁发布事件** → 移到锁外（事件回调是同步模型）。
 - 锁中毒时冷却判定 fail-open（静默失去自触发保护）→ 改为 fail-closed 并告警。
+- **`tests/unit/TransferDragDrop.spec.ts` 有一条 flaky 用例**（复审代理在全量跑时撞到，
+  隔离跑时通过/失败交替）：「拖拽后紧随的那次 click 被吞掉」。根因是用例在
+  `pointerup` 与 `click` 之间插了 `await` —— 浏览器里这两个事件是**同一任务**派发，
+  而 `await` 会跨过宏任务，「吞掉下一次 click」的标志位（`setTimeout(0)` 复位）先被
+  清掉。**修法**：用例按浏览器时序改成「`pointerup` 之后同步派发 `click`，中间不
+  `await`」→ 隔离连跑 5 次全过。**反证**：把吞 click 的 `preventDefault()` 关掉 →
+  该用例失败。
 
 **复审指出的「测试没覆盖生产路径」**：`send_to_synced_sessions`（生产入口）此前零
 覆盖，所以「错误类型判定只认 NotFound」这类问题就藏在里面。
@@ -1711,16 +1718,34 @@ group dropped=[d316ce61-…] remaining=1`，界面状态行更新为「当前同
 
 #### 复审轮之后的验证
 
+**真机（multipass Linux `192.168.252.2`，11 条真机用例全通过）**：
+新增 `real_self_trigger_does_not_loop` —— 用一个**静态校验放行、运行期却会自匹配**
+的触发器复现自触发闭环（条件 `SELF_LOOP\r` 匹配的是终端**回显**，动作文本
+`echo SELF_LOOP` 本身不含 `\r` → 创建时不被拒；写出去的文本被回显 → 再次匹配条件）。
+该用例驱动的是**与界面同一条** `CommandDispatcher::dispatch(AppCommand)` 路径。
+
+**反证**（把冷却的进入点关掉后重跑同一条用例）：
+
+```
+触发器自触发成环了：5 秒内触发了 27249 次
+```
+
+即：**没有冷却时 5 秒触发 27249 次**（与当初「自触发 19081 次把终端刷屏」是同一
+现象），有冷却时 ≤2 次。
+
 | 命令 | 结果 |
 |---|---|
 | `npm test` | Test Files **56 passed (56)**、Tests **528 passed (528)** |
 | `npm run typecheck` / `npm run build` / `npm run check:docs` / `npm run check:bundle` / `npm run check:release` | 均通过 |
 | `npm run test:scripts` | **48** 通过、0 失败 |
 | `cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` | 均 exit 0 |
-| `cargo test --workspace` | **432** 通过、**0** 失败、**19** 忽略 |
+| `cargo test --workspace` | **432** 通过、**0** 失败、**20** 忽略（新增的真机用例计入忽略） |
+| 真机用例（`cargo test -p rshell-core --test real_machine -- --ignored`） | **11** 通过、0 失败 |
 
-> **未做真机复验的部分**：复审驱动出来的改动（右键守卫改计数判定、触发器冷却改时间窗
-> 并移进 `check_output`、同步输入改按状态判定）在本轮**没有**再走一遍真机点击 ——
-> 宿主把 computer-use 的系统权限收回了（`computer_permission_required`），无法再操作
-> 界面。这三条都有对应的单元/集成回归兜住（右键守卫 3 条、触发器 3 条、同步输入 1 条
-> 生产路径用例），且改动前后的真机行为此前分别验证过。
+> **未做真机「点击」复验的部分**：复审驱动出来的**界面层**改动（右键守卫改计数判定）
+> 本轮没有再走一遍真机点击 —— 宿主把 computer-use 的系统权限收回了
+> （`computer_permission_required`），无法再操作界面。这条改动有 3 条单元回归兜住
+> （第二次事件被吞 / 用户真右键两次都到达 / 两次事件相隔很久仍判同一次点击），
+> 且改动前的版本已在真机上验证过「右键菜单稳定停留、九项可点」。触发器冷却与同步
+> 输入判定两处则**有真机证据**（上面的 11 条用例）。
+

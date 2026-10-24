@@ -313,14 +313,19 @@ describe("FileBrowserPane 拖放事件链", () => {
     await row.trigger("pointerdown", { button: 0, clientX: 10, clientY: 10 });
     firePointer("pointermove", { clientX: 60, clientY: 40 });
     firePointer("pointerup", { clientX: 60, clientY: 40 });
+
+    // click 与 pointerup **同一任务**内派发（浏览器就是这样：pointerup 之后
+    // 紧接着 mouseup/click），此时「吞掉下一次 click」的标志位还没被复位
+    // 定时器清掉。
+    //
+    // 这里**不能有 await**：一旦跨过宏任务，复位定时器先跑，标志位就没了，
+    // 用例变成时序敏感的 flaky（实测同一条用例在隔离运行时通过/失败交替）。
+    const clickEvent = new Event("click", { bubbles: true, cancelable: true });
+    row.element.dispatchEvent(clickEvent);
     await flushPromises();
 
     // 拖拽本身不改选中集；随后的 click 必须被吞掉（默认行为被取消），
     // 否则「拖一下」会顺手改掉选中集。
-    // click 与 pointerup 在同一 tick 内派发（标志位还没被定时器复位）。
-    const clickEvent = new Event("click", { bubbles: true, cancelable: true });
-    row.element.dispatchEvent(clickEvent);
-
     expect(clickEvent.defaultPrevented).toBe(true);
     const after = wrapper.emitted("selection-change")?.length ?? 0;
     expect(after).toBe(before);

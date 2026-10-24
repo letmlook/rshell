@@ -1017,6 +1017,70 @@ async fn real_trigger_executes_all_four_action_kinds() {
     assert!(!triggers.iter().any(|t| t.id == disconnect_trigger));
 }
 
+/// 自触发防护（真机）：动作文本的回显若再次匹配条件，不得形成循环
+///
+/// 复审发现：自触发冷却只加在 SSH 的输出处理里，Telnet/Serial 的协议任务
+/// 同样执行 `SendText` 动作却从不进入冷却 —— 那条自触发触发器在
+/// Telnet/Serial 上照样无限刷屏。
+///
+/// 这里用一个**静态校验放行、运行期却会自匹配**的触发器复现这个闭环：
+/// 条件 `SELF_LOOP\r` 匹配的是终端**回显**（带 `\r`），而动作文本
+/// `echo SELF_LOOP` 本身不含 `\r` → 创建时不被拒；写出去的文本被回显 →
+/// 回显再次匹配条件 → 没有冷却就是无限自触发。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器与 RSHELL_REAL_* 环境变量，不进 CI"]
+async fn real_self_trigger_does_not_loop() {
+    let _guard = TEST_LOCK.lock().await;
+    let h = Harness::new();
+
+    let session_id = h.create_ssh_session("self-loop").await;
+    h.connect(session_id).await;
+    h.connected_event(session_id, Duration::from_secs(20)).await;
+
+    let trigger_id = Uuid::new_v4();
+    h.dispatch(AppCommand::CreateTrigger {
+        trigger: Trigger {
+            id: trigger_id,
+            name: "self-loop".to_string(),
+            enabled: true,
+            condition: TriggerCondition::RegexAppear("SELF_LOOP\\r".to_string()),
+            action: TriggerAction::SendText("echo SELF_LOOP\n".to_string()),
+        },
+    })
+    .await
+    .expect("创建触发器失败");
+
+    h.send(session_id, None, "echo SELF_LOOP\n").await;
+
+    // 至少触发一次（动作真的执行了）
+    h.events
+        .wait_for(
+            |event| {
+                matches!(event, AppEvent::TriggerFired { trigger_id: tid, .. } if *tid == trigger_id)
+            },
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("触发器没有触发");
+
+    // 给自触发闭环留出时间后统计触发次数：必须有限
+    // （没有冷却时这里会是几百上千次）
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let fired = h
+        .events
+        .snapshot()
+        .iter()
+        .filter(|event| {
+            matches!(event, AppEvent::TriggerFired { trigger_id: tid, .. } if *tid == trigger_id)
+        })
+        .count();
+    assert!(fired <= 2, "触发器自触发成环了：5 秒内触发了 {fired} 次");
+
+    h.dispatch(AppCommand::DeleteTrigger { trigger_id })
+        .await
+        .expect("删除触发器失败");
+}
+
 // ===== 5. 隧道：Local + Dynamic =====
 
 #[tokio::test]
