@@ -61,6 +61,12 @@ cargo test --workspace
 
 本机 stable 自动更新冲突时，为命令设置 `RUSTUP_TOOLCHAIN=stable RUSTUP_NO_UPDATE_CHECK=1`，不要把工具链故障误报为项目编译失败。
 
+> **`cargo test --workspace` 之前必须先有 `dist/`**：`tauri::generate_context!()` 在
+> **编译期**要求 `frontendDist`（`../dist`）存在，目录不存在时整轮编译以
+> `the frontendDist configuration is set to "../dist" but this path doesn't exist`
+> 失败 —— 报错看着像配置写错，实际只是前端产物没构建。清掉 `dist/` 后先跑
+> `npm run build` 再跑 Rust 门禁。
+
 真机用例（不进 CI，需要真实的 multipass Linux 实例）：
 ```bash
 cd src-tauri

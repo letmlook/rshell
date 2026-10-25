@@ -1774,3 +1774,141 @@ line 6, column 33 | expected `.`, `=``，并且指到了出错的那一行）—
 > 清单改对之后显示器已休眠（桌面截图全黑、AX 绑定不上），无法再截图确认；该行为有
 > 单元回归兜着（`PluginPanel.spec.ts`「扩展点翻成可读说法，不显示 Rust 的 Debug 串」）。
 
+
+### 2026-10-25：死面门禁 + 恒空字段清理 + 面板补齐（macOS）
+
+本轮从「拉最新代码」开始，代码侧三端已经一致（`origin/main` = `allstack/main` =
+本地 HEAD = `8b08385`，无新提交可拉），于是把这一轮用在**按 CLAUDE.md 的审计清单
+逐类扫一遍「后端已实现、界面无入口」**，并把其中「两侧零引用的类型」
+这一类**变成机器门禁**。
+
+#### 拉取与基线
+
+| 检查 | 结果 |
+|---|---|
+| `git fetch --all` | `origin` 成功；`allstack` 走 HTTP 需凭据（`fatal: could not read Username`），改用 Gitea SSH 端口 `ssh://git@192.168.3.87:3022/letmlook/rshell.git` 核对，三端同指 `8b08385` |
+| `npm test`（改动前） | Test Files 56 passed、Tests 528 passed |
+| `cargo test --workspace`（改动前） | 432 通过、0 失败、20 忽略 |
+
+> **踩到的坑**：`cargo test --workspace` 首轮直接编译失败，报
+> `the frontendDist configuration is set to "../dist" but this path doesn't exist`。
+> 看着像 Tauri 配置写错，实际是 `tauri::generate_context!()` **编译期**要求
+> `frontendDist` 目录存在，而上一轮清理磁盘时把 `dist/` 删了。先 `npm run build`
+> 再跑 Rust 门禁即可。已写进 CLAUDE.md 的命令段。
+
+#### 真机验收（multipass Linux `192.168.252.2`）
+
+**11 条真机用例最终全部通过**（`cargo test -p rshell-core --test real_machine
+-- --ignored --test-threads=1`）。过程中有一条真实失败，排查结论是**环境漂移，
+不是应用缺陷**：
+
+| 现象 | 定位过程 | 结论 |
+|---|---|---|
+| `real_telnet_session_logs_in_and_runs_commands` 失败：等不到登录后的 shell 提示符 | 用例已收到 `login:` 与 `assword:`（说明协商与发送路径正常），卡在送入口令之后 | 实例上 `ubuntu` 的口令已不是文档记录的值（SSH 密码认证同样被拒） |
+
+两处**排查手段本身给过假信号**，一并记下：
+
+- **裸 telnet 探测的假阳性**：telnetd 先发一串 IAC 协商字节，其中有 `0x23`(`#`)；
+  以「看到 `$` 或 `#`」为成功判据的脚本会立刻误判成功。判据必须用不会与协商
+  字节混淆的串。
+- **离线比对口令无效**：macOS 的 `crypt` 不支持 yescrypt（`$y$`），对 `$y$` 盐值
+  返回的是短垃圾串，与任何候选都不相等 —— 「全部不匹配」这个结论毫无意义。
+  最后从上一轮会话留在本机的 hook transcript 里取到了当时实际用的口令值。
+
+**处置**：测试夹具 `rshell-test` 是本项目专用实例，口令的唯一消费者就是这条用例，
+于是把口令恢复成文档记录的值（`ubuntu`），并用 SSH 密码认证复验通过。**口令本身
+不写进仓库任何文档**（CLAUDE.md 的「不要记录私钥、密码或脚本中可能含有的凭据」）。
+
+#### 工作包 A：把「两侧零引用的类型」从人工审计变成门禁
+
+CLAUDE.md 列的审计类别里，「两侧零引用的类型」此前**只能人工扫**。新增
+`tests/unit/deadSurface.spec.ts`：沿「类型 → 它引用的类型」建边，从
+「定义文件之外的真实使用点」出发做可达性闭包，不可达者即为死类型。
+
+判据里最关键的一条：**import 与 re-export 不算使用**。`rshell-api/src/lib.rs` 的
+`pub use types::*;` 与 `client.ts` 的 `export type { ... }` 会让**每一个**类型都
+「有引用」，门禁就静默失效了 —— 这与本仓库已有的「假绿」教训同类。
+
+门禁上线后立刻抓出唯一一处死类型：**`ProtocolType`（Rust 与 TS 两侧各一个）**，
+与真正在用的 `Protocol`（`"SSH" | "Telnet" | "Serial"`）完全同义，两侧都零使用方
+（Rust 侧只在同文件自己的测试模块里被引用过一次，等于在声明一个没人用的能力）。
+处置是**删除**而非保留：`Protocol` 才是协议契约的载体，RDP 一旦被加回来
+`removed_rdp_protocol_is_rejected` 立即失败。
+
+#### 工作包 B：`SshKeyInfo.comment` 是恒空字段
+
+`ssh-key` 的 OpenSSH 私钥本来带 comment，后端三处构造点却一律写死
+`comment: String::new()`；前端也从不读它 —— 一个**永远为假的字段**。
+
+**为什么删而不是填**：生成与导入时都执行了 `private_key.set_comment(name)`，
+即密钥的 OpenSSH comment **就是它的名字**；从磁盘重建时 comment 也已被完全吸收进
+`name`（`name = comment`，为空才回落到文件名）。也就是说 comment 不携带任何
+`name` 之外的信息，填它等于把 name 抄一遍。处置：**两侧删除该字段**
+（`SshKeyInfo.comment` 与仅在内存中的 `StoredSshKey.comment`），无信息损失。
+
+#### 工作包 C：加载失败提示「给错原因」
+
+侧栏「部分连接加载失败」此前只有一句话：「请检查配置和**钥匙串访问权限**后重试」。
+但后端给了两类 `kind`（`CredentialMigrationFailed` / `StorageUnavailable`），
+**原因与下一步完全不同** —— 会话存储整个读不到时（`storage_load_issue()`，
+`session_id` 为空的那条）却被引导去查钥匙串，方向指错；两类 message 又都是英文。
+
+处置：按 `kind` 给中文归因与对应下一步（存储 → 查存储目录权限；凭据迁移 → 查钥匙串），
+后端 message 作为技术细节原样保留；「重试加载」入口改为只在后端说该问题可重试时
+才出现（`retryable` 此前**零消费方**，现在有了）。Rust 侧同时把
+`CredentialMissing → retryable: false` 的映射写对（凭据条目不存在时重载读到的还是
+同一份空配置，重试不可能变好）。
+
+> **一处要写清楚**：`CredentialMissing` 目前**走不到**这条加载路径 ——
+> `list_all` 只会在「读存储失败」与「迁移失败」两种情况下产出问题条目；凭据条目
+> 缺失是在连接边界（`credential()`）才被发现的，走的是另一条已经有正确界面
+> （`ConnectionRecoveryNotice`，按错误类型给「更新凭据」入口）的路径。所以这次
+> 改的是**映射表本身**（`load_issue` 对每个错误变体的映射此前全部写 true），
+> 界面上的「可重试 / 不可重试」分流目前仍只有可重试那一种会命中 —— 分流逻辑与
+> 按钮显隐**有单元回归兜着**（`SessionListSecurity.spec.ts`），但真机上暂时
+> 不会出现不可重试的加载问题。
+
+#### 工作包 D：后端已填好、界面没展示的字段接上
+
+| 字段 | 后端 | 此前界面 | 现在 |
+|---|---|---|---|
+| `ActiveTunnelInfo.connections_count` / `bytes_transferred` | 真填 | 完全不显示 | 隧道卡片显示「N 个连接」与字节数 |
+| `HostKeyEntry.first_seen` | 真填（sidecar） | 只显示 `last_seen` | 卡片同时显示「首次连接」 |
+| `PluginInfo.plugin_type` | 真填 | 完全不显示 | 插件卡片显示「类型」（`Wasm` → 「WASM 模块」） |
+
+字节格式化此前在传输面板与隧道面板各写了一份，收敛为 `src/utils/formatSize.ts`
+唯一实现（两个面板显示同一串字节时格式必须一致）。
+
+#### 门禁
+
+| 命令 | 结果 |
+|---|---|
+| `npm test` | Test Files **57 passed (57)**、Tests **538 passed (538)** |
+| `npm run typecheck` / `npm run build` | 均通过 |
+| `npm run check:docs` / `check:bundle` / `check:release` | 均通过 |
+| `npm run test:scripts` | **48** 通过、0 失败 |
+| `cargo fmt --all -- --check` | 退出 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 退出 0 |
+| `cargo test --workspace` | 退出 0（**433** 通过、**0** 失败、**20** 忽略；基线 432 + 本轮新增 1 条） |
+| 真机用例 | **11** 通过、0 失败 |
+
+#### 本轮**未**验证的部分（如实记录）
+
+- **原生 GUI 点击验收没做**：本轮会话没有 computer-use 的系统权限，无法操作
+  macOS 原生窗口。工作包 C 与 D 改的都是**界面呈现**（加载失败提示文案与分流、
+  隧道卡片的两项计数、主机密钥的「首次连接」、插件卡片的「类型」）——
+  这些**只有单元回归兜着，没有真机像素证据**。其中隧道卡片新增的两个数值落在
+  既有的 `tunnel-item-meta` 行内（纯文本，未新增列或按钮），但**窄侧栏（280px）
+  下是否仍不换行/不溢出，未在真机确认**。
+- 上一轮遗留的「插件扩展点可读说法未看到像素」仍未补上（同一原因）。
+- 签名与公证、外部 SSH 服务、物理串口仍按 CLAUDE.md 标记为未验证。
+
+#### 审计结论：判定为「合理保留」的两处
+
+- `HostKeyEntry.trust_level`：在 `host_key_manager` 内部**有真实用途**
+  （`entry.trust_level != TrustLevel::Trusted` 决定条目是否被写回 known_hosts），
+  且该面板只列「已信任」的条目，界面上再显示信任级别是噪声。
+- `AppEvent::ConnectionStateChanged` 的 `info` 载荷：`ConnectionInfo` 本身是
+  会话服务内部缓存的真实结构（`state.connection_info`），只是这个事件里的
+  `info` 字段前端不读。删它要动事件契约两侧而收益仅是少几个字节的载荷，
+  本轮不做 —— 记录在此，不当已解决。
