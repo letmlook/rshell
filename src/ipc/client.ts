@@ -18,7 +18,6 @@ import type {
   RemoteFileEntry,
   TransferTaskInfo,
   Protocol,
-  ProtocolType,
   QuickCommand,
   SessionConfig,
   SshKeyType,
@@ -386,4 +385,4 @@ export const unloadPlugin = (plugin_id: string) => call({ UnloadPlugin: { plugin
 export const listPlugins = () => call<PluginInfo[]>({ ListPlugins: null });
 
 // 重新导出类型方便使用方
-export type { ConnectionState, Protocol, ProtocolType };
+export type { ConnectionState, Protocol };

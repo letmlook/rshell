@@ -539,22 +539,19 @@ pub struct ThemeInfo {
 
 // ===== 多协议 =====
 
-/// 连接协议类型
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ProtocolType {
-    SSH,
-    Telnet,
-    Serial,
-}
+// 连接协议用 Protocol（见文件上部的 `pub enum Protocol`）。此前这里还有一个
+// 同义的 ProtocolType，全仓库零使用方 —— 它只在同文件自己的测试模块里被
+// 引用过一次，等于在声明一个没人用的能力。协议契约测试直接针对真正在用的
+// Protocol 断言，RDP 一旦被加回来立即失败。
+// 零引用类型的门禁见 tests/unit/deadSurface.spec.ts。
 
 #[cfg(test)]
 mod protocol_contract_tests {
-    use super::{ForwardDirection, Protocol, ProtocolType};
+    use super::{ForwardDirection, Protocol};
 
     #[test]
     fn removed_rdp_protocol_is_rejected() {
         assert!(serde_json::from_str::<Protocol>("\"RDP\"").is_err());
-        assert!(serde_json::from_str::<ProtocolType>("\"RDP\"").is_err());
         assert!(serde_json::from_str::<Protocol>("\"SSH\"").is_ok());
         assert!(serde_json::from_str::<Protocol>("\"Telnet\"").is_ok());
         assert!(serde_json::from_str::<Protocol>("\"Serial\"").is_ok());

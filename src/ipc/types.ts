@@ -342,7 +342,10 @@ export interface TerminalColorScheme {
 
 // ===== 多协议配置 =====
 
-export type ProtocolType = "SSH" | "Telnet" | "Serial";
+// 连接协议用 Protocol（"SSH" | "Telnet" | "Serial"）。此前这里还有一个
+// 同义的 ProtocolType，全仓库零使用方（只在 client.ts 被 import 后再
+// re-export 一次，两侧都没人真正用它）—— 与 Protocol 完全重复。
+// 零引用类型的门禁见 tests/unit/deadSurface.spec.ts。
 
 export interface SerialConfig {
   port: string;
