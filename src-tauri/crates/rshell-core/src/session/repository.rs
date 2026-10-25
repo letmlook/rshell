@@ -111,7 +111,10 @@ fn load_issue(session_id: Uuid, error: &SessionRepositoryError) -> SessionLoadIs
             kind: SessionLoadIssueKind::CredentialMigrationFailed,
             message: "The credential entry is missing. Update the credential, then retry loading."
                 .into(),
-            retryable: true,
+            // 凭据条目**根本不存在**：重载只是把同一份配置再读一遍，结果不变。
+            // 只有用户补录凭据之后才会有内容可读 —— 所以这一类不可重试，
+            // 界面应引导去「更新凭据」而不是让用户反复点重试。
+            retryable: false,
         },
         SessionRepositoryError::Storage(_) | SessionRepositoryError::Transaction => SessionLoadIssue {
             session_id: Some(session_id),
@@ -368,6 +371,7 @@ pub(crate) mod tests {
     use rshell_api::credentials::{
         CredentialError, CredentialKey, CredentialKind, CredentialStore,
     };
+    use rshell_api::types::SessionLoadIssueKind;
     use rshell_api::types::{AuthMethod, CredentialUpdate, Protocol, SessionCredential};
     use std::{
         collections::HashMap,
@@ -461,6 +465,26 @@ pub(crate) mod tests {
             assert_safe(&path);
             assert_eq!(repo.list_all().unwrap().sessions.len(), 1);
         }
+    }
+
+    #[test]
+    fn missing_credential_issue_is_not_retryable_while_storage_issue_is() {
+        // 凭据条目不存在：重载读到的还是同一份空配置，重试不可能变好 ——
+        // 界面应引导去补录凭据，而不是让用户反复点「重试加载」。
+        let missing = load_issue(Uuid::new_v4(), &SessionRepositoryError::CredentialMissing);
+        assert!(!missing.retryable);
+        assert_eq!(
+            missing.kind,
+            SessionLoadIssueKind::CredentialMigrationFailed
+        );
+
+        // 存储读不到：修好存储访问权限之后重试是有意义的。
+        let storage = load_issue(
+            Uuid::new_v4(),
+            &SessionRepositoryError::Storage("metadata storage unavailable".into()),
+        );
+        assert!(storage.retryable);
+        assert_eq!(storage.kind, SessionLoadIssueKind::StorageUnavailable);
     }
 
     #[test]

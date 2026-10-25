@@ -15,7 +15,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useSessionsStore } from "../stores/sessions";
 import { DEFAULT_FOLDER_LABEL, useFoldersStore } from "../stores/folders";
 import type { Uuid } from "../ipc/types";
-import type { SessionConfig } from "../ipc/types";
+import type { SessionConfig, SessionLoadIssue } from "../ipc/types";
 import SessionCredentialDialog from "./SessionCredentialDialog.vue";
 import ConnectionRecoveryNotice from "./ConnectionRecoveryNotice.vue";
 import { confirmDialog } from "../utils/dialog";
@@ -188,6 +188,26 @@ function openCredentialRecovery(id: Uuid) {
   if (session) credentialSession.value = session;
 }
 
+/**
+ * 加载失败的原因与下一步。
+ *
+ * 后端给了两类 `kind`，**原因和该做什么完全不同**：一类是钥匙串里的旧凭据
+ * 迁不出来（钥匙串访问权限 / 凭据本身），一类是会话存储整个读不到（存储目录
+ * 权限）。此前界面只有一句话「请检查配置和钥匙串访问权限后重试」—— 存储读不到
+ * 的场景被引导去查钥匙串，指错了方向；两类的 message 又都是英文。
+ *
+ * 这里按 kind 给中文归因与对应下一步，后端的 message 作为技术细节原样保留。
+ */
+function issueReason(issue: SessionLoadIssue): string {
+  if (issue.kind === "StorageUnavailable") {
+    return "连接存储不可用：检查会话存储目录的访问权限后重试";
+  }
+  return "凭据迁移失败：检查钥匙串访问权限后重试";
+}
+
+/** 至少有一条问题在修好原因后重试是有意义的，才给「重试加载」入口 */
+const hasRetryableIssue = computed(() => store.loadIssues.some((issue) => issue.retryable));
+
 function retryConnection(id: Uuid) {
   void store.connect(id).catch(() => undefined);
 }
@@ -279,11 +299,19 @@ onBeforeUnmount(() => {
     <p v-if="store.error" class="error">{{ store.error }}</p>
     <p class="model-hint">一条连接信息可同时开多个标签会话，每个标签是独立的会话实例。</p>
     <div v-if="store.loadIssues.length" class="error" role="alert">
-      <p>部分连接加载失败。请检查配置和钥匙串访问权限后重试。</p>
+      <p>部分连接加载失败。</p>
       <p v-for="issue in store.loadIssues" :key="issue.session_id ?? 'storage'">
-        {{ issue.session_id ?? '连接存储' }}: {{ issue.message }}
+        {{ issue.session_id ?? '连接存储' }}：{{ issueReason(issue) }}
+        <span class="issue-detail">{{ issue.message }}</span>
       </p>
-      <button class="ctx-item" :disabled="store.retryingLoad" @click="store.retryLoad()">重试加载</button>
+      <button
+        v-if="hasRetryableIssue"
+        class="ctx-item"
+        :disabled="store.retryingLoad"
+        @click="store.retryLoad()"
+      >
+        重试加载
+      </button>
     </div>
     <SessionCredentialDialog v-if="credentialSession" :session="credentialSession" @close="credentialSession = null" />
 
@@ -458,6 +486,13 @@ h3 {
   color: var(--rs-p-danger);
   font-size: var(--rs-fs-xs);
   margin: 0;
+}
+/* 后端 message 是技术细节（英文原文），主因与下一步用中文，细节弱化一行 */
+.issue-detail {
+  display: block;
+  color: var(--rs-fg-muted);
+  font-size: var(--rs-fs-xs);
+  word-break: break-word;
 }
 .notice {
   color: var(--rs-fg-muted);

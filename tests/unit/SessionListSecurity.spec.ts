@@ -34,7 +34,7 @@ describe("session credential recovery", () => {
     let retried = false;
     invoke.mockImplementation(async (command: string) => {
       if (command === "list_sessions") return retried ? [session] : [];
-      if (command === "list_session_load_issues") return retried ? [] : [{ session_id: "legacy-id", message: "Could not load or migrate saved session" }];
+      if (command === "list_session_load_issues") return retried ? [] : [{ session_id: "legacy-id", kind: "CredentialMigrationFailed", message: "Could not load or migrate saved session", retryable: true }];
       if (command === "list_folders") return [];
       if (command === "retry_session_load") { retried = true; return; }
       throw new Error(`Unexpected command ${command}`);
@@ -52,6 +52,47 @@ describe("session credential recovery", () => {
     expect(invoke).toHaveBeenCalledWith("retry_session_load", null);
     expect(wrapper.text()).not.toContain("legacy-id");
     expect(wrapper.text()).toContain("Production SSH");
+  });
+
+  it("gives each load-issue kind its own cause instead of pointing every failure at the keychain", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") return [];
+      if (command === "list_session_load_issues") return [
+        { session_id: null, kind: "StorageUnavailable", message: "Could not read saved sessions.", retryable: true },
+        { session_id: "legacy-id", kind: "CredentialMigrationFailed", message: "credential store unavailable", retryable: true },
+      ];
+      if (command === "list_folders") return [];
+      throw new Error(`Unexpected command ${command}`);
+    });
+    const { wrapper, store } = setup();
+    await store.refresh();
+    await flushPromises();
+    // 存储读不到：引导去查存储目录，而不是钥匙串
+    expect(wrapper.text()).toContain("连接存储不可用");
+    expect(wrapper.text()).toContain("会话存储目录");
+    // 凭据迁移失败：引导去查钥匙串
+    expect(wrapper.text()).toContain("凭据迁移失败");
+    expect(wrapper.text()).toContain("钥匙串");
+    // 后端 message 作为技术细节原样保留
+    expect(wrapper.text()).toContain("Could not read saved sessions.");
+    // 两类都可重试 → 有重试入口
+    expect(button("重试加载")).toBeDefined();
+  });
+
+  it("does not offer a retry when the backend marked the issue as not retryable", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") return [];
+      if (command === "list_session_load_issues") return [
+        { session_id: "legacy-id", kind: "CredentialMigrationFailed", message: "The credential entry is missing.", retryable: false },
+      ];
+      if (command === "list_folders") return [];
+      throw new Error(`Unexpected command ${command}`);
+    });
+    const { wrapper, store } = setup();
+    await store.refresh();
+    await flushPromises();
+    expect(wrapper.text()).toContain("凭据迁移失败");
+    expect(button("重试加载")).toBeUndefined();
   });
 
   it.each(["Password", "PublicKey", "KeyboardInteractive"] as const)("updates an existing %s session with only a newly entered secret", async (auth) => {
