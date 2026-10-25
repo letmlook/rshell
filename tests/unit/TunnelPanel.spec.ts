@@ -216,6 +216,21 @@ describe("TunnelPanel", () => {
     wrapper.unmount();
   });
 
+  it("shows the backend-filled connection count and transferred bytes", async () => {
+    // 后端一直在填 connections_count / bytes_transferred，界面此前完全不显示 ——
+    // 用户看不出隧道到底有没有在跑、跑了多少。
+    vi.mocked(listTunnels).mockResolvedValue([
+      { ...activeTunnel, connections_count: 3, bytes_transferred: 2048 },
+    ]);
+    const wrapper = mount(TunnelPanel, { global: { stubs } });
+    await flushPromises();
+
+    const entry = wrapper.find('[data-test="tunnel-list"] > li');
+    expect(entry.text()).toContain("3 个连接");
+    expect(entry.text()).toContain("2.0 KB");
+    wrapper.unmount();
+  });
+
   it("shows the error reason of a broken tunnel instead of a bare variant name", async () => {
     vi.mocked(listTunnels).mockResolvedValue([
       { ...activeTunnel, state: { Error: "session disconnected" } },

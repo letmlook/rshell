@@ -58,6 +58,17 @@ describe("PluginPanel 能力边界", () => {
     wrapper.unmount();
   });
 
+  it("展示插件类型（翻成可读说法，不显示 Rust 的枚举名）", async () => {
+    // plugin_type 后端一直有填，界面上此前完全不显示 —— 用户看不出装的是
+    // 内置模块、WASM 还是动态库。
+    const wrapper = await mountPanel();
+    const text = wrapper.text();
+    expect(text).toContain("类型");
+    expect(text).toContain("WASM 模块");
+    expect(text).not.toContain("Wasm");
+    wrapper.unmount();
+  });
+
   it("展示清单声明的权限（翻成可读说法）", async () => {
     const wrapper = await mountPanel();
     const text = wrapper.text();

@@ -23,6 +23,7 @@ import { ipcErrorMessage } from "../ipc/client";
 import { subscribeAppEvents } from "../ipc/events";
 import type { Uuid, PortForwardRule, ActiveTunnelInfo, TunnelState } from "../ipc/types";
 import { confirmDialog } from "../utils/dialog";
+import { formatSize } from "../utils/formatSize";
 import { useSessionsStore } from "../stores/sessions";
 
 const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
@@ -401,6 +402,8 @@ onBeforeUnmount(() => {
         </div>
         <div class="tunnel-item-meta">
           <span class="tunnel-item-session">{{ sessionName(row.session_id) }}</span>
+          <span class="tunnel-item-stat">{{ row.connections_count }} 个连接</span>
+          <span class="tunnel-item-stat">{{ formatSize(row.bytes_transferred) }}</span>
           <span class="tunnel-item-id" :title="row.id">ID {{ row.id }}</span>
         </div>
       </li>
@@ -540,5 +543,10 @@ h3 {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--rs-font-mono, monospace);
+}
+/* 连接数与已传字节：窄侧栏下允许收缩，但数字本身不截断（截断了读不出大小） */
+.tunnel-item-stat {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 </style>

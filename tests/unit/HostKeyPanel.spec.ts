@@ -47,6 +47,19 @@ describe("HostKeyPanel", () => {
     wrapper.unmount();
   });
 
+  it("shows both the first and the last seen time", async () => {
+    // 后端 sidecar 一直记着首次连接时间，界面上此前只显示「上次连接」——
+    // 用户判断一条主机密钥是不是自己很久以前加的，只能靠猜。
+    vi.mocked(listHostKeys).mockResolvedValue([entry]);
+    const wrapper = mount(HostKeyPanel, { global: { stubs } });
+    await flushPromises();
+
+    const text = wrapper.get('[data-test="host-key-list"]').text();
+    expect(text).toContain("首次连接");
+    expect(text).toContain("上次连接");
+    wrapper.unmount();
+  });
+
   it("says so when nothing is trusted yet", async () => {
     const wrapper = mount(HostKeyPanel, { global: { stubs } });
     await flushPromises();

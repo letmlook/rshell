@@ -14,6 +14,22 @@ function stateLabel(p: PluginInfo): string {
 }
 
 /**
+ * 插件类型 → 可读说法。
+ *
+ * `plugin_type` 后端一直有填（Builtin / Wasm / DynamicLib），此前界面上完全不
+ * 显示 —— 用户看不出装的是哪种插件。Rust 枚举直接显示英文不直观，这里翻成中文。
+ */
+const PLUGIN_TYPE_LABELS: Record<string, string> = {
+  Builtin: "内置",
+  Wasm: "WASM 模块",
+  DynamicLib: "动态库",
+};
+
+function pluginTypeLabel(type: string): string {
+  return PLUGIN_TYPE_LABELS[type] ?? type;
+}
+
+/**
  * 清单声明的权限名 → 可读说法。
  *
  * 权限名是 Rust 枚举的 Debug 输出（`NetworkAccess` 之类），直接显示给用户
@@ -168,6 +184,10 @@ onMounted(scan);
           </el-tag>
         </div>
         <div class="rs-card-body">
+          <div class="rs-card-line">
+            <span class="rs-card-label">类型</span>
+            <span class="rs-card-value">{{ pluginTypeLabel(row.plugin_type) }}</span>
+          </div>
           <div class="rs-card-line">
             <span class="rs-card-label">版本</span>
             <span class="rs-card-value">{{ row.version }}</span>

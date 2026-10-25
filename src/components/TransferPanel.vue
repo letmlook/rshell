@@ -23,6 +23,7 @@
  */
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { formatTransferLogTime, type TransferLogEntry, type TransferLogLevel } from "../utils/transferLog";
+import { formatSize as fmtSize } from "../utils/formatSize";
 
 export type TransferPhase = "queued" | "active" | "paused" | "failed" | "done" | "cancelled";
 
@@ -200,13 +201,6 @@ function runBulkAction(action: BulkAction) {
   const ids = bulkTargets.value[action];
   if (ids.length === 0) return;
   emit("remove-many", ids);
-}
-
-function fmtSize(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 function fmtSpeed(b: number): string {

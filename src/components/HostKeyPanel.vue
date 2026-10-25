@@ -83,6 +83,7 @@ onMounted(async () => {
           <span class="type">{{ entry.key_type }}</span>
           <span class="fp">{{ entry.fingerprint }}</span>
           <span class="seen">上次连接：{{ formatSeen(entry.last_seen) }}</span>
+          <span class="seen">首次连接：{{ formatSeen(entry.first_seen) }}</span>
         </div>
         <el-button
           size="small"
