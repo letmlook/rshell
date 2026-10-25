@@ -19,7 +19,6 @@ fn sample_info() -> SshKeyInfo {
         key_type: SshKeyType::ED25519,
         fingerprint: "SHA256:abc123".into(),
         public_key_blob: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...".into(),
-        comment: "test@host".into(),
         has_passphrase: true,
         created_at: "2026-07-31T00:00:00Z".into(),
     }
@@ -63,7 +62,6 @@ fn ssh_key_info_field_set_is_whitelisted() {
         "key_type",
         "fingerprint",
         "public_key_blob",
-        "comment",
         "has_passphrase",
         "created_at",
     ]

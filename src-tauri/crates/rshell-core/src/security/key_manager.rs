@@ -71,7 +71,6 @@ pub struct StoredSshKey {
     pub fingerprint: String,
     pub public_key_blob: String,
     pub private_key_data: Vec<u8>,
-    pub comment: String,
     pub has_passphrase: bool,
     pub created_at: String,
 }
@@ -206,7 +205,6 @@ impl KeyManager {
             fingerprint,
             public_key_blob: public_key_str,
             private_key_data: key_data.to_vec(),
-            comment: String::new(),
             // PROB-10：has_passphrase 如实反映密钥加密状态，不再恒为 false
             has_passphrase: private_key.is_encrypted(),
             created_at,
@@ -350,7 +348,6 @@ impl KeyManager {
             fingerprint: fingerprint.clone(),
             public_key_blob: public_key_str.clone(),
             private_key_data: private_key_data.clone(),
-            comment: String::new(),
             has_passphrase,
             created_at: now.clone(),
         };
@@ -368,7 +365,6 @@ impl KeyManager {
             key_type,
             fingerprint,
             public_key_blob: public_key_str,
-            comment: String::new(),
             has_passphrase,
             created_at: now,
         };
@@ -469,7 +465,6 @@ impl KeyManager {
             fingerprint: fingerprint.clone(),
             public_key_blob: public_key_str.clone(),
             private_key_data: stored_bytes.clone(),
-            comment: String::new(),
             has_passphrase,
             created_at: now.clone(),
         };
@@ -486,7 +481,6 @@ impl KeyManager {
             key_type,
             fingerprint,
             public_key_blob: public_key_str,
-            comment: String::new(),
             has_passphrase,
             created_at: now,
         };
@@ -549,7 +543,6 @@ impl KeyManager {
                 key_type: k.key_type,
                 fingerprint: k.fingerprint.clone(),
                 public_key_blob: k.public_key_blob.clone(),
-                comment: k.comment.clone(),
                 has_passphrase: k.has_passphrase,
                 created_at: k.created_at.clone(),
             })

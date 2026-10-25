@@ -418,7 +418,6 @@ pub struct SshKeyInfo {
     pub key_type: SshKeyType,
     pub fingerprint: String,
     pub public_key_blob: String,
-    pub comment: String,
     pub has_passphrase: bool,
     pub created_at: String,
 }

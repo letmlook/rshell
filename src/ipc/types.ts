@@ -271,7 +271,6 @@ export interface SshKeyInfo {
   key_type: SshKeyType;
   fingerprint: string;
   public_key_blob: string;
-  comment: string;
   has_passphrase: boolean;
   created_at: Timestamp;
 }
